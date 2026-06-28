@@ -29,6 +29,7 @@
 //   - POST {owner}/{metadata-many,read-many,write-many} -> batch (per-path loop)
 //   DTOs are snake_case; `kind` is exactly "file" | "directory"; errors map
 //   404->NotFound, 400->BadRequest, 409->Conflict (vfs/src/gateway.rs:1016).
+import { randomUUID } from "node:crypto";
 import type { VfsStorage, VfsMetadata } from "./native.js";
 
 const DEFAULT_ROUTE_PREFIX = "/internal/chevalier/vfs";
@@ -126,7 +127,9 @@ export function createVfsGatewayServer(
 
       // ---- leases (mutations acquire/release one; we issue a synthetic grant) --
       if (op === "lease" && method === "POST") {
-        return json(200, { resource_key: `rk:${ownerId}:${relPath}`, owner_token: randomToken() });
+        const body = (await req.json().catch(() => ({}))) as { path?: unknown };
+        const leasePath = normalizePath(typeof body.path === "string" ? body.path : relPath);
+        return json(200, { resource_key: `rk:${ownerId}:${leasePath}`, owner_token: randomToken() });
       }
       if (op === "lease" && method === "DELETE") {
         return new Response(null, { status: 204 });
@@ -350,6 +353,6 @@ function errorResponse(status: number, message: string): Response {
 }
 
 function randomToken(): string {
-  // A synthetic lease owner token; uniqueness is sufficient (single-writer host).
-  return `ot-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`;
+  // Rust FUSE clients deserialize owner_token as a UUID.
+  return randomUUID();
 }

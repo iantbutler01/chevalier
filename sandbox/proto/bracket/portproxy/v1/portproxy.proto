@@ -81,6 +81,7 @@ message InteractiveShellRequest {
   oneof request {
     InteractiveShellStart start = 1;
     bytes stdin_data = 2;
+    InteractiveShellResize resize = 3;
   }
 }
 
@@ -89,6 +90,11 @@ message InteractiveShellStart {
   repeated string args = 2;
   map<string, string> env = 3;
   string cwd = 4;
+}
+
+message InteractiveShellResize {
+  uint32 cols = 1;
+  uint32 rows = 2;
 }
 
 message InteractiveShellResponse {

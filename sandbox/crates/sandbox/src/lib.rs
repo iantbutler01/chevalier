@@ -59,8 +59,8 @@ use proto::bracket::portproxy::v1::port_proxy_client::PortProxyClient;
 use proto::bracket::portproxy::v1::shell_exec_client::ShellExecClient;
 use proto::bracket::portproxy::v1::{
     DeletePathRequest, ExecRequest, ExecResponse, ExecStart, InteractiveShellRequest,
-    InteractiveShellResponse, InteractiveShellStart, ListDirectoryRequest, ReadFileRequest,
-    WriteFileRequest, exec_request, exec_response, interactive_shell_request,
+    InteractiveShellResize, InteractiveShellResponse, InteractiveShellStart, ListDirectoryRequest,
+    ReadFileRequest, WriteFileRequest, exec_request, exec_response, interactive_shell_request,
     interactive_shell_response,
 };
 use proto::vmd::v1::vmd_service_client::VmdServiceClient;
@@ -523,6 +523,7 @@ pub enum ExecEvent {
 #[derive(Clone, Debug)]
 pub enum ShellInput {
     Data(Vec<u8>),
+    Resize { cols: u16, rows: u16 },
     Eof,
 }
 
@@ -1942,6 +1943,22 @@ impl Session {
                         if req_tx
                             .send(InteractiveShellRequest {
                                 request: Some(interactive_shell_request::Request::StdinData(data)),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    ShellInput::Resize { cols, rows } => {
+                        if req_tx
+                            .send(InteractiveShellRequest {
+                                request: Some(interactive_shell_request::Request::Resize(
+                                    InteractiveShellResize {
+                                        cols: u32::from(cols),
+                                        rows: u32::from(rows),
+                                    },
+                                )),
                             })
                             .await
                             .is_err()

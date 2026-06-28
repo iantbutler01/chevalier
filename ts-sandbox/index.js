@@ -591,3 +591,4 @@ module.exports.ExecHandle = nativeBinding.ExecHandle
 module.exports.ForwardHandle = nativeBinding.ForwardHandle
 module.exports.Sandbox = nativeBinding.Sandbox
 module.exports.Session = nativeBinding.Session
+module.exports.ShellHandle = nativeBinding.ShellHandle

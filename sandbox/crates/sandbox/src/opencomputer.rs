@@ -273,6 +273,7 @@ impl OpenComputerControl {
                             break;
                         }
                     }
+                    ShellInput::Resize { .. } => {}
                     ShellInput::Eof => {
                         let _ = write.close().await;
                         break;

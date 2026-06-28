@@ -1,6 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.createVfsGatewayServer = createVfsGatewayServer;
+const node_crypto_1 = require("node:crypto");
 const DEFAULT_ROUTE_PREFIX = "/internal/chevalier/vfs";
 const PRECONDITION_FINGERPRINT_HEADER = "x-chevalier-vfs-precondition-fingerprint";
 /** Build a WHATWG `(Request) => Promise<Response>` handler that serves chevalier's
@@ -85,7 +86,9 @@ function createVfsGatewayServer(opts) {
             }
             // ---- leases (mutations acquire/release one; we issue a synthetic grant) --
             if (op === "lease" && method === "POST") {
-                return json(200, { resource_key: `rk:${ownerId}:${relPath}`, owner_token: randomToken() });
+                const body = (await req.json().catch(() => ({})));
+                const leasePath = normalizePath(typeof body.path === "string" ? body.path : relPath);
+                return json(200, { resource_key: `rk:${ownerId}:${leasePath}`, owner_token: randomToken() });
             }
             if (op === "lease" && method === "DELETE") {
                 return new Response(null, { status: 204 });
@@ -293,6 +296,6 @@ function errorResponse(status, message) {
     return new Response(message, { status, headers: { "content-type": "text/plain" } });
 }
 function randomToken() {
-    // A synthetic lease owner token; uniqueness is sufficient (single-writer host).
-    return `ot-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`;
+    // Rust FUSE clients deserialize owner_token as a UUID.
+    return (0, node_crypto_1.randomUUID)();
 }

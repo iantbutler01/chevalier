@@ -10,6 +10,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures::Stream;
+use portable_pty::PtySize;
 use tokio::fs;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -346,8 +347,10 @@ impl ShellExec for ShellExecService {
         });
 
         let writer = Arc::new(StdMutex::new(writer));
+        let master = Arc::new(StdMutex::new(pair.master));
         {
             let writer = writer.clone();
+            let master = master.clone();
             let killer = killer.clone();
             tokio::spawn(async move {
                 loop {
@@ -368,6 +371,33 @@ impl ShellExec for ShellExecService {
                                     .map_err(|_| std::io::Error::other("writer poisoned"))?;
                                 guard.write_all(&data)?;
                                 guard.flush()
+                            })
+                            .await;
+                            match result {
+                                Ok(Ok(())) => {}
+                                _ => break,
+                            }
+                        }
+                        Ok(Some(InteractiveShellRequest {
+                            request:
+                                Some(
+                                    crate::pb::bracket::portproxy::v1::interactive_shell_request::Request::Resize(
+                                        size,
+                                    ),
+                                ),
+                        })) => {
+                            let master = master.clone();
+                            let cols = u16::try_from(size.cols).unwrap_or(u16::MAX).max(1);
+                            let rows = u16::try_from(size.rows).unwrap_or(u16::MAX).max(1);
+                            let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                                let guard = master.lock().map_err(|_| "pty master poisoned".to_string())?;
+                                guard.resize(PtySize {
+                                    rows,
+                                    cols,
+                                    pixel_width: 0,
+                                    pixel_height: 0,
+                                })
+                                .map_err(|err| err.to_string())
                             })
                             .await;
                             match result {

@@ -37,6 +37,8 @@ export declare class Session {
   get vmId(): string
   /** Start a command; returns a bidirectional `ExecHandle`. */
   exec(command: string, options?: ExecOpts | undefined | null): Promise<ExecHandle>
+  /** Start an interactive PTY shell; returns a bidirectional `ShellHandle`. */
+  shell(options?: ShellOpts | undefined | null): Promise<ShellHandle>
   /** Read a file from the guest. */
   readFile(path: string): Promise<Buffer>
   /** Write a file to the guest. */
@@ -71,6 +73,15 @@ export declare class Session {
   close(): Promise<void>
   /** Delete the backing VM/sandbox and purge provider resources. */
   discard(): Promise<void>
+}
+
+/** Bidirectional handle to a running interactive PTY shell. */
+export declare class ShellHandle {
+  write(data: Buffer): Promise<void>
+  eof(): Promise<void>
+  resize(cols: number, rows: number): Promise<void>
+  /** The next shell event, or `null` when the shell stream ends. */
+  next(): Promise<ShellEventJs | null>
 }
 
 /** A single exec event. `type` is `stdout` | `stderr` | `exit` | `timeout`. */
@@ -179,4 +190,18 @@ export interface SharedMountOpts {
   backendProfile?: string
   vfsEndpoint?: string
   vfsScopePath?: string
+}
+
+/** A single interactive shell event. `type` is `output` | `exit`. */
+export interface ShellEventJs {
+  type: string
+  data?: Buffer
+  code?: number
+}
+
+export interface ShellOpts {
+  shell?: string
+  args?: Array<string>
+  env?: Record<string, string>
+  cwd?: string
 }

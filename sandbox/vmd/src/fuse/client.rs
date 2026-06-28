@@ -25,7 +25,7 @@ impl RemoteVfsClient {
             .timeout(Duration::from_secs(30))
             .pool_idle_timeout(Duration::from_secs(90))
             .http2_adaptive_window(true);
-        if endpoint.trim_start().starts_with("http://") {
+        if http2_prior_knowledge_enabled(endpoint) {
             builder = builder.http2_prior_knowledge();
         }
         let client = builder.build().context("build vfs reqwest client")?;
@@ -308,5 +308,15 @@ impl RemoteVfsClient {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         Err(anyhow!("vfs request failed: {status} {body}"))
+    }
+}
+
+fn http2_prior_knowledge_enabled(_endpoint: &str) -> bool {
+    match std::env::var("CHEVALIER_VFS_HTTP2_PRIOR_KNOWLEDGE") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
     }
 }

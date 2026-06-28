@@ -3,20 +3,20 @@
 //! binding so sandbox provider work can't break the core.
 //!
 //! v1 surface: connect/session/attachSession, exec (bidirectional ExecHandle),
-//! readFile/writeFile, fork, sessionId/vmId. (shell, forwardPort, listDir,
-//! snapshots/daemons are follow-ups — some need engine facade additions.)
+//! shell (interactive PTY ShellHandle), readFile/writeFile, fork,
+//! sessionId/vmId. (listDir/daemons are follow-ups — some need engine facade
+//! additions.)
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chevalier_sandbox::{
-    EventStream, ExecEvent, ExecInput, ExecOptions, ForkOptions, ForwardHandle as EngineForwardHandle,
-    OpenComputerBackendConfig, OpenComputerMountConfig,
-    Sandbox as EngineSandbox, SandboxConfig, SandboxError,
-    SandboxProviderConfig, Session as EngineSession, SessionInfo as EngineSessionInfo,
-    SessionOptions, SharedMount,
-    SharedMountAvailability, SharedMountContinuity,
+    EventStream, ExecEvent, ExecInput, ExecOptions, ForkOptions,
+    ForwardHandle as EngineForwardHandle, OpenComputerBackendConfig, OpenComputerMountConfig,
+    Sandbox as EngineSandbox, SandboxConfig, SandboxError, SandboxProviderConfig,
+    Session as EngineSession, SessionInfo as EngineSessionInfo, SessionOptions, SharedMount,
+    SharedMountAvailability, SharedMountContinuity, ShellEvent, ShellInput, ShellOptions,
 };
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
@@ -119,6 +119,82 @@ impl ExecHandle {
     }
 }
 
+/// A single interactive shell event. `type` is `output` | `exit`.
+#[napi(object)]
+pub struct ShellEventJs {
+    #[napi(js_name = "type")]
+    pub kind: String,
+    pub data: Option<Buffer>,
+    pub code: Option<i32>,
+}
+
+impl From<ShellEvent> for ShellEventJs {
+    fn from(e: ShellEvent) -> Self {
+        match e {
+            ShellEvent::Output(b) => ShellEventJs {
+                kind: "output".into(),
+                data: Some(Buffer::from(b)),
+                code: None,
+            },
+            ShellEvent::Exit(c) => ShellEventJs {
+                kind: "exit".into(),
+                data: None,
+                code: Some(c),
+            },
+        }
+    }
+}
+
+/// Bidirectional handle to a running interactive PTY shell.
+#[napi]
+pub struct ShellHandle {
+    input: tokio::sync::mpsc::Sender<ShellInput>,
+    events: Arc<Mutex<EventStream<ShellEvent>>>,
+}
+
+#[napi]
+impl ShellHandle {
+    #[napi]
+    pub async fn write(&self, data: Buffer) -> napi::Result<()> {
+        self.input
+            .send(ShellInput::Data(data.to_vec()))
+            .await
+            .map_err(|_| napi::Error::from_reason("shell stdin closed"))
+    }
+
+    #[napi]
+    pub async fn eof(&self) -> napi::Result<()> {
+        self.input
+            .send(ShellInput::Eof)
+            .await
+            .map_err(|_| napi::Error::from_reason("shell stdin closed"))
+    }
+
+    #[napi]
+    pub async fn resize(&self, cols: u32, rows: u32) -> napi::Result<()> {
+        let clamp = |v: u32| u16::try_from(v).unwrap_or(u16::MAX).max(1);
+        self.input
+            .send(ShellInput::Resize {
+                cols: clamp(cols),
+                rows: clamp(rows),
+            })
+            .await
+            .map_err(|_| napi::Error::from_reason("shell stdin closed"))
+    }
+
+    /// The next shell event, or `null` when the shell stream ends.
+    #[napi]
+    pub async fn next(&self) -> napi::Result<Option<ShellEventJs>> {
+        use futures::StreamExt;
+        let mut guard = self.events.lock().await;
+        match guard.next().await {
+            Some(Ok(ev)) => Ok(Some(ShellEventJs::from(ev))),
+            Some(Err(e)) => Err(sb_err(e)),
+            None => Ok(None),
+        }
+    }
+}
+
 // ---------------- options ----------------
 
 #[napi(object)]
@@ -128,6 +204,25 @@ pub struct ExecOpts {
     pub detach: Option<bool>,
     pub shell: Option<String>,
     pub close_stdin_on_start: Option<bool>,
+}
+
+#[napi(object)]
+pub struct ShellOpts {
+    pub shell: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub env: Option<HashMap<String, String>>,
+    pub cwd: Option<String>,
+}
+
+impl From<ShellOpts> for ShellOptions {
+    fn from(o: ShellOpts) -> Self {
+        ShellOptions {
+            shell: o.shell,
+            args: o.args.unwrap_or_default(),
+            env: o.env.unwrap_or_default(),
+            cwd: o.cwd,
+        }
+    }
 }
 
 impl From<ExecOpts> for ExecOptions {
@@ -364,6 +459,17 @@ impl Session {
         })
     }
 
+    /// Start an interactive PTY shell; returns a bidirectional `ShellHandle`.
+    #[napi]
+    pub async fn shell(&self, options: Option<ShellOpts>) -> napi::Result<ShellHandle> {
+        let opts = options.map(Into::into).unwrap_or_default();
+        let h = self.inner.shell(opts).await.map_err(sb_err)?;
+        Ok(ShellHandle {
+            input: h.input,
+            events: Arc::new(Mutex::new(h.events)),
+        })
+    }
+
     /// Read a file from the guest.
     #[napi]
     pub async fn read_file(&self, path: String) -> napi::Result<Buffer> {
@@ -425,7 +531,11 @@ impl Session {
     /// Resume a paused VM.
     #[napi]
     pub async fn resume(&self) -> napi::Result<String> {
-        self.inner.resume().await.map(vm_state_label).map_err(sb_err)
+        self.inner
+            .resume()
+            .await
+            .map(vm_state_label)
+            .map_err(sb_err)
     }
 
     /// Stop the VM without deleting its record.
@@ -488,7 +598,10 @@ impl Session {
     /// Delete a VM snapshot.
     #[napi]
     pub async fn delete_snapshot(&self, snapshot_id: String) -> napi::Result<()> {
-        self.inner.delete_snapshot(&snapshot_id).await.map_err(sb_err)
+        self.inner
+            .delete_snapshot(&snapshot_id)
+            .await
+            .map_err(sb_err)
     }
 
     /// Forward a guest TCP port to a local host port.
