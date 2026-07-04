@@ -4,11 +4,16 @@
 
 use crate::providers::StreamChunk;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Default)]
 pub struct ResponsesToolAccumulator {
     current_tool_calls: HashMap<usize, PartialToolCall>,
+    /// Call ids already emitted as ToolCallComplete. The Responses API sends BOTH
+    /// `response.function_call_arguments.done` AND a trailing `response.output_item.done`
+    /// for the SAME function call; without this guard every tool call was emitted twice
+    /// (double execution + duplicate transcript cards downstream).
+    completed_call_ids: HashSet<String>,
     emitted_reasoning: bool,
 }
 
@@ -23,6 +28,7 @@ impl ResponsesToolAccumulator {
     pub fn new() -> Self {
         Self {
             current_tool_calls: HashMap::new(),
+            completed_call_ids: HashSet::new(),
             emitted_reasoning: false,
         }
     }
@@ -106,6 +112,15 @@ impl ResponsesToolAccumulator {
             .unwrap_or(false)
     }
 
+    /// True when this call was already emitted (arguments.done path) — lets the
+    /// `output_item.done` handler act as a FALLBACK instead of a duplicate.
+    pub fn is_completed(&self, index: usize, call_id: Option<&str>) -> bool {
+        match call_id {
+            Some(id) if !id.is_empty() => self.completed_call_ids.contains(id),
+            _ => self.completed_call_ids.contains(&format!("call_{}", index)),
+        }
+    }
+
     pub fn complete_tool(&mut self, index: usize) -> Option<Value> {
         self.current_tool_calls.remove(&index).map(|tool| {
             let call_id = if tool.call_id.is_empty() {
@@ -113,6 +128,7 @@ impl ResponsesToolAccumulator {
             } else {
                 tool.call_id
             };
+            self.completed_call_ids.insert(call_id.clone());
 
             serde_json::json!({
                 "id": call_id,
@@ -267,13 +283,18 @@ pub fn parse_openai_responses_event(
                     .get("call_id")
                     .and_then(|v| v.as_str())
                     .or_else(|| item.get("id").and_then(|v| v.as_str()));
-                let name = item.get("name").and_then(|v| v.as_str());
-                accumulator.start_tool(output_index, call_id, name);
-                if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
-                    accumulator.set_args(output_index, args);
-                }
-                if let Some(completed) = accumulator.complete_tool(output_index) {
-                    chunks.push(StreamChunk::ToolCallComplete(completed));
+                // FALLBACK ONLY: `function_call_arguments.done` already completed this
+                // call on well-formed streams; re-emitting here duplicated every tool
+                // call (same call_id twice). Only complete calls not yet emitted.
+                if !accumulator.is_completed(output_index, call_id) {
+                    let name = item.get("name").and_then(|v| v.as_str());
+                    accumulator.start_tool(output_index, call_id, name);
+                    if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
+                        accumulator.set_args(output_index, args);
+                    }
+                    if let Some(completed) = accumulator.complete_tool(output_index) {
+                        chunks.push(StreamChunk::ToolCallComplete(completed));
+                    }
                 }
             } else if !accumulator.has_emitted_reasoning()
                 && let Some(item) = event_json.get("item")
@@ -382,6 +403,59 @@ mod tests {
             }
             _ => panic!("Expected ToolCallComplete chunk"),
         }
+    }
+
+    #[test]
+    fn test_arguments_done_then_output_item_done_emits_once() {
+        // REGRESSION: the real Responses API sends BOTH events for the same call; every
+        // tool call was emitted twice (same call_id) — double execution downstream.
+        let added = serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": { "type": "function_call", "call_id": "call_dup", "name": "write", "arguments": "" }
+        });
+        let args_done = serde_json::json!({
+            "type": "response.function_call_arguments.done",
+            "output_index": 0,
+            "arguments": "{\"path\":\"a.md\"}"
+        });
+        let item_done = serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": { "type": "function_call", "call_id": "call_dup", "name": "write", "arguments": "{\"path\":\"a.md\"}" }
+        });
+
+        let mut acc = ResponsesToolAccumulator::new();
+        let mut completes = 0;
+        for ev in [&added, &args_done, &item_done] {
+            for chunk in parse_openai_responses_event(ev, &mut acc, true) {
+                if matches!(chunk, StreamChunk::ToolCallComplete(_)) {
+                    completes += 1;
+                }
+            }
+        }
+        assert_eq!(completes, 1, "one tool call must emit exactly one ToolCallComplete");
+    }
+
+    #[test]
+    fn test_output_item_done_alone_still_completes() {
+        // The fallback path must keep working for streams that never send
+        // function_call_arguments.done.
+        let item_done = serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": { "type": "function_call", "call_id": "call_solo", "name": "read", "arguments": "{}" }
+        });
+        let mut acc = ResponsesToolAccumulator::new();
+        let chunks = parse_openai_responses_event(&item_done, &mut acc, true);
+        let completes = chunks
+            .iter()
+            .filter(|c| matches!(c, StreamChunk::ToolCallComplete(_)))
+            .count();
+        assert_eq!(completes, 1);
+        // And a REPLAYED duplicate done for the same call stays suppressed.
+        let again = parse_openai_responses_event(&item_done, &mut acc, true);
+        assert!(again.iter().all(|c| !matches!(c, StreamChunk::ToolCallComplete(_))));
     }
 
     #[test]

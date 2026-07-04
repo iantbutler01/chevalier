@@ -215,6 +215,8 @@ impl OpenComputerControl {
             args: vec!["-lc".to_string(), command.to_string()],
             envs: (!opts.env.is_empty()).then_some(opts.env),
             cwd: None,
+            cols: None,
+            rows: None,
             timeout: opts
                 .timeout_secs
                 .and_then(|value| u64::try_from(value).ok()),
@@ -240,6 +242,8 @@ impl OpenComputerControl {
             args,
             envs: (!opts.env.is_empty()).then_some(opts.env),
             cwd: opts.cwd,
+            cols: opts.cols.map(u32::from),
+            rows: opts.rows.map(u32::from),
             timeout: None,
             max_run_after_disconnect: None,
         };
@@ -264,6 +268,10 @@ impl OpenComputerControl {
         let (mut write, mut read) = ws.split();
         let (input_tx, mut input_rx) = mpsc::channel(64);
         let (event_tx, event_rx) = mpsc::channel(128);
+        let event_tx_input = event_tx.clone();
+        let resize_control = self.clone();
+        let resize_sandbox_id = sandbox_id.to_string();
+        let resize_session_id = created.session_id.clone();
 
         tokio::spawn(async move {
             while let Some(input) = input_rx.recv().await {
@@ -273,7 +281,14 @@ impl OpenComputerControl {
                             break;
                         }
                     }
-                    ShellInput::Resize { .. } => {}
+                    ShellInput::Resize { cols, rows } => {
+                        if let Err(err) = resize_control
+                            .resize_exec_session(&resize_sandbox_id, &resize_session_id, cols, rows)
+                            .await
+                        {
+                            let _ = event_tx_input.send(Err(err)).await;
+                        }
+                    }
                     ShellInput::Eof => {
                         let _ = write.close().await;
                         break;
@@ -422,11 +437,12 @@ impl OpenComputerControl {
                             }
                         }
                         ExecInput::Resize { cols, rows } => {
-                            let _ = event_tx_input
-                                .send(Err(SandboxError::Unsupported(format!(
-                                    "OpenComputer exec resize is not exposed through exec streams: {cols}x{rows}"
-                                ))))
-                                .await;
+                            if let Err(err) = kill_control
+                                .resize_exec_session(&kill_sandbox_id, &kill_session_id, cols, rows)
+                                .await
+                            {
+                                let _ = event_tx_input.send(Err(err)).await;
+                            }
                         }
                     }
                 }
@@ -591,6 +607,39 @@ impl OpenComputerControl {
                 .json(&ExecKillBody { signal }),
         )
         .await
+    }
+
+    async fn resize_exec_session(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<()> {
+        let response = self
+            .client
+            .post(self.sandbox_url(sandbox_id, &format!("/exec/{session_id}/resize")))
+            .header(API_KEY_HEADER, self.cfg.api_key.as_str())
+            .json(&ExecResizeBody {
+                cols: u32::from(cols),
+                rows: u32::from(rows),
+            })
+            .send()
+            .await
+            .map_err(|err| {
+                SandboxError::DaemonUnavailable(format!("OpenComputer request failed: {err}"))
+            })?;
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED {
+            let body = response.text().await.unwrap_or_default();
+            return Err(SandboxError::Unsupported(format!(
+                "OpenComputer exec resize is not exposed by provider ({status}): {body}"
+            )));
+        }
+        if status == StatusCode::NO_CONTENT || status.is_success() {
+            return Ok(());
+        }
+        Err(opencomputer_response_error(response).await)
     }
 
     fn url(&self, suffix: &str) -> String {
@@ -889,6 +938,10 @@ struct ExecStartBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    cols: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rows: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     timeout: Option<u64>,
     #[serde(
         rename = "maxRunAfterDisconnect",
@@ -907,6 +960,12 @@ struct ExecSessionCreated {
 struct ExecKillBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     signal: Option<i32>,
+}
+
+#[derive(Serialize)]
+struct ExecResizeBody {
+    cols: u32,
+    rows: u32,
 }
 
 #[derive(Serialize)]
@@ -1032,6 +1091,31 @@ mod tests {
             exec_event_from_ws_frame(&[0x03, 0, 0, 0, 7]),
             Some(ExecEvent::Exit(7))
         ));
+    }
+
+    #[test]
+    fn shell_start_body_serializes_terminal_size() {
+        let body = ExecStartBody {
+            cmd: "/bin/sh".to_string(),
+            args: vec!["-lc".to_string(), "exec /bin/bash -l".to_string()],
+            envs: None,
+            cwd: Some("/".to_string()),
+            cols: Some(132),
+            rows: Some(43),
+            timeout: None,
+            max_run_after_disconnect: None,
+        };
+
+        assert_eq!(
+            serde_json::to_value(body).expect("serialize start body"),
+            json!({
+                "cmd": "/bin/sh",
+                "args": ["-lc", "exec /bin/bash -l"],
+                "cwd": "/",
+                "cols": 132,
+                "rows": 43,
+            })
+        );
     }
 
     #[test]

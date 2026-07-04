@@ -543,7 +543,8 @@ fn resolve_codex_subscription_config(
     provider_config: Option<&ProviderConfig>,
 ) -> Result<crate::providers::CodexSubscriptionProviderConfig> {
     if let Some(ProviderConfig::CodexSubscription(config)) = provider_config {
-        let mut config = config.clone();
+        // The variant is boxed (clippy large_enum_variant); clone the inner config out.
+        let mut config = (**config).clone();
         if config.base_url.is_none() {
             config.base_url = server_url;
         }

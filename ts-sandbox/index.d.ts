@@ -204,4 +204,6 @@ export interface ShellOpts {
   args?: Array<string>
   env?: Record<string, string>
   cwd?: string
+  cols?: number
+  rows?: number
 }

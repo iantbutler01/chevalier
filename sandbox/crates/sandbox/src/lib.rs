@@ -502,6 +502,8 @@ pub struct ShellOptions {
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub cwd: Option<String>,
+    pub cols: Option<u16>,
+    pub rows: Option<u16>,
 }
 
 #[derive(Clone, Debug)]

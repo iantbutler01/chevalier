@@ -43,7 +43,9 @@ pub struct CodexSubscriptionProviderConfig {
 #[derive(Debug, Clone)]
 pub enum ProviderConfig {
     Anthropic(AnthropicProviderConfig),
-    CodexSubscription(CodexSubscriptionProviderConfig),
+    // Boxed: this variant is ~208 bytes vs ~2 for Anthropic (clippy large_enum_variant);
+    // boxing keeps every ProviderConfig move/clone small.
+    CodexSubscription(Box<CodexSubscriptionProviderConfig>),
 }
 
 // Provider implementations

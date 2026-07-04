@@ -212,15 +212,20 @@ pub struct ShellOpts {
     pub args: Option<Vec<String>>,
     pub env: Option<HashMap<String, String>>,
     pub cwd: Option<String>,
+    pub cols: Option<u32>,
+    pub rows: Option<u32>,
 }
 
 impl From<ShellOpts> for ShellOptions {
     fn from(o: ShellOpts) -> Self {
+        let clamp = |value: Option<u32>| value.map(|v| u16::try_from(v).unwrap_or(u16::MAX).max(1));
         ShellOptions {
             shell: o.shell,
             args: o.args.unwrap_or_default(),
             env: o.env.unwrap_or_default(),
             cwd: o.cwd,
+            cols: clamp(o.cols),
+            rows: clamp(o.rows),
         }
     }
 }

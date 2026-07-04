@@ -594,12 +594,14 @@ dependencies = [
  "aws-config",
  "aws-sdk-bedrockruntime",
  "backoff",
+ "base64 0.22.1",
  "bytes",
  "chevalier-macros",
  "chevalier-mcp",
  "eventsource-stream",
  "futures",
  "gcp_auth",
+ "http 1.4.0",
  "log",
  "minijinja",
  "opentelemetry",
@@ -609,6 +611,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-websockets",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -2861,6 +2864,26 @@ dependencies = [
  "futures-sink",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "tokio-websockets"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f591660438b3038dd04d16c938271c79e7e06260ad2ea2885a4861bfb238605d"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "fastrand",
+ "futures-core",
+ "futures-sink",
+ "http 1.4.0",
+ "httparse",
+ "ring",
+ "tokio",
+ "tokio-native-tls",
+ "tokio-rustls 0.26.4",
+ "tokio-util",
 ]
 
 [[package]]

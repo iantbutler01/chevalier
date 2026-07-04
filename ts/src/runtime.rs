@@ -306,7 +306,7 @@ impl Runtime {
     #[napi]
     pub async fn set_provider_config(&self, config: ProviderConfigInput) {
         let pc = if let Some(codex) = config.codex_subscription {
-            Some(ProviderConfig::CodexSubscription(
+            Some(ProviderConfig::CodexSubscription(Box::new(
                 CodexSubscriptionProviderConfig {
                     token: codex.token,
                     account_id: codex.account_id,
@@ -326,7 +326,7 @@ impl Runtime {
                     text_verbosity: codex.text_verbosity,
                     service_tier: codex.service_tier,
                 },
-            ))
+            )))
         } else {
             config.anthropic.map(|a| {
                 ProviderConfig::Anthropic(AnthropicProviderConfig {

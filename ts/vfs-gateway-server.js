@@ -1,6 +1,37 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.createVfsGatewayServer = createVfsGatewayServer;
+// chevalier VFS gateway SERVER, in TypeScript.
+//
+// chevalier already ships the gateway PROTOCOL (HTTP routes under
+// `/internal/chevalier/vfs/{owner_id}/...`), a Rust SERVER (the `vfs-server`
+// feature, `VfsGatewayBackend` + axum routes in
+// sandbox/crates/sandbox/src/vfs.rs), and Rust + TS CLIENTS
+// (`GatewayVfsStorage` / the bound `VfsStorage.gateway({endpoint,scopePath})`).
+// The missing third corner was a TS server. This is it: a framework-agnostic
+// WHATWG `Request -> Response` handler that speaks the exact same wire contract
+// (mirrored from vfs/src/gateway.rs, the client this must satisfy), backed by any
+// `VfsStorage` (typically `VfsStorage.local(scopeRoot)`).
+//
+// With this, the already-bound `VfsStorage.gateway` client, the Rust client, and a
+// VM FUSE mount all talk to a pure-Node server unchanged. Host it on any HTTP stack
+// (Hono, node:http, etc.) by bridging that stack's request to a WHATWG `Request`.
+//
+// Wire facts mirrored from vfs/src/gateway.rs (the client) + sandbox vfs.rs (DTOs):
+//   - endpoint already includes the {owner_id} segment; the file path is the
+//     `?path=` query arg (scope already folded in by the client).
+//   - GET  {owner}/stat?path=            -> 200 RemoteMetadata | 404
+//   - GET  {owner}/file/raw?path=        -> 200 bytes (Range -> 206) | 404
+//   - GET  {owner}/tree?path=&name_like= -> 200 RemoteDirEntry[]
+//   - PUT  {owner}/file?path=            -> 2xx (body ignored by client); honors the
+//                                           precondition-fingerprint header -> 409
+//   - DELETE {owner}/file?path=&return_metadata=true -> 200 {previous}
+//   - PUT/DELETE {owner}/dir?path=       -> 2xx
+//   - POST {owner}/rename?from=&to=&return_metadata=true -> 200 {previous,current}
+//   - POST/DELETE {owner}/lease          -> 200 {resource_key,owner_token} / 2xx
+//   - POST {owner}/{metadata-many,read-many,write-many} -> batch (per-path loop)
+//   DTOs are snake_case; `kind` is exactly "file" | "directory"; errors map
+//   404->NotFound, 400->BadRequest, 409->Conflict (vfs/src/gateway.rs:1016).
 const node_crypto_1 = require("node:crypto");
 const DEFAULT_ROUTE_PREFIX = "/internal/chevalier/vfs";
 const PRECONDITION_FINGERPRINT_HEADER = "x-chevalier-vfs-precondition-fingerprint";
