@@ -26,11 +26,19 @@ struct CachedDir {
     last_access: Instant,
 }
 
+#[derive(Clone)]
+struct CachedMetadata {
+    metadata: RemoteMetadata,
+    expires_at: Instant,
+    last_access: Instant,
+}
+
 #[derive(Default)]
 struct CacheState {
     file_bytes: usize,
     files: HashMap<String, CachedFile>,
     dirs: HashMap<String, CachedDir>,
+    attrs: HashMap<String, CachedMetadata>,
 }
 
 #[derive(Default)]
@@ -69,6 +77,13 @@ impl RemoteFuseCache {
                 last_access: Instant::now(),
             },
         );
+        if let Some(metadata) = inner
+            .files
+            .get(path)
+            .and_then(|entry| entry.metadata.clone())
+        {
+            put_metadata_locked(&mut inner, path, metadata);
+        }
         while inner.file_bytes > MAX_TOTAL_BYTES {
             let Some(oldest_key) = inner
                 .files
@@ -110,6 +125,18 @@ impl RemoteFuseCache {
                 last_access: now,
             },
         );
+        let cached_entries = inner
+            .dirs
+            .get(path)
+            .map(|entry| entry.entries.clone())
+            .unwrap_or_default();
+        for entry in cached_entries {
+            put_metadata_locked(
+                &mut inner,
+                child_path(path, &entry.name).as_str(),
+                metadata_from_dir_entry(entry),
+            );
+        }
         while inner.dirs.len() > MAX_DIRS {
             let Some(oldest_key) = inner
                 .dirs
@@ -123,11 +150,28 @@ impl RemoteFuseCache {
         }
     }
 
+    pub fn get_metadata(&self, path: &str) -> Option<RemoteMetadata> {
+        let mut inner = self.lock_inner();
+        let entry = inner.attrs.get_mut(path)?;
+        if entry.expires_at <= Instant::now() {
+            inner.attrs.remove(path);
+            return None;
+        }
+        entry.last_access = Instant::now();
+        Some(entry.metadata.clone())
+    }
+
+    pub fn put_metadata(&self, path: &str, metadata: RemoteMetadata) {
+        let mut inner = self.lock_inner();
+        put_metadata_locked(&mut inner, path, metadata);
+    }
+
     pub fn invalidate(&self, path: &str) {
         let mut inner = self.lock_inner();
         if let Some(previous) = inner.files.remove(path) {
             inner.file_bytes = inner.file_bytes.saturating_sub(previous.bytes.len());
         }
+        inner.attrs.remove(path);
         inner.dirs.remove(path);
         if let Some(parent) = parent_path(path) {
             inner.dirs.remove(parent.as_str());
@@ -136,6 +180,38 @@ impl RemoteFuseCache {
 
     fn lock_inner(&self) -> MutexGuard<'_, CacheState> {
         self.inner.lock().unwrap_or_else(|err| err.into_inner())
+    }
+}
+
+fn put_metadata_locked(inner: &mut CacheState, path: &str, metadata: RemoteMetadata) {
+    let now = Instant::now();
+    inner.attrs.retain(|_, value| value.expires_at > now);
+    inner.attrs.insert(
+        path.to_string(),
+        CachedMetadata {
+            metadata,
+            expires_at: now + DIR_TTL,
+            last_access: now,
+        },
+    );
+}
+
+fn metadata_from_dir_entry(entry: RemoteDirEntry) -> RemoteMetadata {
+    RemoteMetadata {
+        kind: entry.kind,
+        size_bytes: entry.size_bytes,
+        link_target: entry.link_target,
+        content_hash: entry.content_hash,
+        updated_at: entry.updated_at,
+    }
+}
+
+fn child_path(parent: &str, name: &str) -> String {
+    let trimmed = parent.trim_matches('/');
+    if trimmed.is_empty() {
+        name.to_string()
+    } else {
+        format!("{trimmed}/{}", name.trim_matches('/'))
     }
 }
 
@@ -160,6 +236,18 @@ mod tests {
             name: name.to_string(),
             kind: "file".to_string(),
             size_bytes: 0,
+            link_target: None,
+            content_hash: None,
+            updated_at: None,
+        }
+    }
+
+    fn symlink_entry(name: &str, target: &str) -> RemoteDirEntry {
+        RemoteDirEntry {
+            name: name.to_string(),
+            kind: "symlink".to_string(),
+            size_bytes: target.len() as u64,
+            link_target: Some(target.to_string()),
             content_hash: None,
             updated_at: None,
         }
@@ -183,5 +271,15 @@ mod tests {
             .collect();
         cache.put_dir("huge", entries);
         assert!(cache.get_dir("huge").is_none());
+    }
+
+    #[test]
+    fn directory_cache_populates_child_metadata_for_readlink() {
+        let cache = RemoteFuseCache::default();
+        cache.put_dir("bin", vec![symlink_entry("tool", "../real-tool")]);
+
+        let metadata = cache.get_metadata("bin/tool").expect("cached metadata");
+        assert_eq!(metadata.kind, "symlink");
+        assert_eq!(metadata.link_target.as_deref(), Some("../real-tool"));
     }
 }

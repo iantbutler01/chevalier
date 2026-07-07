@@ -121,15 +121,17 @@ export declare class VfsStorage {
   /** Read a file's bytes. */
   read(path: string): Promise<Buffer>
   /** Write a file; returns the write result (JSON: content hash, changed, …). */
-  write(path: string, data: Buffer): Promise<any>
+  write(path: string, data: Buffer, options?: VfsWriteOptions | null): Promise<any>
   /** Stat a path; returns typed metadata (`sizeBytes` is a `bigint`) or null. */
   stat(path: string): Promise<VfsMetadata | null>
   /** List a directory's entries with typed metadata. */
-  listDir(path: string): Promise<Array<VfsMetadata>>
+  listDir(path: string, options?: { maxHashBytes?: number | null } | null): Promise<Array<VfsMetadata>>
   /** Create a directory. */
   mkdir(path: string): Promise<void>
+  /** Create a symbolic link. */
+  createSymlink(path: string, target: string): Promise<void>
   /** Delete a file; returns the delete result (JSON). */
-  remove(path: string): Promise<any>
+  remove(path: string, options?: { ifMatch?: string | null } | null): Promise<any>
   /** Remove an (empty) directory. */
   rmdir(path: string): Promise<void>
   /** Rename/move a file; returns the rename result (JSON). */
@@ -257,7 +259,7 @@ export interface RuntimeOptions {
 
 /**
  * A single streamed event. Discriminated by `type`:
- * `content` | `reasoning` | `signature` | `toolCall` | `toolPartial` | `usage` | `complete`.
+ * `content` | `reasoning` | `signature` | `toolCall` | `toolPartial` | `usage` | `rateLimits` | `complete`.
  */
 export interface StreamEvent {
   type: string
@@ -265,7 +267,7 @@ export interface StreamEvent {
   text?: string
   /** Present for `toolCall`. */
   toolCall?: ToolCallJs
-  /** Raw payload for `toolPartial` (partial args), `usage`, `complete` (full response). */
+  /** Raw payload for `toolPartial` (partial args), `usage`, `rateLimits`, `complete` (full response). */
   data?: any
 }
 
@@ -304,9 +306,11 @@ export declare function version(): string
  */
 export interface VfsMetadata {
   path: string
-  /** `"File"` or `"Directory"`. */
+  /** `"File"`, `"Directory"`, `"Symlink"`, or `"Special"`. */
   kind: string
   sizeBytes: bigint
+  linkTarget?: string
+  executable?: boolean
   contentHash?: string
   tokenCount?: number
   version?: string
@@ -323,4 +327,10 @@ export interface VfsObjectState {
   packSlotOffset: bigint
   packSlotLength: bigint
   packSlotCompression: number
+}
+
+/** Write options for VFS storage. */
+export interface VfsWriteOptions {
+  ifMatch?: string | null
+  executable?: boolean
 }

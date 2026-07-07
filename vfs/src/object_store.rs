@@ -288,14 +288,14 @@ impl ObjectStoreClient for LocalObjectStoreClient {
                 continue;
             }
             let suffix = &key[request.prefix.len()..];
-            if let Some(delimiter) = request.delimiter.as_deref()
-                && let Some(index) = suffix.find(delimiter)
-            {
-                let prefix = format!("{}{}", request.prefix, &suffix[..=index]);
-                if seen_prefixes.insert(prefix.clone()) {
-                    page.prefixes.push(prefix);
+            if let Some(delimiter) = request.delimiter.as_deref() {
+                if let Some(index) = suffix.find(delimiter) {
+                    let prefix = format!("{}{}", request.prefix, &suffix[..=index]);
+                    if seen_prefixes.insert(prefix.clone()) {
+                        page.prefixes.push(prefix);
+                    }
+                    continue;
                 }
-                continue;
             }
             page.objects.push(ObjectMetadata {
                 key,
@@ -343,11 +343,11 @@ fn walk_collect(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) -> VfsSto
         })?;
         if metadata.is_dir() {
             walk_collect(root, &path, out)?;
-        } else if metadata.is_file()
-            && let Ok(rel) = path.strip_prefix(root)
-        {
-            let key = rel.to_string_lossy().replace('\\', "/");
-            out.push((key, metadata.len()));
+        } else if metadata.is_file() {
+            if let Ok(rel) = path.strip_prefix(root) {
+                let key = rel.to_string_lossy().replace('\\', "/");
+                out.push((key, metadata.len()));
+            }
         }
     }
     Ok(())

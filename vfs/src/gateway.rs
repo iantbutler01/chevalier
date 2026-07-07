@@ -32,6 +32,7 @@ const OP_MKDIR: &str = "vfs_mkdir";
 const OP_UNLINK: &str = "vfs_unlink";
 const OP_RMDIR: &str = "vfs_rmdir";
 const OP_RENAME: &str = "vfs_rename";
+const OP_SYMLINK: &str = "vfs_symlink";
 
 #[derive(Clone, Debug)]
 pub struct GatewayVfsStorageConfig {
@@ -321,6 +322,9 @@ impl OptimizedVfsStorage for GatewayVfsStorage {
         if let Some(order) = filter.order {
             query.push(("order", dir_list_order_arg(order).to_string()));
         }
+        if let Some(max_hash_bytes) = filter.max_hash_bytes {
+            query.push(("max_hash_bytes", max_hash_bytes.to_string()));
+        }
         let response = self
             .send(self.client.get(self.url("/tree")).query(&query))
             .await?;
@@ -349,6 +353,7 @@ impl OptimizedVfsStorage for GatewayVfsStorage {
                     include_object_state: options.include_object_state,
                     include_token_count: options.include_token_count,
                     limit: options.limit,
+                    max_hash_bytes: options.max_hash_bytes,
                 },
             ))
             .await?;
@@ -666,6 +671,24 @@ impl OptimizedVfsStorage for GatewayVfsStorage {
         self.release_after(&lease, result).await
     }
 
+    async fn create_symlink(&self, path: &str, target: &str) -> VfsStorageResult<()> {
+        let lease = self
+            .acquire_lease(path, 1, self.cfg.mutation_reason.as_str())
+            .await?;
+        let result = self
+            .send(self.mutation_headers(
+                self.client.put(self.url("/symlink")).query(&[
+                    ("path", self.path_arg(path)),
+                    ("target", target.to_string()),
+                ]),
+                &lease,
+                OP_SYMLINK,
+            ))
+            .await
+            .map(|_| ());
+        self.release_after(&lease, result).await
+    }
+
     async fn delete_file_with_metadata(
         &self,
         path: &str,
@@ -887,6 +910,7 @@ struct SubtreeMetadataRequest {
     include_object_state: bool,
     include_token_count: bool,
     limit: Option<i64>,
+    max_hash_bytes: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -908,6 +932,10 @@ struct RemoteSubtreeMetadataEntry {
     path: String,
     kind: String,
     size_bytes: u64,
+    #[serde(default)]
+    executable: bool,
+    #[serde(default)]
+    link_target: Option<String>,
     content_hash: Option<String>,
     token_count: Option<i32>,
     version: Option<String>,
@@ -920,22 +948,25 @@ impl RemoteSubtreeMetadataEntry {
         self,
         storage: &GatewayVfsStorage,
     ) -> VfsStorageResult<VfsStorageMetadata> {
-        Ok(VfsStorageMetadata {
-            path: storage.unscoped_path(self.path),
-            kind: parse_kind(&self.kind)?,
-            size_bytes: self.size_bytes,
-            content_hash: self.content_hash,
-            token_count: self.token_count,
-            version: self.version,
-            updated_at: self.updated_at,
-            object_state: self.object_state.map(|state| VfsStorageObjectState {
-                size_bytes: state.size_bytes,
-                pack_key: state.pack_key,
-                pack_slot_offset: state.pack_slot_offset,
-                pack_slot_length: state.pack_slot_length,
-                pack_slot_compression: state.pack_slot_compression,
-            }),
-        })
+        let mut metadata = VfsStorageMetadata::new(
+            storage.unscoped_path(self.path),
+            parse_kind(&self.kind)?,
+            self.size_bytes,
+        );
+        metadata.link_target = self.link_target;
+        metadata.executable = self.executable;
+        metadata.content_hash = self.content_hash;
+        metadata.token_count = self.token_count;
+        metadata.version = self.version;
+        metadata.updated_at = self.updated_at;
+        metadata.object_state = self.object_state.map(|state| VfsStorageObjectState {
+            size_bytes: state.size_bytes,
+            pack_key: state.pack_key,
+            pack_slot_offset: state.pack_slot_offset,
+            pack_slot_length: state.pack_slot_length,
+            pack_slot_compression: state.pack_slot_compression,
+        });
+        Ok(metadata)
     }
 }
 
@@ -962,22 +993,22 @@ struct PrefetchFileBytes {
 struct RemoteMetadata {
     kind: String,
     size_bytes: u64,
+    #[serde(default)]
+    executable: bool,
+    #[serde(default)]
+    link_target: Option<String>,
     content_hash: Option<String>,
     updated_at: Option<DateTime<Utc>>,
 }
 
 impl RemoteMetadata {
     fn into_storage_metadata(self, path: String) -> VfsStorageResult<VfsStorageMetadata> {
-        Ok(VfsStorageMetadata {
-            path,
-            kind: parse_kind(&self.kind)?,
-            size_bytes: self.size_bytes,
-            content_hash: self.content_hash,
-            token_count: None,
-            version: None,
-            updated_at: self.updated_at,
-            object_state: None,
-        })
+        let mut metadata = VfsStorageMetadata::new(path, parse_kind(&self.kind)?, self.size_bytes);
+        metadata.link_target = self.link_target;
+        metadata.executable = self.executable;
+        metadata.content_hash = self.content_hash;
+        metadata.updated_at = self.updated_at;
+        Ok(metadata)
     }
 }
 
@@ -986,22 +1017,22 @@ struct RemoteDirEntry {
     name: String,
     kind: String,
     size_bytes: u64,
+    #[serde(default)]
+    executable: bool,
+    #[serde(default)]
+    link_target: Option<String>,
     content_hash: Option<String>,
     updated_at: Option<DateTime<Utc>>,
 }
 
 impl RemoteDirEntry {
     fn into_storage_metadata(self, path: String) -> VfsStorageResult<VfsStorageMetadata> {
-        Ok(VfsStorageMetadata {
-            path,
-            kind: parse_kind(&self.kind)?,
-            size_bytes: self.size_bytes,
-            content_hash: self.content_hash,
-            token_count: None,
-            version: None,
-            updated_at: self.updated_at,
-            object_state: None,
-        })
+        let mut metadata = VfsStorageMetadata::new(path, parse_kind(&self.kind)?, self.size_bytes);
+        metadata.link_target = self.link_target;
+        metadata.executable = self.executable;
+        metadata.content_hash = self.content_hash;
+        metadata.updated_at = self.updated_at;
+        Ok(metadata)
     }
 }
 
@@ -1027,6 +1058,8 @@ fn parse_kind(kind: &str) -> VfsStorageResult<VfsStorageEntryKind> {
     match kind {
         "file" => Ok(VfsStorageEntryKind::File),
         "directory" => Ok(VfsStorageEntryKind::Directory),
+        "symlink" => Ok(VfsStorageEntryKind::Symlink),
+        "special" => Ok(VfsStorageEntryKind::Special),
         _ => Err(VfsStorageError::Internal(format!(
             "gateway returned unknown vfs entry kind {kind}"
         ))),
@@ -1080,6 +1113,7 @@ mod tests {
                     entry_kind: Some(VfsStorageEntryKind::File),
                     limit: Some(2),
                     order: Some(crate::VfsStorageDirListOrder::NameDesc),
+                    max_hash_bytes: Some(64),
                 },
             )
             .await
@@ -1099,6 +1133,54 @@ mod tests {
         assert_query_value(&request.target, "entry_kind", "file");
         assert_query_value(&request.target, "limit", "2");
         assert_query_value(&request.target, "order", "name_desc");
+        assert_query_value(&request.target, "max_hash_bytes", "64");
+    }
+
+    #[tokio::test]
+    async fn gateway_preserves_symlink_link_target_metadata() {
+        let (endpoint, requests) = serve_sequence(vec![
+            r#"{"kind":"symlink","size_bytes":10,"link_target":"target.txt","content_hash":null,"updated_at":null}"#
+                .to_string(),
+            r#"[{"name":"link.txt","kind":"symlink","size_bytes":10,"link_target":"target.txt","content_hash":null,"updated_at":null}]"#
+                .to_string(),
+            r#"{"entries":[{"path":"scope/link.txt","kind":"symlink","size_bytes":10,"link_target":"target.txt","content_hash":null,"token_count":null,"version":null,"updated_at":null,"object_state":null}]}"#
+                .to_string(),
+        ]);
+        let storage =
+            GatewayVfsStorage::new(GatewayVfsStorageConfig::new(endpoint).with_scope_path("scope"));
+
+        let stat = storage
+            .stat("link.txt")
+            .await
+            .expect("stat")
+            .expect("metadata");
+        assert_eq!(stat.kind, VfsStorageEntryKind::Symlink);
+        assert_eq!(stat.link_target.as_deref(), Some("target.txt"));
+
+        let listed = storage
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .expect("list dir");
+        assert_eq!(listed[0].kind, VfsStorageEntryKind::Symlink);
+        assert_eq!(listed[0].link_target.as_deref(), Some("target.txt"));
+
+        let subtree = storage
+            .list_subtree_file_metadata("", VfsStorageSubtreeOptions::default())
+            .await
+            .expect("subtree metadata");
+        assert_eq!(subtree[0].kind, VfsStorageEntryKind::Symlink);
+        assert_eq!(subtree[0].path, "link.txt");
+        assert_eq!(subtree[0].link_target.as_deref(), Some("target.txt"));
+
+        let stat_request = requests.recv().expect("stat request");
+        assert_eq!(stat_request.method, "GET");
+        assert!(stat_request.target.starts_with("/stat?"));
+        let tree_request = requests.recv().expect("tree request");
+        assert_eq!(tree_request.method, "GET");
+        assert!(tree_request.target.starts_with("/tree?"));
+        let subtree_request = requests.recv().expect("subtree request");
+        assert_eq!(subtree_request.method, "POST");
+        assert_eq!(subtree_request.target, "/subtree-metadata");
     }
 
     #[tokio::test]
@@ -1115,6 +1197,7 @@ mod tests {
                     include_object_state: true,
                     include_token_count: true,
                     limit: Some(5),
+                    max_hash_bytes: Some(4096),
                 },
             )
             .await
@@ -1137,6 +1220,7 @@ mod tests {
         assert!(request.body.contains(r#""include_object_state":true"#));
         assert!(request.body.contains(r#""include_token_count":true"#));
         assert!(request.body.contains(r#""limit":5"#));
+        assert!(request.body.contains(r#""max_hash_bytes":4096"#));
     }
 
     #[tokio::test]
@@ -1294,6 +1378,42 @@ mod tests {
             delete_request
                 .headers
                 .contains("x-chevalier-vfs-precondition-secondary-fingerprint: secondary-a")
+        );
+
+        let release_request = requests.recv().expect("release request");
+        assert_eq!(release_request.method, "DELETE");
+        assert_eq!(release_request.target, "/lease");
+    }
+
+    #[tokio::test]
+    async fn gateway_create_symlink_uses_leased_symlink_route() {
+        let (endpoint, requests) = serve_sequence(vec![
+            r#"{"resource_key":"rk","owner_token":"ot"}"#.to_string(),
+            String::new(),
+            String::new(),
+        ]);
+        let storage =
+            GatewayVfsStorage::new(GatewayVfsStorageConfig::new(endpoint).with_scope_path("scope"));
+
+        storage
+            .create_symlink("link.txt", "target.txt")
+            .await
+            .expect("create symlink");
+
+        let lease_request = requests.recv().expect("lease request");
+        assert_eq!(lease_request.method, "POST");
+        assert_eq!(lease_request.target, "/lease");
+        assert!(lease_request.body.contains(r#""path":"scope/link.txt""#));
+
+        let symlink_request = requests.recv().expect("symlink request");
+        assert_eq!(symlink_request.method, "PUT");
+        assert!(symlink_request.target.starts_with("/symlink?"));
+        assert_query_value(&symlink_request.target, "path", "scope/link.txt");
+        assert_query_value(&symlink_request.target, "target", "target.txt");
+        assert!(
+            symlink_request
+                .headers
+                .contains("x-chevalier-vfs-operation: vfs_symlink")
         );
 
         let release_request = requests.recv().expect("release request");

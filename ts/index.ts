@@ -20,7 +20,69 @@ export type {
   CodexSubscriptionConfigInput,
   VfsMetadata,
   VfsObjectState,
+  VfsWriteOptions,
 } from "./native.js";
+
+const VFS_ERR_PREFIX = /^VFS:\s+\[([A-Z0-9_]+) status=(\d{3})\]\s*([\s\S]*)$/;
+
+function setErrorField(error: Error, field: string, value: unknown): void {
+  try {
+    Object.defineProperty(error, field, {
+      value,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  } catch {
+    try {
+      (error as Error & Record<string, unknown>)[field] = value;
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
+function normalizeVfsNativeError(e: unknown): never {
+  if (e instanceof Error) {
+    const match = VFS_ERR_PREFIX.exec(e.message);
+    if (match) {
+      const status = Number(match[2]);
+      setErrorField(e, "code", match[1]);
+      setErrorField(e, "status", status);
+      setErrorField(e, "statusCode", status);
+    }
+  }
+  throw e;
+}
+
+const VFS_ERROR_PATCHED = Symbol.for("chevalier.vfs.errorPatch");
+const vfsStorageProto = native.VfsStorage.prototype as unknown as Record<PropertyKey, unknown>;
+if (!vfsStorageProto[VFS_ERROR_PATCHED]) {
+  for (const method of [
+    "read",
+    "write",
+    "stat",
+    "listDir",
+    "mkdir",
+    "createSymlink",
+    "remove",
+    "rmdir",
+    "rename",
+  ] as const) {
+    const original = vfsStorageProto[method];
+    if (typeof original === "function") {
+      const originalFn = original as (
+        this: native.VfsStorage,
+        ...args: unknown[]
+      ) => Promise<unknown>;
+      vfsStorageProto[method] = function patchedVfsMethod(this: native.VfsStorage, ...args: unknown[]) {
+        return Promise.resolve(originalFn.apply(this, args)).catch(normalizeVfsNativeError);
+      };
+    }
+  }
+  Object.defineProperty(vfsStorageProto, VFS_ERROR_PATCHED, { value: true });
+}
+
 export { McpClient, McpServer, VfsStorage, version } from "./native.js";
 // The TS implementation of chevalier's VFS gateway SERVER (the missing third
 // corner — the Rust server + Rust/TS clients already exist). A pure-Node
@@ -110,11 +172,26 @@ export interface ToolDef {
   handler?: (args: any) => unknown | Promise<unknown>;
 }
 
+export type ProviderRateLimitScope = "session" | "subscription";
+
+export interface ProviderRateLimit {
+  scope: ProviderRateLimitScope;
+  usedPercent: number;
+  windowMinutes: number;
+  resetsAtEpochSec: number;
+}
+
+export interface RateLimitsStreamEvent {
+  type: "rateLimits";
+  data: ProviderRateLimit[];
+}
+
 /** Result of `run`, with an optional decoded `value` when an output schema is given. */
 export type TypedRunResult<T> = native.RunResult & { value?: T };
 
 /** A stream event, with an optional decoded `value` on the `complete` event when
- *  an output schema was provided. */
+ *  an output schema was provided. Codex subscription streams may also emit
+ *  `rateLimits` with `ProviderRateLimit[]` in `data`. */
 export type TypedStreamEvent<T> = native.StreamEvent & { value?: T };
 
 /** The Chevalier agent runtime. */

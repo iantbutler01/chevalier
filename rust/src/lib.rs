@@ -53,6 +53,7 @@ pub mod prelude {
     pub use crate::types::{
         AssistantResponse, CacheMarker, ChatMessage, ChatRole, CreateResult, MediaPart,
         MediaSource, MediaSourceKind, MultimodalMessage, Provider, ProviderCapabilities,
-        ReasoningSegment, ResponsePart, ResponseStreamEvent, TokenUsage, ToolCall, ToolResult,
+        ProviderRateLimit, ProviderRateLimitScope, ReasoningSegment, ResponsePart,
+        ResponseStreamEvent, TokenUsage, ToolCall, ToolResult,
     };
 }

@@ -193,6 +193,37 @@ impl RemoteVfsClient {
         Ok(())
     }
 
+    pub async fn create_symlink(
+        &self,
+        path: &str,
+        target: &str,
+        lease: &LeaseGrant,
+        surface_kind: &str,
+        operation: &str,
+    ) -> Result<()> {
+        self.request(
+            self.client
+                .put(self.url("/symlink"))
+                .query(&[
+                    ("path", self.path_arg(path)),
+                    ("target", target.to_string()),
+                ])
+                .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
+                .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
+                .header(CHEVALIER_VFS_OPERATION_HEADER, operation)
+                .header(
+                    CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+                    lease.resource_key.as_str(),
+                )
+                .header(
+                    CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                    lease.owner_token.to_string(),
+                ),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn rmdir(
         &self,
         path: &str,

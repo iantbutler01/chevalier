@@ -463,8 +463,37 @@ pub enum ResponseStreamEvent {
     ToolPartial(serde_json::Value),
     /// Final usage statistics for the streamed response.
     Usage(TokenUsage),
+    /// Provider rate-limit window usage for the streamed response.
+    RateLimits(Vec<ProviderRateLimit>),
     /// Final canonical assistant response.
     Complete(AssistantResponse),
+}
+
+/// Provider rate-limit scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderRateLimitScope {
+    Session,
+    Subscription,
+}
+
+impl ProviderRateLimitScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Subscription => "subscription",
+        }
+    }
+}
+
+/// Provider rate-limit window usage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRateLimit {
+    pub scope: ProviderRateLimitScope,
+    pub used_percent: u32,
+    pub window_minutes: u64,
+    pub resets_at_epoch_sec: u64,
 }
 
 /// Token usage statistics

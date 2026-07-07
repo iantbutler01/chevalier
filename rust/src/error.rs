@@ -27,6 +27,14 @@ pub enum Error {
     #[error("Non-retryable error: {0}")]
     NonRetryable(String),
 
+    /// Codex subscription usage limit reached.
+    #[error("{message}")]
+    CodexUsageLimit {
+        message: String,
+        reached_type: Option<String>,
+        resets_at_epoch_sec: Option<u64>,
+    },
+
     /// Parse error when parsing LLM output
     #[error("Parse error: {0}")]
     Parse(String),

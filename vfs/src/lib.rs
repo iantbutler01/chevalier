@@ -39,9 +39,12 @@ pub enum VfsStorageError {
 pub type VfsStorageResult<T> = std::result::Result<T, VfsStorageError>;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VfsStorageEntryKind {
     File,
     Directory,
+    Symlink,
+    Special,
 }
 
 impl VfsStorageEntryKind {
@@ -49,6 +52,8 @@ impl VfsStorageEntryKind {
         match self {
             Self::File => "file",
             Self::Directory => "directory",
+            Self::Symlink => "symlink",
+            Self::Special => "special",
         }
     }
 }
@@ -63,15 +68,48 @@ pub struct VfsStorageObjectState {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VfsStorageMetadata {
     pub path: String,
     pub kind: VfsStorageEntryKind,
     pub size_bytes: u64,
+    #[serde(default)]
+    pub link_target: Option<String>,
+    #[serde(default)]
+    pub executable: bool,
     pub content_hash: Option<String>,
     pub token_count: Option<i32>,
     pub version: Option<String>,
     pub updated_at: Option<DateTime<Utc>>,
     pub object_state: Option<VfsStorageObjectState>,
+}
+
+impl Default for VfsStorageMetadata {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            kind: VfsStorageEntryKind::File,
+            size_bytes: 0,
+            link_target: None,
+            executable: false,
+            content_hash: None,
+            token_count: None,
+            version: None,
+            updated_at: None,
+            object_state: None,
+        }
+    }
+}
+
+impl VfsStorageMetadata {
+    pub fn new(path: impl Into<String>, kind: VfsStorageEntryKind, size_bytes: u64) -> Self {
+        Self {
+            path: path.into(),
+            kind,
+            size_bytes,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -93,6 +131,8 @@ pub struct VfsStorageDirListFilter {
     pub entry_kind: Option<VfsStorageEntryKind>,
     pub limit: Option<i64>,
     pub order: Option<VfsStorageDirListOrder>,
+    #[serde(default)]
+    pub max_hash_bytes: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -108,12 +148,20 @@ pub struct VfsStorageSubtreeOptions {
     pub include_object_state: bool,
     pub include_token_count: bool,
     pub limit: Option<i64>,
+    #[serde(default)]
+    pub max_hash_bytes: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct VfsStorageReadRange {
     pub offset: u64,
     pub length: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsStorageWriteOptions {
+    #[serde(default)]
+    pub executable: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -210,6 +258,17 @@ pub trait OptimizedVfsStorage: Send + Sync {
         precondition: Option<VfsStorageWritePrecondition>,
     ) -> VfsStorageResult<VfsStorageWriteResult>;
 
+    async fn write_with_options(
+        &self,
+        path: &str,
+        bytes: Bytes,
+        precondition: Option<VfsStorageWritePrecondition>,
+        options: Option<VfsStorageWriteOptions>,
+    ) -> VfsStorageResult<VfsStorageWriteResult> {
+        let _ = options;
+        self.write(path, bytes, precondition).await
+    }
+
     async fn write_many_atomic(
         &self,
         writes: Vec<VfsStorageWrite>,
@@ -221,6 +280,17 @@ pub trait OptimizedVfsStorage: Send + Sync {
     ) -> VfsStorageResult<Vec<VfsStorageWriteResult>>;
 
     async fn mkdir(&self, path: &str) -> VfsStorageResult<()>;
+
+    /// Create a symbolic link when the backend supports symlink metadata.
+    ///
+    /// Backends that cannot represent symlinks use this stable BadRequest. The
+    /// FUSE bridge maps that BadRequest to EPERM for symlink(2).
+    async fn create_symlink(&self, path: &str, target: &str) -> VfsStorageResult<()> {
+        let _ = (path, target);
+        Err(VfsStorageError::BadRequest(
+            "symlink creation not supported by this VFS backend".to_string(),
+        ))
+    }
 
     async fn delete_file_with_metadata(
         &self,

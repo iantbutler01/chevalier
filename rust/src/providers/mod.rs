@@ -11,7 +11,10 @@ use crate::error::Result;
 use crate::utils::ConversationMessage;
 
 // Re-export types for convenience
-pub use crate::types::{AssistantResponse, CacheMarker, CostInfo, Provider, TokenUsage};
+pub use crate::types::{
+    AssistantResponse, CacheMarker, CostInfo, Provider, ProviderRateLimit, ProviderRateLimitScope,
+    TokenUsage,
+};
 
 #[derive(Debug, Clone)]
 pub struct AnthropicProviderConfig {
@@ -396,6 +399,9 @@ pub enum StreamChunk {
         cached_tokens: u64,
         cache_write_input_tokens: u64,
     },
+
+    /// Provider rate-limit window usage.
+    RateLimits(Vec<ProviderRateLimit>),
 }
 
 /// Trace callback type for monitoring (wrapped in Arc for Clone support)

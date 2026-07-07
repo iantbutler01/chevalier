@@ -3,13 +3,20 @@
 // @dive-rel: Mirrors the old local nymfs adapter semantics while exposing batch-oriented calls.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 use crate::{
@@ -18,18 +25,116 @@ use crate::{
     VfsStorageObjectState, VfsStoragePrefetchOptions, VfsStoragePrefetchResult,
     VfsStorageReadIfChanged, VfsStorageReadIfChangedResult, VfsStorageReadRange,
     VfsStorageRenameResult, VfsStorageResult, VfsStorageSubtreeOptions, VfsStorageWrite,
-    VfsStorageWritePrecondition, VfsStorageWriteResult,
+    VfsStorageWriteOptions, VfsStorageWritePrecondition, VfsStorageWriteResult,
     pack::{SlotCompression, hex_hash},
 };
 
 #[derive(Clone, Debug)]
 pub struct LocalVfsStorage {
     root: PathBuf,
+    hash_cache: Arc<Mutex<HashMap<PathBuf, CachedFileHash>>>,
+    path_locks: PathLockTable,
+    #[cfg(test)]
+    hash_read_count: Arc<AtomicUsize>,
+}
+
+struct SymlinkTargetInfo {
+    target_text: String,
+}
+
+#[derive(Clone, Debug)]
+struct CachedFileHash {
+    size_bytes: u64,
+    mtime_ns: i128,
+    hash: String,
+}
+
+/// Per-path async mutual exclusion for the check+install critical section.
+///
+/// Waiting is done through `tokio::sync::Mutex`, which parks the *task* (yielding
+/// the worker thread) rather than blocking the OS thread. A blocking wait here would
+/// starve the napi tokio runtime: enough concurrent same-path mutations would leave
+/// every worker parked in a `Condvar::wait`, with no thread left to run — and release
+/// — the lock holder. The map's `std::sync::Mutex` is only ever held for the brief
+/// fetch-or-create, never across an `.await`.
+#[derive(Clone, Default)]
+struct PathLockTable {
+    inner: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+}
+
+struct PathLocks {
+    guards: Vec<OwnedMutexGuard<()>>,
+    keys: Vec<String>,
+    table: PathLockTable,
+}
+
+const HASH_CACHE_RECENCY_GUARD: Duration = Duration::from_secs(2);
+
+impl std::fmt::Debug for PathLockTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PathLockTable").finish_non_exhaustive()
+    }
+}
+
+impl PathLockTable {
+    /// Acquire exclusive locks for every path in `paths`, awaiting (never blocking the
+    /// worker) until each is free. Keys are sorted+deduped so a multi-path acquisition
+    /// can never deadlock against another one acquiring an overlapping set.
+    async fn lock(&self, paths: impl IntoIterator<Item = String>) -> PathLocks {
+        let mut keys = paths
+            .into_iter()
+            .map(|path| path.trim_matches('/').to_string())
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        let mutexes = {
+            let mut map = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+            keys.iter()
+                .map(|key| {
+                    map.entry(key.clone())
+                        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                        .clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut guards = Vec::with_capacity(mutexes.len());
+        for mutex in mutexes {
+            guards.push(mutex.lock_owned().await);
+        }
+        PathLocks {
+            guards,
+            keys,
+            table: self.clone(),
+        }
+    }
+}
+
+impl Drop for PathLocks {
+    fn drop(&mut self) {
+        // Release the held guards first, then prune any per-path entry that no other
+        // task is still holding or waiting on (strong_count == 1 => only the map).
+        self.guards.clear();
+        let mut map = self.table.inner.lock().unwrap_or_else(|err| err.into_inner());
+        for key in &self.keys {
+            if map
+                .get(key)
+                .is_some_and(|mutex| Arc::strong_count(mutex) == 1)
+            {
+                map.remove(key);
+            }
+        }
+    }
 }
 
 impl LocalVfsStorage {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            hash_cache: Arc::new(Mutex::new(HashMap::new())),
+            path_locks: PathLockTable::default(),
+            #[cfg(test)]
+            hash_read_count: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -70,23 +175,70 @@ impl LocalVfsStorage {
             .join("/"))
     }
 
+    fn assert_no_symlink_ancestor(&self, abs_path: &Path) -> VfsStorageResult<()> {
+        let rel = abs_path.strip_prefix(&self.root).map_err(|err| {
+            VfsStorageError::Internal(format!("local path escaped vfs root: {err}"))
+        })?;
+        let mut current = self.root.clone();
+        let mut components = rel.components().peekable();
+        while let Some(component) = components.next() {
+            let Component::Normal(part) = component else {
+                continue;
+            };
+            current.push(part);
+            if components.peek().is_none() {
+                break;
+            }
+            let metadata = match fs::symlink_metadata(&current) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err) => return Err(VfsStorageError::Internal(err.to_string())),
+            };
+            if metadata.file_type().is_symlink() {
+                return Err(VfsStorageError::BadRequest(
+                    "unsupported file type: symlink".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn metadata_for_abs(&self, abs_path: &Path) -> VfsStorageResult<Option<VfsStorageMetadata>> {
-        let metadata = match fs::metadata(abs_path) {
+        self.metadata_for_abs_with_hash_limit(abs_path, None)
+    }
+
+    fn metadata_for_abs_with_hash_limit(
+        &self,
+        abs_path: &Path,
+        max_hash_bytes: Option<u64>,
+    ) -> VfsStorageResult<Option<VfsStorageMetadata>> {
+        self.assert_no_symlink_ancestor(abs_path)?;
+        let metadata = match fs::symlink_metadata(abs_path) {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(VfsStorageError::Internal(err.to_string())),
         };
-        let kind = if metadata.is_dir() {
+        let file_type = metadata.file_type();
+        let kind = if file_type.is_symlink() {
+            VfsStorageEntryKind::Symlink
+        } else if metadata.is_dir() {
             VfsStorageEntryKind::Directory
-        } else {
+        } else if metadata.is_file() {
             VfsStorageEntryKind::File
+        } else {
+            VfsStorageEntryKind::Special
         };
-        let content_hash = if metadata.is_file() {
-            hash_file_if_present(abs_path)?
+        let link_target = if kind == VfsStorageEntryKind::Symlink {
+            Some(self.validate_symlink_target(abs_path)?.target_text)
         } else {
             None
         };
-        let object_state = metadata.is_file().then(|| VfsStorageObjectState {
+        let content_hash = if kind == VfsStorageEntryKind::File {
+            self.hash_file_for_metadata(abs_path, &metadata, max_hash_bytes)?
+        } else {
+            None
+        };
+        let object_state = (kind == VfsStorageEntryKind::File).then(|| VfsStorageObjectState {
             size_bytes: metadata.len(),
             pack_key: format!("local://{}", abs_path.display()),
             pack_slot_offset: 0,
@@ -97,6 +249,8 @@ impl LocalVfsStorage {
             path: self.logical_path_for(abs_path)?,
             kind,
             size_bytes: metadata.len(),
+            link_target,
+            executable: executable_from_metadata(&metadata, kind),
             content_hash,
             token_count: None,
             version: None,
@@ -110,11 +264,77 @@ impl LocalVfsStorage {
         self.metadata_for_abs(&abs_path)
     }
 
+    fn validate_symlink_target(&self, link_path: &Path) -> VfsStorageResult<SymlinkTargetInfo> {
+        let target = fs::read_link(link_path).map_err(|_| unsupported_symlink_error())?;
+        self.validate_symlink_target_text(link_path, &target)
+    }
+
+    fn validate_symlink_target_text(
+        &self,
+        link_path: &Path,
+        target: &Path,
+    ) -> VfsStorageResult<SymlinkTargetInfo> {
+        let target_text = target.to_string_lossy().into_owned();
+        if target_text.is_empty() {
+            return Err(unsupported_symlink_error());
+        }
+        let lexical_root = self.lexical_root()?;
+        let canonical_root =
+            fs::canonicalize(&self.root).map_err(|_| unsupported_symlink_error())?;
+        let link_rel = link_path
+            .strip_prefix(&self.root)
+            .map_err(|_| unsupported_symlink_error())?;
+        let link_parent_rel = link_rel.parent().unwrap_or_else(|| Path::new(""));
+        let link_parent = lexical_root.join(link_parent_rel);
+        let resolved = if target.is_absolute() {
+            lexical_normalize(target)
+        } else {
+            lexical_normalize(&link_parent.join(target))
+        };
+        if !resolved.starts_with(&lexical_root) {
+            return Err(unsupported_symlink_error());
+        }
+        match fs::metadata(&resolved) {
+            Ok(metadata) => {
+                let canonical_target =
+                    fs::canonicalize(&resolved).map_err(|_| unsupported_symlink_error())?;
+                if !canonical_target.starts_with(&canonical_root) {
+                    return Err(unsupported_symlink_error());
+                }
+                if !metadata.is_file() && !metadata.is_dir() {
+                    return Err(unsupported_symlink_error());
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(unsupported_symlink_error()),
+        }
+        let resolved_rel = resolved
+            .strip_prefix(&lexical_root)
+            .map_err(|_| unsupported_symlink_error())?;
+        let normalized_target = relative_path_between(link_parent_rel, resolved_rel);
+        Ok(SymlinkTargetInfo {
+            target_text: normalized_target,
+        })
+    }
+
+    fn lexical_root(&self) -> VfsStorageResult<PathBuf> {
+        let root = if self.root.is_absolute() {
+            self.root.clone()
+        } else {
+            std::env::current_dir()
+                .map_err(|err| VfsStorageError::Internal(err.to_string()))?
+                .join(&self.root)
+        };
+        Ok(lexical_normalize(&root))
+    }
+
     fn write_precondition(&self, path: &str) -> VfsStorageResult<VfsStorageWritePrecondition> {
         let abs_path = self.abs_path(path)?;
+        self.assert_no_symlink_ancestor(&abs_path)?;
         Ok(VfsStorageWritePrecondition {
             fingerprint: Some(
-                hash_file_if_present(&abs_path)?.unwrap_or_else(|| "absent".to_string()),
+                hash_file_if_present_uncached(self, &abs_path)?
+                    .unwrap_or_else(|| "absent".to_string()),
             ),
             secondary_fingerprint: None,
         })
@@ -140,6 +360,73 @@ impl LocalVfsStorage {
                 "local vfs write precondition failed for {path}"
             )))
         }
+    }
+
+    async fn lock_write_paths(&self, paths: impl IntoIterator<Item = String>) -> PathLocks {
+        self.path_locks.lock(paths).await
+    }
+
+    fn hash_file_for_metadata(
+        &self,
+        path: &Path,
+        metadata: &fs::Metadata,
+        max_hash_bytes: Option<u64>,
+    ) -> VfsStorageResult<Option<String>> {
+        if !metadata.is_file() {
+            self.invalidate_hash(path);
+            return Ok(None);
+        }
+        if max_hash_bytes.is_some_and(|max| metadata.len() > max) {
+            return Ok(None);
+        }
+        let mtime_ns = metadata_mtime_ns(metadata);
+        if !metadata_is_recent(metadata) {
+            if let Some(cached) = self
+                .hash_cache
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .get(path)
+                .cloned()
+            {
+                if cached.size_bytes == metadata.len() && cached.mtime_ns == mtime_ns {
+                    return Ok(Some(cached.hash));
+                }
+            }
+        }
+        let hash = hash_file_if_present_uncached(self, path)?;
+        if let Some(hash) = hash.as_ref() {
+            self.remember_hash(path, metadata, hash.clone());
+        } else {
+            self.invalidate_hash(path);
+        }
+        Ok(hash)
+    }
+
+    fn remember_hash(&self, path: &Path, metadata: &fs::Metadata, hash: String) {
+        let mut cache = self
+            .hash_cache
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        cache.insert(
+            path.to_path_buf(),
+            CachedFileHash {
+                size_bytes: metadata.len(),
+                mtime_ns: metadata_mtime_ns(metadata),
+                hash,
+            },
+        );
+    }
+
+    fn invalidate_hash(&self, path: &Path) {
+        self.hash_cache
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(path);
+    }
+
+    #[cfg(test)]
+    fn hash_read_count(&self) -> usize {
+        self.hash_read_count.load(AtomicOrdering::SeqCst)
     }
 }
 
@@ -170,6 +457,24 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         filter: VfsStorageDirListFilter,
     ) -> VfsStorageResult<Vec<VfsStorageMetadata>> {
         let abs_path = self.abs_path(path)?;
+        self.assert_no_symlink_ancestor(&abs_path)?;
+        let directory_metadata = match fs::symlink_metadata(&abs_path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(VfsStorageError::NotFound(path.to_string()));
+            }
+            Err(err) => return Err(VfsStorageError::Internal(err.to_string())),
+        };
+        if directory_metadata.file_type().is_symlink()
+            || (!directory_metadata.is_file() && !directory_metadata.is_dir())
+        {
+            return Ok(Vec::new());
+        }
+        if !directory_metadata.is_dir() {
+            return Err(VfsStorageError::BadRequest(format!(
+                "vfs path {path} is not a directory"
+            )));
+        }
         let read_dir = fs::read_dir(&abs_path).map_err(|err| match err.kind() {
             std::io::ErrorKind::NotFound => VfsStorageError::NotFound(path.to_string()),
             _ => VfsStorageError::Internal(err.to_string()),
@@ -181,13 +486,20 @@ impl OptimizedVfsStorage for LocalVfsStorage {
             if !filter_name(&name, &filter) {
                 continue;
             }
-            let Some(metadata) = self.metadata_for_abs(&entry.path())? else {
+            let metadata =
+                match self.metadata_for_abs_with_hash_limit(&entry.path(), filter.max_hash_bytes) {
+                    Ok(Some(metadata)) => metadata,
+                    Ok(None) => continue,
+                    Err(err) if is_excluded_listing_error(&err) => continue,
+                    Err(err) => return Err(err),
+                };
+            if is_excluded_listing_kind(metadata.kind) {
                 continue;
-            };
-            if let Some(kind) = filter.entry_kind
-                && metadata.kind != kind
-            {
-                continue;
+            }
+            if let Some(kind) = filter.entry_kind {
+                if metadata.kind != kind {
+                    continue;
+                }
             }
             entries.push(metadata);
         }
@@ -204,17 +516,33 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         options: VfsStorageSubtreeOptions,
     ) -> VfsStorageResult<Vec<VfsStorageMetadata>> {
         let root = self.abs_path(prefix)?;
-        if !root.exists() {
-            return Ok(Vec::new());
-        }
+        self.assert_no_symlink_ancestor(&root)?;
         let mut stack = vec![root];
         let mut out = Vec::new();
         while let Some(path) = stack.pop() {
-            let metadata = match fs::metadata(&path) {
+            let metadata = match fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => return Err(VfsStorageError::Internal(err.to_string())),
             };
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                match self.metadata_for_abs(&path) {
+                    Ok(Some(link_metadata)) => out.push(link_metadata),
+                    Ok(None) => {}
+                    Err(err) if is_excluded_listing_error(&err) => {}
+                    Err(err) => return Err(err),
+                }
+                if let Some(limit) = options.limit {
+                    if out.len() >= limit.max(0) as usize {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if !metadata.is_file() && !metadata.is_dir() {
+                continue;
+            }
             if metadata.is_dir() {
                 for entry in
                     fs::read_dir(&path).map_err(|err| VfsStorageError::Internal(err.to_string()))?
@@ -227,15 +555,17 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                 }
                 continue;
             }
-            if metadata.is_file()
-                && let Some(file_metadata) = self.metadata_for_abs(&path)?
-            {
-                out.push(file_metadata);
+            if metadata.is_file() {
+                if let Some(file_metadata) =
+                    self.metadata_for_abs_with_hash_limit(&path, options.max_hash_bytes)?
+                {
+                    out.push(file_metadata);
+                }
             }
-            if let Some(limit) = options.limit
-                && out.len() >= limit.max(0) as usize
-            {
-                break;
+            if let Some(limit) = options.limit {
+                if out.len() >= limit.max(0) as usize {
+                    break;
+                }
             }
         }
         out.sort_by(|a, b| a.path.cmp(&b.path));
@@ -243,14 +573,15 @@ impl OptimizedVfsStorage for LocalVfsStorage {
     }
 
     async fn read(&self, path: &str) -> VfsStorageResult<Bytes> {
-        read_file(&self.abs_path(path)?).map(Bytes::from)
+        let abs_path = self.abs_path(path)?;
+        self.assert_no_symlink_ancestor(&abs_path)?;
+        read_file(&abs_path).map(Bytes::from)
     }
 
     async fn read_range(&self, path: &str, range: VfsStorageReadRange) -> VfsStorageResult<Bytes> {
-        let mut file = fs::File::open(self.abs_path(path)?).map_err(|err| match err.kind() {
-            std::io::ErrorKind::NotFound => VfsStorageError::NotFound(path.to_string()),
-            _ => VfsStorageError::Internal(err.to_string()),
-        })?;
+        let abs_path = self.abs_path(path)?;
+        self.assert_no_symlink_ancestor(&abs_path)?;
+        let mut file = open_regular_file(&abs_path)?;
         file.seek(SeekFrom::Start(range.offset))
             .map_err(|err| VfsStorageError::Internal(err.to_string()))?;
         let mut bytes = Vec::with_capacity(range.length as usize);
@@ -311,14 +642,26 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         bytes: Bytes,
         precondition: Option<VfsStorageWritePrecondition>,
     ) -> VfsStorageResult<VfsStorageWriteResult> {
-        let result = self
-            .write_many_atomic(vec![VfsStorageWrite {
-                path: path.to_string(),
-                bytes,
-                token_count: None,
-                precondition,
-            }])
-            .await?;
+        self.write_with_options(path, bytes, precondition, None)
+            .await
+    }
+
+    async fn write_with_options(
+        &self,
+        path: &str,
+        bytes: Bytes,
+        precondition: Option<VfsStorageWritePrecondition>,
+        options: Option<VfsStorageWriteOptions>,
+    ) -> VfsStorageResult<VfsStorageWriteResult> {
+        let write = VfsStorageWrite {
+            path: path.to_string(),
+            bytes,
+            token_count: None,
+            precondition,
+        };
+        let _locks = self.lock_write_paths([write.path.clone()]).await;
+        self.assert_precondition(&write.path, write.precondition.as_ref())?;
+        let result = install_writes_with_options(self, vec![(write, options)])?;
         result
             .into_iter()
             .next()
@@ -329,6 +672,9 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         &self,
         writes: Vec<VfsStorageWrite>,
     ) -> VfsStorageResult<Vec<VfsStorageWriteResult>> {
+        let _locks = self
+            .lock_write_paths(writes.iter().map(|write| write.path.clone()))
+            .await;
         for write in &writes {
             self.assert_precondition(&write.path, write.precondition.as_ref())?;
         }
@@ -339,6 +685,9 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         &self,
         writes: Vec<VfsStorageWrite>,
     ) -> VfsStorageResult<Vec<VfsStorageWriteResult>> {
+        let _locks = self
+            .lock_write_paths(writes.iter().map(|write| write.path.clone()))
+            .await;
         for write in &writes {
             self.assert_precondition(&write.path, write.precondition.as_ref())?;
         }
@@ -367,8 +716,13 @@ impl OptimizedVfsStorage for LocalVfsStorage {
     }
 
     async fn mkdir(&self, path: &str) -> VfsStorageResult<()> {
-        fs::create_dir_all(self.abs_path(path)?)
-            .map_err(|err| VfsStorageError::Internal(err.to_string()))
+        let abs_path = self.abs_path(path)?;
+        self.assert_no_symlink_ancestor(&abs_path)?;
+        fs::create_dir_all(abs_path).map_err(|err| VfsStorageError::Internal(err.to_string()))
+    }
+
+    async fn create_symlink(&self, path: &str, target: &str) -> VfsStorageResult<()> {
+        create_symlink_impl(self, path, target)
     }
 
     async fn delete_file_with_metadata(
@@ -376,6 +730,7 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         path: &str,
         precondition: Option<VfsStorageWritePrecondition>,
     ) -> VfsStorageResult<VfsStorageDeleteResult> {
+        let _locks = self.lock_write_paths([path.to_string()]).await;
         self.assert_precondition(path, precondition.as_ref())?;
         let previous = self.metadata_for_path(path)?;
         if matches!(
@@ -386,11 +741,14 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                 "vfs path {path} is not a file"
             )));
         }
-        match fs::remove_file(self.abs_path(path)?) {
+        let abs_path = self.abs_path(path)?;
+        self.assert_no_symlink_ancestor(&abs_path)?;
+        match fs::remove_file(&abs_path) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(VfsStorageError::Internal(err.to_string())),
         }
+        self.invalidate_hash(&abs_path);
         Ok(VfsStorageDeleteResult { previous })
     }
 
@@ -403,7 +761,9 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                 "vfs path {path} is not a directory"
             )));
         }
-        match fs::remove_dir(self.abs_path(path)?) {
+        let abs_path = self.abs_path(path)?;
+        self.assert_no_symlink_ancestor(&abs_path)?;
+        match fs::remove_dir(abs_path) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => Err(
                 VfsStorageError::Conflict(format!("vfs directory {path} is not empty")),
@@ -421,12 +781,16 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         let Some(_) = previous else {
             return Err(VfsStorageError::NotFound(from.to_string()));
         };
+        let from_abs = self.abs_path(from)?;
+        self.assert_no_symlink_ancestor(&from_abs)?;
         let to_abs = self.abs_path(to)?;
+        self.assert_no_symlink_ancestor(&to_abs)?;
         if let Some(parent) = to_abs.parent() {
             fs::create_dir_all(parent).map_err(|err| VfsStorageError::Internal(err.to_string()))?;
         }
-        fs::rename(self.abs_path(from)?, &to_abs)
-            .map_err(|err| VfsStorageError::Internal(err.to_string()))?;
+        fs::rename(&from_abs, &to_abs).map_err(|err| VfsStorageError::Internal(err.to_string()))?;
+        self.invalidate_hash(&from_abs);
+        self.invalidate_hash(&to_abs);
         let current = self.metadata_for_abs(&to_abs)?;
         Ok(VfsStorageRenameResult { previous, current })
     }
@@ -444,9 +808,19 @@ fn install_writes(
     storage: &LocalVfsStorage,
     writes: Vec<VfsStorageWrite>,
 ) -> VfsStorageResult<Vec<VfsStorageWriteResult>> {
+    install_writes_with_options(
+        storage,
+        writes.into_iter().map(|write| (write, None)).collect(),
+    )
+}
+
+fn install_writes_with_options(
+    storage: &LocalVfsStorage,
+    writes: Vec<(VfsStorageWrite, Option<VfsStorageWriteOptions>)>,
+) -> VfsStorageResult<Vec<VfsStorageWriteResult>> {
     let mut seen = HashSet::new();
     let mut staged = Vec::with_capacity(writes.len());
-    for write in writes {
+    for (write, options) in writes {
         if !seen.insert(write.path.clone()) {
             return Err(VfsStorageError::BadRequest(format!(
                 "duplicate vfs write path: {}",
@@ -454,9 +828,16 @@ fn install_writes(
             )));
         }
         let abs_path = storage.abs_path(&write.path)?;
+        storage.assert_no_symlink_ancestor(&abs_path)?;
         let previous_hash = storage
             .metadata_for_abs(&abs_path)?
             .and_then(|metadata| metadata.content_hash);
+        let executable = options.as_ref().is_some_and(|options| options.executable);
+        let previous_mode = if executable {
+            existing_regular_file_mode(&abs_path)?
+        } else {
+            None
+        };
         let content_hash = hex_hash(&write.bytes);
         if let Some(parent) = abs_path.parent() {
             fs::create_dir_all(parent).map_err(|err| VfsStorageError::Internal(err.to_string()))?;
@@ -471,13 +852,26 @@ fn install_writes(
         ));
         fs::write(&tmp_path, &write.bytes)
             .map_err(|err| VfsStorageError::Internal(err.to_string()))?;
-        staged.push((write.path, abs_path, tmp_path, content_hash, previous_hash));
+        staged.push((
+            write.path,
+            abs_path,
+            tmp_path,
+            content_hash,
+            previous_hash,
+            executable,
+            previous_mode,
+        ));
     }
 
     let mut results = Vec::with_capacity(staged.len());
-    for (path, abs_path, tmp_path, content_hash, previous_hash) in staged {
+    for (path, abs_path, tmp_path, content_hash, previous_hash, executable, previous_mode) in staged
+    {
         fs::rename(&tmp_path, &abs_path)
             .map_err(|err| VfsStorageError::Internal(err.to_string()))?;
+        apply_executable_option(&abs_path, executable, previous_mode)?;
+        let metadata = fs::symlink_metadata(&abs_path)
+            .map_err(|err| VfsStorageError::Internal(err.to_string()))?;
+        storage.remember_hash(&abs_path, &metadata, content_hash.clone());
         results.push(VfsStorageWriteResult {
             path,
             content_hash,
@@ -489,21 +883,246 @@ fn install_writes(
 }
 
 fn read_file(path: &Path) -> VfsStorageResult<Vec<u8>> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(bytes),
+    let mut file = open_regular_file(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|err| VfsStorageError::Internal(err.to_string()))?;
+    Ok(bytes)
+}
+
+fn hash_file_if_present_uncached(
+    _storage: &LocalVfsStorage,
+    path: &Path,
+) -> VfsStorageResult<Option<String>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(VfsStorageError::Internal(err.to_string())),
+    };
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    #[cfg(test)]
+    _storage
+        .hash_read_count
+        .fetch_add(1, AtomicOrdering::SeqCst);
+    match read_file(path) {
+        Ok(bytes) => Ok(Some(hex_hash(&bytes))),
+        Err(VfsStorageError::NotFound(_)) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn open_regular_file(path: &Path) -> VfsStorageResult<fs::File> {
+    assert_supported_read_target(path)?;
+    let file = fs::File::open(path).map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => VfsStorageError::NotFound(path.display().to_string()),
+        _ => VfsStorageError::Internal(err.to_string()),
+    })?;
+    // The path is inside a locally trusted scope, but checking the opened fd
+    // closes the cheap final-component kind-change window before reads.
+    let metadata = file
+        .metadata()
+        .map_err(|err| VfsStorageError::Internal(err.to_string()))?;
+    if !metadata.is_file() {
+        return Err(VfsStorageError::BadRequest(
+            "unsupported file type: special".to_string(),
+        ));
+    }
+    Ok(file)
+}
+
+fn assert_supported_read_target(path: &Path) -> VfsStorageResult<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            Err(VfsStorageError::NotFound(path.display().to_string()))
+            return Err(VfsStorageError::NotFound(path.display().to_string()));
         }
+        Err(err) => return Err(VfsStorageError::Internal(err.to_string())),
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(VfsStorageError::BadRequest(
+            "unsupported file type: symlink".to_string(),
+        ));
+    }
+    if !metadata.is_file() {
+        if metadata.is_dir() {
+            return Err(VfsStorageError::BadRequest(format!(
+                "vfs path {} is not a file",
+                path.display()
+            )));
+        }
+        return Err(VfsStorageError::BadRequest(
+            "unsupported file type: special".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(part) => out.push(part),
+            Component::RootDir | Component::Prefix(_) => out.push(component.as_os_str()),
+        }
+    }
+    out
+}
+
+fn relative_path_between(from_dir: &Path, target: &Path) -> String {
+    let from = from_dir
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let to = target
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let common = from
+        .iter()
+        .zip(to.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut parts = Vec::new();
+    parts.extend(std::iter::repeat_n("..".to_string(), from.len() - common));
+    parts.extend(to[common..].iter().cloned());
+    if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    }
+}
+
+fn metadata_is_recent(metadata: &fs::Metadata) -> bool {
+    let Ok(modified) = metadata.modified() else {
+        return true;
+    };
+    match SystemTime::now().duration_since(modified) {
+        Ok(elapsed) => elapsed < HASH_CACHE_RECENCY_GUARD,
+        Err(_) => true,
+    }
+}
+
+#[cfg(unix)]
+fn metadata_mtime_ns(metadata: &fs::Metadata) -> i128 {
+    metadata.mtime() as i128 * 1_000_000_000 + metadata.mtime_nsec() as i128
+}
+
+#[cfg(not(unix))]
+fn metadata_mtime_ns(metadata: &fs::Metadata) -> i128 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as i128)
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn create_symlink_impl(
+    storage: &LocalVfsStorage,
+    path: &str,
+    target: &str,
+) -> VfsStorageResult<()> {
+    let abs_path = storage.abs_path(path)?;
+    storage.assert_no_symlink_ancestor(&abs_path)?;
+    if let Some(parent) = abs_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| VfsStorageError::Internal(err.to_string()))?;
+    }
+    let target = storage.validate_symlink_target_text(&abs_path, Path::new(target))?;
+    std::os::unix::fs::symlink(target.target_text, &abs_path)
+        .map_err(|err| VfsStorageError::Internal(err.to_string()))
+}
+
+#[cfg(not(unix))]
+fn create_symlink_impl(
+    _storage: &LocalVfsStorage,
+    _path: &str,
+    _target: &str,
+) -> VfsStorageResult<()> {
+    Err(VfsStorageError::BadRequest(
+        "local vfs backend does not support symlink creation on this platform".to_string(),
+    ))
+}
+
+fn unsupported_symlink_error() -> VfsStorageError {
+    VfsStorageError::BadRequest("unsupported file type: symlink".to_string())
+}
+
+fn is_excluded_listing_error(error: &VfsStorageError) -> bool {
+    matches!(
+        error,
+        VfsStorageError::BadRequest(message)
+            if message == "unsupported file type: symlink"
+                || message == "unsupported file type: special"
+    )
+}
+
+fn is_excluded_listing_kind(kind: VfsStorageEntryKind) -> bool {
+    matches!(kind, VfsStorageEntryKind::Special)
+}
+
+#[cfg(unix)]
+fn executable_from_metadata(metadata: &fs::Metadata, kind: VfsStorageEntryKind) -> bool {
+    kind == VfsStorageEntryKind::File && metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn executable_from_metadata(_metadata: &fs::Metadata, _kind: VfsStorageEntryKind) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn existing_regular_file_mode(path: &Path) -> VfsStorageResult<Option<u32>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata.permissions().mode() & 0o777)),
+        Ok(_) => Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(VfsStorageError::Internal(err.to_string())),
     }
 }
 
-fn hash_file_if_present(path: &Path) -> VfsStorageResult<Option<String>> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(hex_hash(&bytes))),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(VfsStorageError::Internal(err.to_string())),
+#[cfg(not(unix))]
+fn existing_regular_file_mode(_path: &Path) -> VfsStorageResult<Option<u32>> {
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn apply_executable_option(
+    path: &Path,
+    executable: bool,
+    previous_mode: Option<u32>,
+) -> VfsStorageResult<()> {
+    if !executable {
+        return Ok(());
     }
+    let target_mode = previous_mode.map(|mode| mode | 0o111).unwrap_or(0o755);
+    let metadata =
+        fs::symlink_metadata(path).map_err(|err| VfsStorageError::Internal(err.to_string()))?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(target_mode);
+    fs::set_permissions(path, permissions).map_err(|err| VfsStorageError::Internal(err.to_string()))
+}
+
+#[cfg(not(unix))]
+fn apply_executable_option(
+    _path: &Path,
+    _executable: bool,
+    _previous_mode: Option<u32>,
+) -> VfsStorageResult<()> {
+    Ok(())
 }
 
 fn modified_at(metadata: &fs::Metadata) -> Option<DateTime<Utc>> {
@@ -511,15 +1130,15 @@ fn modified_at(metadata: &fs::Metadata) -> Option<DateTime<Utc>> {
 }
 
 fn filter_name(name: &str, filter: &VfsStorageDirListFilter) -> bool {
-    if let Some(pattern) = filter.name_like.as_deref()
-        && !sql_like_match(pattern, name)
-    {
-        return false;
+    if let Some(pattern) = filter.name_like.as_deref() {
+        if !sql_like_match(pattern, name) {
+            return false;
+        }
     }
-    if let Some(pattern) = filter.name_not_like.as_deref()
-        && sql_like_match(pattern, name)
-    {
-        return false;
+    if let Some(pattern) = filter.name_not_like.as_deref() {
+        if sql_like_match(pattern, name) {
+            return false;
+        }
     }
     true
 }
@@ -595,6 +1214,20 @@ fn sql_like_match(pattern: &str, name: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    #[cfg(unix)]
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    #[cfg(unix)]
+    use std::process::Command;
+    use std::sync::{Arc, Barrier};
+
+    fn set_old_mtime(path: &Path) {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .open(path)
+            .expect("open for mtime");
+        file.set_modified(SystemTime::now() - Duration::from_secs(5))
+            .expect("set old mtime");
+    }
 
     #[tokio::test]
     async fn local_storage_round_trips_batch_and_range_reads() {
@@ -718,6 +1351,490 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn in_scope_file_symlink_is_listed_with_target_but_not_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("target.txt"), b"target").expect("target file");
+        symlink("target.txt", dir.path().join("link.txt")).expect("symlink");
+
+        let storage = LocalVfsStorage::new(dir.path());
+        let metadata = storage
+            .stat("link.txt")
+            .await
+            .expect("stat")
+            .expect("symlink metadata");
+        assert_eq!(metadata.kind, VfsStorageEntryKind::Symlink);
+        assert_eq!(metadata.link_target.as_deref(), Some("target.txt"));
+        assert_eq!(metadata.content_hash, None);
+
+        let listed = storage
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .expect("list dir");
+        let link = listed
+            .iter()
+            .find(|entry| entry.path == "link.txt")
+            .expect("listed symlink");
+        assert_eq!(link.kind, VfsStorageEntryKind::Symlink);
+        assert_eq!(link.link_target.as_deref(), Some("target.txt"));
+
+        let subtree = storage
+            .list_subtree_file_metadata("", VfsStorageSubtreeOptions::default())
+            .await
+            .expect("subtree");
+        assert!(subtree.iter().any(|entry| {
+            entry.path == "link.txt"
+                && entry.kind == VfsStorageEntryKind::Symlink
+                && entry.link_target.as_deref() == Some("target.txt")
+        }));
+
+        let err = storage
+            .read("link.txt")
+            .await
+            .expect_err("symlink read rejected");
+        assert_eq!(
+            err,
+            VfsStorageError::BadRequest("unsupported file type: symlink".to_string())
+        );
+        let err = storage
+            .read_range(
+                "link.txt",
+                VfsStorageReadRange {
+                    offset: 0,
+                    length: 1,
+                },
+            )
+            .await
+            .expect_err("symlink range read rejected");
+        assert_eq!(
+            err,
+            VfsStorageError::BadRequest("unsupported file type: symlink".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn escaping_symlink_is_absent_from_listings_and_read_stat_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let outside_file = outside.path().join("secret.txt");
+        fs::write(&outside_file, b"secret").expect("outside file");
+        symlink(&outside_file, dir.path().join("secret.txt")).expect("symlink");
+
+        let storage = LocalVfsStorage::new(dir.path());
+        let listed = storage
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .expect("list dir");
+        assert!(listed.iter().all(|entry| entry.path != "secret.txt"));
+
+        let subtree = storage
+            .list_subtree_file_metadata("", VfsStorageSubtreeOptions::default())
+            .await
+            .expect("subtree");
+        assert!(subtree.iter().all(|entry| entry.path != "secret.txt"));
+
+        let err = storage
+            .stat("secret.txt")
+            .await
+            .expect_err("escaping symlink stat rejected");
+        assert_eq!(
+            err,
+            VfsStorageError::BadRequest("unsupported file type: symlink".to_string())
+        );
+
+        let err = storage
+            .read("secret.txt")
+            .await
+            .expect_err("symlink read rejected");
+        assert_eq!(
+            err,
+            VfsStorageError::BadRequest("unsupported file type: symlink".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn in_scope_dir_symlink_is_listed_but_not_recursed_in_subtree_listing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("a.txt"), b"a").expect("file");
+        fs::create_dir(dir.path().join("real-dir")).expect("real dir");
+        fs::write(dir.path().join("real-dir").join("nested.txt"), b"nested").expect("nested file");
+        symlink("real-dir", dir.path().join("dir-link")).expect("dir symlink");
+        let storage = LocalVfsStorage::new(dir.path());
+
+        let listed = storage
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .expect("list dir");
+        let link = listed
+            .iter()
+            .find(|entry| entry.path == "dir-link")
+            .expect("listed dir symlink");
+        assert_eq!(link.kind, VfsStorageEntryKind::Symlink);
+        assert_eq!(link.link_target.as_deref(), Some("real-dir"));
+
+        let subtree = storage
+            .list_subtree_file_metadata("", VfsStorageSubtreeOptions::default())
+            .await
+            .expect("subtree");
+        assert_eq!(
+            subtree
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>(),
+            vec![
+                "a.txt".to_string(),
+                "dir-link".to_string(),
+                "real-dir/nested.txt".to_string()
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_symlink_accepts_in_scope_target_and_rejects_escape() {
+        let base = tempfile::tempdir().expect("base tempdir");
+        let root = base.path().join("root");
+        let outside = base.path().join("outside");
+        fs::create_dir_all(&root).expect("root");
+        fs::create_dir_all(&outside).expect("outside");
+        fs::write(root.join("target.txt"), b"target").expect("target");
+        fs::write(outside.join("secret.txt"), b"secret").expect("secret");
+
+        let storage = LocalVfsStorage::new(&root);
+        storage
+            .create_symlink("link.txt", "target.txt")
+            .await
+            .expect("create in-scope symlink");
+        let metadata = storage
+            .stat("link.txt")
+            .await
+            .expect("stat")
+            .expect("symlink metadata");
+        assert_eq!(metadata.kind, VfsStorageEntryKind::Symlink);
+        assert_eq!(metadata.link_target.as_deref(), Some("target.txt"));
+
+        let err = storage
+            .create_symlink("bad-link.txt", "../outside/secret.txt")
+            .await
+            .expect_err("escaping symlink rejected");
+        assert_eq!(
+            err,
+            VfsStorageError::BadRequest("unsupported file type: symlink".to_string())
+        );
+        assert!(!root.join("bad-link.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_symlink_accepts_dangling_in_scope_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        storage.mkdir("proj").await.expect("mkdir");
+
+        storage
+            .create_symlink("proj/link.txt", "target.txt")
+            .await
+            .expect("dangling symlink is legal");
+        let metadata = storage
+            .stat("proj/link.txt")
+            .await
+            .expect("stat link")
+            .expect("link metadata");
+        assert_eq!(metadata.kind, VfsStorageEntryKind::Symlink);
+        assert_eq!(metadata.link_target.as_deref(), Some("target.txt"));
+
+        storage
+            .write("proj/target.txt", Bytes::from_static(b"later"), None)
+            .await
+            .expect("create target later");
+        let followed = fs::read(dir.path().join("proj/link.txt")).expect("host follows link");
+        assert_eq!(followed, b"later");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_symlink_rejects_lexical_parent_escape() {
+        let base = tempfile::tempdir().expect("base tempdir");
+        let root = base.path().join("root");
+        fs::create_dir_all(root.join("proj")).expect("root");
+        let storage = LocalVfsStorage::new(&root);
+
+        let err = storage
+            .create_symlink("proj/bad-link.txt", "../../outside/secret.txt")
+            .await
+            .expect_err("lexical escape rejected");
+        assert_eq!(
+            err,
+            VfsStorageError::BadRequest("unsupported file type: symlink".to_string())
+        );
+        assert!(!root.join("proj/bad-link.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_symlink_rejects_existing_escaping_symlink_chain() {
+        let base = tempfile::tempdir().expect("base tempdir");
+        let root = base.path().join("root");
+        let outside = base.path().join("outside");
+        fs::create_dir_all(&root).expect("root");
+        fs::create_dir_all(&outside).expect("outside");
+        fs::write(outside.join("secret.txt"), b"secret").expect("secret");
+        symlink(&outside, root.join("escape")).expect("escape symlink");
+        let storage = LocalVfsStorage::new(&root);
+
+        let err = storage
+            .create_symlink("bad-link.txt", "escape/secret.txt")
+            .await
+            .expect_err("canonical symlink chain escape rejected");
+        assert_eq!(
+            err,
+            VfsStorageError::BadRequest("unsupported file type: symlink".to_string())
+        );
+        assert!(!root.join("bad-link.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn absolute_in_scope_symlink_target_is_reported_and_stored_relative() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("dir")).expect("dir");
+        fs::write(dir.path().join("target.txt"), b"target").expect("target");
+        let storage = LocalVfsStorage::new(dir.path());
+        let absolute_target = dir.path().join("target.txt");
+
+        storage
+            .create_symlink(
+                "dir/link.txt",
+                absolute_target.to_str().expect("absolute target"),
+            )
+            .await
+            .expect("create absolute in-scope symlink");
+        assert_eq!(
+            fs::read_link(dir.path().join("dir/link.txt")).expect("read link"),
+            PathBuf::from("../target.txt")
+        );
+        let metadata = storage
+            .stat("dir/link.txt")
+            .await
+            .expect("stat")
+            .expect("link metadata");
+        assert_eq!(metadata.link_target.as_deref(), Some("../target.txt"));
+
+        symlink(&absolute_target, dir.path().join("raw-absolute")).expect("raw symlink");
+        let raw = storage
+            .stat("raw-absolute")
+            .await
+            .expect("stat raw")
+            .expect("raw metadata");
+        assert_eq!(raw.link_target.as_deref(), Some("target.txt"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_is_excluded_from_listings_and_read_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("regular.txt"), b"regular").expect("regular file");
+        let status = Command::new("mkfifo")
+            .arg(dir.path().join("pipe"))
+            .status()
+            .expect("mkfifo command");
+        assert!(status.success());
+        let storage = LocalVfsStorage::new(dir.path());
+
+        let listed = storage
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .expect("list dir");
+        assert_eq!(
+            listed
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>(),
+            vec!["regular.txt".to_string()]
+        );
+
+        let subtree = storage
+            .list_subtree_file_metadata("", VfsStorageSubtreeOptions::default())
+            .await
+            .expect("subtree");
+        assert_eq!(
+            subtree
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>(),
+            vec!["regular.txt".to_string()]
+        );
+
+        let metadata = storage
+            .stat("pipe")
+            .await
+            .expect("stat")
+            .expect("fifo metadata");
+        assert_eq!(metadata.kind, VfsStorageEntryKind::Special);
+
+        let err = storage.read("pipe").await.expect_err("fifo read rejected");
+        assert_eq!(
+            err,
+            VfsStorageError::BadRequest("unsupported file type: special".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_metadata_reflects_regular_file_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        storage
+            .write("script.sh", Bytes::from_static(b"#!/bin/sh\n"), None)
+            .await
+            .expect("write");
+        let path = dir.path().join("script.sh");
+        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("chmod");
+
+        let metadata = storage
+            .stat("script.sh")
+            .await
+            .expect("stat")
+            .expect("metadata");
+        assert!(metadata.executable);
+
+        let listed = storage
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .expect("list dir");
+        assert!(listed.iter().any(|entry| entry.executable));
+
+        let subtree = storage
+            .list_subtree_file_metadata("", VfsStorageSubtreeOptions::default())
+            .await
+            .expect("subtree");
+        assert!(subtree.iter().any(|entry| entry.executable));
+    }
+
+    #[tokio::test]
+    async fn local_storage_reuses_hash_cache_for_unchanged_old_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cached.txt");
+        fs::write(&path, b"cached").expect("write");
+        set_old_mtime(&path);
+        let storage = LocalVfsStorage::new(dir.path());
+
+        let first = storage
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .expect("first list");
+        assert_eq!(storage.hash_read_count(), 1);
+        let second = storage
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .expect("second list");
+
+        assert_eq!(storage.hash_read_count(), 1);
+        assert_eq!(first[0].content_hash, second[0].content_hash);
+    }
+
+    #[tokio::test]
+    async fn local_storage_rehashes_when_file_stat_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cached.txt");
+        fs::write(&path, b"cached").expect("write");
+        set_old_mtime(&path);
+        let storage = LocalVfsStorage::new(dir.path());
+
+        let first = storage
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .expect("first list");
+        fs::write(&path, b"changed").expect("rewrite");
+        let second = storage
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .expect("second list");
+
+        assert_eq!(storage.hash_read_count(), 2);
+        assert_ne!(first[0].content_hash, second[0].content_hash);
+    }
+
+    #[tokio::test]
+    async fn local_storage_skips_hash_for_oversized_listing_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("large.bin"), b"large").expect("write");
+        let storage = LocalVfsStorage::new(dir.path());
+
+        let entries = storage
+            .list_dir_with_metadata(
+                "",
+                VfsStorageDirListFilter {
+                    max_hash_bytes: Some(4),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].size_bytes, 5);
+        assert_eq!(entries[0].content_hash, None);
+        assert_eq!(storage.hash_read_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_with_executable_option_sets_execute_bits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        storage
+            .write_with_options(
+                "bin/tool",
+                Bytes::from_static(b"tool"),
+                None,
+                Some(VfsStorageWriteOptions { executable: true }),
+            )
+            .await
+            .expect("write executable");
+        let mode = fs::metadata(dir.path().join("bin/tool"))
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
+        let metadata = storage
+            .stat("bin/tool")
+            .await
+            .expect("stat")
+            .expect("metadata");
+        assert!(metadata.executable);
+
+        storage
+            .write("bin/existing", Bytes::from_static(b"old"), None)
+            .await
+            .expect("write existing");
+        let existing = dir.path().join("bin/existing");
+        let mut permissions = fs::metadata(&existing).expect("metadata").permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&existing, permissions).expect("chmod existing");
+        storage
+            .write_with_options(
+                "bin/existing",
+                Bytes::from_static(b"new"),
+                None,
+                Some(VfsStorageWriteOptions { executable: true }),
+            )
+            .await
+            .expect("rewrite executable");
+        let mode = fs::metadata(existing)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o711);
+    }
+
     #[tokio::test]
     async fn local_storage_enforces_write_preconditions() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -743,6 +1860,58 @@ mod tests {
             .await
             .expect_err("stale precondition");
         assert!(matches!(err, VfsStorageError::Conflict(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_storage_allows_only_one_concurrent_same_fingerprint_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        let first = storage
+            .write("guarded.txt", Bytes::from_static(b"first"), None)
+            .await
+            .expect("initial write");
+        let precondition = VfsStorageWritePrecondition {
+            fingerprint: Some(first.content_hash),
+            secondary_fingerprint: None,
+        };
+        let barrier = Arc::new(Barrier::new(2));
+        let left_storage = storage.clone();
+        let right_storage = storage.clone();
+        let left_precondition = precondition.clone();
+        let right_precondition = precondition;
+        let left_barrier = barrier.clone();
+        let right_barrier = barrier;
+
+        let left = tokio::spawn(async move {
+            left_barrier.wait();
+            left_storage
+                .write(
+                    "guarded.txt",
+                    Bytes::from_static(b"left"),
+                    Some(left_precondition),
+                )
+                .await
+        });
+        let right = tokio::spawn(async move {
+            right_barrier.wait();
+            right_storage
+                .write(
+                    "guarded.txt",
+                    Bytes::from_static(b"right"),
+                    Some(right_precondition),
+                )
+                .await
+        });
+
+        let results = vec![
+            left.await.expect("left task"),
+            right.await.expect("right task"),
+        ];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert!(results.iter().any(|result| {
+            matches!(result, Err(VfsStorageError::Conflict(message)) if message.contains("guarded.txt"))
+        }));
     }
 
     #[tokio::test]

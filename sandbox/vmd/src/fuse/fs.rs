@@ -1,15 +1,16 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
+use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use chevalier_sandbox::vfs::{
     VFS_OPERATION_MKDIR, VFS_OPERATION_RENAME, VFS_OPERATION_RMDIR, VFS_OPERATION_SETATTR_SIZE,
-    VFS_OPERATION_UNLINK, VFS_OPERATION_WRITE_THROUGH, VFS_SURFACE_KIND_VM_SHARED,
-    VFS_SURFACE_KIND_VM_WORKSPACE, VfsDirEntry as RemoteDirEntry, VfsLeaseGrant as LeaseGrant,
-    VfsMetadata as RemoteMetadata, scoped_vfs_path,
+    VFS_OPERATION_SYMLINK, VFS_OPERATION_UNLINK, VFS_OPERATION_WRITE_THROUGH,
+    VFS_SURFACE_KIND_VM_SHARED, VFS_SURFACE_KIND_VM_WORKSPACE, VfsDirEntry as RemoteDirEntry,
+    VfsLeaseGrant as LeaseGrant, VfsMetadata as RemoteMetadata, scoped_vfs_path,
 };
 use fuser::{
     BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
@@ -192,17 +193,18 @@ impl RemoteFuseFs {
 
     fn attr_for_path(&self, path: &str, metadata: &RemoteMetadata) -> FileAttr {
         let ino = self.ensure_ino(path);
-        let kind = if metadata.kind == "directory" {
-            FileType::Directory
-        } else {
-            FileType::RegularFile
-        };
-        let perm = if matches!(kind, FileType::Directory) {
-            if self.read_only { 0o555 } else { 0o755 }
-        } else if self.read_only {
-            0o444
-        } else {
-            0o644
+        let kind = file_type_for_kind(&metadata.kind);
+        let perm = match kind {
+            FileType::Directory => {
+                if self.read_only {
+                    0o555
+                } else {
+                    0o755
+                }
+            }
+            FileType::Symlink => 0o777,
+            _ if self.read_only => 0o444,
+            _ => 0o644,
         };
         let mtime = metadata
             .updated_at
@@ -280,9 +282,17 @@ impl RemoteFuseFs {
     }
 
     fn stat_path(&self, path: &str) -> FuseResult<Option<RemoteMetadata>> {
-        self.tokio
+        if let Some(metadata) = self.cache.get_metadata(path) {
+            return Ok(Some(metadata));
+        }
+        let metadata = self
+            .tokio
             .block_on(self.client.stat(path))
-            .map_err(|_| Errno::EIO)
+            .map_err(|_| Errno::EIO)?;
+        if let Some(metadata) = metadata.as_ref() {
+            self.cache.put_metadata(path, metadata.clone());
+        }
+        Ok(metadata)
     }
 
     fn read_bytes(&self, path: &str, offset: u64, size: u32) -> FuseResult<Vec<u8>> {
@@ -364,6 +374,7 @@ impl RemoteFuseFs {
             Ok(None) => RemoteMetadata {
                 kind: "file".to_string(),
                 size_bytes: 0,
+                link_target: None,
                 content_hash: None,
                 updated_at: None,
             },
@@ -405,6 +416,7 @@ impl RemoteFuseFs {
             Some(RemoteMetadata {
                 kind: "file".to_string(),
                 size_bytes: state.buffer.len() as u64,
+                link_target: None,
                 content_hash: Some(next_content_hash.clone()),
                 updated_at: metadata.updated_at,
             }),
@@ -461,6 +473,7 @@ impl RemoteFuseFs {
         let metadata = RemoteMetadata {
             kind: "file".to_string(),
             size_bytes: size,
+            link_target: None,
             content_hash: Some(content_hash_for_bytes(&bytes)),
             updated_at: None,
         };
@@ -570,6 +583,14 @@ fn content_hash_for_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex_encode(hasher.finalize().as_ref())
+}
+
+fn file_type_for_kind(kind: &str) -> FileType {
+    match kind {
+        "directory" => FileType::Directory,
+        "symlink" => FileType::Symlink,
+        _ => FileType::RegularFile,
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -717,6 +738,22 @@ impl Filesystem for RemoteFuseFs {
         }
     }
 
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let result: FuseResult<Vec<u8>> = (|| {
+            let path = self.path_for_ino(ino)?;
+            let metadata = self.stat_path(&path)?.ok_or(Errno::ENOENT)?;
+            if metadata.kind != "symlink" {
+                return Err(Errno::EINVAL);
+            }
+            let target = metadata.link_target.ok_or(Errno::EINVAL)?;
+            Ok(target.into_bytes())
+        })();
+        match result {
+            Ok(bytes) => reply.data(&bytes),
+            Err(err) => reply.error(err),
+        }
+    }
+
     fn setattr(
         &self,
         _req: &Request,
@@ -751,6 +788,7 @@ impl Filesystem for RemoteFuseFs {
                         &RemoteMetadata {
                             kind: "file".to_string(),
                             size_bytes,
+                            link_target: None,
                             content_hash: None,
                             updated_at: None,
                         },
@@ -768,6 +806,7 @@ impl Filesystem for RemoteFuseFs {
                             &RemoteMetadata {
                                 kind: "file".to_string(),
                                 size_bytes: state.buffer.len() as u64,
+                                link_target: None,
                                 content_hash: state.base_content_hash,
                                 updated_at: None,
                             },
@@ -817,11 +856,7 @@ impl Filesystem for RemoteFuseFs {
                     format!("{}/{}", path, entry.name)
                 };
                 let child_ino = self.ensure_ino(&child_path);
-                let file_type = if entry.kind == "directory" {
-                    FileType::Directory
-                } else {
-                    FileType::RegularFile
-                };
+                let file_type = file_type_for_kind(&entry.kind);
                 entries.push((child_ino, file_type, entry.name));
             }
             for (index, (entry_ino, kind, name)) in
@@ -1021,6 +1056,48 @@ impl Filesystem for RemoteFuseFs {
         }
     }
 
+    fn symlink(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let result: FuseResult<FileAttr> = (|| {
+            if self.read_only {
+                return Err(Errno::EROFS);
+            }
+            let target = target.to_str().ok_or(Errno::EINVAL)?.to_string();
+            let parent_path = self.path_for_ino(parent)?;
+            let path = Self::child_path(parent_path.as_str(), link_name)?;
+            let surface = self.surface_kind_for_path(&path);
+            let lease = self
+                .tokio
+                .block_on(
+                    self.client
+                        .acquire_lease(&path, 1, "create vfs fuse symlink"),
+                )
+                .map_err(|_| Errno::EIO)?;
+            let create_result = self.tokio.block_on(self.client.create_symlink(
+                &path,
+                &target,
+                &lease,
+                surface,
+                VFS_OPERATION_SYMLINK,
+            ));
+            let _ = self.tokio.block_on(self.client.release_lease(&lease));
+            create_result.map_err(|_| Errno::EPERM)?;
+            self.cache.invalidate(&path);
+            let metadata = self.stat_path(&path)?.ok_or(Errno::EIO)?;
+            Ok(self.attr_for_path(&path, &metadata))
+        })();
+        match result {
+            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Err(err) => reply.error(err),
+        }
+    }
+
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let result: FuseResult<()> = (|| {
             let parent_path = self.path_for_ino(parent)?;
@@ -1121,6 +1198,7 @@ impl Filesystem for RemoteFuseFs {
             let metadata = self.stat_path(&path)?.unwrap_or(RemoteMetadata {
                 kind: "file".to_string(),
                 size_bytes: 0,
+                link_target: None,
                 content_hash: None,
                 updated_at: None,
             });

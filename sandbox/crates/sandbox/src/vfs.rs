@@ -26,6 +26,7 @@ pub const CHEVALIER_VFS_PRECONDITION_SECONDARY_FINGERPRINT_HEADER: &str =
 pub const VFS_COMPONENT_VM_RUNTIME: &str = "vm_runtime";
 pub const VFS_ENTRY_KIND_FILE: &str = "file";
 pub const VFS_ENTRY_KIND_DIRECTORY: &str = "directory";
+pub const VFS_ENTRY_KIND_SYMLINK: &str = "symlink";
 pub const VFS_SURFACE_KIND_VM_SHARED: &str = "vm_shared_vfs";
 pub const VFS_SURFACE_KIND_VM_WORKSPACE: &str = "vm_workspace_vfs";
 pub const VFS_OPERATION_WRITE_THROUGH: &str = "vfs_write_through";
@@ -34,6 +35,7 @@ pub const VFS_OPERATION_MKDIR: &str = "vfs_mkdir";
 pub const VFS_OPERATION_UNLINK: &str = "vfs_unlink";
 pub const VFS_OPERATION_RMDIR: &str = "vfs_rmdir";
 pub const VFS_OPERATION_RENAME: &str = "vfs_rename";
+pub const VFS_OPERATION_SYMLINK: &str = "vfs_symlink";
 
 pub const DEFAULT_VFS_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
@@ -42,6 +44,8 @@ pub struct VfsDirEntry {
     pub name: String,
     pub kind: String,
     pub size_bytes: u64,
+    #[serde(default)]
+    pub link_target: Option<String>,
     pub content_hash: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -50,6 +54,8 @@ pub struct VfsDirEntry {
 pub struct VfsMetadata {
     pub kind: String,
     pub size_bytes: u64,
+    #[serde(default)]
+    pub link_target: Option<String>,
     pub content_hash: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -97,6 +103,8 @@ pub struct VfsListDirOptions {
     pub limit: Option<i64>,
     #[serde(default)]
     pub order: Option<String>,
+    #[serde(default)]
+    pub max_hash_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -113,6 +121,8 @@ pub struct VfsSubtreeMetadataEntry {
     pub path: String,
     pub kind: String,
     pub size_bytes: u64,
+    #[serde(default)]
+    pub link_target: Option<String>,
     pub content_hash: Option<String>,
     pub token_count: Option<i32>,
     pub version: Option<String>,
@@ -129,6 +139,8 @@ pub struct VfsSubtreeMetadataRequest {
     pub include_token_count: bool,
     #[serde(default)]
     pub limit: Option<i64>,
+    #[serde(default)]
+    pub max_hash_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -277,6 +289,15 @@ pub struct VfsRenameRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VfsSymlinkRequest {
+    pub owner_id: String,
+    pub path: String,
+    pub target: String,
+    pub headers: VfsWriteHeaders,
+    pub scope: VfsWriteScope,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VfsLeaseAcquire {
     pub owner_id: String,
     pub path: String,
@@ -396,15 +417,16 @@ mod server {
         CHEVALIER_VFS_RESOURCE_KEY_HEADER, CHEVALIER_VFS_ROUTE_PREFIX, CHEVALIER_VFS_RUN_ID_HEADER,
         CHEVALIER_VFS_SURFACE_KIND_HEADER, DEFAULT_VFS_BODY_LIMIT_BYTES, VFS_COMPONENT_VM_RUNTIME,
         VFS_ENTRY_KIND_FILE, VFS_OPERATION_MKDIR, VFS_OPERATION_RENAME, VFS_OPERATION_RMDIR,
-        VFS_OPERATION_UNLINK, VFS_OPERATION_WRITE_THROUGH, VfsDeleteMetadataResponse, VfsDirEntry,
-        VfsGatewayError, VfsHeaderAliases, VfsLeaseAcquire, VfsLeaseAcquireRequest, VfsLeaseGrant,
-        VfsLeaseReleaseRequest, VfsListDirOptions, VfsMetadata, VfsMetadataManyRequest,
-        VfsMetadataManyResponse, VfsNamespaceMutationRequest, VfsPrefetchSubtreeRequest,
-        VfsPrefetchSubtreeResponse, VfsReadManyRequest, VfsReadManyResponse, VfsReadRange,
-        VfsRenameMetadataResponse, VfsRenameRequest, VfsResult, VfsSubtreeMetadataEntry,
-        VfsSubtreeMetadataRequest, VfsSubtreeMetadataResponse, VfsWriteHeaders, VfsWriteManyBody,
-        VfsWriteManyRequest, VfsWriteManyResponse, VfsWriteManyResult, VfsWritePrecondition,
-        VfsWriteRequest, VfsWriteScope, parse_vfs_range_header,
+        VFS_OPERATION_SYMLINK, VFS_OPERATION_UNLINK, VFS_OPERATION_WRITE_THROUGH,
+        VfsDeleteMetadataResponse, VfsDirEntry, VfsGatewayError, VfsHeaderAliases, VfsLeaseAcquire,
+        VfsLeaseAcquireRequest, VfsLeaseGrant, VfsLeaseReleaseRequest, VfsListDirOptions,
+        VfsMetadata, VfsMetadataManyRequest, VfsMetadataManyResponse, VfsNamespaceMutationRequest,
+        VfsPrefetchSubtreeRequest, VfsPrefetchSubtreeResponse, VfsReadManyRequest,
+        VfsReadManyResponse, VfsReadRange, VfsRenameMetadataResponse, VfsRenameRequest, VfsResult,
+        VfsSubtreeMetadataEntry, VfsSubtreeMetadataRequest, VfsSubtreeMetadataResponse,
+        VfsSymlinkRequest, VfsWriteHeaders, VfsWriteManyBody, VfsWriteManyRequest,
+        VfsWriteManyResponse, VfsWriteManyResult, VfsWritePrecondition, VfsWriteRequest,
+        VfsWriteScope, parse_vfs_range_header,
     };
 
     #[async_trait]
@@ -504,6 +526,11 @@ mod server {
             Ok(VfsDeleteMetadataResponse { previous: None })
         }
         async fn mkdir(&self, request: VfsNamespaceMutationRequest) -> VfsResult<()>;
+        async fn create_symlink(&self, _request: VfsSymlinkRequest) -> VfsResult<()> {
+            Err(VfsGatewayError::BadRequest(
+                "gateway backend does not support symlink creation".to_string(),
+            ))
+        }
         async fn rmdir(&self, request: VfsNamespaceMutationRequest) -> VfsResult<()>;
         async fn rename(&self, request: VfsRenameRequest) -> VfsResult<()>;
         async fn rename_with_metadata(
@@ -580,6 +607,10 @@ mod server {
                 put(put_dir::<S, B>).delete(delete_dir::<S, B>),
             )
             .route(
+                &format!("{prefix}/{{owner_id}}/symlink"),
+                put(put_symlink::<S, B>),
+            )
+            .route(
                 &format!("{prefix}/{{owner_id}}/rename"),
                 post(post_rename::<S, B>),
             )
@@ -598,6 +629,7 @@ mod server {
         entry_kind: Option<String>,
         limit: Option<i64>,
         order: Option<String>,
+        max_hash_bytes: Option<u64>,
     }
 
     impl TreeQuery {
@@ -608,6 +640,7 @@ mod server {
                 entry_kind: self.entry_kind.clone(),
                 limit: self.limit,
                 order: self.order.clone(),
+                max_hash_bytes: self.max_hash_bytes,
             }
         }
     }
@@ -616,6 +649,12 @@ mod server {
     struct PathQuery {
         path: Option<String>,
         return_metadata: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SymlinkQuery {
+        path: Option<String>,
+        target: String,
     }
 
     #[derive(Debug, Deserialize)]
@@ -919,6 +958,43 @@ mod server {
         )
         .await?;
         backend.mkdir(request).await?;
+        Ok(StatusCode::NO_CONTENT)
+    }
+
+    async fn put_symlink<S, B>(
+        State(backend): State<B>,
+        Path(owner_id): Path<String>,
+        Query(params): Query<SymlinkQuery>,
+        headers: HeaderMap,
+    ) -> VfsResult<StatusCode>
+    where
+        B: VfsGatewayBackend + FromRef<S>,
+        S: Clone + Send + Sync + 'static,
+    {
+        let path = required_path(params.path.as_deref())?;
+        if params.target.is_empty() {
+            return Err(VfsGatewayError::BadRequest(
+                "symlink target is required".to_string(),
+            ));
+        }
+        let scope = backend.derive_write_scope(owner_id.as_str(), path).await?;
+        let aliases = backend.header_aliases();
+        let write_headers = parse_write_headers(
+            &headers,
+            &aliases,
+            scope.default_surface_kind.as_str(),
+            VFS_OPERATION_SYMLINK,
+        )?;
+        validate_declared_resource_key(&headers, &aliases, scope.resource_key.as_str())?;
+        backend
+            .create_symlink(VfsSymlinkRequest {
+                owner_id,
+                path: path.to_string(),
+                target: params.target,
+                headers: write_headers,
+                scope,
+            })
+            .await?;
         Ok(StatusCode::NO_CONTENT)
     }
 
@@ -1299,8 +1375,8 @@ mod server_tests {
         VFS_SURFACE_KIND_VM_WORKSPACE, VfsDirEntry, VfsGatewayBackend, VfsGatewayError,
         VfsLeaseAcquire, VfsLeaseGrant, VfsLeaseReleaseRequest, VfsMetadata,
         VfsMetadataManyResponse, VfsNamespaceMutationRequest, VfsReadManyResponse, VfsReadRange,
-        VfsRenameRequest, VfsResult, VfsWriteManyRequest, VfsWriteManyResponse, VfsWriteManyResult,
-        VfsWriteRequest, VfsWriteScope, chevalier_vfs_routes,
+        VfsRenameRequest, VfsResult, VfsSymlinkRequest, VfsWriteManyRequest, VfsWriteManyResponse,
+        VfsWriteManyResult, VfsWriteRequest, VfsWriteScope, chevalier_vfs_routes,
     };
 
     #[derive(Clone, Default)]
@@ -1318,6 +1394,7 @@ mod server_tests {
         mkdirs: Vec<VfsNamespaceMutationRequest>,
         rmdirs: Vec<VfsNamespaceMutationRequest>,
         renames: Vec<VfsRenameRequest>,
+        symlinks: Vec<VfsSymlinkRequest>,
         leases: Vec<VfsLeaseAcquire>,
         releases: Vec<VfsLeaseReleaseRequest>,
         valid_tokens: HashSet<Uuid>,
@@ -1332,6 +1409,7 @@ mod server_tests {
                 name: format!("{owner_id}:{path}:file.txt"),
                 kind: VFS_ENTRY_KIND_FILE.to_string(),
                 size_bytes: 5,
+                link_target: None,
                 content_hash: None,
                 updated_at: None,
             }])
@@ -1344,6 +1422,7 @@ mod server_tests {
                 return Ok(VfsMetadata {
                     kind: VFS_ENTRY_KIND_DIRECTORY.to_string(),
                     size_bytes: 0,
+                    link_target: None,
                     content_hash: None,
                     updated_at: None,
                 });
@@ -1354,6 +1433,7 @@ mod server_tests {
             Ok(VfsMetadata {
                 kind: VFS_ENTRY_KIND_FILE.to_string(),
                 size_bytes: bytes.len() as u64,
+                link_target: None,
                 content_hash: None,
                 updated_at: None,
             })
@@ -1366,6 +1446,7 @@ mod server_tests {
                 return Ok(VfsMetadata {
                     kind: VFS_ENTRY_KIND_DIRECTORY.to_string(),
                     size_bytes: 0,
+                    link_target: None,
                     content_hash: None,
                     updated_at: None,
                 });
@@ -1376,6 +1457,7 @@ mod server_tests {
             Ok(VfsMetadata {
                 kind: VFS_ENTRY_KIND_FILE.to_string(),
                 size_bytes: bytes.len() as u64,
+                link_target: None,
                 content_hash: None,
                 updated_at: None,
             })
@@ -1463,6 +1545,12 @@ mod server_tests {
             let mut inner = self.inner.lock().unwrap();
             inner.dirs.insert(request.path.clone());
             inner.mkdirs.push(request);
+            Ok(())
+        }
+
+        async fn create_symlink(&self, request: VfsSymlinkRequest) -> VfsResult<()> {
+            let mut inner = self.inner.lock().unwrap();
+            inner.symlinks.push(request);
             Ok(())
         }
 
@@ -1789,6 +1877,11 @@ mod server_tests {
             ),
             ("PUT", "/internal/chevalier/vfs/owner-1/dir?path=folder", ""),
             (
+                "PUT",
+                "/internal/chevalier/vfs/owner-1/symlink?path=link.txt&target=target.txt",
+                "",
+            ),
+            (
                 "DELETE",
                 "/internal/chevalier/vfs/owner-1/file?path=new.txt",
                 "",
@@ -1832,8 +1925,11 @@ mod server_tests {
         assert_eq!(inner.writes.len(), 1);
         assert_eq!(inner.deletes.len(), 1);
         assert_eq!(inner.mkdirs.len(), 1);
+        assert_eq!(inner.symlinks.len(), 1);
         assert_eq!(inner.rmdirs.len(), 1);
         assert_eq!(inner.renames.len(), 1);
+        assert_eq!(inner.symlinks[0].path, "link.txt");
+        assert_eq!(inner.symlinks[0].target, "target.txt");
         let delete_precondition = inner.deletes[0]
             .precondition
             .as_ref()

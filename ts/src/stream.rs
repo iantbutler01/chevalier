@@ -24,7 +24,7 @@ pub(crate) fn to_value_or_marker<T: serde::Serialize>(v: T) -> serde_json::Value
 }
 
 /// A single streamed event. Discriminated by `type`:
-/// `content` | `reasoning` | `signature` | `toolCall` | `toolPartial` | `usage` | `complete`.
+/// `content` | `reasoning` | `signature` | `toolCall` | `toolPartial` | `usage` | `rateLimits` | `complete`.
 #[napi(object)]
 pub struct StreamEvent {
     #[napi(js_name = "type")]
@@ -33,7 +33,7 @@ pub struct StreamEvent {
     pub text: Option<String>,
     /// Present for `toolCall`.
     pub tool_call: Option<ToolCallJs>,
-    /// Raw payload for `toolPartial` (partial args), `usage`, `complete` (full response).
+    /// Raw payload for `toolPartial` (partial args), `usage`, `rateLimits`, `complete` (full response).
     pub data: Option<serde_json::Value>,
 }
 
@@ -71,6 +71,10 @@ impl From<ResponseStreamEvent> for StreamEvent {
             ResponseStreamEvent::Usage(u) => StreamEvent {
                 data: Some(to_value_or_marker(u)),
                 ..base("usage")
+            },
+            ResponseStreamEvent::RateLimits(rate_limits) => StreamEvent {
+                data: Some(to_value_or_marker(rate_limits)),
+                ..base("rateLimits")
             },
             ResponseStreamEvent::Complete(r) => StreamEvent {
                 data: Some(to_value_or_marker(r)),
@@ -119,5 +123,32 @@ impl Drop for StreamHandle {
     /// are released immediately rather than lingering.
     fn drop(&mut self) {
         self.abort.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chevalier_core::types::{ProviderRateLimit, ProviderRateLimitScope};
+
+    #[test]
+    fn test_rate_limits_event_is_js_visible() {
+        let event = StreamEvent::from(ResponseStreamEvent::RateLimits(vec![ProviderRateLimit {
+            scope: ProviderRateLimitScope::Session,
+            used_percent: 42,
+            window_minutes: 300,
+            resets_at_epoch_sec: 1_783_504_800,
+        }]));
+
+        assert_eq!(event.kind, "rateLimits");
+        assert_eq!(
+            event.data,
+            Some(serde_json::json!([{
+                "scope": "session",
+                "usedPercent": 42,
+                "windowMinutes": 300,
+                "resetsAtEpochSec": 1_783_504_800_u64
+            }]))
+        );
     }
 }

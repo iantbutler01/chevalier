@@ -41,6 +41,61 @@ exports.Runtime = exports.ChevalierError = exports.createVfsGatewayServer = expo
 exports.agentic = agentic;
 const native = __importStar(require("./native.js"));
 const zod_to_json_schema_1 = require("zod-to-json-schema");
+const VFS_ERR_PREFIX = /^VFS:\s+\[([A-Z0-9_]+) status=(\d{3})\]\s*([\s\S]*)$/;
+function setErrorField(error, field, value) {
+    try {
+        Object.defineProperty(error, field, {
+            value,
+            enumerable: true,
+            configurable: true,
+            writable: true,
+        });
+    }
+    catch {
+        try {
+            error[field] = value;
+        }
+        catch {
+            /* best effort */
+        }
+    }
+}
+function normalizeVfsNativeError(e) {
+    if (e instanceof Error) {
+        const match = VFS_ERR_PREFIX.exec(e.message);
+        if (match) {
+            const status = Number(match[2]);
+            setErrorField(e, "code", match[1]);
+            setErrorField(e, "status", status);
+            setErrorField(e, "statusCode", status);
+        }
+    }
+    throw e;
+}
+const VFS_ERROR_PATCHED = Symbol.for("chevalier.vfs.errorPatch");
+const vfsStorageProto = native.VfsStorage.prototype;
+if (!vfsStorageProto[VFS_ERROR_PATCHED]) {
+    for (const method of [
+        "read",
+        "write",
+        "stat",
+        "listDir",
+        "mkdir",
+        "createSymlink",
+        "remove",
+        "rmdir",
+        "rename",
+    ]) {
+        const original = vfsStorageProto[method];
+        if (typeof original === "function") {
+            const originalFn = original;
+            vfsStorageProto[method] = function patchedVfsMethod(...args) {
+                return Promise.resolve(originalFn.apply(this, args)).catch(normalizeVfsNativeError);
+            };
+        }
+    }
+    Object.defineProperty(vfsStorageProto, VFS_ERROR_PATCHED, { value: true });
+}
 var native_js_1 = require("./native.js");
 Object.defineProperty(exports, "McpClient", { enumerable: true, get: function () { return native_js_1.McpClient; } });
 Object.defineProperty(exports, "McpServer", { enumerable: true, get: function () { return native_js_1.McpServer; } });

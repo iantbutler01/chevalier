@@ -1,6 +1,6 @@
 import * as native from "./native.js";
 import type { ZodType } from "zod";
-export type { RunResult, ToolCallJs, ToolSchemaJs, StreamEvent, Message, MediaPartInput, GatewayOptions, ProviderConfigInput, AnthropicCacheConfig, CodexSubscriptionConfigInput, VfsMetadata, VfsObjectState, } from "./native.js";
+export type { RunResult, ToolCallJs, ToolSchemaJs, StreamEvent, Message, MediaPartInput, GatewayOptions, ProviderConfigInput, AnthropicCacheConfig, CodexSubscriptionConfigInput, VfsMetadata, VfsObjectState, VfsWriteOptions, } from "./native.js";
 export { McpClient, McpServer, VfsStorage, version } from "./native.js";
 export { createVfsGatewayServer } from "./vfs-gateway-server.js";
 export type { VfsGatewayServerOptions } from "./vfs-gateway-server.js";
@@ -42,12 +42,24 @@ export interface ToolDef {
      *  schema-only (host-dispatched) tool. */
     handler?: (args: any) => unknown | Promise<unknown>;
 }
+export type ProviderRateLimitScope = "session" | "subscription";
+export interface ProviderRateLimit {
+    scope: ProviderRateLimitScope;
+    usedPercent: number;
+    windowMinutes: number;
+    resetsAtEpochSec: number;
+}
+export interface RateLimitsStreamEvent {
+    type: "rateLimits";
+    data: ProviderRateLimit[];
+}
 /** Result of `run`, with an optional decoded `value` when an output schema is given. */
 export type TypedRunResult<T> = native.RunResult & {
     value?: T;
 };
 /** A stream event, with an optional decoded `value` on the `complete` event when
- *  an output schema was provided. */
+ *  an output schema was provided. Codex subscription streams may also emit
+ *  `rateLimits` with `ProviderRateLimit[]` in `data`. */
 export type TypedStreamEvent<T> = native.StreamEvent & {
     value?: T;
 };

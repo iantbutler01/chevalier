@@ -11,6 +11,7 @@ pub fn error_code(e: &EngineError) -> &'static str {
         EngineError::ContextLengthExceeded(_) => "CONTEXT_LENGTH_EXCEEDED",
         EngineError::RetriesExceeded(_) => "RETRIES_EXCEEDED",
         EngineError::NonRetryable(_) => "NON_RETRYABLE",
+        EngineError::CodexUsageLimit { .. } => "CODEX_USAGE_LIMIT",
         EngineError::Parse(_) => "PARSE",
         EngineError::Validation(_) => "VALIDATION",
         EngineError::ToolNotFound(_) => "TOOL_NOT_FOUND",

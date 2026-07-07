@@ -9,19 +9,143 @@ use bytes::Bytes;
 use chevalier_vfs::gateway::{GatewayVfsStorage, GatewayVfsStorageConfig};
 use chevalier_vfs::local::LocalVfsStorage;
 use chevalier_vfs::{
-    OptimizedVfsStorage, VfsStorageEntryKind, VfsStorageError, VfsStorageMetadata,
-    VfsStorageObjectState,
+    OptimizedVfsStorage, VfsStorageDirListFilter, VfsStorageEntryKind, VfsStorageError,
+    VfsStorageMetadata, VfsStorageObjectState, VfsStorageWriteOptions, VfsStorageWritePrecondition,
 };
 use napi::bindgen_prelude::{BigInt, Buffer};
 use napi_derive::napi;
+use serde_json::{Map, Value};
 
 fn vfs_err(e: VfsStorageError) -> napi::Error {
-    napi::Error::new(napi::Status::GenericFailure, format!("VFS: {e}"))
+    let (status, code) = match &e {
+        VfsStorageError::NotFound(_) => (404, "VFS_NOT_FOUND"),
+        VfsStorageError::BadRequest(_) => (400, "VFS_BAD_REQUEST"),
+        VfsStorageError::Forbidden(_) => (403, "VFS_FORBIDDEN"),
+        VfsStorageError::Conflict(_) => (409, "VFS_CONFLICT"),
+        VfsStorageError::Internal(_) => (500, "VFS_INTERNAL"),
+    };
+    napi::Error::new(
+        napi::Status::GenericFailure,
+        format!("VFS: [{code} status={status}] {e}"),
+    )
+}
+
+fn invalid_options_err(message: impl Into<String>) -> napi::Error {
+    napi::Error::new(napi::Status::InvalidArg, message.into())
+}
+
+fn serialize_err(e: serde_json::Error) -> napi::Error {
+    napi::Error::new(napi::Status::GenericFailure, format!("serialize: {e}"))
 }
 
 fn to_json<T: serde::Serialize>(v: T) -> napi::Result<serde_json::Value> {
-    serde_json::to_value(v)
-        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("serialize: {e}")))
+    serde_json::to_value(v).map_err(serialize_err)
+}
+
+fn normalize_if_match(value: String) -> Option<String> {
+    let mut next = value.trim().to_string();
+    if let Some(stripped) = next.strip_prefix("W/") {
+        next = stripped.trim().to_string();
+    }
+    if next.len() >= 2
+        && ((next.starts_with('"') && next.ends_with('"'))
+            || (next.starts_with('\'') && next.ends_with('\'')))
+    {
+        next = next[1..next.len() - 1].trim().to_string();
+    }
+    if let Some(stripped) = next.strip_prefix("sha256:") {
+        next = stripped.to_string();
+    }
+    if next.is_empty() || next.eq_ignore_ascii_case("null") {
+        None
+    } else {
+        Some(next)
+    }
+}
+
+fn options_object<'a>(options: Option<&'a Value>) -> napi::Result<Option<&'a Map<String, Value>>> {
+    let Some(options) = options else {
+        return Ok(None);
+    };
+    options
+        .as_object()
+        .ok_or_else(|| invalid_options_err("invalid VFS options: expected object"))
+        .map(Some)
+}
+
+fn option_field<'a>(
+    options: &'a Map<String, Value>,
+    camel: &str,
+    snake: &str,
+) -> Option<&'a Value> {
+    options.get(camel).or_else(|| options.get(snake))
+}
+
+fn precondition_from_options(
+    options: Option<&Value>,
+) -> napi::Result<Option<VfsStorageWritePrecondition>> {
+    let Some(options) = options_object(options)? else {
+        return Ok(None);
+    };
+    let Some(if_match) = option_field(options, "ifMatch", "if_match") else {
+        return Ok(None);
+    };
+    let fingerprint = match if_match {
+        Value::Null => None,
+        Value::String(value) => normalize_if_match(value.clone()),
+        _ => {
+            return Err(invalid_options_err(
+                "invalid VFS options: ifMatch must be a string or null",
+            ));
+        }
+    };
+    Ok(Some(VfsStorageWritePrecondition {
+        fingerprint,
+        secondary_fingerprint: None,
+    }))
+}
+
+fn write_options_from_options(
+    options: Option<&Value>,
+) -> napi::Result<Option<VfsStorageWriteOptions>> {
+    let Some(options) = options_object(options)? else {
+        return Ok(None);
+    };
+    let executable = match option_field(options, "executable", "executable") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(invalid_options_err(
+                "invalid VFS options: executable must be a boolean",
+            ));
+        }
+    };
+    if executable {
+        Ok(Some(VfsStorageWriteOptions { executable: true }))
+    } else {
+        Ok(None)
+    }
+}
+
+fn list_filter_from_options(options: Option<&Value>) -> napi::Result<VfsStorageDirListFilter> {
+    let Some(options) = options_object(options)? else {
+        return Ok(VfsStorageDirListFilter::default());
+    };
+    let max_hash_bytes = match option_field(options, "maxHashBytes", "max_hash_bytes") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(value)) => Some(value.as_u64().ok_or_else(|| {
+            invalid_options_err("invalid VFS options: maxHashBytes must be a non-negative integer")
+        })?),
+        Some(_) => {
+            return Err(invalid_options_err(
+                "invalid VFS options: maxHashBytes must be a non-negative integer",
+            ));
+        }
+    };
+    Ok(VfsStorageDirListFilter {
+        max_hash_bytes,
+        ..Default::default()
+    })
 }
 
 /// Pack-slot location for an object-backed file.
@@ -52,9 +176,11 @@ impl From<VfsStorageObjectState> for VfsObjectState {
 #[napi(object)]
 pub struct VfsMetadata {
     pub path: String,
-    /// `"File"` or `"Directory"`.
+    /// `"File"`, `"Directory"`, `"Symlink"`, or `"Special"`.
     pub kind: String,
     pub size_bytes: BigInt,
+    pub link_target: Option<String>,
+    pub executable: Option<bool>,
     pub content_hash: Option<String>,
     pub token_count: Option<i32>,
     pub version: Option<String>,
@@ -70,9 +196,14 @@ impl From<VfsStorageMetadata> for VfsMetadata {
             kind: match m.kind {
                 VfsStorageEntryKind::File => "File",
                 VfsStorageEntryKind::Directory => "Directory",
+                VfsStorageEntryKind::Symlink => "Symlink",
+                VfsStorageEntryKind::Special => "Special",
+                _ => "Unknown",
             }
             .to_string(),
             size_bytes: BigInt::from(m.size_bytes),
+            link_target: m.link_target,
+            executable: Some(m.executable),
             content_hash: m.content_hash,
             token_count: m.token_count,
             version: m.version,
@@ -90,6 +221,15 @@ pub struct GatewayOptions {
     pub scope_path: Option<String>,
     pub component: Option<String>,
     pub mutation_reason: Option<String>,
+}
+
+/// Write options for VFS storage.
+#[napi(object)]
+#[allow(dead_code)]
+pub struct VfsWriteOptions {
+    #[napi(ts_type = "string | null")]
+    pub if_match: Option<String>,
+    pub executable: Option<bool>,
 }
 
 /// A virtual filesystem. Construct via `VfsStorage.local(root)` or
@@ -138,11 +278,23 @@ impl VfsStorage {
     }
 
     /// Write a file; returns the write result (JSON: content hash, changed, …).
-    #[napi]
-    pub async fn write(&self, path: String, data: Buffer) -> napi::Result<serde_json::Value> {
+    #[napi(ts_args_type = "path: string, data: Buffer, options?: VfsWriteOptions | null")]
+    pub async fn write(
+        &self,
+        path: String,
+        data: Buffer,
+        options: Option<Value>,
+    ) -> napi::Result<serde_json::Value> {
+        let precondition = precondition_from_options(options.as_ref())?;
+        let write_options = write_options_from_options(options.as_ref())?;
         let r = self
             .inner
-            .write(&path, Bytes::from(data.to_vec()), None)
+            .write_with_options(
+                &path,
+                Bytes::from(data.to_vec()),
+                precondition,
+                write_options,
+            )
             .await
             .map_err(vfs_err)?;
         to_json(r)
@@ -160,11 +312,16 @@ impl VfsStorage {
     }
 
     /// List a directory's entries with typed metadata.
-    #[napi]
-    pub async fn list_dir(&self, path: String) -> napi::Result<Vec<VfsMetadata>> {
+    #[napi(ts_args_type = "path: string, options?: { maxHashBytes?: number | null } | null")]
+    pub async fn list_dir(
+        &self,
+        path: String,
+        options: Option<Value>,
+    ) -> napi::Result<Vec<VfsMetadata>> {
+        let filter = list_filter_from_options(options.as_ref())?;
         let items = self
             .inner
-            .list_dir_with_metadata(&path, Default::default())
+            .list_dir_with_metadata(&path, filter)
             .await
             .map_err(vfs_err)?;
         Ok(items.into_iter().map(VfsMetadata::from).collect())
@@ -176,12 +333,26 @@ impl VfsStorage {
         self.inner.mkdir(&path).await.map_err(vfs_err)
     }
 
-    /// Delete a file; returns the delete result (JSON).
+    /// Create a symbolic link.
     #[napi]
-    pub async fn remove(&self, path: String) -> napi::Result<serde_json::Value> {
+    pub async fn create_symlink(&self, path: String, target: String) -> napi::Result<()> {
+        self.inner
+            .create_symlink(&path, &target)
+            .await
+            .map_err(vfs_err)
+    }
+
+    /// Delete a file; returns the delete result (JSON).
+    #[napi(ts_args_type = "path: string, options?: { ifMatch?: string | null } | null")]
+    pub async fn remove(
+        &self,
+        path: String,
+        options: Option<Value>,
+    ) -> napi::Result<serde_json::Value> {
+        let precondition = precondition_from_options(options.as_ref())?;
         let r = self
             .inner
-            .delete_file_with_metadata(&path, None)
+            .delete_file_with_metadata(&path, precondition)
             .await
             .map_err(vfs_err)?;
         to_json(r)

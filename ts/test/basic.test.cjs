@@ -5,7 +5,15 @@ const assert = require("node:assert");
 const os = require("node:os");
 const path = require("node:path");
 const fs = require("node:fs");
-const { Runtime, agentic, McpClient, McpServer, VfsStorage, version } = require("../index.js");
+const {
+  Runtime,
+  agentic,
+  createVfsGatewayServer,
+  McpClient,
+  McpServer,
+  VfsStorage,
+  version,
+} = require("../index.js");
 
 test("version()", () => {
   assert.match(version(), /^\d+\.\d+\.\d+/);
@@ -36,6 +44,180 @@ test("vfs local round-trip", async () => {
   assert.strictEqual((await vfs.read("a.txt")).toString(), "hi chevalier");
   const st = await vfs.stat("a.txt");
   assert.strictEqual(st.kind, "File");
+});
+
+test("vfs gateway forwards conditional writes into the backing store", async () => {
+  let currentHash = "old";
+  let statCalls = 0;
+  let releaseStats;
+  const bothStatsReached = new Promise((resolve) => {
+    releaseStats = resolve;
+  });
+  const store = {
+    async stat(path) {
+      const observedHash = currentHash;
+      statCalls += 1;
+      if (statCalls <= 2) {
+        if (statCalls === 2) releaseStats();
+        await bothStatsReached;
+      }
+      return {
+        path,
+        kind: "File",
+        sizeBytes: BigInt(1),
+        contentHash: observedHash,
+        updatedAt: null,
+      };
+    },
+    async write(_path, data, options) {
+      if (Object.prototype.hasOwnProperty.call(options ?? {}, "ifMatch")) {
+        if (options.ifMatch !== currentHash) {
+          throw new Error("VFS: [VFS_CONFLICT status=409] conflict: stale write");
+        }
+      }
+      const previousHash = currentHash;
+      currentHash = data.toString("utf8");
+      return { contentHash: currentHash, previousHash, changed: previousHash !== currentHash };
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+  const request = (body) =>
+    handler(
+      new Request("http://local/internal/chevalier/vfs/owner/file?path=a.txt", {
+        method: "PUT",
+        headers: { "x-chevalier-vfs-precondition-fingerprint": "old" },
+        body,
+      }),
+    );
+
+  const responses = await Promise.all([request("first"), request("second")]);
+  assert.deepStrictEqual(
+    responses.map((response) => response.status).sort(),
+    [200, 409],
+  );
+});
+
+test("vfs gateway aliases If-Match and ifMatch into canonical 409 preconditions", async () => {
+  const files = new Map([
+    ["a.txt", Buffer.from("old")],
+    ["batch.txt", Buffer.from("batch-old")],
+  ]);
+  const optionsSeen = [];
+  const store = {
+    async stat(path) {
+      const bytes = files.get(path);
+      if (bytes === undefined) return null;
+      return {
+        path,
+        kind: "File",
+        sizeBytes: BigInt(bytes.length),
+        contentHash: bytes.toString("utf8"),
+        updatedAt: null,
+      };
+    },
+    async write(path, data, options) {
+      optionsSeen.push({ op: "write", path, options });
+      if (Object.prototype.hasOwnProperty.call(options ?? {}, "ifMatch")) {
+        const currentHash = files.get(path)?.toString("utf8") ?? null;
+        if (options.ifMatch !== currentHash) {
+          throw new Error("VFS: [VFS_CONFLICT status=409] conflict: stale write");
+        }
+      }
+      const previousHash = files.get(path)?.toString("utf8") ?? null;
+      files.set(path, Buffer.from(data));
+      return {
+        contentHash: data.toString("utf8"),
+        previousHash,
+        changed: previousHash !== data.toString("utf8"),
+      };
+    },
+    async remove(path, options) {
+      optionsSeen.push({ op: "remove", path, options });
+      if (Object.prototype.hasOwnProperty.call(options ?? {}, "ifMatch")) {
+        const currentHash = files.get(path)?.toString("utf8") ?? null;
+        if (options.ifMatch !== currentHash) {
+          throw new Error("VFS: [VFS_CONFLICT status=409] conflict: stale delete");
+        }
+      }
+      files.delete(path);
+      return { removed: true };
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+
+  const matchedHeader = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/file?path=a.txt", {
+      method: "PUT",
+      headers: { "If-Match": 'W/"sha256:old"' },
+      body: "new",
+    }),
+  );
+  assert.strictEqual(matchedHeader.status, 200);
+  assert.deepStrictEqual(optionsSeen.at(-1), {
+    op: "write",
+    path: "a.txt",
+    options: { ifMatch: "old" },
+  });
+  assert.strictEqual(files.get("a.txt")?.toString("utf8"), "new");
+
+  const staleHeader = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/file?path=a.txt", {
+      method: "PUT",
+      headers: { "If-Match": "deadbeef" },
+      body: "clobber",
+    }),
+  );
+  assert.strictEqual(staleHeader.status, 409);
+  assert.strictEqual(files.get("a.txt")?.toString("utf8"), "new");
+
+  const matchedQuery = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/file?path=a.txt&ifMatch=sha256:new", {
+      method: "DELETE",
+    }),
+  );
+  assert.strictEqual(matchedQuery.status, 200);
+  assert.deepStrictEqual(optionsSeen.at(-1), {
+    op: "remove",
+    path: "a.txt",
+    options: { ifMatch: "new" },
+  });
+  assert.strictEqual(files.has("a.txt"), false);
+
+  const batchBody = Buffer.from("batch-new");
+  const matchedBody = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/write-many", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        writes: [{ path: "batch.txt", body: [...batchBody], ifMatch: '"sha256:batch-old"' }],
+      }),
+    }),
+  );
+  assert.strictEqual(matchedBody.status, 200);
+  assert.deepStrictEqual(optionsSeen.at(-1), {
+    op: "write",
+    path: "batch.txt",
+    options: { ifMatch: "batch-old" },
+  });
+  assert.strictEqual(files.get("batch.txt")?.toString("utf8"), "batch-new");
+
+  const createdBody = Buffer.from("batch-created");
+  const matchedNullBody = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/write-many", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        writes: [{ path: "created-by-batch.txt", body: [...createdBody], ifMatch: null }],
+      }),
+    }),
+  );
+  assert.strictEqual(matchedNullBody.status, 200);
+  assert.deepStrictEqual(optionsSeen.at(-1), {
+    op: "write",
+    path: "created-by-batch.txt",
+    options: { ifMatch: null },
+  });
+  assert.strictEqual(files.get("created-by-batch.txt")?.toString("utf8"), "batch-created");
 });
 
 test("mcp server + client end-to-end", async () => {

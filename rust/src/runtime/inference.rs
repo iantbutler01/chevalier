@@ -247,6 +247,9 @@ async fn stream_chunk_to_runtime_events(
             cached_tokens,
             cache_write_input_tokens,
         })]),
+        StreamChunk::RateLimits(rate_limits) => {
+            Ok(vec![ResponseStreamEvent::RateLimits(rate_limits)])
+        }
     }
 }
 

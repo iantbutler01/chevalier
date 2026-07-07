@@ -21,9 +21,15 @@
 //   - GET  {owner}/file/raw?path=        -> 200 bytes (Range -> 206) | 404
 //   - GET  {owner}/tree?path=&name_like= -> 200 RemoteDirEntry[]
 //   - PUT  {owner}/file?path=            -> 2xx (body ignored by client); honors the
-//                                           precondition-fingerprint header -> 409
-//   - DELETE {owner}/file?path=&return_metadata=true -> 200 {previous}
+//                                           precondition-fingerprint header, `If-Match`,
+//                                           or `ifMatch` query alias -> 409.
+//                                           `If-Match` is an alias in chevalier's
+//                                           protocol, not a separate HTTP 412 path.
+//                                           Fingerprint is `contentHash`: SHA-256 hex
+//                                           of the current logical file bytes.
+//   - DELETE {owner}/file?path=&return_metadata=true -> 200 {previous}; same precondition
 //   - PUT/DELETE {owner}/dir?path=       -> 2xx
+//   - PUT  {owner}/symlink?path=&target= -> 2xx
 //   - POST {owner}/rename?from=&to=&return_metadata=true -> 200 {previous,current}
 //   - POST/DELETE {owner}/lease          -> 200 {resource_key,owner_token} / 2xx
 //   - POST {owner}/{metadata-many,read-many,write-many} -> batch (per-path loop)
@@ -34,6 +40,7 @@ import type { VfsStorage, VfsMetadata } from "./native.js";
 
 const DEFAULT_ROUTE_PREFIX = "/internal/chevalier/vfs";
 const PRECONDITION_FINGERPRINT_HEADER = "x-chevalier-vfs-precondition-fingerprint";
+const IF_MATCH_HEADER = "if-match";
 
 export interface VfsGatewayServerOptions {
   /** Map a request's `{owner_id}` to the backing store. Typically
@@ -109,9 +116,17 @@ export function createVfsGatewayServer(
       if (method === "GET" && op === "tree") {
         if (isGitExcludedPath(relPath)) return errorResponse(404, `not found: ${relPath}`);
         const dir = relPath === "" ? "." : relPath;
+        const maxHashBytes = parseOptionalNonNegativeInteger(
+          q.get("max_hash_bytes") ?? q.get("maxHashBytes"),
+          "max_hash_bytes",
+        );
+        if (maxHashBytes instanceof Response) return maxHashBytes;
         let entries: VfsMetadata[];
         try {
-          entries = await store.listDir(dir);
+          entries = await store.listDir(
+            dir,
+            maxHashBytes === null ? undefined : { maxHashBytes },
+          );
         } catch {
           return errorResponse(404, `not found: ${dir}`);
         }
@@ -138,22 +153,28 @@ export function createVfsGatewayServer(
       // ---- single-file mutations -----------------------------------------
       if (method === "PUT" && op === "file") {
         if (isGitExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
-        const precond = req.headers.get(PRECONDITION_FINGERPRINT_HEADER);
-        if (precond !== null && precond !== "") {
-          const cur = await store.stat(relPath);
-          const curHash = cur?.contentHash ?? null;
-          if (precond !== curHash) {
-            // CAS mismatch -> 409 Conflict; the file is NOT touched (no clobber).
-            return errorResponse(409, `precondition failed for ${relPath}`);
-          }
-        }
+        const precondition = requestPrecondition(req, q);
+        const failed = await enforceFingerprintPrecondition(store, relPath, precondition);
+        if (failed !== null) return failed;
         const body = Buffer.from(await req.arrayBuffer());
-        const res = (await store.write(relPath, body)) as {
+        let res: {
           content_hash?: string;
           contentHash?: string;
           previous_hash?: string | null;
           changed?: boolean;
         };
+        try {
+          res = (await store.write(relPath, body, preconditionOptions(precondition))) as {
+            content_hash?: string;
+            contentHash?: string;
+            previous_hash?: string | null;
+            changed?: boolean;
+          };
+        } catch (e) {
+          const failed = conflictResponseFromStoreError(e, relPath);
+          if (failed !== null) return failed;
+          throw e;
+        }
         // The bound client ignores this body on the plain-write path and recomputes
         // its own result; we return the real result for completeness.
         return json(200, {
@@ -166,15 +187,20 @@ export function createVfsGatewayServer(
 
       if (method === "DELETE" && op === "file") {
         if (isGitExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
+        const precondition = requestPrecondition(req, q);
+        const failed = await enforceFingerprintPrecondition(store, relPath, precondition);
+        if (failed !== null) return failed;
         let previous: ReturnType<typeof toRemoteMetadata> | null = null;
         if (q.get("return_metadata") === "true") {
           const cur = await store.stat(relPath);
           previous = cur === null ? null : toRemoteMetadata(cur);
         }
         try {
-          await store.remove(relPath);
-        } catch {
-          /* idempotent delete: absent is fine */
+          await store.remove(relPath, preconditionOptions(precondition));
+        } catch (e) {
+          const failed = conflictResponseFromStoreError(e, relPath);
+          if (failed !== null) return failed;
+          throw e;
         }
         return json(200, { previous });
       }
@@ -182,6 +208,17 @@ export function createVfsGatewayServer(
       if (method === "PUT" && op === "dir") {
         if (isGitExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
         await store.mkdir(relPath);
+        return new Response(null, { status: 204 });
+      }
+      if (method === "PUT" && op === "symlink") {
+        if (isGitExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
+        const target = q.get("target");
+        if (target === null || target === "") return errorResponse(400, "symlink requires target");
+        try {
+          await store.createSymlink(relPath, target);
+        } catch (e) {
+          return errorResponse(400, (e as Error).message);
+        }
         return new Response(null, { status: 204 });
       }
       if (method === "DELETE" && op === "dir") {
@@ -244,32 +281,53 @@ export function createVfsGatewayServer(
 
       if (method === "POST" && op === "write-many") {
         const body = (await req.json()) as {
-          writes: { path: string; body: number[]; precondition?: { fingerprint?: string | null } }[];
+          writes: WriteManyRequestItem[];
         };
         // Atomic-ish: check all preconditions first, then apply. Any mismatch -> 409.
         for (const w of body.writes) {
           const path = normalizePath(w.path);
           if (isGitExcludedPath(path)) return errorResponse(400, `excluded path: ${path}`);
-          const fp = w.precondition?.fingerprint ?? null;
-          if (fp !== null) {
-            const cur = await store.stat(path);
-            if (fp !== (cur?.contentHash ?? null)) {
-              return errorResponse(409, `precondition failed for ${w.path}`);
-            }
-          }
+          const failed = await enforceFingerprintPrecondition(store, path, writeItemPrecondition(w));
+          if (failed !== null) return failed;
         }
         const results = [];
         for (const w of body.writes) {
           const p = normalizePath(w.path);
           const cur = await store.stat(p);
           const prev = cur?.contentHash ?? null;
-          const res = (await store.write(p, Buffer.from(w.body))) as {
+          const precondition = writeItemPrecondition(w);
+          let res: {
             content_hash?: string;
             contentHash?: string;
+            previous_hash?: string | null;
+            previousHash?: string | null;
             changed?: boolean;
           };
+          try {
+            res = (await store.write(
+              p,
+              Buffer.from(w.body),
+              preconditionOptions(precondition),
+            )) as {
+              content_hash?: string;
+              contentHash?: string;
+              previous_hash?: string | null;
+              previousHash?: string | null;
+              changed?: boolean;
+            };
+          } catch (e) {
+            const failed = conflictResponseFromStoreError(e, p);
+            if (failed !== null) return failed;
+            throw e;
+          }
           const hash = res.content_hash ?? res.contentHash ?? "";
-          results.push({ path: p, content_hash: hash, previous_hash: prev, changed: res.changed ?? prev !== hash });
+          const previousHash = res.previous_hash ?? res.previousHash ?? prev;
+          results.push({
+            path: p,
+            content_hash: hash,
+            previous_hash: previousHash,
+            changed: res.changed ?? previousHash !== hash,
+          });
         }
         return json(200, { results });
       }
@@ -306,15 +364,131 @@ function isGitExcludedPath(path: string): boolean {
     .some((part) => part === ".git");
 }
 
-/** `VfsStorage` metadata `kind` is "File"|"Directory"; the wire wants "file"|"directory". */
-function wireKind(kind: string): "file" | "directory" {
-  return kind.toLowerCase().startsWith("dir") ? "directory" : "file";
+type FingerprintPrecondition =
+  | { present: false }
+  | { present: true; fingerprint: string | null };
+
+function normalizeFingerprint(raw: string | null | undefined): string | null {
+  if (raw === null || raw === undefined) return null;
+  let next = raw.trim();
+  if (next.startsWith("W/")) next = next.slice(2).trim();
+  if (
+    (next.startsWith('"') && next.endsWith('"')) ||
+    (next.startsWith("'") && next.endsWith("'"))
+  ) {
+    next = next.slice(1, -1).trim();
+  }
+  if (next.startsWith("sha256:")) next = next.slice("sha256:".length);
+  if (next === "" || next.toLowerCase() === "null") return null;
+  return next;
+}
+
+function preconditionFromRaw(raw: string | null): FingerprintPrecondition {
+  return { present: true, fingerprint: normalizeFingerprint(raw) };
+}
+
+function queryIfMatch(query: URLSearchParams): string | null {
+  return query.get("ifMatch") ?? query.get("if_match");
+}
+
+function requestPrecondition(req: Request, query: URLSearchParams): FingerprintPrecondition {
+  const raw =
+    req.headers.get(PRECONDITION_FINGERPRINT_HEADER) ??
+    req.headers.get(IF_MATCH_HEADER) ??
+    queryIfMatch(query);
+  if (raw !== null) return preconditionFromRaw(raw);
+  return { present: false };
+}
+
+function preconditionOptions(
+  precondition: FingerprintPrecondition,
+): { ifMatch?: string | null } | undefined {
+  if (!precondition.present) return undefined;
+  return { ifMatch: precondition.fingerprint };
+}
+
+type WriteManyRequestItem = {
+  path: string;
+  body: number[];
+  ifMatch?: string | null;
+  if_match?: string | null;
+  precondition?: {
+    fingerprint?: string | null;
+    ifMatch?: string | null;
+    if_match?: string | null;
+  };
+};
+
+function ownValue<T extends object, K extends PropertyKey>(obj: T | undefined, key: K): unknown {
+  if (obj === undefined || !Object.prototype.hasOwnProperty.call(obj, key)) return undefined;
+  return (obj as Record<K, unknown>)[key];
+}
+
+function writeItemPrecondition(write: WriteManyRequestItem): FingerprintPrecondition {
+  let raw = ownValue(write.precondition, "fingerprint");
+  if (raw === undefined) raw = ownValue(write.precondition, "ifMatch");
+  if (raw === undefined) raw = ownValue(write.precondition, "if_match");
+  if (raw === undefined) raw = ownValue(write, "ifMatch");
+  if (raw === undefined) raw = ownValue(write, "if_match");
+  if (raw === undefined) return { present: false };
+  if (raw !== null && typeof raw !== "string") {
+    throw new Error("invalid write precondition: ifMatch/fingerprint must be a string or null");
+  }
+  return preconditionFromRaw(raw);
+}
+
+function conflictResponseFromStoreError(error: unknown, path: string): Response | null {
+  const message = error instanceof Error ? error.message : String(error);
+  if (
+    message.includes("VFS_CONFLICT") ||
+    message.includes("status=409") ||
+    /\bconflict:/i.test(message)
+  ) {
+    return errorResponse(409, `precondition failed for ${path}`);
+  }
+  return null;
+}
+
+function parseOptionalNonNegativeInteger(
+  raw: string | null,
+  name: string,
+): number | null | Response {
+  if (raw === null || raw.trim() === "") return null;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    return errorResponse(400, `${name} must be a non-negative integer`);
+  }
+  return value;
+}
+
+async function enforceFingerprintPrecondition(
+  store: VfsStorage,
+  path: string,
+  precondition: FingerprintPrecondition,
+): Promise<Response | null> {
+  if (!precondition.present) return null;
+  const cur = await store.stat(path);
+  const curHash = cur?.contentHash ?? null;
+  if (precondition.fingerprint === curHash) return null;
+  // CAS mismatch -> 409 Conflict; the file is NOT touched (no clobber).
+  return errorResponse(409, `precondition failed for ${path}`);
+}
+
+/** `VfsStorage` metadata `kind` is PascalCase; the wire uses lowercase kinds. */
+function wireKind(kind: string): "file" | "directory" | "symlink" | "special" {
+  const lower = kind.toLowerCase();
+  if (lower.startsWith("dir")) return "directory";
+  if (lower.startsWith("sym")) return "symlink";
+  if (lower.startsWith("spec")) return "special";
+  return "file";
 }
 
 function toRemoteMetadata(md: VfsMetadata) {
   return {
     kind: wireKind(md.kind),
     size_bytes: Number(md.sizeBytes),
+    executable: md.executable ?? false,
+    link_target: md.linkTarget ?? null,
     content_hash: md.contentHash ?? null,
     updated_at: md.updatedAt ?? null,
   };
@@ -326,6 +500,8 @@ function toRemoteDirEntry(md: VfsMetadata) {
     name,
     kind: wireKind(md.kind),
     size_bytes: Number(md.sizeBytes),
+    executable: md.executable ?? false,
+    link_target: md.linkTarget ?? null,
     content_hash: md.contentHash ?? null,
     updated_at: md.updatedAt ?? null,
   };
