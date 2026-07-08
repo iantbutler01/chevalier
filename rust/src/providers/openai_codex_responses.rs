@@ -370,6 +370,14 @@ impl OpenAICodexResponsesClient {
                     return;
                 }
 
+                // Live per-turn usage: the `codex.rate_limits` stream event (the ONLY
+                // source on the WS transport — headers are handshake-only).
+                let rate_limit_updates = codex_rate_limits_from_event(&event_json);
+                if !rate_limit_updates.is_empty() {
+                    let _ = tx.unbounded_send(Ok(StreamChunk::RateLimits(rate_limit_updates)));
+                    continue;
+                }
+
                 let done = is_completion_event(&event_json);
                 let event_json = normalize_completion_event(event_json);
                 for chunk in parse_openai_responses_event(&event_json, &mut accumulator, has_tools)
@@ -448,6 +456,15 @@ impl OpenAICodexResponsesClient {
 
                 if let Err(error) = reject_codex_error_event(&sse_json) {
                     return futures::future::ready(Some(vec![Err(error)]));
+                }
+
+                // Live per-turn usage on the SSE transport too (the `codex.rate_limits`
+                // event, same as the WS path — not the response headers).
+                let rate_limit_updates = codex_rate_limits_from_event(&sse_json);
+                if !rate_limit_updates.is_empty() {
+                    return futures::future::ready(Some(vec![Ok(StreamChunk::RateLimits(
+                        rate_limit_updates,
+                    ))]));
                 }
 
                 let event_json = normalize_completion_event(sse_json);
@@ -780,6 +797,58 @@ fn codex_rate_limits_from_headers(headers: &HeaderMap) -> Vec<ProviderRateLimit>
             resets_at_epoch_sec: header_u64(headers, reset_header)?,
         })
     })
+    .collect()
+}
+
+/// Live rate limits arrive as a `codex.rate_limits` STREAM event on the SSE/WebSocket
+/// transports — the handshake/response headers only carry them on plain HTTP (which
+/// Codex uses only for the non-streaming path). Mirrors the Codex CLI's own WS handler
+/// (codex-rs/codex-api/src/endpoint/responses_websocket.rs: `event.kind() ==
+/// "codex.rate_limits"` -> parse_rate_limit_event). Event shape:
+///   { "type": "codex.rate_limits",
+///     "rate_limits": { "primary":   { used_percent, window_minutes, reset_at },
+///                      "secondary": { used_percent, window_minutes, reset_at } } }
+fn codex_rate_limit_window_from_event(
+    scope: ProviderRateLimitScope,
+    window: Option<&Value>,
+) -> Option<ProviderRateLimit> {
+    let window = window?;
+    let used_percent = window.get("used_percent").and_then(Value::as_f64)?;
+    let window_minutes = window
+        .get("window_minutes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    // Codex's event window field is `reset_at`; some transports/logs use `resets_at`.
+    let resets_at = window
+        .get("reset_at")
+        .or_else(|| window.get("resets_at"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    Some(ProviderRateLimit {
+        scope,
+        used_percent: used_percent.round().clamp(0.0, u32::MAX as f64) as u32,
+        window_minutes,
+        resets_at_epoch_sec: resets_at,
+    })
+}
+
+fn codex_rate_limits_from_event(event_json: &Value) -> Vec<ProviderRateLimit> {
+    if event_json.get("type").and_then(Value::as_str) != Some("codex.rate_limits") {
+        return Vec::new();
+    }
+    let details = event_json.get("rate_limits");
+    [
+        codex_rate_limit_window_from_event(
+            ProviderRateLimitScope::Session,
+            details.and_then(|d| d.get("primary")),
+        ),
+        codex_rate_limit_window_from_event(
+            ProviderRateLimitScope::Subscription,
+            details.and_then(|d| d.get("secondary")),
+        ),
+    ]
+    .into_iter()
+    .flatten()
     .collect()
 }
 
@@ -1272,5 +1341,38 @@ mod tests {
                 ..
             } if reached_type == "secondary_credits_depleted"
         ));
+    }
+
+    #[test]
+    fn test_codex_rate_limits_stream_event_parses_session_and_weekly() {
+        // The exact shape Codex streams on SSE/WS (from a real session rollout log).
+        let event = serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": {
+                "primary":   { "used_percent": 8.0,  "window_minutes": 300,   "reset_at": 1783462580_i64 },
+                "secondary": { "used_percent": 23.0, "window_minutes": 10080, "reset_at": 1783925974_i64 }
+            }
+        });
+        let limits = codex_rate_limits_from_event(&event);
+        assert_eq!(limits.len(), 2);
+        let session = limits
+            .iter()
+            .find(|l| l.scope == ProviderRateLimitScope::Session)
+            .unwrap();
+        assert_eq!(session.used_percent, 8);
+        assert_eq!(session.window_minutes, 300);
+        assert_eq!(session.resets_at_epoch_sec, 1783462580);
+        let weekly = limits
+            .iter()
+            .find(|l| l.scope == ProviderRateLimitScope::Subscription)
+            .unwrap();
+        assert_eq!(weekly.used_percent, 23);
+        assert_eq!(weekly.window_minutes, 10080);
+    }
+
+    #[test]
+    fn test_non_rate_limit_event_yields_no_limits() {
+        let event = serde_json::json!({ "type": "response.output_text.delta", "delta": "hi" });
+        assert!(codex_rate_limits_from_event(&event).is_empty());
     }
 }
