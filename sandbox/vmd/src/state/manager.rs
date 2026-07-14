@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use rand::RngCore;
 use serde_json::json;
 use tokio::process::{Child, Command};
-use tokio::sync::{OwnedMutexGuard, RwLock};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use tokio::time::sleep;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
@@ -33,6 +33,7 @@ use crate::config::{self, Config};
 use crate::fuse;
 use crate::image::{self, BASE_IMAGE_EXT, BASE_IMAGE_SIZE_GB, PrebuiltImageStatus};
 use crate::network;
+use crate::pci::{self, PciDeviceAssignmentSpec, PciInventoryDevice, PciInventoryState};
 use crate::state::metadata::{load_metadata, save_metadata};
 use crate::state::runtime::VmRuntime;
 use crate::state::types::{
@@ -85,6 +86,45 @@ const ARM64_BIOS_CANDIDATES: [&str; 6] = [
 ];
 
 #[derive(Clone, Copy, Debug)]
+struct VmResourceBounds {
+    max_vcpu: i32,
+    max_memory_mb: i32,
+    max_disk_gb: i32,
+}
+
+impl Default for VmResourceBounds {
+    fn default() -> Self {
+        Self {
+            max_vcpu: MAX_VM_VCPU,
+            max_memory_mb: MAX_VM_MEMORY_MB,
+            max_disk_gb: MAX_VM_DISK_GB,
+        }
+    }
+}
+
+impl VmResourceBounds {
+    fn from_env() -> Result<Self> {
+        Ok(Self {
+            max_vcpu: positive_resource_bound_from_env(
+                "CHEVALIER_SANDBOX_MAX_VM_VCPU",
+                "BRACKET_SANDBOX_MAX_VM_VCPU",
+                MAX_VM_VCPU,
+            )?,
+            max_memory_mb: positive_resource_bound_from_env(
+                "CHEVALIER_SANDBOX_MAX_VM_MEMORY_MB",
+                "BRACKET_SANDBOX_MAX_VM_MEMORY_MB",
+                MAX_VM_MEMORY_MB,
+            )?,
+            max_disk_gb: positive_resource_bound_from_env(
+                "CHEVALIER_SANDBOX_MAX_VM_DISK_GB",
+                "BRACKET_SANDBOX_MAX_VM_DISK_GB",
+                MAX_VM_DISK_GB,
+            )?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub enum CreateVmStage {
     DownloadImage,
     ConvertImage,
@@ -116,6 +156,12 @@ pub enum ManagerError {
     InvalidState,
     #[error("operation cancelled")]
     Cancelled,
+    #[error("PCI conflict: {0}")]
+    PciConflict(String),
+    #[error("PCI unavailable: {0}")]
+    PciUnavailable(String),
+    #[error("unsupported operation: {0}")]
+    Unsupported(String),
     #[error("capacity exceeded for {resource}: limit={limit} current={current}")]
     CapacityExceeded {
         resource: &'static str,
@@ -160,8 +206,17 @@ pub struct PendingSnapshot {
 pub struct Manager {
     cfg: Config,
     host_arch: String,
+    resource_bounds: VmResourceBounds,
     vms: RwLock<HashMap<String, Arc<Vm>>>,
     snapshots: RwLock<HashMap<String, SnapshotRecord>>,
+    pci_leases: Mutex<HashMap<String, String>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PciActionResult {
+    pub metadata: VmMetadata,
+    pub restart_required: bool,
+    pub detail: String,
 }
 
 impl Manager {
@@ -169,12 +224,21 @@ impl Manager {
     pub async fn new(mut cfg: Config) -> ManagerResult<Self> {
         cfg.normalize().map_err(ManagerError::Other)?;
         let host_arch = normalize_arch(std::env::consts::ARCH)?;
+        let resource_bounds = VmResourceBounds::from_env().map_err(ManagerError::Other)?;
+        info!(
+            max_vcpu = resource_bounds.max_vcpu,
+            max_memory_mb = resource_bounds.max_memory_mb,
+            max_disk_gb = resource_bounds.max_disk_gb,
+            "configured per-VM resource admission bounds"
+        );
 
         let manager = Self {
             cfg,
             host_arch,
+            resource_bounds,
             vms: RwLock::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
+            pci_leases: Mutex::new(HashMap::new()),
         };
 
         manager.discover().await?;
@@ -330,6 +394,27 @@ impl Manager {
                         meta.architecture = self.host_arch.clone();
                     }
 
+                    let mut vm_device_ids = HashSet::new();
+                    let mut leases = self.pci_leases.lock().await;
+                    for assignment in &meta.pci_devices {
+                        if !vm_device_ids.insert(assignment.id.as_str()) {
+                            return Err(ManagerError::Other(anyhow!(
+                                "VM {} contains duplicate PCI assignment `{}`",
+                                meta.id,
+                                assignment.id
+                            )));
+                        }
+                        if let Some(owner) = leases.insert(assignment.id.clone(), meta.id.clone()) {
+                            return Err(ManagerError::Other(anyhow!(
+                                "PCI device `{}` is claimed by both VM {} and VM {}",
+                                assignment.id,
+                                owner,
+                                meta.id
+                            )));
+                        }
+                    }
+                    drop(leases);
+
                     let vm = Arc::new(Vm::new(
                         meta.clone(),
                         VmRuntime::new(&vm_dir),
@@ -408,6 +493,365 @@ impl Manager {
             self.metadata_with_runtime_network_snapshot(metadata).await,
             runtime,
         ))
+    }
+
+    pub fn pci_enabled(&self) -> bool {
+        self.cfg.pci.enabled()
+    }
+
+    pub async fn list_host_pci_devices(&self) -> Vec<PciInventoryDevice> {
+        let leases = self.pci_leases.lock().await.clone();
+        pci::inventory(&self.cfg.pci, &leases)
+    }
+
+    fn ensure_pci_compatible(&self, metadata: &VmMetadata) -> ManagerResult<()> {
+        if !self.cfg.pci.enabled() {
+            return Err(ManagerError::Unsupported(
+                "PCI assignment is disabled on this vmd".to_string(),
+            ));
+        }
+        if !cfg!(target_os = "linux") || self.host_arch != ARCH_AMD64 {
+            return Err(ManagerError::Unsupported(
+                "PCI assignment requires an amd64 Linux vmd host".to_string(),
+            ));
+        }
+        if metadata.architecture != ARCH_AMD64 {
+            return Err(ManagerError::Unsupported(
+                "PCI assignment requires an amd64 guest".to_string(),
+            ));
+        }
+        if self.cfg.ha_mode {
+            return Err(ManagerError::Unsupported(
+                "PCI assignment is unavailable in ha mode".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn reserve_pci_devices(
+        &self,
+        vm_id: &str,
+        device_ids: &[String],
+    ) -> ManagerResult<Vec<PciDeviceAssignmentSpec>> {
+        if device_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut requested = HashSet::new();
+        for device_id in device_ids {
+            if !requested.insert(device_id.as_str()) {
+                return Err(ManagerError::PciConflict(format!(
+                    "device `{device_id}` was requested more than once"
+                )));
+            }
+            if self.cfg.pci.device(device_id).is_none() {
+                return Err(ManagerError::PciUnavailable(format!(
+                    "device `{device_id}` is not allowlisted"
+                )));
+            }
+        }
+
+        let mut leases = self.pci_leases.lock().await;
+        let inventory = pci::inventory(&self.cfg.pci, &leases);
+        for device_id in device_ids {
+            let device = inventory
+                .iter()
+                .find(|device| device.id == *device_id)
+                .ok_or_else(|| {
+                    ManagerError::PciUnavailable(format!("device `{device_id}` is not allowlisted"))
+                })?;
+            if device.state == PciInventoryState::Assigned {
+                return Err(ManagerError::PciConflict(format!(
+                    "device `{device_id}` is assigned to VM {}",
+                    device.assigned_vm_id
+                )));
+            }
+            if device.state == PciInventoryState::Unavailable {
+                return Err(ManagerError::PciUnavailable(format!(
+                    "device `{device_id}`: {}",
+                    device.unavailable_reason
+                )));
+            }
+        }
+
+        let assignments = device_ids
+            .iter()
+            .map(|device_id| {
+                let policy = self.cfg.pci.device(device_id).expect("validated policy");
+                PciDeviceAssignmentSpec {
+                    id: policy.id.clone(),
+                    bdfs: policy.bdfs.clone(),
+                    iommu_groups: Vec::new(),
+                    original_drivers: HashMap::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        for assignment in &assignments {
+            leases.insert(assignment.id.clone(), vm_id.to_string());
+        }
+        Ok(assignments)
+    }
+
+    async fn release_pci_leases(&self, vm_id: &str, assignments: &[PciDeviceAssignmentSpec]) {
+        let mut leases = self.pci_leases.lock().await;
+        for assignment in assignments {
+            if leases
+                .get(&assignment.id)
+                .is_some_and(|owner| owner == vm_id)
+            {
+                leases.remove(&assignment.id);
+            }
+        }
+    }
+
+    pub async fn attach_pci_device(
+        &self,
+        vm_id: &str,
+        device_id: &str,
+    ) -> ManagerResult<PciActionResult> {
+        let vm = self.vm_by_id(vm_id).await?;
+        let mut inner = vm.lock().await;
+        self.ensure_pci_compatible(&inner.metadata)?;
+        if inner
+            .metadata
+            .pci_devices
+            .iter()
+            .any(|assignment| assignment.id == device_id)
+        {
+            return Ok(PciActionResult {
+                metadata: inner.metadata.clone(),
+                restart_required: false,
+                detail: "device is already attached".to_string(),
+            });
+        }
+
+        let policy = self.cfg.pci.device(device_id).cloned().ok_or_else(|| {
+            ManagerError::PciUnavailable(format!("device `{device_id}` is not allowlisted"))
+        })?;
+        let running = matches!(inner.runtime.state, VmState::Running | VmState::Paused);
+        if running && !policy.hotplug {
+            return Ok(PciActionResult {
+                metadata: inner.metadata.clone(),
+                restart_required: true,
+                detail: "device policy requires a cold attach".to_string(),
+            });
+        }
+
+        let mut assignments = self
+            .reserve_pci_devices(vm_id, &[device_id.to_string()])
+            .await?;
+        let mut assignment = assignments.remove(0);
+        if !running {
+            inner.metadata.pci_devices.push(assignment);
+            if let Err(error) = save_metadata(&vm.dir, &mut inner.metadata) {
+                let assignments = inner
+                    .metadata
+                    .pci_devices
+                    .pop()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                drop(inner);
+                self.release_pci_leases(vm_id, &assignments).await;
+                return Err(ManagerError::Other(error));
+            }
+            return Ok(PciActionResult {
+                metadata: inner.metadata.clone(),
+                restart_required: false,
+                detail: "device will be assigned on the next VM start".to_string(),
+            });
+        }
+
+        let monitor = inner
+            .runtime
+            .monitor
+            .clone()
+            .ok_or_else(|| ManagerError::Other(anyhow!("vm monitor unavailable")))?;
+        assignment = match pci::prepare_assignment(
+            &self.cfg.pci,
+            device_id,
+            self.cfg.qemu_process.run_as_uid,
+            self.cfg.qemu_process.run_as_gid,
+        )
+        .await
+        {
+            Ok(assignment) => assignment,
+            Err(error) => match error.downcast::<pci::PciRollbackError>() {
+                Ok(failure) => {
+                    let detail = failure.to_string();
+                    inner.metadata.pci_devices.push(failure.assignment);
+                    save_metadata(&vm.dir, &mut inner.metadata).map_err(ManagerError::Other)?;
+                    return Ok(PciActionResult {
+                        metadata: inner.metadata.clone(),
+                        restart_required: true,
+                        detail,
+                    });
+                }
+                Err(error) => {
+                    self.release_pci_leases(vm_id, std::slice::from_ref(&assignment))
+                        .await;
+                    return Err(ManagerError::Other(error));
+                }
+            },
+        };
+        let mut added: Vec<String> = Vec::new();
+        for (index, bdf) in assignment.bdfs.iter().enumerate() {
+            let qemu_id = pci::qemu_device_id(&assignment.id, index);
+            if let Err(error) = monitor.device_add_vfio(&qemu_id, bdf).await {
+                let mut cleanup_error = None;
+                for added_id in added.iter().rev() {
+                    if let Err(delete_error) = monitor
+                        .device_del_wait(added_id, Duration::from_secs(5))
+                        .await
+                    {
+                        cleanup_error = Some(delete_error);
+                        break;
+                    }
+                }
+                if let Some(cleanup_error) = cleanup_error {
+                    inner.metadata.pci_devices.push(assignment);
+                    save_metadata(&vm.dir, &mut inner.metadata).map_err(ManagerError::Other)?;
+                    return Ok(PciActionResult {
+                        metadata: inner.metadata.clone(),
+                        restart_required: true,
+                        detail: format!(
+                            "PCI hot-add failed ({error}) and live cleanup failed ({cleanup_error})"
+                        ),
+                    });
+                }
+                if let Err(release_error) =
+                    pci::release_assignment(&self.cfg.pci, &assignment).await
+                {
+                    inner.metadata.pci_devices.push(assignment);
+                    save_metadata(&vm.dir, &mut inner.metadata).map_err(ManagerError::Other)?;
+                    return Ok(PciActionResult {
+                        metadata: inner.metadata.clone(),
+                        restart_required: true,
+                        detail: format!(
+                            "PCI hot-add failed ({error}) and host release failed ({release_error})"
+                        ),
+                    });
+                }
+                self.release_pci_leases(vm_id, std::slice::from_ref(&assignment))
+                    .await;
+                return Err(ManagerError::Other(error));
+            }
+            added.push(qemu_id);
+        }
+        inner.metadata.pci_devices.push(assignment);
+        if let Err(save_error) = save_metadata(&vm.dir, &mut inner.metadata) {
+            let assignment = inner
+                .metadata
+                .pci_devices
+                .pop()
+                .expect("new PCI assignment must be present");
+            let mut cleanup_error = None;
+            for added_id in added.iter().rev() {
+                if let Err(error) = monitor
+                    .device_del_wait(added_id, Duration::from_secs(5))
+                    .await
+                {
+                    cleanup_error = Some(error);
+                    break;
+                }
+            }
+            if let Some(cleanup_error) = cleanup_error {
+                inner.metadata.pci_devices.push(assignment);
+                let _ = save_metadata(&vm.dir, &mut inner.metadata);
+                return Ok(PciActionResult {
+                    metadata: inner.metadata.clone(),
+                    restart_required: true,
+                    detail: format!(
+                        "PCI metadata persistence failed ({save_error}) and live cleanup failed ({cleanup_error})"
+                    ),
+                });
+            }
+            if let Err(release_error) = pci::release_assignment(&self.cfg.pci, &assignment).await {
+                inner.metadata.pci_devices.push(assignment);
+                let _ = save_metadata(&vm.dir, &mut inner.metadata);
+                return Ok(PciActionResult {
+                    metadata: inner.metadata.clone(),
+                    restart_required: true,
+                    detail: format!(
+                        "PCI metadata persistence failed ({save_error}) and host release failed ({release_error})"
+                    ),
+                });
+            }
+            self.release_pci_leases(vm_id, std::slice::from_ref(&assignment))
+                .await;
+            return Err(ManagerError::Other(save_error));
+        }
+        Ok(PciActionResult {
+            metadata: inner.metadata.clone(),
+            restart_required: false,
+            detail: "device hot-attached".to_string(),
+        })
+    }
+
+    pub async fn detach_pci_device(
+        &self,
+        vm_id: &str,
+        device_id: &str,
+    ) -> ManagerResult<PciActionResult> {
+        let vm = self.vm_by_id(vm_id).await?;
+        let mut inner = vm.lock().await;
+        self.ensure_pci_compatible(&inner.metadata)?;
+        let Some(index) = inner
+            .metadata
+            .pci_devices
+            .iter()
+            .position(|assignment| assignment.id == device_id)
+        else {
+            return Ok(PciActionResult {
+                metadata: inner.metadata.clone(),
+                restart_required: false,
+                detail: "device is already detached".to_string(),
+            });
+        };
+        let assignment = inner.metadata.pci_devices[index].clone();
+        let policy = self.cfg.pci.device(device_id);
+        let running = matches!(inner.runtime.state, VmState::Running | VmState::Paused);
+        if running && !policy.is_some_and(|policy| policy.hotplug) {
+            return Ok(PciActionResult {
+                metadata: inner.metadata.clone(),
+                restart_required: true,
+                detail: "device policy requires a cold detach".to_string(),
+            });
+        }
+        if running {
+            let monitor = inner
+                .runtime
+                .monitor
+                .clone()
+                .ok_or_else(|| ManagerError::Other(anyhow!("vm monitor unavailable")))?;
+            for function_index in (0..assignment.bdfs.len()).rev() {
+                let qemu_id = pci::qemu_device_id(&assignment.id, function_index);
+                if let Err(error) = monitor
+                    .device_del_wait(&qemu_id, Duration::from_secs(10))
+                    .await
+                {
+                    return Ok(PciActionResult {
+                        metadata: inner.metadata.clone(),
+                        restart_required: true,
+                        detail: format!("live detach failed: {error}"),
+                    });
+                }
+            }
+        }
+        pci::release_assignment(&self.cfg.pci, &assignment)
+            .await
+            .map_err(ManagerError::Other)?;
+        inner.metadata.pci_devices.remove(index);
+        if let Err(error) = save_metadata(&vm.dir, &mut inner.metadata) {
+            inner.metadata.pci_devices.insert(index, assignment.clone());
+            return Err(ManagerError::Other(error));
+        }
+        self.release_pci_leases(vm_id, std::slice::from_ref(&assignment))
+            .await;
+        Ok(PciActionResult {
+            metadata: inner.metadata.clone(),
+            restart_required: false,
+            detail: "device detached".to_string(),
+        })
     }
 
     pub async fn running_vm_health_probe_targets(
@@ -619,7 +1063,7 @@ impl Manager {
         if params.resources.disk_gb <= 0 {
             params.resources.disk_gb = 10;
         }
-        enforce_resource_bounds(&params.resources)?;
+        enforce_resource_bounds(&params.resources, self.resource_bounds)?;
         self.enforce_create_vm_capacity().await?;
         let name = sanitize_name(&params.name);
         // @dive: Shared mounts are normalized before persistence so mount tags and host paths stay stable across restarts and forks.
@@ -709,21 +1153,51 @@ impl Manager {
             metadata: params.metadata.clone(),
             snapshots: Vec::new(),
             shared_mounts: params.shared_mounts.clone(),
+            pci_devices: Vec::new(),
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
+        if !params.pci_device_ids.is_empty() {
+            if matches!(&params.source.source_type, VmSourceType::Snapshot) {
+                let _ = fs::remove_dir_all(&vm_dir);
+                return Err(ManagerError::Other(anyhow!(
+                    "PCI devices cannot be assigned while creating from a snapshot"
+                )));
+            }
+            if let Err(error) = self.ensure_pci_compatible(&meta) {
+                let _ = fs::remove_dir_all(&vm_dir);
+                return Err(error);
+            }
+            meta.pci_devices = match self.reserve_pci_devices(&id, &params.pci_device_ids).await {
+                Ok(assignments) => assignments,
+                Err(error) => {
+                    let _ = fs::remove_dir_all(&vm_dir);
+                    return Err(error);
+                }
+            };
+        }
         meta.metadata.insert(
             META_STORAGE_PROFILE.to_string(),
             self.cfg.storage_profile.as_str().to_string(),
         );
         assign_new_portproxy_auth_token(&mut meta.metadata);
 
-        save_metadata(&vm_dir, &mut meta).map_err(ManagerError::Other)?;
+        if let Err(error) = save_metadata(&vm_dir, &mut meta) {
+            self.release_pci_leases(&id, &meta.pci_devices).await;
+            let _ = fs::remove_dir_all(&vm_dir);
+            return Err(ManagerError::Other(error));
+        }
 
         let runtime = VmRuntime::new(&vm_dir);
         let vm = Arc::new(Vm::new(meta.clone(), runtime, vm_dir.clone()));
-        self.insert_creating_vm_with_capacity(id.clone(), vm.clone())
-            .await?;
+        if let Err(error) = self
+            .insert_creating_vm_with_capacity(id.clone(), vm.clone())
+            .await
+        {
+            self.release_pci_leases(&id, &meta.pci_devices).await;
+            let _ = fs::remove_dir_all(&vm_dir);
+            return Err(error);
+        }
         let mut vm_guard = vm.lock_owned().await;
 
         let create_result = match params.source.source_type {
@@ -753,6 +1227,7 @@ impl Manager {
             Ok(vm_guard) => vm_guard,
             Err(err) => {
                 self.vms.write().await.remove(&id);
+                self.release_pci_leases(&id, &meta.pci_devices).await;
                 let _ = fs::remove_dir_all(&vm_dir);
                 return Err(err);
             }
@@ -761,6 +1236,7 @@ impl Manager {
         vm_guard.metadata.state = VmState::Stopped;
         if let Err(err) = save_metadata(&vm.dir, &mut vm_guard.metadata) {
             self.vms.write().await.remove(&id);
+            self.release_pci_leases(&id, &meta.pci_devices).await;
             let _ = fs::remove_dir_all(&vm_dir);
             return Err(ManagerError::Other(err));
         }
@@ -839,10 +1315,19 @@ impl Manager {
                 return Err(ManagerError::InvalidState);
             }
         }
-        let runtime_dir = {
+        let (runtime_dir, assignments) = {
             let inner = vm.lock().await;
-            inner.runtime.runtime_dir.clone()
+            (
+                inner.runtime.runtime_dir.clone(),
+                inner.metadata.pci_devices.clone(),
+            )
         };
+
+        for assignment in assignments.iter().rev() {
+            pci::release_assignment(&self.cfg.pci, assignment)
+                .await
+                .map_err(ManagerError::Other)?;
+        }
 
         fs::remove_dir_all(&vm.dir)?;
         let _ = fs::remove_dir_all(runtime_dir);
@@ -851,6 +1336,7 @@ impl Manager {
             .write()
             .await
             .retain(|_, record| record.vm_id != id);
+        self.release_pci_leases(id, &assignments).await;
         self.cleanup_fork_base_if_unreferenced(fork_base_path).await;
         self.garbage_collect_orphaned_fork_roots().await;
         Ok(())
@@ -865,6 +1351,11 @@ impl Manager {
 
         let parent_state = {
             let inner = parent_vm.lock().await;
+            if !inner.metadata.pci_devices.is_empty() {
+                return Err(ManagerError::Unsupported(
+                    "VMs with assigned PCI devices cannot be forked".to_string(),
+                ));
+            }
             inner.runtime.state
         };
         let parent_was_running = matches!(parent_state, VmState::Running | VmState::Paused);
@@ -1007,6 +1498,7 @@ impl Manager {
             metadata: child_metadata,
             snapshots: child_restore_snapshot.clone().into_iter().collect(),
             shared_mounts: parent_shared_mounts,
+            pci_devices: Vec::new(),
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -1368,7 +1860,7 @@ impl Manager {
         params: SnapshotParams,
     ) -> ManagerResult<PendingSnapshot> {
         let vm = self.vm_by_id(vm_id).await?;
-        let (state, monitor, disk_path, vm_dir, arch) = {
+        let (state, monitor, disk_path, vm_dir, arch, has_pci_devices) = {
             let inner = vm.lock().await;
             (
                 inner.runtime.state,
@@ -1376,8 +1868,15 @@ impl Manager {
                 vm.disk_path(),
                 vm.dir.clone(),
                 inner.metadata.architecture.clone(),
+                !inner.metadata.pci_devices.is_empty(),
             )
         };
+
+        if has_pci_devices {
+            return Err(ManagerError::Unsupported(
+                "VMs with assigned PCI devices cannot be snapshotted".to_string(),
+            ));
+        }
 
         // @dive: Snapshots are always live, paired {disk internal snapshot, external RAM
         //        file} pairs. Stopped VMs have no RAM state to preserve, and a disk-only
@@ -1614,9 +2113,19 @@ impl Manager {
         let host_arch = self.host_arch.clone();
         let id = id.to_string();
 
-        // @dive: Launch has external side effects (FUSE mounts, virtiofsd, qemu). Run it
-        //        in an owned task so caller cancellation/timeouts don't drop the launch
-        //        future halfway through and leave untracked local runtime behind.
+        let booting_from_incoming = {
+            let inner = vm.lock().await;
+            !inner.metadata.boot_incoming_ram_path.is_empty()
+                && boot_incoming_snapshot_matches_current(&inner.metadata)?
+        };
+        if booting_from_incoming {
+            // A deferred incoming qemu is not registered until restore completes. Keep
+            // that launch caller-owned so cancellation drops its kill-on-drop child.
+            return Self::start_vm_inner(cfg, host_arch, vm, id).await;
+        }
+
+        // Ordinary launches retain their established owned-task behavior so caller
+        // cancellation cannot interrupt sidecar and runtime registration cleanup.
         match tokio::spawn(async move { Self::start_vm_inner(cfg, host_arch, vm, id).await }).await
         {
             Ok(result) => result,
@@ -1778,6 +2287,86 @@ impl Manager {
             }
             let starting_from_state = inner.runtime.state;
 
+            if !inner.metadata.pci_devices.is_empty() {
+                if !cfg!(target_os = "linux")
+                    || host_arch != ARCH_AMD64
+                    || inner.metadata.architecture != ARCH_AMD64
+                    || cfg.ha_mode
+                {
+                    return Err(ManagerError::Other(anyhow!(
+                        "assigned PCI devices require a non-HA amd64 Linux host and guest"
+                    )));
+                }
+                let mut resolved = Vec::with_capacity(inner.metadata.pci_devices.len());
+                let mut newly_prepared = Vec::new();
+                for current in &inner.metadata.pci_devices {
+                    let policy = cfg.pci.device(&current.id).ok_or_else(|| {
+                        ManagerError::Other(anyhow!(
+                            "assigned PCI device `{}` is no longer in the vmd allowlist",
+                            current.id
+                        ))
+                    })?;
+                    if policy.bdfs != current.bdfs {
+                        return Err(ManagerError::Other(anyhow!(
+                            "assigned PCI device `{}` no longer matches the vmd allowlist",
+                            current.id
+                        )));
+                    }
+                    if pci::assignment_ready(&cfg.pci, current) {
+                        resolved.push(current.clone());
+                        continue;
+                    }
+                    match pci::prepare_assignment(
+                        &cfg.pci,
+                        &current.id,
+                        cfg.qemu_process.run_as_uid,
+                        cfg.qemu_process.run_as_gid,
+                    )
+                    .await
+                    {
+                        Ok(assignment) => {
+                            newly_prepared.push(assignment.clone());
+                            resolved.push(assignment);
+                        }
+                        Err(error) => {
+                            for assignment in newly_prepared.iter().rev() {
+                                let _ = pci::release_assignment(&cfg.pci, assignment).await;
+                            }
+                            let (error, failed_assignment) =
+                                match error.downcast::<pci::PciRollbackError>() {
+                                    Ok(failure) => {
+                                        (anyhow!(failure.to_string()), Some(failure.assignment))
+                                    }
+                                    Err(error) => (error, None),
+                                };
+                            let mut durable = inner.metadata.pci_devices.clone();
+                            for prepared in newly_prepared.iter().chain(failed_assignment.iter()) {
+                                if let Some(slot) = durable
+                                    .iter_mut()
+                                    .find(|assignment| assignment.id == prepared.id)
+                                {
+                                    *slot = prepared.clone();
+                                }
+                            }
+                            inner.metadata.pci_devices = durable;
+                            if let Err(save_error) = save_metadata(&vm.dir, &mut inner.metadata) {
+                                return Err(ManagerError::Other(error.context(format!(
+                                    "persisting PCI rollback state also failed: {save_error}"
+                                ))));
+                            }
+                            return Err(ManagerError::Other(error));
+                        }
+                    }
+                }
+                inner.metadata.pci_devices = resolved;
+                if let Err(error) = save_metadata(&vm.dir, &mut inner.metadata) {
+                    for assignment in newly_prepared.iter().rev() {
+                        let _ = pci::release_assignment(&cfg.pci, assignment).await;
+                    }
+                    return Err(ManagerError::Other(error));
+                }
+            }
+
             let binary =
                 Self::qemu_binary_for_arch_from(&cfg, &host_arch, &inner.metadata.architecture)?;
 
@@ -1846,7 +2435,7 @@ impl Manager {
             }
             inner.runtime.state = VmState::Creating;
             inner.metadata.state = VmState::Creating;
-            if !boot_incoming_guest_runtime_matches(&inner.metadata)? {
+            if !boot_incoming_snapshot_matches_current(&inner.metadata)? {
                 warn!(
                     vm_id = %id,
                     incoming = %inner.metadata.boot_incoming_ram_path,
@@ -1855,7 +2444,11 @@ impl Manager {
                 inner.metadata.boot_incoming_ram_path.clear();
             }
 
+            // Consume the one-shot incoming path after copying launch metadata. This
+            // keeps cancellation cleanup synchronous while the launch copy still emits
+            // `-incoming defer` and starts the selected RAM format over QMP.
             let snapshot = inner.metadata.clone();
+            inner.metadata.boot_incoming_ram_path.clear();
             save_metadata(&vm.dir, &mut inner.metadata).map_err(ManagerError::Other)?;
 
             (
@@ -2197,31 +2790,30 @@ impl Manager {
         cmd.stdout(std::process::Stdio::from(log_file));
         cmd.stderr(std::process::Stdio::from(stderr_file));
 
-        let mut child = match cmd
-            .spawn()
-            .with_context(|| format!("spawn qemu {}", binary))
-        {
-            Ok(child) => child,
-            Err(err) => {
-                if let Some(cgroup) = qemu_cgroup.take() {
-                    cgroup.cleanup();
+        let booting_from_incoming = !meta_snapshot.boot_incoming_ram_path.is_empty();
+        let mut child =
+            match spawn_launch_child(&mut cmd, &format!("qemu {binary}"), booting_from_incoming) {
+                Ok(child) => child,
+                Err(err) => {
+                    if let Some(cgroup) = qemu_cgroup.take() {
+                        cgroup.cleanup();
+                    }
+                    if let Some(handle) = tap_network_handle.take() {
+                        handle.shutdown().await;
+                    }
+                    if vm_proxy_upstream_addr.is_some() {
+                        let _ = network::unregister_vm_proxy_policy(id).await;
+                    }
+                    for handle in &virtiofsd_handles {
+                        virt::terminate_virtiofsd(handle);
+                    }
+                    for handle in &fuse_handles {
+                        let _ = fuse::unmount_fuse(handle).await;
+                    }
+                    mark_vm_state(&vm, VmState::Error).await;
+                    return Err(ManagerError::Other(err));
                 }
-                if let Some(handle) = tap_network_handle.take() {
-                    handle.shutdown().await;
-                }
-                if vm_proxy_upstream_addr.is_some() {
-                    let _ = network::unregister_vm_proxy_policy(id).await;
-                }
-                for handle in &virtiofsd_handles {
-                    virt::terminate_virtiofsd(handle);
-                }
-                for handle in &fuse_handles {
-                    let _ = fuse::unmount_fuse(handle).await;
-                }
-                mark_vm_state(&vm, VmState::Error).await;
-                return Err(ManagerError::Other(err));
-            }
-        };
+            };
 
         let monitor =
             match virt::wait_for_monitor(qmp_path.as_path(), Duration::from_secs(20)).await {
@@ -2246,7 +2838,6 @@ impl Manager {
                     return Err(err);
                 }
             };
-        let booting_from_incoming = !meta_snapshot.boot_incoming_ram_path.is_empty();
         if booting_from_incoming {
             let ram_format = boot_incoming_ram_format(&meta_snapshot);
             if let Err(err) = virt::start_incoming_migration_from_file(
@@ -2648,6 +3239,11 @@ impl Manager {
         let vm = self.vm_by_id(vm_id).await?;
         let (state, snapshot, disk_path, vm_dir, arch) = {
             let inner = vm.lock().await;
+            if !inner.metadata.pci_devices.is_empty() {
+                return Err(ManagerError::Unsupported(
+                    "VMs with assigned PCI devices cannot restore snapshots".to_string(),
+                ));
+            }
             let state = inner.runtime.state;
             let snapshot = inner
                 .metadata
@@ -2667,6 +3263,18 @@ impl Manager {
         };
 
         let current_runtime_fingerprint = current_guest_runtime_fingerprint(arch.as_str())?;
+        if !snapshot_ram_format_is_supported(&snapshot) {
+            return Err(ManagerError::Unsupported(format!(
+                "snapshot {} uses unsupported RAM format `{}`; only `{}` is supported",
+                snapshot.name,
+                if snapshot.ram_format.trim().is_empty() {
+                    "<missing>"
+                } else {
+                    snapshot.ram_format.as_str()
+                },
+                virt::RAM_SNAPSHOT_FORMAT_MAPPED,
+            )));
+        }
         if snapshot.guest_runtime_fingerprint.as_deref()
             != Some(current_runtime_fingerprint.as_str())
         {
@@ -2689,19 +3297,12 @@ impl Manager {
                 ram_path.display()
             )));
         }
-        if snapshot.ram_format.trim().is_empty() {
-            return Err(ManagerError::Other(anyhow!(
-                "snapshot {} is missing RAM snapshot format metadata; skipping restore because the VM runtime was upgraded",
-                snapshot.name
-            )));
-        }
-
         // @dive: Single restore path for the background-snapshot world. qemu's `-incoming`
         //        flag can only be consumed at launch, so we always: stop the current qemu
         //        process (if any), revert the qcow2 disk state offline via `qemu-img
         //        snapshot -a`, set `boot_incoming_ram_path` on the metadata for the next
-        //        launch, and restart via `start_vm`. After the launch we clear the
-        //        one-shot path so subsequent boots of this VM don't loop back.
+        //        launch, and restart via `start_vm_inner`. The launch consumes the
+        //        one-shot path before spawning qemu so subsequent boots don't loop back.
         if matches!(state, VmState::Running | VmState::Paused) {
             self.force_stop_vm(vm_id).await?;
         }
@@ -2722,33 +3323,13 @@ impl Manager {
 
         let cfg = self.cfg.clone();
         let host_arch = self.host_arch.clone();
-        let start_vm = vm.clone();
-        let clear_vm = vm.clone();
         let launch_vm_id = vm_id.to_string();
-        let clear_vm_id = vm_id.to_string();
 
         // Relaunch qemu; `-incoming file:<path>` consumes the RAM file and brings the
-        // guest back to the running state of the snapshot moment. Keep the one-shot
-        // incoming-pointer cleanup in the same owned task as launch so RPC cancellation
-        // cannot leave future restarts pinned to this RAM file.
-        match tokio::spawn(async move {
-            let result = Self::start_vm_inner(cfg, host_arch, start_vm, launch_vm_id).await;
-            {
-                let mut inner = clear_vm.lock().await;
-                inner.metadata.boot_incoming_ram_path.clear();
-                if let Err(err) = save_metadata(&clear_vm.dir, &mut inner.metadata) {
-                    warn!(vm_id = %clear_vm_id, error = %err, "clear boot_incoming_ram_path failed");
-                }
-            }
-            result
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(err) => Err(ManagerError::Other(anyhow!(
-                "restore_snapshot launch task failed: {err}"
-            ))),
-        }
+        // guest back to the running state of the snapshot moment. `start_vm_inner`
+        // consumes the one-shot incoming pointer before spawning, so this future can
+        // remain cancellation-owned without pinning later starts to the RAM file.
+        Self::start_vm_inner(cfg, host_arch, vm, launch_vm_id).await
     }
 
     async fn create_from_docker(
@@ -3366,6 +3947,15 @@ fn build_qemu_args(
         "virtio-net-pci,netdev=net0,mac={}",
         meta.network.mac
     ));
+    for assignment in &meta.pci_devices {
+        for (function_index, bdf) in assignment.bdfs.iter().enumerate() {
+            args.push("-device".to_string());
+            args.push(format!(
+                "vfio-pci,host={bdf},id={}",
+                pci::qemu_device_id(&assignment.id, function_index)
+            ));
+        }
+    }
     args.push("-display".to_string());
     args.push("none".to_string());
     args.push("-serial".to_string());
@@ -3500,7 +4090,11 @@ fn snapshot_guest_runtime_matches_current(
     Ok(snapshot.guest_runtime_fingerprint.as_deref() == Some(current.as_str()))
 }
 
-fn boot_incoming_guest_runtime_matches(meta: &VmMetadata) -> ManagerResult<bool> {
+fn snapshot_ram_format_is_supported(snapshot: &SnapshotMetadata) -> bool {
+    snapshot.ram_format == virt::RAM_SNAPSHOT_FORMAT_MAPPED
+}
+
+fn boot_incoming_snapshot_matches_current(meta: &VmMetadata) -> ManagerResult<bool> {
     if meta.boot_incoming_ram_path.is_empty() {
         return Ok(true);
     }
@@ -3520,7 +4114,8 @@ fn boot_incoming_guest_runtime_matches(meta: &VmMetadata) -> ManagerResult<bool>
         return Ok(false);
     };
 
-    snapshot_guest_runtime_matches_current(snapshot, meta.architecture.as_str())
+    Ok(snapshot_ram_format_is_supported(snapshot)
+        && snapshot_guest_runtime_matches_current(snapshot, meta.architecture.as_str())?)
 }
 
 fn boot_incoming_ram_format(meta: &VmMetadata) -> &str {
@@ -3528,15 +4123,14 @@ fn boot_incoming_ram_format(meta: &VmMetadata) -> &str {
         .file_name()
         .and_then(|value| value.to_str())
     else {
-        return virt::RAM_SNAPSHOT_FORMAT_LEGACY;
+        return "";
     };
 
     meta.snapshots
         .iter()
         .find(|snapshot| snapshot.ram_file_name == incoming_file_name)
         .map(|snapshot| snapshot.ram_format.as_str())
-        .filter(|format| !format.trim().is_empty())
-        .unwrap_or(virt::RAM_SNAPSHOT_FORMAT_LEGACY)
+        .unwrap_or("")
 }
 
 fn vm_proxy_policy_from_metadata(meta: &VmMetadata) -> Result<network::VmProxyPolicyConfig> {
@@ -3761,6 +4355,17 @@ async fn cleanup_runtime_mounts(vm: &Arc<Vm>) {
     for handle in &fuse_handles {
         let _ = fuse::unmount_fuse(handle).await;
     }
+}
+
+fn spawn_launch_child(
+    command: &mut Command,
+    context_label: &str,
+    cancellation_owned: bool,
+) -> Result<Child> {
+    command.kill_on_drop(cancellation_owned);
+    command
+        .spawn()
+        .with_context(|| format!("spawn {context_label}"))
 }
 
 async fn abort_launch(
@@ -4597,25 +5202,46 @@ fn fork_snapshot_durability(
     }
 }
 
-fn enforce_resource_bounds(resources: &crate::state::ResourceSpec) -> ManagerResult<()> {
-    if resources.vcpu > MAX_VM_VCPU {
+fn positive_resource_bound_from_env(primary: &str, fallback: &str, default: i32) -> Result<i32> {
+    let configured = env::var(primary)
+        .ok()
+        .map(|value| (primary, value))
+        .or_else(|| env::var(fallback).ok().map(|value| (fallback, value)));
+    let Some((name, raw)) = configured else {
+        return Ok(default);
+    };
+    let value = raw
+        .trim()
+        .parse::<i32>()
+        .with_context(|| format!("{name} must be a positive 32-bit integer"))?;
+    if value <= 0 {
+        bail!("{name} must be greater than zero");
+    }
+    Ok(value)
+}
+
+fn enforce_resource_bounds(
+    resources: &crate::state::ResourceSpec,
+    bounds: VmResourceBounds,
+) -> ManagerResult<()> {
+    if resources.vcpu > bounds.max_vcpu {
         return Err(ManagerError::CapacityExceeded {
             resource: "vcpu",
-            limit: MAX_VM_VCPU as usize,
+            limit: bounds.max_vcpu as usize,
             current: resources.vcpu as usize,
         });
     }
-    if resources.memory_mb > MAX_VM_MEMORY_MB {
+    if resources.memory_mb > bounds.max_memory_mb {
         return Err(ManagerError::CapacityExceeded {
             resource: "memory_mb",
-            limit: MAX_VM_MEMORY_MB as usize,
+            limit: bounds.max_memory_mb as usize,
             current: resources.memory_mb as usize,
         });
     }
-    if resources.disk_gb > MAX_VM_DISK_GB {
+    if resources.disk_gb > bounds.max_disk_gb {
         return Err(ManagerError::CapacityExceeded {
             resource: "disk_gb",
-            limit: MAX_VM_DISK_GB as usize,
+            limit: bounds.max_disk_gb as usize,
             current: resources.disk_gb as usize,
         });
     }
@@ -4625,6 +5251,43 @@ fn enforce_resource_bounds(resources: &crate::state::ResourceSpec) -> ManagerRes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_resource_bounds_preserve_existing_admission_limits() {
+        let resources = crate::state::ResourceSpec {
+            vcpu: 8,
+            memory_mb: 32 * 1024,
+            disk_gb: 64,
+        };
+
+        let error = enforce_resource_bounds(&resources, VmResourceBounds::default())
+            .expect_err("default memory ceiling should reject 32 GiB");
+        assert!(matches!(
+            error,
+            ManagerError::CapacityExceeded {
+                resource: "memory_mb",
+                limit: 16_384,
+                current: 32_768,
+            }
+        ));
+    }
+
+    #[test]
+    fn configured_resource_bounds_allow_larger_dedicated_vm() {
+        let resources = crate::state::ResourceSpec {
+            vcpu: 8,
+            memory_mb: 32 * 1024,
+            disk_gb: 64,
+        };
+        let bounds = VmResourceBounds {
+            max_vcpu: 16,
+            max_memory_mb: 64 * 1024,
+            max_disk_gb: 200,
+        };
+
+        enforce_resource_bounds(&resources, bounds)
+            .expect("operator-configured bounds should admit the dedicated VM");
+    }
 
     fn qemu_img_available() -> bool {
         std::process::Command::new("qemu-img")
@@ -4670,6 +5333,59 @@ mod tests {
         .expect("test tap spec")
     }
 
+    fn qemu_test_metadata(vm_id: &str) -> VmMetadata {
+        VmMetadata {
+            id: vm_id.to_string(),
+            name: vm_id.to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            state: VmState::Stopped,
+            architecture: ARCH_AMD64.to_string(),
+            source: VmSource {
+                source_type: VmSourceType::Docker,
+                reference: "mock/image:latest".to_string(),
+            },
+            resources: crate::state::ResourceSpec {
+                vcpu: 1,
+                memory_mb: 512,
+                disk_gb: 10,
+            },
+            network: NetworkSpec {
+                mac: "02:00:00:00:00:20".to_string(),
+                proxy_port: 3000,
+                rpc_port: 3001,
+            },
+            metadata: HashMap::new(),
+            snapshots: Vec::new(),
+            shared_mounts: Vec::new(),
+            pci_devices: Vec::new(),
+            boot_incoming_ram_path: String::new(),
+            started_at: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_launch_kills_owned_child_within_bound() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("exec sleep 30");
+        let child = spawn_launch_child(&mut command, "test qemu", true)
+            .expect("spawn cancellation-owned child");
+        let pid = child.id().expect("spawned child should have a pid");
+        assert!(pid_exists(pid));
+
+        let timeout_result = tokio::time::timeout(Duration::from_millis(25), async move {
+            let _owned_child = child;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert!(timeout_result.is_err(), "launch future should time out");
+        assert!(
+            wait_for_pid_exit(pid, Duration::from_secs(2)).await,
+            "dropping a timed-out launch must kill its child"
+        );
+    }
+
     #[tokio::test]
     async fn fork_vm_stopped_parent_uses_shared_cow_backing() {
         if !qemu_img_available() {
@@ -4707,6 +5423,8 @@ mod tests {
             node_registry: None,
             control_bus: None,
             vfs_internal_service_token: None,
+            pci_policy_path: None,
+            pci: Default::default(),
             qemu_process: Default::default(),
             guest_network: Default::default(),
             network_services: Default::default(),
@@ -4717,7 +5435,9 @@ mod tests {
         let manager = Manager {
             cfg,
             host_arch: test_arch.to_string(),
+            resource_bounds: VmResourceBounds::default(),
             vms: RwLock::new(HashMap::new()),
+            pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };
 
@@ -4787,6 +5507,7 @@ mod tests {
                 vfs_endpoint: String::new(),
                 vfs_scope_path: String::new(),
             }],
+            pci_devices: Vec::new(),
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -4928,6 +5649,7 @@ mod tests {
             metadata: HashMap::new(),
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
+            pci_devices: Vec::new(),
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -4952,6 +5674,8 @@ mod tests {
             node_registry: None,
             control_bus: None,
             vfs_internal_service_token: None,
+            pci_policy_path: None,
+            pci: Default::default(),
             qemu_process: Default::default(),
             guest_network: Default::default(),
             network_services: Default::default(),
@@ -4962,7 +5686,9 @@ mod tests {
         let manager = Manager {
             cfg,
             host_arch: ARCH_AMD64.to_string(),
+            resource_bounds: VmResourceBounds::default(),
             vms: RwLock::new(HashMap::new()),
+            pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };
 
@@ -5002,6 +5728,8 @@ mod tests {
             node_registry: None,
             control_bus: None,
             vfs_internal_service_token: None,
+            pci_policy_path: None,
+            pci: Default::default(),
             qemu_process: Default::default(),
             guest_network: Default::default(),
             network_services: Default::default(),
@@ -5012,7 +5740,9 @@ mod tests {
         let manager = Manager {
             cfg,
             host_arch: ARCH_AMD64.to_string(),
+            resource_bounds: VmResourceBounds::default(),
             vms: RwLock::new(HashMap::new()),
+            pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };
 
@@ -5044,6 +5774,7 @@ mod tests {
             metadata: HashMap::new(),
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
+            pci_devices: Vec::new(),
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -5096,6 +5827,8 @@ mod tests {
             node_registry: None,
             control_bus: None,
             vfs_internal_service_token: None,
+            pci_policy_path: None,
+            pci: Default::default(),
             qemu_process: Default::default(),
             guest_network: Default::default(),
             network_services: Default::default(),
@@ -5106,7 +5839,9 @@ mod tests {
         let manager = Manager {
             cfg,
             host_arch: ARCH_AMD64.to_string(),
+            resource_bounds: VmResourceBounds::default(),
             vms: RwLock::new(HashMap::new()),
+            pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };
 
@@ -5138,6 +5873,7 @@ mod tests {
             metadata: HashMap::from([(META_FORK_DEPTH.to_string(), "1".to_string())]),
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
+            pci_devices: Vec::new(),
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -5205,6 +5941,8 @@ mod tests {
             node_registry: None,
             control_bus: None,
             vfs_internal_service_token: None,
+            pci_policy_path: None,
+            pci: Default::default(),
             qemu_process: Default::default(),
             guest_network: Default::default(),
             network_services: Default::default(),
@@ -5215,7 +5953,9 @@ mod tests {
         let manager = Manager {
             cfg,
             host_arch: ARCH_AMD64.to_string(),
+            resource_bounds: VmResourceBounds::default(),
             vms: RwLock::new(HashMap::new()),
+            pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };
 
@@ -5247,6 +5987,7 @@ mod tests {
             metadata: HashMap::new(),
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
+            pci_devices: Vec::new(),
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -5298,6 +6039,8 @@ mod tests {
             node_registry: None,
             control_bus: None,
             vfs_internal_service_token: None,
+            pci_policy_path: None,
+            pci: Default::default(),
             qemu_process: Default::default(),
             guest_network: Default::default(),
             network_services: Default::default(),
@@ -5308,7 +6051,9 @@ mod tests {
         let manager = Manager {
             cfg,
             host_arch: ARCH_AMD64.to_string(),
+            resource_bounds: VmResourceBounds::default(),
             vms: RwLock::new(HashMap::new()),
+            pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };
 
@@ -5370,6 +6115,7 @@ mod tests {
             ]),
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
+            pci_devices: Vec::new(),
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -5442,6 +6188,49 @@ mod tests {
     }
 
     #[test]
+    fn build_qemu_args_only_emits_vfio_for_explicit_assignments() {
+        let mut meta = qemu_test_metadata("vm-pci-args");
+        let baseline = build_qemu_args(
+            &meta,
+            Path::new("/tmp/vm-pci-args"),
+            Path::new("/tmp/vm-pci-args/qmp.sock"),
+            Path::new("/tmp/vm-pci-args/qemu.pid"),
+            ARCH_AMD64,
+            Some(&test_tap_spec(&meta.id)),
+            &[],
+        )
+        .expect("build baseline qemu args");
+        assert!(!baseline.iter().any(|arg| arg.contains("vfio-pci")));
+
+        meta.pci_devices.push(PciDeviceAssignmentSpec {
+            id: "rtx6000-ada".to_string(),
+            bdfs: vec!["0000:09:00.0".to_string(), "0000:09:00.1".to_string()],
+            iommu_groups: vec!["21".to_string()],
+            original_drivers: HashMap::new(),
+        });
+        let assigned = build_qemu_args(
+            &meta,
+            Path::new("/tmp/vm-pci-args"),
+            Path::new("/tmp/vm-pci-args/qmp.sock"),
+            Path::new("/tmp/vm-pci-args/qemu.pid"),
+            ARCH_AMD64,
+            Some(&test_tap_spec(&meta.id)),
+            &[],
+        )
+        .expect("build assigned qemu args");
+        assert!(
+            assigned
+                .iter()
+                .any(|arg| { arg == "vfio-pci,host=0000:09:00.0,id=pci_rtx6000_ada_0" })
+        );
+        assert!(
+            assigned
+                .iter()
+                .any(|arg| { arg == "vfio-pci,host=0000:09:00.1,id=pci_rtx6000_ada_1" })
+        );
+    }
+
+    #[test]
     fn build_qemu_args_falls_back_to_virtfs_when_virtiofsd_unavailable() {
         // @dive: Dev hosts (notably macOS) cannot run virtiofsd, so vmd passes an empty
         //        handle slice and the builder must fall back to legacy `-virtfs`
@@ -5481,6 +6270,7 @@ mod tests {
                 vfs_endpoint: String::new(),
                 vfs_scope_path: String::new(),
             }],
+            pci_devices: Vec::new(),
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -5546,6 +6336,7 @@ mod tests {
             metadata: HashMap::new(),
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
+            pci_devices: Vec::new(),
             boot_incoming_ram_path: "/srv/chevalier/vms/vm-incoming/snapshots/snap-abc.ram"
                 .to_string(),
             started_at: None,
@@ -5570,6 +6361,20 @@ mod tests {
             .get(incoming_idx + 1)
             .expect("`-incoming` missing its value arg");
         assert_eq!(next, "defer", "unexpected -incoming value");
+    }
+
+    #[test]
+    fn only_mapped_ram_snapshots_are_restore_compatible() {
+        let mut snapshot = new_snapshot_metadata("test".to_string(), String::new());
+
+        snapshot.ram_format = "legacy".to_string();
+        assert!(!snapshot_ram_format_is_supported(&snapshot));
+
+        snapshot.ram_format = String::new();
+        assert!(!snapshot_ram_format_is_supported(&snapshot));
+
+        snapshot.ram_format = virt::RAM_SNAPSHOT_FORMAT_MAPPED.to_string();
+        assert!(snapshot_ram_format_is_supported(&snapshot));
     }
 
     #[test]
@@ -5598,6 +6403,7 @@ mod tests {
             metadata: HashMap::new(),
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
+            pci_devices: Vec::new(),
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -5658,6 +6464,7 @@ mod tests {
             metadata: HashMap::new(),
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
+            pci_devices: Vec::new(),
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -5714,6 +6521,7 @@ mod tests {
             metadata: HashMap::new(),
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
+            pci_devices: Vec::new(),
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -5848,6 +6656,7 @@ mod tests {
                 vfs_endpoint: String::new(),
                 vfs_scope_path: String::new(),
             }],
+            pci_devices: Vec::new(),
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -6042,6 +6851,8 @@ mod tests {
                 node_registry: None,
                 control_bus: None,
                 vfs_internal_service_token: None,
+                pci_policy_path: None,
+                pci: Default::default(),
                 qemu_process: Default::default(),
                 guest_network: Default::default(),
                 network_services: Default::default(),
@@ -6049,7 +6860,9 @@ mod tests {
                 snapshot_staging_dir: None,
             },
             host_arch: ARCH_ARM64.to_string(),
+            resource_bounds: VmResourceBounds::default(),
             vms: RwLock::new(HashMap::new()),
+            pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };
 

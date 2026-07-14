@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::pci::PciDeviceAssignmentSpec;
 use crate::state::runtime::VmRuntime;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -157,8 +158,8 @@ pub struct SnapshotMetadata {
     pub created_at: DateTime<Utc>,
     /// Filename of the external RAM state file under `<vm_dir>/snapshots/`. Required.
     pub ram_file_name: String,
-    /// QEMU RAM migration file format. Empty/missing means the legacy sequential
-    /// `file:` migration stream used before mapped-ram support.
+    /// QEMU RAM migration file format. Only `mapped-ram` is restorable; empty or older
+    /// values are retained in metadata only so callers can reject and cold-start safely.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ram_format: String,
     /// Fingerprint of the guest runtime/bootstrap payload active when the RAM
@@ -187,6 +188,8 @@ pub struct VmMetadata {
     pub snapshots: Vec<SnapshotMetadata>,
     #[serde(default)]
     pub shared_mounts: Vec<SharedMountSpec>,
+    #[serde(default)]
+    pub pci_devices: Vec<PciDeviceAssignmentSpec>,
     /// Absolute path of an external RAM file for the next `start_vm` to consume via
     /// `-incoming file:<path>`. Set transiently by `restore_snapshot` (and by fork Path
     /// A for both parent and child) right before the launch, cleared after the launch
@@ -251,6 +254,7 @@ pub struct CreateVmParams {
     pub auto_start: bool,
     pub architecture: String,
     pub shared_mounts: Vec<SharedMountSpec>,
+    pub pci_device_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]

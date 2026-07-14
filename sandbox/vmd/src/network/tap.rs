@@ -529,6 +529,11 @@ fn cleanup_vm_tap_network(spec: &VmTapNetworkSpec) -> Result<()> {
         "--tproxy-mark",
         TPROXY_MARK_MASKED,
     ]);
+    // Envoy binds a fresh ephemeral port on each VM start. The exact deletion
+    // above cannot identify a TPROXY rule left by an earlier start, so remove
+    // any remaining mangle rules owned by this deterministic tap before the
+    // replacement policy is installed.
+    delete_iptables_chain_rules_for_interface("mangle", "PREROUTING", tap)?;
     for protocol in ["udp", "tcp"] {
         delete_iptables_repeated(&[
             "-t",
@@ -674,6 +679,43 @@ fn delete_iptables_repeated(args: &[&str]) {
             break;
         }
     }
+}
+
+fn delete_iptables_chain_rules_for_interface(
+    table: &str,
+    chain: &str,
+    interface: &str,
+) -> Result<()> {
+    let output = Command::new("iptables")
+        .args(["-t", table, "-L", chain, "-n", "-v", "-x", "--line-numbers"])
+        .output()
+        .with_context(|| format!("list iptables {table}/{chain} rules"))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "iptables failed with status {} while listing {table}/{chain}",
+            output.status
+        ));
+    }
+
+    let mut rule_numbers = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let number = fields.next()?.parse::<u32>().ok()?;
+            fields.any(|field| field == interface).then_some(number)
+        })
+        .collect::<Vec<_>>();
+    rule_numbers.sort_unstable_by(|left, right| right.cmp(left));
+
+    for rule_number in rule_numbers {
+        let rule_number = rule_number.to_string();
+        run_cmd(
+            "iptables",
+            &["-t", table, "-D", chain, rule_number.as_str()],
+        )
+        .with_context(|| format!("delete stale iptables {table}/{chain} rule for {interface}"))?;
+    }
+    Ok(())
 }
 
 fn iptables(args: &[&str], label: &str) -> Result<()> {

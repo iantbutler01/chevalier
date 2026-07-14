@@ -5,6 +5,7 @@ const assert = require("node:assert");
 const os = require("node:os");
 const path = require("node:path");
 const fs = require("node:fs");
+const { createHash } = require("node:crypto");
 const {
   Runtime,
   agentic,
@@ -44,6 +45,95 @@ test("vfs local round-trip", async () => {
   assert.strictEqual((await vfs.read("a.txt")).toString(), "hi chevalier");
   const st = await vfs.stat("a.txt");
   assert.strictEqual(st.kind, "File");
+});
+
+test("vfs bulk metadata preserves request order and missing entries", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "chev-metadata-many-test-"));
+  const vfs = VfsStorage.local(root);
+  await vfs.write("a.txt", Buffer.from("a"));
+  await vfs.write("b.txt", Buffer.from("bb"));
+
+  const rows = await vfs.metadataMany(["b.txt", "missing.txt", "a.txt"]);
+
+  assert.strictEqual(rows[0].path, "b.txt");
+  assert.strictEqual(rows[0].sizeBytes, 2n);
+  assert.strictEqual(rows[1], null);
+  assert.strictEqual(rows[2].path, "a.txt");
+});
+
+test("vfs gateway streams verified uploads and serves bounded ranges", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "chev-stream-test-"));
+  const backing = VfsStorage.local(root);
+  const handler = createVfsGatewayServer({ resolveStore: async () => backing });
+  const payload = Buffer.alloc(3 * 1024 * 1024 + 29, 0x5a);
+  const expected = createHash("sha256").update(payload).digest("hex");
+  const response = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/file?path=large.bin", {
+      method: "PUT",
+      headers: {
+        "content-length": String(payload.length),
+        "x-chevalier-vfs-expected-content-sha256": expected,
+        "x-chevalier-vfs-stream-upload": "1",
+      },
+      body: payload,
+    }),
+  );
+  assert.strictEqual(response.status, 200);
+  assert.strictEqual((await backing.stat("large.bin")).contentHash, expected);
+
+  const range = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/file/raw?path=large.bin", {
+      headers: { range: "bytes=1048576-2097151" },
+    }),
+  );
+  assert.strictEqual(range.status, 206);
+  assert.strictEqual((await range.arrayBuffer()).byteLength, 1024 * 1024);
+  assert.strictEqual(range.headers.get("content-range"), `bytes 1048576-2097151/${payload.length}`);
+});
+
+test("vfs streamed upload rejects torn content and destination CAS races", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "chev-stream-race-test-"));
+  const backing = VfsStorage.local(root);
+  const original = Buffer.from("original");
+  const raced = Buffer.from("raced destination");
+  await backing.write("guarded.bin", original);
+  const originalHash = createHash("sha256").update(original).digest("hex");
+  const payload = Buffer.alloc(2 * 1024 * 1024 + 7, 0x44);
+  const payloadHash = createHash("sha256").update(payload).digest("hex");
+  let raceOnCommit = false;
+  const store = {
+    stat: (path) => backing.stat(path),
+    writeFromFile: async (path, sourcePath, expectedHash, options) => {
+      if (raceOnCommit) {
+        raceOnCommit = false;
+        await backing.write(path, raced);
+      }
+      return backing.writeFromFile(path, sourcePath, expectedHash, options);
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+  const request = (expectedHash) =>
+    handler(
+      new Request("http://local/internal/chevalier/vfs/owner/file?path=guarded.bin", {
+        method: "PUT",
+        headers: {
+          "content-length": String(payload.length),
+          "x-chevalier-vfs-expected-content-sha256": expectedHash,
+          "x-chevalier-vfs-precondition-fingerprint": originalHash,
+          "x-chevalier-vfs-stream-upload": "1",
+        },
+        body: payload,
+      }),
+    );
+
+  const torn = await request("0".repeat(64));
+  assert.strictEqual(torn.status, 409);
+  assert.strictEqual((await backing.read("guarded.bin")).toString(), "original");
+
+  raceOnCommit = true;
+  const racedResponse = await request(payloadHash);
+  assert.strictEqual(racedResponse.status, 409);
+  assert.strictEqual((await backing.read("guarded.bin")).toString(), "raced destination");
 });
 
 test("vfs gateway forwards conditional writes into the backing store", async () => {
@@ -95,6 +185,87 @@ test("vfs gateway forwards conditional writes into the backing store", async () 
     responses.map((response) => response.status).sort(),
     [200, 409],
   );
+});
+
+test("vfs gateway forwards executable metadata on writes", async () => {
+  const seen = [];
+  const store = {
+    async stat() {
+      return null;
+    },
+    async write(path, data, options) {
+      seen.push({ path, body: data.toString("utf8"), options });
+      return { contentHash: "hash", previousHash: null, changed: true };
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+
+  const response = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/file?path=script.sh", {
+      method: "PUT",
+      headers: { "x-chevalier-vfs-executable": "true" },
+      body: "#!/bin/sh\n",
+    }),
+  );
+
+  assert.strictEqual(response.status, 200);
+  assert.deepStrictEqual(seen, [
+    { path: "script.sh", body: "#!/bin/sh\n", options: { executable: true } },
+  ]);
+});
+
+test("vfs gateway reports backing-store listing failures as 500, not an empty-looking 404", async () => {
+  const store = {
+    async listDir() {
+      throw new Error("VFS: [VFS_INTERNAL status=500] disk read failed");
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+
+  const response = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/tree?path=.", { method: "GET" }),
+  );
+
+  assert.strictEqual(response.status, 500);
+  assert.match(await response.text(), /disk read failed/);
+});
+
+test("vfs gateway CAS fingerprints symbolic-link targets", async () => {
+  let target = "target.txt";
+  const store = {
+    async stat(path) {
+      return target === null
+        ? null
+        : { path, kind: "Symlink", sizeBytes: BigInt(target.length), linkTarget: target };
+    },
+    async remove(_path, options) {
+      const current =
+        target === null ? null : `symlink:${createHash("sha256").update(target).digest("hex")}`;
+      if (options?.ifMatch !== current) throw new Error("VFS: [VFS_CONFLICT status=409] stale link");
+      target = null;
+      return { removed: true };
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+  const expected = `symlink:${createHash("sha256").update("target.txt").digest("hex")}`;
+
+  const stale = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/file?path=link.txt", {
+      method: "DELETE",
+      headers: { "x-chevalier-vfs-precondition-fingerprint": "symlink:stale" },
+    }),
+  );
+  assert.strictEqual(stale.status, 409);
+  assert.strictEqual(target, "target.txt");
+
+  const matched = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/file?path=link.txt", {
+      method: "DELETE",
+      headers: { "x-chevalier-vfs-precondition-fingerprint": expected },
+    }),
+  );
+  assert.strictEqual(matched.status, 200);
+  assert.strictEqual(target, null);
 });
 
 test("vfs gateway aliases If-Match and ifMatch into canonical 409 preconditions", async () => {

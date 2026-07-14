@@ -10,7 +10,8 @@ use chevalier_vfs::gateway::{GatewayVfsStorage, GatewayVfsStorageConfig};
 use chevalier_vfs::local::LocalVfsStorage;
 use chevalier_vfs::{
     OptimizedVfsStorage, VfsStorageDirListFilter, VfsStorageEntryKind, VfsStorageError,
-    VfsStorageMetadata, VfsStorageObjectState, VfsStorageWriteOptions, VfsStorageWritePrecondition,
+    VfsStorageMetadata, VfsStorageMetadataFields, VfsStorageObjectState, VfsStorageWriteOptions,
+    VfsStorageWritePrecondition,
 };
 use napi::bindgen_prelude::{BigInt, Buffer};
 use napi_derive::napi;
@@ -112,7 +113,7 @@ fn write_options_from_options(
         return Ok(None);
     };
     let executable = match option_field(options, "executable", "executable") {
-        None | Some(Value::Null) => false,
+        None | Some(Value::Null) => return Ok(None),
         Some(Value::Bool(value)) => *value,
         Some(_) => {
             return Err(invalid_options_err(
@@ -120,11 +121,7 @@ fn write_options_from_options(
             ));
         }
     };
-    if executable {
-        Ok(Some(VfsStorageWriteOptions { executable: true }))
-    } else {
-        Ok(None)
-    }
+    Ok(Some(VfsStorageWriteOptions { executable }))
 }
 
 fn list_filter_from_options(options: Option<&Value>) -> napi::Result<VfsStorageDirListFilter> {
@@ -277,6 +274,34 @@ impl VfsStorage {
         Ok(Buffer::from(b.to_vec()))
     }
 
+    /// Read a bounded byte range without materializing the whole file.
+    #[napi]
+    pub async fn read_range(
+        &self,
+        path: String,
+        offset: BigInt,
+        length: u32,
+    ) -> napi::Result<Buffer> {
+        let (_, offset, lossless) = offset.get_u64();
+        if !lossless {
+            return Err(invalid_options_err(
+                "invalid VFS range: offset must be a non-negative u64",
+            ));
+        }
+        let bytes = self
+            .inner
+            .read_range(
+                &path,
+                chevalier_vfs::VfsStorageReadRange {
+                    offset,
+                    length: u64::from(length),
+                },
+            )
+            .await
+            .map_err(vfs_err)?;
+        Ok(Buffer::from(bytes.to_vec()))
+    }
+
     /// Write a file; returns the write result (JSON: content hash, changed, …).
     #[napi(ts_args_type = "path: string, data: Buffer, options?: VfsWriteOptions | null")]
     pub async fn write(
@@ -298,6 +323,33 @@ impl VfsStorage {
             .await
             .map_err(vfs_err)?;
         to_json(r)
+    }
+
+    /// Atomically install a host-local staged file with bounded memory.
+    #[napi(
+        ts_args_type = "path: string, sourcePath: string, expectedContentHash: string, options?: VfsWriteOptions | null"
+    )]
+    pub async fn write_from_file(
+        &self,
+        path: String,
+        source_path: String,
+        expected_content_hash: String,
+        options: Option<Value>,
+    ) -> napi::Result<serde_json::Value> {
+        let precondition = precondition_from_options(options.as_ref())?;
+        let write_options = write_options_from_options(options.as_ref())?;
+        let result = self
+            .inner
+            .write_from_local_file(
+                &path,
+                PathBuf::from(source_path).as_path(),
+                Some(expected_content_hash.as_str()),
+                precondition,
+                write_options,
+            )
+            .await
+            .map_err(vfs_err)?;
+        to_json(result)
     }
 
     /// Stat a path; returns typed metadata (`sizeBytes` is a `bigint`) or null.
@@ -325,6 +377,23 @@ impl VfsStorage {
             .await
             .map_err(vfs_err)?;
         Ok(items.into_iter().map(VfsMetadata::from).collect())
+    }
+
+    /// Read metadata for an indexed set of paths in one backend request.
+    #[napi]
+    pub async fn metadata_many(
+        &self,
+        paths: Vec<String>,
+    ) -> napi::Result<Vec<Option<VfsMetadata>>> {
+        let items = self
+            .inner
+            .metadata_many(&paths, VfsStorageMetadataFields::default())
+            .await
+            .map_err(vfs_err)?;
+        Ok(items
+            .into_iter()
+            .map(|item| item.map(VfsMetadata::from))
+            .collect())
     }
 
     /// Create a directory.

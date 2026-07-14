@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use uuid::Uuid;
 
+use crate::pci::PciConfig;
+
 pub const BASE_IMAGES_DIR_NAME: &str = "base_images";
 const DEFAULT_NODE_REGISTRY_PREFIX: &str = "/chevalier-sandbox";
 const DEFAULT_NODE_REGISTRY_TTL_SECS: i64 = 15;
@@ -313,6 +315,10 @@ pub struct Config {
     pub shared_mount_profiles: Vec<String>,
     pub vfs_internal_service_token: Option<String>,
     pub qemu_process: QemuProcessConfig,
+    /// Optional root/operator-owned allowlist for dedicated PCI assignment. When
+    /// absent, vmd performs no PCI discovery or host-device operations.
+    pub pci_policy_path: Option<String>,
+    pub pci: PciConfig,
     pub guest_network: GuestNetworkConfig,
     pub network_services: NetworkServicesConfig,
     pub ha_mode: bool,
@@ -346,6 +352,8 @@ impl Default for Config {
             shared_mount_profiles: default_shared_mount_profiles_from_env(),
             vfs_internal_service_token: default_vfs_internal_service_token_from_env(),
             qemu_process: QemuProcessConfig::default(),
+            pci_policy_path: default_pci_policy_path_from_env(),
+            pci: PciConfig::default(),
             guest_network: default_guest_network_from_env(),
             network_services: NetworkServicesConfig::default(),
             ha_mode: default_ha_mode_from_env(),
@@ -418,6 +426,20 @@ impl Config {
         self.shared_mount_profiles =
             normalize_shared_mount_profiles(self.shared_mount_profiles.clone());
         self.qemu_process.normalize()?;
+        self.pci = match self.pci_policy_path.as_deref() {
+            Some(path) if !path.trim().is_empty() => {
+                let path = expand_home(path)?;
+                self.pci_policy_path = Some(canonical_string(&path)?);
+                PciConfig::load(&path)?
+            }
+            _ => {
+                self.pci_policy_path = None;
+                PciConfig::default()
+            }
+        };
+        if self.ha_mode && self.pci.enabled() {
+            bail!("PCI assignment is incompatible with ha mode");
+        }
         self.guest_network.normalize()?;
         self.network_services.normalize(&self.guest_network)?;
         if let Some(registry) = self.node_registry.as_mut() {
@@ -1007,6 +1029,14 @@ fn default_shared_mount_profiles_from_env() -> Vec<String> {
 fn default_vfs_internal_service_token_from_env() -> Option<String> {
     env::var("CHEVALIER_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN")
         .or_else(|_| env::var("BRACKET_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn default_pci_policy_path_from_env() -> Option<String> {
+    env::var("CHEVALIER_SANDBOX_PCI_POLICY")
+        .or_else(|_| env::var("BRACKET_SANDBOX_PCI_POLICY"))
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())

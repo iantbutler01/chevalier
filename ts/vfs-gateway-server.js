@@ -39,9 +39,15 @@ exports.createVfsGatewayServer = createVfsGatewayServer;
 //   DTOs are snake_case; `kind` is exactly "file" | "directory"; errors map
 //   404->NotFound, 400->BadRequest, 409->Conflict (vfs/src/gateway.rs:1016).
 const node_crypto_1 = require("node:crypto");
+const promises_1 = require("node:fs/promises");
+const node_os_1 = require("node:os");
+const node_path_1 = require("node:path");
 const DEFAULT_ROUTE_PREFIX = "/internal/chevalier/vfs";
 const PRECONDITION_FINGERPRINT_HEADER = "x-chevalier-vfs-precondition-fingerprint";
 const IF_MATCH_HEADER = "if-match";
+const EXECUTABLE_HEADER = "x-chevalier-vfs-executable";
+const EXPECTED_CONTENT_HASH_HEADER = "x-chevalier-vfs-expected-content-sha256";
+const STREAM_UPLOAD_HEADER = "x-chevalier-vfs-stream-upload";
 /** Build a WHATWG `(Request) => Promise<Response>` handler that serves chevalier's
  *  VFS gateway protocol, delegating storage to `resolveStore(ownerId)`. */
 function createVfsGatewayServer(opts) {
@@ -79,23 +85,45 @@ function createVfsGatewayServer(opts) {
             if (method === "GET" && op === "file/raw") {
                 if (isGitExcludedPath(relPath))
                     return errorResponse(404, `not found: ${relPath}`);
-                let buf;
-                try {
-                    buf = await store.read(relPath);
-                }
-                catch {
-                    return errorResponse(404, `not found: ${relPath}`);
-                }
-                const range = parseRange(req.headers.get("range"), buf.length);
-                if (range !== null) {
-                    const slice = buf.subarray(range.start, range.end + 1);
+                const requestedRange = req.headers.get("range");
+                if (requestedRange !== null) {
+                    let metadata;
+                    try {
+                        metadata = await store.stat(relPath);
+                    }
+                    catch (error) {
+                        if (isVfsNotFoundError(error))
+                            return errorResponse(404, `not found: ${relPath}`);
+                        throw error;
+                    }
+                    if (metadata === null)
+                        return errorResponse(404, `not found: ${relPath}`);
+                    const size = Number(metadata.sizeBytes);
+                    const range = parseRange(requestedRange, size);
+                    if (range === null)
+                        return errorResponse(416, `invalid range for ${relPath}`);
+                    const length = range.end - range.start + 1;
+                    const streamingStore = store;
+                    const slice = typeof streamingStore.readRange === "function"
+                        ? await streamingStore.readRange(relPath, BigInt(range.start), length)
+                        : (await store.read(relPath)).subarray(range.start, range.end + 1);
                     return new Response(asBody(slice), {
                         status: 206,
                         headers: {
                             "content-type": "application/octet-stream",
-                            "content-range": `bytes ${range.start}-${range.end}/${buf.length}`,
+                            "content-range": `bytes ${range.start}-${range.end}/${size}`,
+                            "content-length": String(slice.byteLength),
                         },
                     });
+                }
+                let buf;
+                try {
+                    buf = await store.read(relPath);
+                }
+                catch (error) {
+                    if (isVfsNotFoundError(error))
+                        return errorResponse(404, `not found: ${relPath}`);
+                    throw error;
                 }
                 return new Response(asBody(buf), {
                     status: 200,
@@ -113,8 +141,10 @@ function createVfsGatewayServer(opts) {
                 try {
                     entries = await store.listDir(dir, maxHashBytes === null ? undefined : { maxHashBytes });
                 }
-                catch {
-                    return errorResponse(404, `not found: ${dir}`);
+                catch (error) {
+                    if (isVfsNotFoundError(error))
+                        return errorResponse(404, `not found: ${dir}`);
+                    throw error;
                 }
                 const nameLike = q.get("name_like");
                 const nameNotLike = q.get("name_not_like");
@@ -139,13 +169,79 @@ function createVfsGatewayServer(opts) {
                 if (isGitExcludedPath(relPath))
                     return errorResponse(400, `excluded path: ${relPath}`);
                 const precondition = requestPrecondition(req, q);
+                const writeOptions = requestWriteOptions(req);
                 const failed = await enforceFingerprintPrecondition(store, relPath, precondition);
                 if (failed !== null)
                     return failed;
+                if (req.headers.get(STREAM_UPLOAD_HEADER) === "1") {
+                    const expectedHash = req.headers.get(EXPECTED_CONTENT_HASH_HEADER)?.trim().toLowerCase() ?? "";
+                    if (!/^[a-f0-9]{64}$/.test(expectedHash)) {
+                        return errorResponse(400, `${EXPECTED_CONTENT_HASH_HEADER} must be a SHA-256 hex digest`);
+                    }
+                    const declaredLength = parseOptionalNonNegativeInteger(req.headers.get("content-length"), "content-length");
+                    if (declaredLength instanceof Response)
+                        return declaredLength;
+                    const stagedDir = await (0, promises_1.mkdtemp)((0, node_path_1.join)((0, node_os_1.tmpdir)(), "chevalier-vfs-upload-"));
+                    const stagedPath = (0, node_path_1.join)(stagedDir, "payload");
+                    try {
+                        const staged = await (0, promises_1.open)(stagedPath, "wx", 0o600);
+                        const hasher = (0, node_crypto_1.createHash)("sha256");
+                        let received = 0;
+                        try {
+                            const reader = req.body?.getReader();
+                            if (reader !== undefined) {
+                                for (;;) {
+                                    const { done, value } = await reader.read();
+                                    if (done)
+                                        break;
+                                    if (value.byteLength === 0)
+                                        continue;
+                                    hasher.update(value);
+                                    await staged.write(value);
+                                    received += value.byteLength;
+                                }
+                            }
+                            await staged.sync();
+                        }
+                        finally {
+                            await staged.close();
+                        }
+                        if (declaredLength !== null && received !== declaredLength) {
+                            return errorResponse(400, `streamed upload length mismatch for ${relPath}`);
+                        }
+                        if (hasher.digest("hex") !== expectedHash) {
+                            return errorResponse(409, `streamed upload hash mismatch for ${relPath}`);
+                        }
+                        const streamingStore = store;
+                        const options = { ...preconditionOptions(precondition), ...writeOptions };
+                        const res = typeof streamingStore.writeFromFile === "function"
+                            ? await streamingStore.writeFromFile(relPath, stagedPath, expectedHash, options)
+                            : await store.write(relPath, await (0, promises_1.readFile)(stagedPath), options);
+                        const value = res;
+                        return json(200, {
+                            path: relPath,
+                            content_hash: value.content_hash ?? value.contentHash ?? expectedHash,
+                            previous_hash: value.previous_hash ?? null,
+                            changed: value.changed ?? true,
+                        });
+                    }
+                    catch (error) {
+                        const conflict = conflictResponseFromStoreError(error, relPath);
+                        if (conflict !== null)
+                            return conflict;
+                        throw error;
+                    }
+                    finally {
+                        await (0, promises_1.rm)(stagedDir, { recursive: true, force: true }).catch(() => undefined);
+                    }
+                }
                 const body = Buffer.from(await req.arrayBuffer());
                 let res;
                 try {
-                    res = (await store.write(relPath, body, preconditionOptions(precondition)));
+                    res = (await store.write(relPath, body, {
+                        ...preconditionOptions(precondition),
+                        ...writeOptions,
+                    }));
                 }
                 catch (e) {
                     const failed = conflictResponseFromStoreError(e, relPath);
@@ -201,7 +297,9 @@ function createVfsGatewayServer(opts) {
                     await store.createSymlink(relPath, target);
                 }
                 catch (e) {
-                    return errorResponse(400, e.message);
+                    if (isVfsBadRequestError(e))
+                        return errorResponse(400, e.message);
+                    throw e;
                 }
                 return new Response(null, { status: 204 });
             }
@@ -211,8 +309,9 @@ function createVfsGatewayServer(opts) {
                 try {
                     await store.rmdir(relPath);
                 }
-                catch {
-                    /* idempotent */
+                catch (error) {
+                    if (!isVfsNotFoundError(error))
+                        throw error;
                 }
                 return new Response(null, { status: 204 });
             }
@@ -257,8 +356,11 @@ function createVfsGatewayServer(opts) {
                         const buf = await store.read(path);
                         entries.push([...buf]);
                     }
-                    catch {
-                        entries.push(null);
+                    catch (error) {
+                        if (isVfsNotFoundError(error))
+                            entries.push(null);
+                        else
+                            throw error;
                     }
                 }
                 return json(200, { entries });
@@ -304,6 +406,8 @@ function createVfsGatewayServer(opts) {
             return errorResponse(404, `unhandled route: ${method} ${op}`);
         }
         catch (e) {
+            if (isVfsBadRequestError(e))
+                return errorResponse(400, e.message);
             return errorResponse(500, `gateway server error: ${e.message}`);
         }
     };
@@ -329,6 +433,29 @@ function isGitExcludedPath(path) {
         .split("/")
         .filter((part) => part !== "" && part !== ".")
         .some((part) => part === ".git");
+}
+function vfsErrorStatus(error) {
+    const value = error;
+    if (typeof value?.status === "number")
+        return value.status;
+    if (typeof value?.statusCode === "number")
+        return value.statusCode;
+    if (typeof value?.code === "number")
+        return value.code;
+    if (typeof value?.message === "string") {
+        const match = /status=(\d{3})/.exec(value.message);
+        if (match !== null)
+            return Number(match[1]);
+    }
+    return null;
+}
+function isVfsNotFoundError(error) {
+    const value = error;
+    return value?.code === "VFS_NOT_FOUND" || vfsErrorStatus(error) === 404;
+}
+function isVfsBadRequestError(error) {
+    const value = error;
+    return value?.code === "VFS_BAD_REQUEST" || vfsErrorStatus(error) === 400;
 }
 function normalizeFingerprint(raw) {
     if (raw === null || raw === undefined)
@@ -359,6 +486,19 @@ function requestPrecondition(req, query) {
     if (raw !== null)
         return preconditionFromRaw(raw);
     return { present: false };
+}
+function requestWriteOptions(req) {
+    const raw = req.headers.get(EXECUTABLE_HEADER);
+    if (raw === null)
+        return {};
+    if (raw === "true")
+        return { executable: true };
+    if (raw === "false")
+        return { executable: false };
+    throw Object.assign(new Error(`${EXECUTABLE_HEADER} must be true or false`), {
+        code: "VFS_BAD_REQUEST",
+        status: 400,
+    });
 }
 function preconditionOptions(precondition) {
     if (!precondition.present)
@@ -409,11 +549,21 @@ async function enforceFingerprintPrecondition(store, path, precondition) {
     if (!precondition.present)
         return null;
     const cur = await store.stat(path);
-    const curHash = cur?.contentHash ?? null;
+    const curHash = mutationFingerprint(cur);
     if (precondition.fingerprint === curHash)
         return null;
     // CAS mismatch -> 409 Conflict; the file is NOT touched (no clobber).
     return errorResponse(409, `precondition failed for ${path}`);
+}
+function mutationFingerprint(metadata) {
+    if (metadata === null)
+        return null;
+    if (metadata.kind.toLowerCase().startsWith("sym")) {
+        return typeof metadata.linkTarget === "string" && metadata.linkTarget !== ""
+            ? `symlink:${(0, node_crypto_1.createHash)("sha256").update(metadata.linkTarget).digest("hex")}`
+            : null;
+    }
+    return metadata.contentHash ?? null;
 }
 /** `VfsStorage` metadata `kind` is PascalCase; the wire uses lowercase kinds. */
 function wireKind(kind) {

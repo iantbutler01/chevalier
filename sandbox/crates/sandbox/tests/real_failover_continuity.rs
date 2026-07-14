@@ -55,6 +55,7 @@ fn failover_sandbox_config(secondary_endpoint: String) -> SandboxConfig {
     let mut cfg = SandboxConfig {
         auto_spawn: false,
         prewarm_on_start: false,
+        default_image: "ghcr.io/bracketdevelopers/uv-builder:main".to_string(),
         connect_timeout: Duration::from_secs(30),
         daemon_start_timeout: Duration::from_secs(30),
         portproxy_ready_timeout: Duration::from_secs(180),

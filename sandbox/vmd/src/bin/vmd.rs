@@ -30,6 +30,9 @@ struct Args {
     qemu_run_as_uid: Option<u32>,
     #[arg(long)]
     qemu_run_as_gid: Option<u32>,
+    /// Root/operator-owned allowlist enabling dedicated PCI assignment.
+    #[arg(long)]
+    pci_policy: Option<String>,
     #[arg(long)]
     guest_dns_server: Option<String>,
     #[arg(long)]
@@ -192,6 +195,9 @@ async fn main() -> Result<()> {
     }
     if let Some(gid) = args.qemu_run_as_gid {
         cfg.qemu_process.run_as_gid = gid;
+    }
+    if let Some(policy) = args.pci_policy {
+        cfg.pci_policy_path = Some(policy);
     }
     if let Some(guest_dns_server) = args.guest_dns_server {
         cfg.guest_network.dns_server = Some(guest_dns_server);

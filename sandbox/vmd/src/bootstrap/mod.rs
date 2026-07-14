@@ -588,6 +588,8 @@ network:
       set-name: chevalier0
       dhcp4: false
       dhcp6: false
+      accept-ra: false
+      link-local: []
       addresses:
         - "$TAP_ADDRESS_CIDR"
       routes:
@@ -1229,6 +1231,8 @@ mod tests {
         assert!(script.contains("net.ipv6.conf.all.disable_ipv6=1"));
         assert!(script.contains("disabling inherited netplan config"));
         assert!(script.contains("chmod 0600 /etc/netplan/90-chevalier-tap.yaml"));
+        assert!(script.contains("accept-ra: false"));
+        assert!(script.contains("link-local: []"));
         assert!(script.contains("ExecStartPre=/usr/local/sbin/chevalier-apply-tap-network.sh"));
         assert!(script.contains("cat <<'EOF' >/usr/local/sbin/chevalier-apply-tap-network.sh"));
         assert!(script.contains("ip -4 addr flush dev \"$TAP_IFACE_VALUE\""));

@@ -21,13 +21,14 @@ use chevalier_sandbox::proto::bracket::portproxy::v1::{
 use chevalier_sandbox::proto::google::protobuf::Empty;
 use chevalier_sandbox::proto::vmd::v1::vmd_service_server::{VmdService, VmdServiceServer};
 use chevalier_sandbox::proto::vmd::v1::{
-    CreateSnapshotRequest, CreateVmRequest, CreateVmStreamResponse, DeleteSnapshotRequest,
-    DeleteVmRequest, ForkVmRequest, ForkVmResponse, GetSnapshotRequest, GetVmRequest,
-    HealthRequest, HealthResponse, InfoRequest, InfoResponse, ListSnapshotsRequest,
-    ListSnapshotsResponse, ListVMsRequest, ListVMsResponse, NetworkSpec, PortProxyPorts,
-    PreDownloadVmImageRequest, PreDownloadVmImageResponse, ResourceSpec, RestoreSnapshotRequest,
-    Snapshot, UpdateVmRequest, Vm, VmActionRequest, VmSource, VmSourceType, VmState,
-    create_vm_stream_response,
+    AttachPciDeviceRequest, CreateSnapshotRequest, CreateVmRequest, CreateVmStreamResponse,
+    DeleteSnapshotRequest, DeleteVmRequest, DetachPciDeviceRequest, ForkVmRequest, ForkVmResponse,
+    GetSnapshotRequest, GetVmRequest, HealthRequest, HealthResponse, InfoRequest, InfoResponse,
+    ListHostPciDevicesRequest, ListHostPciDevicesResponse, ListSnapshotsRequest,
+    ListSnapshotsResponse, ListVMsRequest, ListVMsResponse, NetworkSpec, PciDeviceActionResponse,
+    PortProxyPorts, PreDownloadVmImageRequest, PreDownloadVmImageResponse, ResourceSpec,
+    RestoreSnapshotRequest, Snapshot, UpdateVmRequest, Vm, VmActionRequest, VmSource, VmSourceType,
+    VmState, create_vm_stream_response,
 };
 use chevalier_sandbox::{
     ExecEvent, ExecInput, ExecOptions, ForkOptions, Sandbox, SandboxConfig, SandboxError,
@@ -105,6 +106,7 @@ impl MockVmd {
             snapshots: Vec::new(),
             started_at: None,
             shared_mounts: Vec::new(),
+            pci_devices: Vec::new(),
         }
     }
 
@@ -313,6 +315,30 @@ impl VmdService for MockVmd {
             .vm_mutate(&request.into_inner().vm_id, VmState::Stopped as i32, true)
             .await?;
         Ok(Response::new(vm))
+    }
+
+    async fn list_host_pci_devices(
+        &self,
+        _request: Request<ListHostPciDevicesRequest>,
+    ) -> Result<Response<ListHostPciDevicesResponse>, Status> {
+        Ok(Response::new(ListHostPciDevicesResponse {
+            enabled: false,
+            devices: Vec::new(),
+        }))
+    }
+
+    async fn attach_pci_device(
+        &self,
+        _request: Request<AttachPciDeviceRequest>,
+    ) -> Result<Response<PciDeviceActionResponse>, Status> {
+        Err(Status::failed_precondition("PCI assignment disabled"))
+    }
+
+    async fn detach_pci_device(
+        &self,
+        _request: Request<DetachPciDeviceRequest>,
+    ) -> Result<Response<PciDeviceActionResponse>, Status> {
+        Err(Status::failed_precondition("PCI assignment disabled"))
     }
 
     async fn list_snapshots(
@@ -686,6 +712,7 @@ impl TestHarness {
 fn sandbox_config() -> SandboxConfig {
     SandboxConfig {
         auto_spawn: false,
+        default_image: "ghcr.io/bracketdevelopers/uv-builder:main".to_string(),
         connect_timeout: Duration::from_secs(2),
         daemon_start_timeout: Duration::from_secs(2),
         portproxy_ready_timeout: Duration::from_millis(700),
@@ -711,6 +738,23 @@ async fn wait_for_port_closed(port: u16) {
         sleep(Duration::from_millis(25)).await;
     }
     panic!("timed out waiting for port to close: {port}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn disabled_pci_inventory_is_backward_compatible_without_a_capability_token() {
+    let harness = TestHarness::start().await;
+    let sandbox = Sandbox::connect(harness.vmd_endpoint.clone(), sandbox_config())
+        .await
+        .expect("connect sandbox facade to mock vmd");
+
+    let inventory = sandbox
+        .list_host_pci_devices()
+        .await
+        .expect("disabled inventory should not require a PCI token");
+    assert!(!inventory.enabled);
+    assert!(inventory.devices.is_empty());
+
+    harness.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

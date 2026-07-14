@@ -13,10 +13,13 @@ use std::time::Duration;
 
 use chevalier_sandbox::{
     EventStream, ExecEvent, ExecInput, ExecOptions, ForkOptions,
-    ForwardHandle as EngineForwardHandle, OpenComputerBackendConfig, OpenComputerMountConfig,
-    Sandbox as EngineSandbox, SandboxConfig, SandboxError, SandboxProviderConfig,
-    Session as EngineSession, SessionInfo as EngineSessionInfo, SessionOptions, SharedMount,
-    SharedMountAvailability, SharedMountContinuity, ShellEvent, ShellInput, ShellOptions,
+    ForwardHandle as EngineForwardHandle, HostPciDevice as EngineHostPciDevice,
+    HostPciDeviceState as EngineHostPciDeviceState, HostPciFunction as EngineHostPciFunction,
+    HostPciInventory as EngineHostPciInventory, OpenComputerBackendConfig, OpenComputerMountConfig,
+    PciDeviceAction as EnginePciDeviceAction, ResourceLimits, Sandbox as EngineSandbox,
+    SandboxConfig, SandboxError, SandboxProviderConfig, Session as EngineSession,
+    SessionInfo as EngineSessionInfo, SessionOptions, SharedMount, SharedMountAvailability,
+    SharedMountContinuity, ShellEvent, ShellInput, ShellOptions,
 };
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
@@ -310,6 +313,7 @@ pub struct SessionOpts {
     pub auto_start: Option<bool>,
     pub shared_mounts: Option<Vec<SharedMountOpts>>,
     pub egress_allowlist: Option<Vec<String>>,
+    pub pci_device_ids: Option<Vec<String>>,
 }
 
 impl From<SessionOpts> for SessionOptions {
@@ -328,6 +332,7 @@ impl From<SessionOpts> for SessionOptions {
                 .map(SharedMountOpts::into_shared_mount)
                 .collect(),
             egress_allowlist: o.egress_allowlist,
+            pci_device_ids: o.pci_device_ids.unwrap_or_default(),
             ..Default::default()
         }
     }
@@ -422,6 +427,99 @@ impl From<EngineSessionInfo> for SessionInfoJs {
             branch_id: info.branch_id,
             parent_session_id: info.parent_session_id,
             fork_id: info.fork_id,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct HostPciFunctionJs {
+    pub bdf: String,
+    pub vendor_id: String,
+    pub device_id: String,
+    pub class_code: String,
+    pub driver: String,
+    pub iommu_group: String,
+}
+
+impl From<EngineHostPciFunction> for HostPciFunctionJs {
+    fn from(function: EngineHostPciFunction) -> Self {
+        Self {
+            bdf: function.bdf,
+            vendor_id: function.vendor_id,
+            device_id: function.device_id,
+            class_code: function.class_code,
+            driver: function.driver,
+            iommu_group: function.iommu_group,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct HostPciDeviceJs {
+    pub id: String,
+    pub label: String,
+    pub functions: Vec<HostPciFunctionJs>,
+    pub state: String,
+    pub assigned_vm_id: String,
+    pub managed: bool,
+    pub hotplug_capable: bool,
+    pub unavailable_reason: String,
+}
+
+impl From<EngineHostPciDevice> for HostPciDeviceJs {
+    fn from(device: EngineHostPciDevice) -> Self {
+        let state = match device.state {
+            EngineHostPciDeviceState::Disabled => "disabled",
+            EngineHostPciDeviceState::Unavailable => "unavailable",
+            EngineHostPciDeviceState::Host => "host",
+            EngineHostPciDeviceState::Ready => "ready",
+            EngineHostPciDeviceState::Assigned => "assigned",
+            EngineHostPciDeviceState::Error => "error",
+            EngineHostPciDeviceState::Unknown => "unknown",
+        };
+        Self {
+            id: device.id,
+            label: device.label,
+            functions: device.functions.into_iter().map(Into::into).collect(),
+            state: state.to_string(),
+            assigned_vm_id: device.assigned_vm_id,
+            managed: device.managed,
+            hotplug_capable: device.hotplug_capable,
+            unavailable_reason: device.unavailable_reason,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct HostPciInventoryJs {
+    pub enabled: bool,
+    pub devices: Vec<HostPciDeviceJs>,
+}
+
+impl From<EngineHostPciInventory> for HostPciInventoryJs {
+    fn from(inventory: EngineHostPciInventory) -> Self {
+        Self {
+            enabled: inventory.enabled,
+            devices: inventory.devices.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct PciDeviceActionJs {
+    pub device: Option<HostPciDeviceJs>,
+    pub restart_required: bool,
+    pub detail: String,
+    pub vm_state: String,
+}
+
+impl From<EnginePciDeviceAction> for PciDeviceActionJs {
+    fn from(action: EnginePciDeviceAction) -> Self {
+        Self {
+            device: action.device.map(Into::into),
+            restart_required: action.restart_required,
+            detail: action.detail,
+            vm_state: vm_state_label(action.vm_state),
         }
     }
 }
@@ -527,10 +625,51 @@ impl Session {
         self.inner.state().await.map(vm_state_label).map_err(sb_err)
     }
 
+    #[napi]
+    pub async fn list_pci_devices(&self) -> napi::Result<HostPciInventoryJs> {
+        self.inner
+            .list_pci_devices()
+            .await
+            .map(Into::into)
+            .map_err(sb_err)
+    }
+
+    #[napi]
+    pub async fn attach_pci_device(&self, device_id: String) -> napi::Result<PciDeviceActionJs> {
+        self.inner
+            .attach_pci_device(&device_id)
+            .await
+            .map(Into::into)
+            .map_err(sb_err)
+    }
+
+    #[napi]
+    pub async fn detach_pci_device(&self, device_id: String) -> napi::Result<PciDeviceActionJs> {
+        self.inner
+            .detach_pci_device(&device_id)
+            .await
+            .map(Into::into)
+            .map_err(sb_err)
+    }
+
     /// Pause the VM without deleting it.
     #[napi]
     pub async fn pause(&self) -> napi::Result<String> {
         self.inner.pause().await.map(vm_state_label).map_err(sb_err)
+    }
+
+    #[napi]
+    pub async fn start(&self) -> napi::Result<String> {
+        self.inner.start().await.map(vm_state_label).map_err(sb_err)
+    }
+
+    #[napi]
+    pub async fn restart(&self) -> napi::Result<String> {
+        self.inner
+            .restart()
+            .await
+            .map(vm_state_label)
+            .map_err(sb_err)
     }
 
     /// Resume a paused VM.
@@ -647,11 +786,29 @@ impl Session {
 #[napi(object)]
 pub struct SandboxConnectOptions {
     pub auth_token: Option<String>,
+    pub pci_access_token: Option<String>,
     pub connect_timeout_ms: Option<f64>,
     pub default_image: Option<String>,
     pub default_architecture: Option<String>,
+    pub default_vcpu: Option<u32>,
+    pub default_memory_mb: Option<u32>,
+    pub default_disk_gb: Option<u32>,
     pub provider: Option<String>,
     pub open_computer: Option<OpenComputerProviderOpts>,
+}
+
+fn positive_resource(value: Option<u32>, label: &str) -> Result<Option<i32>, SandboxError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value == 0 {
+        return Err(SandboxError::InvalidConfig(format!(
+            "{label} must be greater than zero"
+        )));
+    }
+    i32::try_from(value)
+        .map(Some)
+        .map_err(|_| SandboxError::InvalidConfig(format!("{label} exceeds the supported maximum")))
 }
 
 #[napi(object)]
@@ -764,6 +921,9 @@ impl Sandbox {
             if let Some(t) = o.auth_token {
                 cfg.auth_token = Some(t);
             }
+            if let Some(token) = o.pci_access_token {
+                cfg.pci_access_token = Some(token);
+            }
             if let Some(ms) = o.connect_timeout_ms {
                 cfg.connect_timeout = Duration::from_millis(ms as u64);
             }
@@ -773,6 +933,17 @@ impl Sandbox {
             if let Some(architecture) = o.default_architecture {
                 cfg.default_architecture = Some(architecture);
             }
+            cfg.default_resources = ResourceLimits {
+                vcpu: positive_resource(o.default_vcpu, "default vCPU count")
+                    .map_err(sb_err)?
+                    .unwrap_or(cfg.default_resources.vcpu),
+                memory_mb: positive_resource(o.default_memory_mb, "default memory MB")
+                    .map_err(sb_err)?
+                    .unwrap_or(cfg.default_resources.memory_mb),
+                disk_gb: positive_resource(o.default_disk_gb, "default disk GB")
+                    .map_err(sb_err)?
+                    .unwrap_or(cfg.default_resources.disk_gb),
+            };
             let provider = o.provider.unwrap_or_else(|| "chevalier".to_string());
             match provider.as_str() {
                 "chevalier" | "local" | "vmd" => {}
@@ -813,11 +984,31 @@ impl Sandbox {
         Ok(Session { inner: s })
     }
 
+    /// Attach without restoring, starting, or probing the VM.
+    #[napi]
+    pub async fn attach_session_passive(&self, session_id: String) -> napi::Result<Session> {
+        let s = self
+            .inner
+            .attach_session_passive(&session_id)
+            .await
+            .map_err(sb_err)?;
+        Ok(Session { inner: s })
+    }
+
     /// List live sessions visible to this sandbox provider.
     #[napi]
     pub async fn list_sessions(&self) -> napi::Result<Vec<SessionInfoJs>> {
         let sessions = self.inner.list_sessions().await.map_err(sb_err)?;
         Ok(sessions.into_iter().map(Into::into).collect())
+    }
+
+    #[napi]
+    pub async fn list_host_pci_devices(&self) -> napi::Result<HostPciInventoryJs> {
+        self.inner
+            .list_host_pci_devices()
+            .await
+            .map(Into::into)
+            .map_err(sb_err)
     }
 
     /// Discard a provider session by id, even if this process does not hold a Session handle.

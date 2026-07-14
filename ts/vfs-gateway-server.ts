@@ -35,12 +35,28 @@
 //   - POST {owner}/{metadata-many,read-many,write-many} -> batch (per-path loop)
 //   DTOs are snake_case; `kind` is exactly "file" | "directory"; errors map
 //   404->NotFound, 400->BadRequest, 409->Conflict (vfs/src/gateway.rs:1016).
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdtemp, open, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { VfsStorage, VfsMetadata } from "./native.js";
 
 const DEFAULT_ROUTE_PREFIX = "/internal/chevalier/vfs";
 const PRECONDITION_FINGERPRINT_HEADER = "x-chevalier-vfs-precondition-fingerprint";
 const IF_MATCH_HEADER = "if-match";
+const EXECUTABLE_HEADER = "x-chevalier-vfs-executable";
+const EXPECTED_CONTENT_HASH_HEADER = "x-chevalier-vfs-expected-content-sha256";
+const STREAM_UPLOAD_HEADER = "x-chevalier-vfs-stream-upload";
+
+type StreamingVfsStorage = VfsStorage & {
+  readRange?: (path: string, offset: bigint, length: number) => Promise<Buffer>;
+  writeFromFile?: (
+    path: string,
+    sourcePath: string,
+    expectedContentHash: string,
+    options?: { ifMatch?: string | null; executable?: boolean } | null,
+  ) => Promise<unknown>;
+};
 
 export interface VfsGatewayServerOptions {
   /** Map a request's `{owner_id}` to the backing store. Typically
@@ -90,22 +106,40 @@ export function createVfsGatewayServer(
 
       if (method === "GET" && op === "file/raw") {
         if (isGitExcludedPath(relPath)) return errorResponse(404, `not found: ${relPath}`);
-        let buf: Buffer;
-        try {
-          buf = await store.read(relPath);
-        } catch {
-          return errorResponse(404, `not found: ${relPath}`);
-        }
-        const range = parseRange(req.headers.get("range"), buf.length);
-        if (range !== null) {
-          const slice = buf.subarray(range.start, range.end + 1);
+        const requestedRange = req.headers.get("range");
+        if (requestedRange !== null) {
+          let metadata: VfsMetadata | null;
+          try {
+            metadata = await store.stat(relPath);
+          } catch (error) {
+            if (isVfsNotFoundError(error)) return errorResponse(404, `not found: ${relPath}`);
+            throw error;
+          }
+          if (metadata === null) return errorResponse(404, `not found: ${relPath}`);
+          const size = Number(metadata.sizeBytes);
+          const range = parseRange(requestedRange, size);
+          if (range === null) return errorResponse(416, `invalid range for ${relPath}`);
+          const length = range.end - range.start + 1;
+          const streamingStore = store as StreamingVfsStorage;
+          const slice =
+            typeof streamingStore.readRange === "function"
+              ? await streamingStore.readRange(relPath, BigInt(range.start), length)
+              : (await store.read(relPath)).subarray(range.start, range.end + 1);
           return new Response(asBody(slice), {
             status: 206,
             headers: {
               "content-type": "application/octet-stream",
-              "content-range": `bytes ${range.start}-${range.end}/${buf.length}`,
+              "content-range": `bytes ${range.start}-${range.end}/${size}`,
+              "content-length": String(slice.byteLength),
             },
           });
+        }
+        let buf: Buffer;
+        try {
+          buf = await store.read(relPath);
+        } catch (error) {
+          if (isVfsNotFoundError(error)) return errorResponse(404, `not found: ${relPath}`);
+          throw error;
         }
         return new Response(asBody(buf), {
           status: 200,
@@ -127,8 +161,9 @@ export function createVfsGatewayServer(
             dir,
             maxHashBytes === null ? undefined : { maxHashBytes },
           );
-        } catch {
-          return errorResponse(404, `not found: ${dir}`);
+        } catch (error) {
+          if (isVfsNotFoundError(error)) return errorResponse(404, `not found: ${dir}`);
+          throw error;
         }
         const nameLike = q.get("name_like");
         const nameNotLike = q.get("name_not_like");
@@ -154,8 +189,70 @@ export function createVfsGatewayServer(
       if (method === "PUT" && op === "file") {
         if (isGitExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
         const precondition = requestPrecondition(req, q);
+        const writeOptions = requestWriteOptions(req);
         const failed = await enforceFingerprintPrecondition(store, relPath, precondition);
         if (failed !== null) return failed;
+        if (req.headers.get(STREAM_UPLOAD_HEADER) === "1") {
+          const expectedHash = req.headers.get(EXPECTED_CONTENT_HASH_HEADER)?.trim().toLowerCase() ?? "";
+          if (!/^[a-f0-9]{64}$/.test(expectedHash)) {
+            return errorResponse(400, `${EXPECTED_CONTENT_HASH_HEADER} must be a SHA-256 hex digest`);
+          }
+          const declaredLength = parseOptionalNonNegativeInteger(req.headers.get("content-length"), "content-length");
+          if (declaredLength instanceof Response) return declaredLength;
+          const stagedDir = await mkdtemp(join(tmpdir(), "chevalier-vfs-upload-"));
+          const stagedPath = join(stagedDir, "payload");
+          try {
+            const staged = await open(stagedPath, "wx", 0o600);
+            const hasher = createHash("sha256");
+            let received = 0;
+            try {
+              const reader = req.body?.getReader();
+              if (reader !== undefined) {
+                for (;;) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  if (value.byteLength === 0) continue;
+                  hasher.update(value);
+                  await staged.write(value);
+                  received += value.byteLength;
+                }
+              }
+              await staged.sync();
+            } finally {
+              await staged.close();
+            }
+            if (declaredLength !== null && received !== declaredLength) {
+              return errorResponse(400, `streamed upload length mismatch for ${relPath}`);
+            }
+            if (hasher.digest("hex") !== expectedHash) {
+              return errorResponse(409, `streamed upload hash mismatch for ${relPath}`);
+            }
+            const streamingStore = store as StreamingVfsStorage;
+            const options = { ...preconditionOptions(precondition), ...writeOptions };
+            const res =
+              typeof streamingStore.writeFromFile === "function"
+                ? await streamingStore.writeFromFile(relPath, stagedPath, expectedHash, options)
+                : await store.write(relPath, await readFile(stagedPath), options);
+            const value = res as {
+              content_hash?: string;
+              contentHash?: string;
+              previous_hash?: string | null;
+              changed?: boolean;
+            };
+            return json(200, {
+              path: relPath,
+              content_hash: value.content_hash ?? value.contentHash ?? expectedHash,
+              previous_hash: value.previous_hash ?? null,
+              changed: value.changed ?? true,
+            });
+          } catch (error) {
+            const conflict = conflictResponseFromStoreError(error, relPath);
+            if (conflict !== null) return conflict;
+            throw error;
+          } finally {
+            await rm(stagedDir, { recursive: true, force: true }).catch(() => undefined);
+          }
+        }
         const body = Buffer.from(await req.arrayBuffer());
         let res: {
           content_hash?: string;
@@ -164,7 +261,10 @@ export function createVfsGatewayServer(
           changed?: boolean;
         };
         try {
-          res = (await store.write(relPath, body, preconditionOptions(precondition))) as {
+          res = (await store.write(relPath, body, {
+            ...preconditionOptions(precondition),
+            ...writeOptions,
+          })) as {
             content_hash?: string;
             contentHash?: string;
             previous_hash?: string | null;
@@ -217,7 +317,8 @@ export function createVfsGatewayServer(
         try {
           await store.createSymlink(relPath, target);
         } catch (e) {
-          return errorResponse(400, (e as Error).message);
+          if (isVfsBadRequestError(e)) return errorResponse(400, (e as Error).message);
+          throw e;
         }
         return new Response(null, { status: 204 });
       }
@@ -225,8 +326,8 @@ export function createVfsGatewayServer(
         if (isGitExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
         try {
           await store.rmdir(relPath);
-        } catch {
-          /* idempotent */
+        } catch (error) {
+          if (!isVfsNotFoundError(error)) throw error;
         }
         return new Response(null, { status: 204 });
       }
@@ -272,8 +373,9 @@ export function createVfsGatewayServer(
           try {
             const buf = await store.read(path);
             entries.push([...buf]);
-          } catch {
-            entries.push(null);
+          } catch (error) {
+            if (isVfsNotFoundError(error)) entries.push(null);
+            else throw error;
           }
         }
         return json(200, { entries });
@@ -334,6 +436,7 @@ export function createVfsGatewayServer(
 
       return errorResponse(404, `unhandled route: ${method} ${op}`);
     } catch (e) {
+      if (isVfsBadRequestError(e)) return errorResponse(400, (e as Error).message);
       return errorResponse(500, `gateway server error: ${(e as Error).message}`);
     }
   };
@@ -362,6 +465,28 @@ function isGitExcludedPath(path: string): boolean {
     .split("/")
     .filter((part) => part !== "" && part !== ".")
     .some((part) => part === ".git");
+}
+
+function vfsErrorStatus(error: unknown): number | null {
+  const value = error as { status?: unknown; statusCode?: unknown; code?: unknown; message?: unknown };
+  if (typeof value?.status === "number") return value.status;
+  if (typeof value?.statusCode === "number") return value.statusCode;
+  if (typeof value?.code === "number") return value.code;
+  if (typeof value?.message === "string") {
+    const match = /status=(\d{3})/.exec(value.message);
+    if (match !== null) return Number(match[1]);
+  }
+  return null;
+}
+
+function isVfsNotFoundError(error: unknown): boolean {
+  const value = error as { code?: unknown; message?: unknown };
+  return value?.code === "VFS_NOT_FOUND" || vfsErrorStatus(error) === 404;
+}
+
+function isVfsBadRequestError(error: unknown): boolean {
+  const value = error as { code?: unknown };
+  return value?.code === "VFS_BAD_REQUEST" || vfsErrorStatus(error) === 400;
 }
 
 type FingerprintPrecondition =
@@ -398,6 +523,17 @@ function requestPrecondition(req: Request, query: URLSearchParams): FingerprintP
     queryIfMatch(query);
   if (raw !== null) return preconditionFromRaw(raw);
   return { present: false };
+}
+
+function requestWriteOptions(req: Request): { executable?: boolean } {
+  const raw = req.headers.get(EXECUTABLE_HEADER);
+  if (raw === null) return {};
+  if (raw === "true") return { executable: true };
+  if (raw === "false") return { executable: false };
+  throw Object.assign(new Error(`${EXECUTABLE_HEADER} must be true or false`), {
+    code: "VFS_BAD_REQUEST",
+    status: 400,
+  });
 }
 
 function preconditionOptions(
@@ -468,10 +604,20 @@ async function enforceFingerprintPrecondition(
 ): Promise<Response | null> {
   if (!precondition.present) return null;
   const cur = await store.stat(path);
-  const curHash = cur?.contentHash ?? null;
+  const curHash = mutationFingerprint(cur);
   if (precondition.fingerprint === curHash) return null;
   // CAS mismatch -> 409 Conflict; the file is NOT touched (no clobber).
   return errorResponse(409, `precondition failed for ${path}`);
+}
+
+function mutationFingerprint(metadata: VfsMetadata | null): string | null {
+  if (metadata === null) return null;
+  if (metadata.kind.toLowerCase().startsWith("sym")) {
+    return typeof metadata.linkTarget === "string" && metadata.linkTarget !== ""
+      ? `symlink:${createHash("sha256").update(metadata.linkTarget).digest("hex")}`
+      : null;
+  }
+  return metadata.contentHash ?? null;
 }
 
 /** `VfsStorage` metadata `kind` is PascalCase; the wire uses lowercase kinds. */

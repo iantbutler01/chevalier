@@ -88,6 +88,41 @@ message SharedMount {
   string vfs_scope_path = 9;
 }
 
+enum HostPciDeviceState {
+  HOST_PCI_DEVICE_STATE_UNSPECIFIED = 0;
+  HOST_PCI_DEVICE_STATE_DISABLED = 1;
+  HOST_PCI_DEVICE_STATE_UNAVAILABLE = 2;
+  HOST_PCI_DEVICE_STATE_HOST = 3;
+  HOST_PCI_DEVICE_STATE_READY = 4;
+  HOST_PCI_DEVICE_STATE_ASSIGNED = 5;
+  HOST_PCI_DEVICE_STATE_ERROR = 6;
+}
+
+message HostPciFunction {
+  string bdf = 1;
+  string vendor_id = 2;
+  string device_id = 3;
+  string class_code = 4;
+  string driver = 5;
+  string iommu_group = 6;
+}
+
+message HostPciDevice {
+  string id = 1;
+  string label = 2;
+  repeated HostPciFunction functions = 3;
+  HostPciDeviceState state = 4;
+  string assigned_vm_id = 5;
+  bool managed = 6;
+  bool hotplug_capable = 7;
+  string unavailable_reason = 8;
+}
+
+message PciDeviceAssignment {
+  string id = 1;
+  repeated string bdfs = 2;
+}
+
 message Snapshot {
   string id = 1;
   string name = 2;
@@ -110,6 +145,7 @@ message VM {
   repeated Snapshot snapshots = 11;
   google.protobuf.Timestamp started_at = 12;
   repeated SharedMount shared_mounts = 13;
+  repeated PciDeviceAssignment pci_devices = 14;
 }
 
 message ListVMsRequest {
@@ -132,6 +168,31 @@ message CreateVMRequest {
   bool auto_start = 5;
   string architecture = 6;
   repeated SharedMount shared_mounts = 7;
+  repeated string pci_device_ids = 8;
+}
+
+message ListHostPciDevicesRequest {}
+
+message ListHostPciDevicesResponse {
+  bool enabled = 1;
+  repeated HostPciDevice devices = 2;
+}
+
+message AttachPciDeviceRequest {
+  string vm_id = 1;
+  string device_id = 2;
+}
+
+message DetachPciDeviceRequest {
+  string vm_id = 1;
+  string device_id = 2;
+}
+
+message PciDeviceActionResponse {
+  VM vm = 1;
+  HostPciDevice device = 2;
+  bool restart_required = 3;
+  string detail = 4;
 }
 
 enum CreateVmPhase {
@@ -254,6 +315,10 @@ service VMDService {
   rpc PauseVM(VMActionRequest) returns (VM);
   rpc ResumeVM(VMActionRequest) returns (VM);
   rpc ForceStopVM(VMActionRequest) returns (VM);
+
+  rpc ListHostPciDevices(ListHostPciDevicesRequest) returns (ListHostPciDevicesResponse);
+  rpc AttachPciDevice(AttachPciDeviceRequest) returns (PciDeviceActionResponse);
+  rpc DetachPciDevice(DetachPciDeviceRequest) returns (PciDeviceActionResponse);
 
   rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
   rpc CreateSnapshot(CreateSnapshotRequest) returns (Snapshot);

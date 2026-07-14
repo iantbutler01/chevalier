@@ -68,6 +68,7 @@ fn control_plane_sandbox_config() -> SandboxConfig {
     let mut cfg = SandboxConfig {
         auto_spawn: false,
         prewarm_on_start: false,
+        default_image: "ghcr.io/bracketdevelopers/uv-builder:main".to_string(),
         connect_timeout: Duration::from_secs(15),
         daemon_start_timeout: Duration::from_secs(20),
         distributed_control: Some(distributed_control_config_from_env()),
@@ -81,6 +82,7 @@ fn direct_sandbox_config() -> SandboxConfig {
     let mut cfg = SandboxConfig {
         auto_spawn: false,
         prewarm_on_start: false,
+        default_image: "ghcr.io/bracketdevelopers/uv-builder:main".to_string(),
         connect_timeout: Duration::from_secs(15),
         daemon_start_timeout: Duration::from_secs(20),
         distributed_control: None,

@@ -4,16 +4,21 @@
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures::TryStreamExt;
+use http_body::Frame;
+use http_body_util::StreamBody;
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
+use std::{path::Path, time::Duration};
+use tokio_util::io::ReaderStream;
 
 use crate::{
     OptimizedVfsStorage, VfsStorageDeleteResult, VfsStorageDirListFilter, VfsStorageEntryKind,
     VfsStorageError, VfsStorageMetadata, VfsStorageMetadataFields, VfsStorageObjectState,
     VfsStoragePrefetchOptions, VfsStoragePrefetchResult, VfsStorageReadIfChanged,
     VfsStorageReadIfChangedResult, VfsStorageReadRange, VfsStorageRenameResult, VfsStorageResult,
-    VfsStorageSubtreeOptions, VfsStorageWrite, VfsStorageWritePrecondition, VfsStorageWriteResult,
-    pack::hex_hash,
+    VfsStorageSubtreeOptions, VfsStorageWrite, VfsStorageWriteOptions, VfsStorageWritePrecondition,
+    VfsStorageWriteResult, pack::hex_hash,
 };
 
 const COMPONENT_HEADER: &str = "x-chevalier-vfs-component";
@@ -25,6 +30,9 @@ const LOCK_OWNER_TOKEN_HEADER: &str = "x-chevalier-vfs-lock-owner-token";
 const PRECONDITION_FINGERPRINT_HEADER: &str = "x-chevalier-vfs-precondition-fingerprint";
 const PRECONDITION_SECONDARY_FINGERPRINT_HEADER: &str =
     "x-chevalier-vfs-precondition-secondary-fingerprint";
+const EXECUTABLE_HEADER: &str = "x-chevalier-vfs-executable";
+const EXPECTED_CONTENT_HASH_HEADER: &str = "x-chevalier-vfs-expected-content-sha256";
+const STREAM_UPLOAD_HEADER: &str = "x-chevalier-vfs-stream-upload";
 const DEFAULT_COMPONENT: &str = "vfs_gateway_storage";
 const DEFAULT_REASON: &str = "gateway vfs storage mutation";
 const OP_WRITE: &str = "vfs_write_through";
@@ -33,6 +41,8 @@ const OP_UNLINK: &str = "vfs_unlink";
 const OP_RMDIR: &str = "vfs_rmdir";
 const OP_RENAME: &str = "vfs_rename";
 const OP_SYMLINK: &str = "vfs_symlink";
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct GatewayVfsStorageConfig {
@@ -92,7 +102,11 @@ impl GatewayVfsStorage {
     pub fn new(cfg: GatewayVfsStorageConfig) -> Self {
         Self {
             cfg,
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+                .timeout(DEFAULT_REQUEST_TIMEOUT)
+                .build()
+                .expect("default VFS gateway HTTP client must build"),
         }
     }
 
@@ -483,23 +497,17 @@ impl OptimizedVfsStorage for GatewayVfsStorage {
         bytes: Bytes,
         precondition: Option<VfsStorageWritePrecondition>,
     ) -> VfsStorageResult<VfsStorageWriteResult> {
-        if precondition.is_some() {
-            return self
-                .write_many_atomic(vec![VfsStorageWrite {
-                    path: path.to_string(),
-                    bytes,
-                    token_count: None,
-                    precondition,
-                }])
-                .await?
-                .into_iter()
-                .next()
-                .ok_or_else(|| {
-                    VfsStorageError::Internal(
-                        "gateway precondition write returned no result".into(),
-                    )
-                });
-        }
+        self.write_with_options(path, bytes, precondition, None)
+            .await
+    }
+
+    async fn write_with_options(
+        &self,
+        path: &str,
+        bytes: Bytes,
+        precondition: Option<VfsStorageWritePrecondition>,
+        options: Option<VfsStorageWriteOptions>,
+    ) -> VfsStorageResult<VfsStorageWriteResult> {
         let previous_hash = self
             .stat(path)
             .await?
@@ -508,24 +516,84 @@ impl OptimizedVfsStorage for GatewayVfsStorage {
         let lease = self
             .acquire_lease(path, 1, self.cfg.mutation_reason.as_str())
             .await?;
-        let result = self
-            .send(
-                self.mutation_headers(
-                    self.client
-                        .put(self.url("/file"))
-                        .query(&[("path", self.path_arg(path))])
-                        .body(bytes),
-                    &lease,
-                    OP_WRITE,
-                ),
+        let mut request = self.mutation_headers_with_precondition(
+            self.client
+                .put(self.url("/file"))
+                .query(&[("path", self.path_arg(path))])
+                .body(bytes),
+            &lease,
+            OP_WRITE,
+            precondition.as_ref(),
+        );
+        if let Some(options) = options {
+            request = request.header(EXECUTABLE_HEADER, options.executable.to_string());
+        }
+        let result = self.send(request).await.map(|_| VfsStorageWriteResult {
+            path: path.to_string(),
+            content_hash: next_hash.clone(),
+            previous_hash: previous_hash.clone(),
+            changed: previous_hash.as_deref() != Some(next_hash.as_str()),
+        });
+        self.release_after(&lease, result).await
+    }
+
+    async fn write_from_local_file(
+        &self,
+        path: &str,
+        source_path: &Path,
+        expected_content_hash: Option<&str>,
+        precondition: Option<VfsStorageWritePrecondition>,
+        options: Option<VfsStorageWriteOptions>,
+    ) -> VfsStorageResult<VfsStorageWriteResult> {
+        let metadata = tokio::fs::metadata(source_path).await.map_err(|error| {
+            VfsStorageError::Internal(format!("stat staged VFS upload: {error}"))
+        })?;
+        if !metadata.is_file() {
+            return Err(VfsStorageError::BadRequest(
+                "staged VFS upload source is not a regular file".to_string(),
+            ));
+        }
+        let expected_content_hash = expected_content_hash.ok_or_else(|| {
+            VfsStorageError::BadRequest(
+                "streamed gateway writes require an expected content hash".to_string(),
             )
-            .await
-            .map(|_| VfsStorageWriteResult {
-                path: path.to_string(),
-                content_hash: next_hash.clone(),
-                previous_hash: previous_hash.clone(),
-                changed: previous_hash.as_deref() != Some(next_hash.as_str()),
-            });
+        })?;
+        let previous_hash = self
+            .stat(path)
+            .await?
+            .and_then(|metadata| metadata.content_hash);
+        let lease = self
+            .acquire_lease(path, 1, self.cfg.mutation_reason.as_str())
+            .await?;
+        let file = tokio::fs::File::open(source_path).await.map_err(|error| {
+            VfsStorageError::Internal(format!("open staged VFS upload: {error}"))
+        })?;
+        let body =
+            reqwest::Body::wrap(StreamBody::new(ReaderStream::new(file).map_ok(Frame::data)));
+        let transfer_seconds = metadata.len().div_ceil(128 * 1024).max(300);
+        let mut request = self.mutation_headers_with_precondition(
+            self.client
+                .put(self.url("/file"))
+                .query(&[("path", self.path_arg(path))])
+                .header(STREAM_UPLOAD_HEADER, "1")
+                .header(EXPECTED_CONTENT_HASH_HEADER, expected_content_hash)
+                .header(header::CONTENT_LENGTH, metadata.len())
+                .timeout(Duration::from_secs(transfer_seconds))
+                .body(body),
+            &lease,
+            OP_WRITE,
+            precondition.as_ref(),
+        );
+        if let Some(options) = options {
+            request = request.header(EXECUTABLE_HEADER, options.executable.to_string());
+        }
+        let content_hash = expected_content_hash.to_string();
+        let result = self.send(request).await.map(|_| VfsStorageWriteResult {
+            path: path.to_string(),
+            changed: previous_hash.as_deref() != Some(content_hash.as_str()),
+            previous_hash: previous_hash.clone(),
+            content_hash,
+        });
         self.release_after(&lease, result).await
     }
 
@@ -1181,6 +1249,107 @@ mod tests {
         let subtree_request = requests.recv().expect("subtree request");
         assert_eq!(subtree_request.method, "POST");
         assert_eq!(subtree_request.target, "/subtree-metadata");
+    }
+
+    #[tokio::test]
+    async fn gateway_write_forwards_precondition_and_executable_metadata() {
+        let body = Bytes::from_static(b"next");
+        let (endpoint, requests) = serve_sequence(vec![
+            r#"{"kind":"file","size_bytes":3,"content_hash":"old-hash","updated_at":null}"#
+                .to_string(),
+            r#"{"resource_key":"rk","owner_token":"ot"}"#.to_string(),
+            String::new(),
+            String::new(),
+        ]);
+        let storage =
+            GatewayVfsStorage::new(GatewayVfsStorageConfig::new(endpoint).with_scope_path("scope"));
+
+        storage
+            .write_with_options(
+                "script.sh",
+                body,
+                Some(VfsStorageWritePrecondition {
+                    fingerprint: Some("old-hash".to_string()),
+                    secondary_fingerprint: None,
+                }),
+                Some(VfsStorageWriteOptions { executable: true }),
+            )
+            .await
+            .expect("write with executable metadata");
+
+        let stat_request = requests.recv().expect("stat request");
+        assert_eq!(stat_request.method, "GET");
+        let lease_request = requests.recv().expect("lease request");
+        assert_eq!(lease_request.method, "POST");
+        let write_request = requests.recv().expect("write request");
+        assert_eq!(write_request.method, "PUT");
+        assert!(
+            write_request
+                .headers
+                .contains("x-chevalier-vfs-precondition-fingerprint: old-hash")
+        );
+        assert!(
+            write_request
+                .headers
+                .contains("x-chevalier-vfs-executable: true")
+        );
+        let release_request = requests.recv().expect("release request");
+        assert_eq!(release_request.method, "DELETE");
+    }
+
+    #[tokio::test]
+    async fn gateway_streams_staged_file_with_integrity_headers() {
+        let staged = tempfile::NamedTempFile::new().expect("staged file");
+        std::fs::write(staged.path(), b"stream me").expect("write staged file");
+        let expected = hex_hash(b"stream me");
+        let (endpoint, requests) = serve_sequence(vec![
+            r#"{"kind":"file","size_bytes":3,"content_hash":"old-hash","updated_at":null}"#
+                .to_string(),
+            r#"{"resource_key":"rk","owner_token":"ot"}"#.to_string(),
+            String::new(),
+            String::new(),
+        ]);
+        let storage =
+            GatewayVfsStorage::new(GatewayVfsStorageConfig::new(endpoint).with_scope_path("scope"));
+
+        storage
+            .write_from_local_file(
+                "large.bin",
+                staged.path(),
+                Some(&expected),
+                Some(VfsStorageWritePrecondition {
+                    fingerprint: None,
+                    secondary_fingerprint: None,
+                }),
+                Some(VfsStorageWriteOptions { executable: false }),
+            )
+            .await
+            .expect("stream upload");
+
+        let stat_request = requests.recv().expect("stat request");
+        assert_eq!(stat_request.method, "GET");
+        assert!(stat_request.target.starts_with("/stat?"));
+        let lease_request = requests.recv().expect("lease request");
+        assert_eq!(lease_request.target, "/lease");
+        let upload_request = requests.recv().expect("upload request");
+        assert_eq!(upload_request.method, "PUT");
+        assert_query_value(&upload_request.target, "path", "scope/large.bin");
+        assert!(
+            upload_request
+                .headers
+                .contains("x-chevalier-vfs-stream-upload: 1")
+        );
+        assert!(upload_request.headers.contains(&format!(
+            "x-chevalier-vfs-expected-content-sha256: {expected}"
+        )));
+        assert!(
+            upload_request
+                .headers
+                .contains("x-chevalier-vfs-executable: false")
+        );
+        assert_eq!(upload_request.body, "stream me");
+        let release_request = requests.recv().expect("release request");
+        assert_eq!(release_request.target, "/lease");
     }
 
     #[tokio::test]

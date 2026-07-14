@@ -30,6 +30,7 @@ async fn facade_routes_through_control_gateways_on_real_daemons() {
     let cfg = SandboxConfig {
         auto_spawn: false,
         prewarm_on_start: false,
+        default_image: "ghcr.io/bracketdevelopers/uv-builder:main".to_string(),
         connect_timeout: Duration::from_secs(3),
         control_gateway_endpoints: gateway_endpoints,
         ..SandboxConfig::default()

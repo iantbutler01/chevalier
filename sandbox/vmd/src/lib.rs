@@ -22,6 +22,7 @@ pub mod health_reconciler;
 pub mod image;
 pub mod network;
 pub mod partition;
+pub mod pci;
 pub mod public_ingress;
 pub mod reconcile;
 pub mod registry;

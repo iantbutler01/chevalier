@@ -143,6 +143,7 @@ fn distributed_warm_pool_config(
     SandboxConfig {
         auto_spawn: false,
         prewarm_on_start,
+        default_image: image.to_string(),
         connect_timeout: Duration::from_secs(15),
         daemon_start_timeout: Duration::from_secs(20),
         warm_pool_profiles: vec![WarmPoolProfile {
@@ -292,6 +293,7 @@ async fn warm_pool_hit_path_avoids_image_download_and_conversion_on_request_path
             auto_start: false,
             architecture: arch.clone(),
             shared_mounts: Vec::new(),
+            pci_device_ids: Vec::new(),
         }))
         .await
         .expect("start direct create_vm stream")
@@ -464,6 +466,7 @@ async fn local_auto_spawn_prewarm_avoids_first_command_transport_reset_spam() {
         portproxy_ready_timeout: Duration::from_secs(20),
         daemon_bin: Some(daemon_bin),
         daemon_data_dir: Some(temp_dir.path().to_path_buf()),
+        default_image: image.clone(),
         warm_pool_profiles: vec![WarmPoolProfile {
             image: image.clone(),
             architecture: Some(arch.clone()),

@@ -5,7 +5,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use sha2::Digest;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
 
@@ -46,6 +47,8 @@ struct SymlinkTargetInfo {
 struct CachedFileHash {
     size_bytes: u64,
     mtime_ns: i128,
+    change_ns: i128,
+    cached_at: SystemTime,
     hash: String,
 }
 
@@ -69,6 +72,7 @@ struct PathLocks {
 }
 
 const HASH_CACHE_RECENCY_GUARD: Duration = Duration::from_secs(2);
+const HASH_CACHE_MAX_AGE: Duration = Duration::from_secs(30);
 
 impl std::fmt::Debug for PathLockTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -114,7 +118,11 @@ impl Drop for PathLocks {
         // Release the held guards first, then prune any per-path entry that no other
         // task is still holding or waiting on (strong_count == 1 => only the map).
         self.guards.clear();
-        let mut map = self.table.inner.lock().unwrap_or_else(|err| err.into_inner());
+        let mut map = self
+            .table
+            .inner
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         for key in &self.keys {
             if map
                 .get(key)
@@ -331,11 +339,26 @@ impl LocalVfsStorage {
     fn write_precondition(&self, path: &str) -> VfsStorageResult<VfsStorageWritePrecondition> {
         let abs_path = self.abs_path(path)?;
         self.assert_no_symlink_ancestor(&abs_path)?;
+        let fingerprint = match fs::symlink_metadata(&abs_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = self
+                    .metadata_for_path(path)?
+                    .and_then(|metadata| metadata.link_target)
+                    .ok_or_else(|| {
+                        VfsStorageError::Internal(format!(
+                            "symlink metadata did not include target for {path}"
+                        ))
+                    })?;
+                format!("symlink:{}", hex_hash(target.as_bytes()))
+            }
+            Ok(metadata) if metadata.is_file() => hash_file_if_present_uncached(self, &abs_path)?
+                .unwrap_or_else(|| "absent".to_string()),
+            Ok(_) => "absent".to_string(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => "absent".to_string(),
+            Err(err) => return Err(VfsStorageError::Internal(err.to_string())),
+        };
         Ok(VfsStorageWritePrecondition {
-            fingerprint: Some(
-                hash_file_if_present_uncached(self, &abs_path)?
-                    .unwrap_or_else(|| "absent".to_string()),
-            ),
+            fingerprint: Some(fingerprint),
             secondary_fingerprint: None,
         })
     }
@@ -380,6 +403,7 @@ impl LocalVfsStorage {
             return Ok(None);
         }
         let mtime_ns = metadata_mtime_ns(metadata);
+        let change_ns = metadata_change_ns(metadata);
         if !metadata_is_recent(metadata) {
             if let Some(cached) = self
                 .hash_cache
@@ -388,7 +412,14 @@ impl LocalVfsStorage {
                 .get(path)
                 .cloned()
             {
-                if cached.size_bytes == metadata.len() && cached.mtime_ns == mtime_ns {
+                let cache_fresh = SystemTime::now()
+                    .duration_since(cached.cached_at)
+                    .is_ok_and(|age| age < HASH_CACHE_MAX_AGE);
+                if cache_fresh
+                    && cached.size_bytes == metadata.len()
+                    && cached.mtime_ns == mtime_ns
+                    && cached.change_ns == change_ns
+                {
                     return Ok(Some(cached.hash));
                 }
             }
@@ -412,6 +443,8 @@ impl LocalVfsStorage {
             CachedFileHash {
                 size_bytes: metadata.len(),
                 mtime_ns: metadata_mtime_ns(metadata),
+                change_ns: metadata_change_ns(metadata),
+                cached_at: SystemTime::now(),
                 hash,
             },
         );
@@ -427,6 +460,18 @@ impl LocalVfsStorage {
     #[cfg(test)]
     fn hash_read_count(&self) -> usize {
         self.hash_read_count.load(AtomicOrdering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn expire_cached_hash(&self, path: &Path) {
+        if let Some(cached) = self
+            .hash_cache
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get_mut(path)
+        {
+            cached.cached_at = SystemTime::UNIX_EPOCH;
+        }
     }
 }
 
@@ -668,6 +713,89 @@ impl OptimizedVfsStorage for LocalVfsStorage {
             .ok_or_else(|| VfsStorageError::Internal("write returned no result".to_string()))
     }
 
+    async fn write_from_local_file(
+        &self,
+        path: &str,
+        source_path: &Path,
+        expected_content_hash: Option<&str>,
+        precondition: Option<VfsStorageWritePrecondition>,
+        options: Option<VfsStorageWriteOptions>,
+    ) -> VfsStorageResult<VfsStorageWriteResult> {
+        assert_supported_read_target(source_path)?;
+        let _locks = self.lock_write_paths([path.to_string()]).await;
+        self.assert_precondition(path, precondition.as_ref())?;
+
+        let abs_path = self.abs_path(path)?;
+        self.assert_no_symlink_ancestor(&abs_path)?;
+        let previous_hash = self
+            .metadata_for_abs(&abs_path)?
+            .and_then(|metadata| metadata.content_hash);
+        let previous_mode = existing_regular_file_mode(&abs_path)?;
+        if let Some(parent) = abs_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+        }
+        let tmp_path = abs_path.with_file_name(format!(
+            ".{}.{}.tmp",
+            abs_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("vfs"),
+            Uuid::new_v4()
+        ));
+
+        let install = (|| -> VfsStorageResult<String> {
+            let mut source = open_regular_file(source_path)?;
+            let mut staged = fs::File::create(&tmp_path)
+                .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+            let mut hasher = sha2::Sha256::new();
+            let mut buffer = vec![0_u8; 1024 * 1024];
+            loop {
+                let read = source
+                    .read(&mut buffer)
+                    .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+                staged
+                    .write_all(&buffer[..read])
+                    .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+            }
+            staged
+                .sync_all()
+                .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+            let content_hash = format!("{:x}", hasher.finalize());
+            if expected_content_hash.is_some_and(|expected| expected != content_hash) {
+                return Err(VfsStorageError::Conflict(format!(
+                    "staged VFS upload hash mismatch for {path}"
+                )));
+            }
+            fs::rename(&tmp_path, &abs_path)
+                .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+            let executable = options.as_ref().is_some_and(|value| value.executable);
+            apply_executable_option(&abs_path, executable, previous_mode)?;
+            Ok(content_hash)
+        })();
+
+        let content_hash = match install {
+            Ok(content_hash) => content_hash,
+            Err(error) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(error);
+            }
+        };
+        let metadata = fs::symlink_metadata(&abs_path)
+            .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+        self.remember_hash(&abs_path, &metadata, content_hash.clone());
+        Ok(VfsStorageWriteResult {
+            path: path.to_string(),
+            changed: previous_hash.as_deref() != Some(content_hash.as_str()),
+            previous_hash,
+            content_hash,
+        })
+    }
+
     async fn write_many_atomic(
         &self,
         writes: Vec<VfsStorageWrite>,
@@ -906,11 +1034,27 @@ fn hash_file_if_present_uncached(
     _storage
         .hash_read_count
         .fetch_add(1, AtomicOrdering::SeqCst);
-    match read_file(path) {
-        Ok(bytes) => Ok(Some(hex_hash(&bytes))),
+    match hash_regular_file(path) {
+        Ok(hash) => Ok(Some(hash)),
         Err(VfsStorageError::NotFound(_)) => Ok(None),
         Err(err) => Err(err),
     }
+}
+
+fn hash_regular_file(path: &Path) -> VfsStorageResult<String> {
+    let mut file = open_regular_file(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn open_regular_file(path: &Path) -> VfsStorageResult<fs::File> {
@@ -1018,6 +1162,16 @@ fn metadata_is_recent(metadata: &fs::Metadata) -> bool {
 #[cfg(unix)]
 fn metadata_mtime_ns(metadata: &fs::Metadata) -> i128 {
     metadata.mtime() as i128 * 1_000_000_000 + metadata.mtime_nsec() as i128
+}
+
+#[cfg(unix)]
+fn metadata_change_ns(metadata: &fs::Metadata) -> i128 {
+    metadata.ctime() as i128 * 1_000_000_000 + metadata.ctime_nsec() as i128
+}
+
+#[cfg(not(unix))]
+fn metadata_change_ns(metadata: &fs::Metadata) -> i128 {
+    metadata_mtime_ns(metadata)
 }
 
 #[cfg(not(unix))]
@@ -1529,6 +1683,43 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn symlink_target_fingerprint_guards_delete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        fs::write(dir.path().join("target.txt"), b"target").expect("target");
+        storage
+            .create_symlink("link.txt", "target.txt")
+            .await
+            .expect("create symlink");
+        let expected = format!("symlink:{}", hex_hash(b"target.txt"));
+
+        let stale = storage
+            .delete_file_with_metadata(
+                "link.txt",
+                Some(VfsStorageWritePrecondition {
+                    fingerprint: Some("symlink:stale".to_string()),
+                    secondary_fingerprint: None,
+                }),
+            )
+            .await;
+        assert!(matches!(stale, Err(VfsStorageError::Conflict(_))));
+        assert!(dir.path().join("link.txt").exists());
+
+        storage
+            .delete_file_with_metadata(
+                "link.txt",
+                Some(VfsStorageWritePrecondition {
+                    fingerprint: Some(expected),
+                    secondary_fingerprint: None,
+                }),
+            )
+            .await
+            .expect("matching symlink delete");
+        assert!(!dir.path().join("link.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn create_symlink_accepts_dangling_in_scope_target() {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = LocalVfsStorage::new(dir.path());
@@ -1760,6 +1951,44 @@ mod tests {
         assert_ne!(first[0].content_hash, second[0].content_hash);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_storage_eventually_rehashes_same_size_write_with_restored_mtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cached.txt");
+        fs::write(&path, b"cached").expect("write");
+        set_old_mtime(&path);
+        let restored_mtime = fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        let storage = LocalVfsStorage::new(dir.path());
+
+        let first = storage
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .expect("first list");
+        std::thread::sleep(Duration::from_millis(2));
+        fs::write(&path, b"mutate").expect("same-size rewrite");
+        fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("open for restored mtime")
+            .set_modified(restored_mtime)
+            .expect("restore mtime");
+        // Some Linux backing filesystems expose ctime at coarse resolution. The
+        // bounded cache age is the correctness fallback when size+mtime+ctime
+        // all happen to collide.
+        storage.expire_cached_hash(&path);
+        let second = storage
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .expect("second list");
+
+        assert_eq!(storage.hash_read_count(), 2);
+        assert_ne!(first[0].content_hash, second[0].content_hash);
+    }
+
     #[tokio::test]
     async fn local_storage_skips_hash_for_oversized_listing_entry() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1860,6 +2089,60 @@ mod tests {
             .await
             .expect_err("stale precondition");
         assert!(matches!(err, VfsStorageError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn local_storage_streams_staged_files_with_hash_and_cas_guards() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staging = tempfile::tempdir().expect("staging tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        let original = storage
+            .write("large.bin", Bytes::from_static(b"original"), None)
+            .await
+            .expect("initial write");
+        let source = staging.path().join("payload");
+        let payload = vec![0x5a_u8; 3 * 1024 * 1024 + 17];
+        fs::write(&source, &payload).expect("stage payload");
+        let expected = hex_hash(&payload);
+
+        let result = storage
+            .write_from_local_file(
+                "large.bin",
+                &source,
+                Some(&expected),
+                Some(VfsStorageWritePrecondition {
+                    fingerprint: Some(original.content_hash),
+                    secondary_fingerprint: None,
+                }),
+                Some(VfsStorageWriteOptions { executable: false }),
+            )
+            .await
+            .expect("streamed install");
+        assert_eq!(result.content_hash, expected);
+        assert_eq!(
+            fs::read(dir.path().join("large.bin")).expect("read"),
+            payload
+        );
+
+        fs::write(&source, b"different").expect("replace staged payload");
+        let error = storage
+            .write_from_local_file(
+                "large.bin",
+                &source,
+                Some(&expected),
+                Some(VfsStorageWritePrecondition {
+                    fingerprint: Some(result.content_hash),
+                    secondary_fingerprint: None,
+                }),
+                None,
+            )
+            .await
+            .expect_err("hash mismatch");
+        assert!(matches!(error, VfsStorageError::Conflict(_)));
+        assert_eq!(
+            fs::read(dir.path().join("large.bin")).expect("read after rejection"),
+            payload
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

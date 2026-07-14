@@ -25,8 +25,11 @@ export declare class Sandbox {
   session(options?: SessionOpts | undefined | null): Promise<Session>
   /** Attach to an existing session by id. */
   attachSession(sessionId: string): Promise<Session>
+  /** Attach without restoring, starting, or probing the VM. */
+  attachSessionPassive(sessionId: string): Promise<Session>
   /** List live sessions visible to this sandbox provider. */
   listSessions(): Promise<Array<SessionInfoJs>>
+  listHostPciDevices(): Promise<HostPciInventoryJs>
   /** Discard a provider session by id, even if this process does not hold a Session handle. */
   discardSessionById(sessionId: string): Promise<void>
 }
@@ -51,8 +54,13 @@ export declare class Session {
   restoreCheckpoint(checkpointId: string): Promise<Session>
   /** Read the current VM state from the sandbox provider. */
   getState(): Promise<string>
+  listPciDevices(): Promise<HostPciInventoryJs>
+  attachPciDevice(deviceId: string): Promise<PciDeviceActionJs>
+  detachPciDevice(deviceId: string): Promise<PciDeviceActionJs>
   /** Pause the VM without deleting it. */
   pause(): Promise<string>
+  start(): Promise<string>
+  restart(): Promise<string>
   /** Resume a paused VM. */
   resume(): Promise<string>
   /** Stop the VM without deleting its record. */
@@ -105,6 +113,31 @@ export interface ForkOpts {
   autoStartChild?: boolean
 }
 
+export interface HostPciDeviceJs {
+  id: string
+  label: string
+  functions: Array<HostPciFunctionJs>
+  state: string
+  assignedVmId: string
+  managed: boolean
+  hotplugCapable: boolean
+  unavailableReason: string
+}
+
+export interface HostPciFunctionJs {
+  bdf: string
+  vendorId: string
+  deviceId: string
+  classCode: string
+  driver: string
+  iommuGroup: string
+}
+
+export interface HostPciInventoryJs {
+  enabled: boolean
+  devices: Array<HostPciDeviceJs>
+}
+
 export interface OpenComputerMountOpts {
   path?: string
   driver?: string
@@ -134,11 +167,22 @@ export interface OpenComputerProviderOpts {
   sharedMounts?: Record<string, OpenComputerMountOpts>
 }
 
+export interface PciDeviceActionJs {
+  device?: HostPciDeviceJs
+  restartRequired: boolean
+  detail: string
+  vmState: string
+}
+
 export interface SandboxConnectOptions {
   authToken?: string
+  pciAccessToken?: string
   connectTimeoutMs?: number
   defaultImage?: string
   defaultArchitecture?: string
+  defaultVcpu?: number
+  defaultMemoryMb?: number
+  defaultDiskGb?: number
   provider?: string
   openComputer?: OpenComputerProviderOpts
 }
@@ -166,6 +210,7 @@ export interface SessionOpts {
   autoStart?: boolean
   sharedMounts?: Array<SharedMountOpts>
   egressAllowlist?: Array<string>
+  pciDeviceIds?: Array<string>
 }
 
 export interface SessionSnapshotJs {

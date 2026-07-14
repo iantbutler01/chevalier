@@ -65,10 +65,13 @@ use proto::bracket::portproxy::v1::{
 };
 use proto::vmd::v1::vmd_service_client::VmdServiceClient;
 use proto::vmd::v1::{
-    CreateSnapshotRequest, CreateVmRequest, DeleteSnapshotRequest, ForkVmRequest, GetVmRequest,
+    AttachPciDeviceRequest, CreateSnapshotRequest, CreateVmRequest, DeleteSnapshotRequest,
+    DetachPciDeviceRequest, ForkVmRequest, GetVmRequest, ListHostPciDevicesRequest,
     ListSnapshotsRequest, ListVMsRequest, Metadata, PreDownloadVmImageRequest, ResourceSpec,
     RestoreSnapshotRequest, Vm, VmActionRequest, VmSource, VmSourceType,
 };
+
+const PCI_CAPABILITY_HEADER: &str = "x-chevalier-pci-token";
 
 const META_SESSION_ID: &str = "chevalier.session_id";
 const META_BRANCH_ID: &str = "chevalier.branch_id";
@@ -392,6 +395,7 @@ pub struct SandboxConfig {
     pub prewarm_on_start: bool,
     pub distributed_control: Option<DistributedControlConfig>,
     pub auth_token: Option<String>,
+    pub pci_access_token: Option<String>,
     pub tls: Option<TlsClientConfig>,
 }
 
@@ -409,8 +413,7 @@ impl Default for SandboxConfig {
             daemon_start_timeout: Duration::from_secs(20),
             portproxy_ready_timeout: Duration::from_secs(90),
             connect_timeout: Duration::from_secs(5),
-            default_image: std::env::var("BRACKET_VM_IMAGE")
-                .unwrap_or_else(|_| "ghcr.io/bracketdevelopers/uv-builder:main".to_string()),
+            default_image: std::env::var("BRACKET_VM_IMAGE").unwrap_or_default(),
             default_architecture: None,
             default_resources: ResourceLimits::default(),
             default_shell: "/bin/sh".to_string(),
@@ -419,6 +422,7 @@ impl Default for SandboxConfig {
             prewarm_on_start: true,
             distributed_control: None,
             auth_token: None,
+            pci_access_token: None,
             tls: None,
         }
     }
@@ -435,6 +439,7 @@ pub struct SessionOptions {
     pub resources: Option<ResourceLimits>,
     pub shared_mounts: Vec<SharedMount>,
     pub egress_allowlist: Option<Vec<String>>,
+    pub pci_device_ids: Vec<String>,
 }
 
 impl Default for SessionOptions {
@@ -449,6 +454,7 @@ impl Default for SessionOptions {
             resources: None,
             shared_mounts: Vec::new(),
             egress_allowlist: None,
+            pci_device_ids: Vec::new(),
         }
     }
 }
@@ -845,6 +851,53 @@ pub struct SessionSnapshot {
     pub description: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostPciDeviceState {
+    Disabled,
+    Unavailable,
+    Host,
+    Ready,
+    Assigned,
+    Error,
+    Unknown,
+}
+
+#[derive(Clone, Debug)]
+pub struct HostPciFunction {
+    pub bdf: String,
+    pub vendor_id: String,
+    pub device_id: String,
+    pub class_code: String,
+    pub driver: String,
+    pub iommu_group: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct HostPciDevice {
+    pub id: String,
+    pub label: String,
+    pub functions: Vec<HostPciFunction>,
+    pub state: HostPciDeviceState,
+    pub assigned_vm_id: String,
+    pub managed: bool,
+    pub hotplug_capable: bool,
+    pub unavailable_reason: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct HostPciInventory {
+    pub enabled: bool,
+    pub devices: Vec<HostPciDevice>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PciDeviceAction {
+    pub device: Option<HostPciDevice>,
+    pub restart_required: bool,
+    pub detail: String,
+    pub vm_state: i32,
+}
+
 #[derive(Clone)]
 pub struct Sandbox {
     inner: Arc<SandboxInner>,
@@ -859,6 +912,7 @@ struct SandboxInner {
     cfg: SandboxConfig,
     control_backend: ControlBackend,
     auth_header: Option<MetadataValue<Ascii>>,
+    pci_auth_header: Option<MetadataValue<Ascii>>,
     #[cfg(feature = "host")]
     managed_daemon: Mutex<Option<ManagedDaemon>>,
     ready_vm_rpc: Mutex<HashMap<String, GuestRpcAccess>>,
@@ -905,6 +959,8 @@ enum RebindRestorePolicy {
 
 #[derive(Clone, Copy, Debug)]
 enum SessionVmAction {
+    Start,
+    Restart,
     Pause,
     Resume,
     Stop,
@@ -2244,6 +2300,61 @@ impl Session {
         Ok(vm.state)
     }
 
+    pub async fn list_pci_devices(&self) -> Result<HostPciInventory> {
+        if matches!(
+            &self.sandbox.inner.control_backend,
+            ControlBackend::OpenComputer(_)
+        ) {
+            return Err(SandboxError::Unsupported(
+                "PCI assignment is only available for vmd-backed sandboxes".to_string(),
+            ));
+        }
+        let endpoint = self.current_node_endpoint().await;
+        self.sandbox.list_host_pci_devices_at(&endpoint).await
+    }
+
+    pub async fn attach_pci_device(&self, device_id: &str) -> Result<PciDeviceAction> {
+        if matches!(
+            &self.sandbox.inner.control_backend,
+            ControlBackend::OpenComputer(_)
+        ) {
+            return Err(SandboxError::Unsupported(
+                "PCI assignment is only available for vmd-backed sandboxes".to_string(),
+            ));
+        }
+        let endpoint = self.current_node_endpoint().await;
+        let mut client = self.sandbox.vmd_client_for_endpoint(&endpoint).await?;
+        let response = client
+            .attach_pci_device(self.sandbox.request_with_pci_auth(AttachPciDeviceRequest {
+                vm_id: self.vm_id.clone(),
+                device_id: device_id.to_string(),
+            })?)
+            .await?
+            .into_inner();
+        Ok(map_pci_action(response))
+    }
+
+    pub async fn detach_pci_device(&self, device_id: &str) -> Result<PciDeviceAction> {
+        if matches!(
+            &self.sandbox.inner.control_backend,
+            ControlBackend::OpenComputer(_)
+        ) {
+            return Err(SandboxError::Unsupported(
+                "PCI assignment is only available for vmd-backed sandboxes".to_string(),
+            ));
+        }
+        let endpoint = self.current_node_endpoint().await;
+        let mut client = self.sandbox.vmd_client_for_endpoint(&endpoint).await?;
+        let response = client
+            .detach_pci_device(self.sandbox.request_with_pci_auth(DetachPciDeviceRequest {
+                vm_id: self.vm_id.clone(),
+                device_id: device_id.to_string(),
+            })?)
+            .await?
+            .into_inner();
+        Ok(map_pci_action(response))
+    }
+
     async fn vm_action(&self, action: SessionVmAction) -> Result<i32> {
         if matches!(
             &self.sandbox.inner.control_backend,
@@ -2260,6 +2371,8 @@ impl Session {
             vm_id: self.vm_id.clone(),
         });
         let vm = match action {
+            SessionVmAction::Start => client.start_vm(request).await?.into_inner(),
+            SessionVmAction::Restart => client.restart_vm(request).await?.into_inner(),
             SessionVmAction::Pause => client.pause_vm(request).await?.into_inner(),
             SessionVmAction::Resume => client.resume_vm(request).await?.into_inner(),
             SessionVmAction::Stop => client.stop_vm(request).await?.into_inner(),
@@ -2274,6 +2387,14 @@ impl Session {
 
     pub async fn pause(&self) -> Result<i32> {
         self.vm_action(SessionVmAction::Pause).await
+    }
+
+    pub async fn start(&self) -> Result<i32> {
+        self.vm_action(SessionVmAction::Start).await
+    }
+
+    pub async fn restart(&self) -> Result<i32> {
+        self.vm_action(SessionVmAction::Restart).await
     }
 
     pub async fn resume(&self) -> Result<i32> {
@@ -2541,6 +2662,15 @@ impl Session {
 
 impl Sandbox {
     pub async fn new(mut config: SandboxConfig) -> Result<Self> {
+        if matches!(&config.provider, SandboxProviderConfig::Chevalier) {
+            config.default_image = config.default_image.trim().to_string();
+            if config.default_image.is_empty() {
+                return Err(SandboxError::InvalidConfig(
+                    "default image is required for the Chevalier provider; set SandboxConfig.default_image or BRACKET_VM_IMAGE"
+                        .to_string(),
+                ));
+            }
+        }
         config.endpoint = normalize_endpoint(&config.endpoint)?;
         let mut normalized_gateways = Vec::new();
         for endpoint in std::mem::take(&mut config.control_gateway_endpoints) {
@@ -2554,6 +2684,8 @@ impl Sandbox {
         normalized_gateways.retain(|endpoint| endpoint != &config.endpoint);
         config.control_gateway_endpoints = normalized_gateways;
         let auth_header = compile_auth_header(config.auth_token.as_deref())?;
+        let pci_auth_header =
+            compile_metadata_token(config.pci_access_token.as_deref(), "PCI capability token")?;
 
         let control_backend = Self::build_control_backend(&config).await?;
 
@@ -2562,6 +2694,7 @@ impl Sandbox {
                 cfg: config,
                 control_backend,
                 auth_header,
+                pci_auth_header,
                 #[cfg(feature = "host")]
                 managed_daemon: Mutex::new(None),
                 ready_vm_rpc: Mutex::new(HashMap::new()),
@@ -2792,6 +2925,7 @@ impl Sandbox {
                     vfs_scope_path: mount.vfs_scope_path,
                 })
                 .collect(),
+            pci_device_ids: opts.pci_device_ids,
         };
 
         let node_endpoint = self
@@ -2824,10 +2958,12 @@ impl Sandbox {
         .await?;
 
         let mut client = self.vmd_client_for_endpoint(&node_endpoint).await?;
-        let mut stream = client
-            .create_vm(self.request_with_auth(request))
-            .await?
-            .into_inner();
+        let request = if request.pci_device_ids.is_empty() {
+            self.request_with_auth(request)
+        } else {
+            self.request_with_pci_auth(request)?
+        };
+        let mut stream = client.create_vm(request).await?.into_inner();
 
         let mut final_vm: Option<Vm> = None;
         while let Some(update) = stream.message().await? {
@@ -2984,6 +3120,33 @@ impl Sandbox {
         Ok(session)
     }
 
+    /// Reconstruct a session handle without restoring, starting, or probing the VM.
+    /// Lifecycle owners use this when the next action is explicitly pause, restore,
+    /// start, or discard; ordinary `attach_session` retains its ready-to-execute contract.
+    pub async fn attach_session_passive(&self, session_id: &str) -> Result<Session> {
+        let started = Instant::now();
+        if matches!(&self.inner.control_backend, ControlBackend::OpenComputer(_)) {
+            return self.attach_session(session_id).await;
+        }
+
+        let (vm, node_endpoint) = self
+            .find_vm_by_session_id(session_id)
+            .await?
+            .ok_or_else(|| SandboxError::SessionNotFound(session_id.to_string()))?;
+        validate_vm_mount_contract(session_id, &vm)?;
+        let current_fence = self.current_session_fence(session_id).await?;
+        let session = Session {
+            sandbox: self.clone(),
+            session_id: session_id.to_string(),
+            vm_id: vm.id,
+            node_endpoint: Arc::new(Mutex::new(node_endpoint)),
+            ownership_fence: Arc::new(Mutex::new(current_fence)),
+            shared_mounts: Arc::new(Vec::new()),
+        };
+        log_slo_observation("session.attach.passive", started.elapsed(), "ok");
+        Ok(session)
+    }
+
     pub async fn find_vm_by_id_including_endpoint(
         &self,
         vm_id: &str,
@@ -3036,6 +3199,34 @@ impl Sandbox {
         }
 
         Ok(())
+    }
+
+    pub async fn list_host_pci_devices(&self) -> Result<HostPciInventory> {
+        if matches!(&self.inner.control_backend, ControlBackend::OpenComputer(_)) {
+            return Err(SandboxError::Unsupported(
+                "PCI assignment is only available for vmd-backed sandboxes".to_string(),
+            ));
+        }
+        self.list_host_pci_devices_at(&self.inner.cfg.endpoint)
+            .await
+    }
+
+    async fn list_host_pci_devices_at(&self, endpoint: &str) -> Result<HostPciInventory> {
+        let mut client = self.vmd_client_for_endpoint(endpoint).await?;
+        let response = client
+            .list_host_pci_devices(
+                self.request_with_optional_pci_auth(ListHostPciDevicesRequest {}),
+            )
+            .await?
+            .into_inner();
+        Ok(HostPciInventory {
+            enabled: response.enabled,
+            devices: response
+                .devices
+                .into_iter()
+                .map(map_host_pci_device)
+                .collect(),
+        })
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
@@ -3398,6 +3589,25 @@ impl Sandbox {
                 .insert("authorization", value.clone());
         }
         request
+    }
+
+    fn request_with_optional_pci_auth<T>(&self, message: T) -> Request<T> {
+        let mut request = self.request_with_auth(message);
+        if let Some(value) = self.inner.pci_auth_header.as_ref() {
+            request
+                .metadata_mut()
+                .insert(PCI_CAPABILITY_HEADER, value.clone());
+        }
+        request
+    }
+
+    fn request_with_pci_auth<T>(&self, message: T) -> Result<Request<T>> {
+        if self.inner.pci_auth_header.is_none() {
+            return Err(SandboxError::InvalidConfig(
+                "PCI operation requires SandboxConfig.pci_access_token".to_string(),
+            ));
+        }
+        Ok(self.request_with_optional_pci_auth(message))
     }
 
     #[cfg(feature = "distributed-control")]
@@ -4515,6 +4725,19 @@ fn compile_auth_header(raw_token: Option<&str>) -> Result<Option<MetadataValue<A
     Ok(Some(metadata))
 }
 
+fn compile_metadata_token(
+    raw_token: Option<&str>,
+    label: &str,
+) -> Result<Option<MetadataValue<Ascii>>> {
+    let Some(token) = raw_token.map(str::trim).filter(|token| !token.is_empty()) else {
+        return Ok(None);
+    };
+    let metadata = MetadataValue::try_from(token).map_err(|error| {
+        SandboxError::InvalidConfig(format!("{label} is not valid ASCII: {error}"))
+    })?;
+    Ok(Some(metadata))
+}
+
 fn portproxy_auth_header_from_metadata(
     metadata: &HashMap<String, String>,
 ) -> Result<Option<MetadataValue<Ascii>>> {
@@ -4671,6 +4894,48 @@ fn resolve_tier_b_eligibility(metadata: &HashMap<String, String>) -> bool {
 
 fn vm_tier_b_eligible(vm: &Vm) -> bool {
     resolve_tier_b_eligibility(&vm.metadata)
+}
+
+fn map_host_pci_device(device: proto::vmd::v1::HostPciDevice) -> HostPciDevice {
+    let state = match proto::vmd::v1::HostPciDeviceState::try_from(device.state) {
+        Ok(proto::vmd::v1::HostPciDeviceState::Disabled) => HostPciDeviceState::Disabled,
+        Ok(proto::vmd::v1::HostPciDeviceState::Unavailable) => HostPciDeviceState::Unavailable,
+        Ok(proto::vmd::v1::HostPciDeviceState::Host) => HostPciDeviceState::Host,
+        Ok(proto::vmd::v1::HostPciDeviceState::Ready) => HostPciDeviceState::Ready,
+        Ok(proto::vmd::v1::HostPciDeviceState::Assigned) => HostPciDeviceState::Assigned,
+        Ok(proto::vmd::v1::HostPciDeviceState::Error) => HostPciDeviceState::Error,
+        _ => HostPciDeviceState::Unknown,
+    };
+    HostPciDevice {
+        id: device.id,
+        label: device.label,
+        functions: device
+            .functions
+            .into_iter()
+            .map(|function| HostPciFunction {
+                bdf: function.bdf,
+                vendor_id: function.vendor_id,
+                device_id: function.device_id,
+                class_code: function.class_code,
+                driver: function.driver,
+                iommu_group: function.iommu_group,
+            })
+            .collect(),
+        state,
+        assigned_vm_id: device.assigned_vm_id,
+        managed: device.managed,
+        hotplug_capable: device.hotplug_capable,
+        unavailable_reason: device.unavailable_reason,
+    }
+}
+
+fn map_pci_action(response: proto::vmd::v1::PciDeviceActionResponse) -> PciDeviceAction {
+    PciDeviceAction {
+        device: response.device.map(map_host_pci_device),
+        restart_required: response.restart_required,
+        detail: response.detail,
+        vm_state: response.vm.map_or(0, |vm| vm.state),
+    }
 }
 
 fn shared_mount_availability_proto(availability: &SharedMountAvailability) -> i32 {
@@ -5016,12 +5281,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chevalier_provider_requires_an_explicit_default_image() {
+        let config = SandboxConfig {
+            default_image: "  ".to_string(),
+            auto_spawn: false,
+            prewarm_on_start: false,
+            ..SandboxConfig::default()
+        };
+
+        let error = match Sandbox::connect("http://127.0.0.1:1", config).await {
+            Ok(_) => panic!("missing default image should fail before connecting"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SandboxError::InvalidConfig(_)));
+        assert!(error.to_string().contains("default image is required"));
+    }
+
+    #[tokio::test]
     async fn opencomputer_session_alias_resolves_and_clears_requested_ids() {
         let sandbox = Sandbox {
             inner: Arc::new(SandboxInner {
                 cfg: SandboxConfig::default(),
                 control_backend: ControlBackend::Direct,
                 auth_header: None,
+                pci_auth_header: None,
                 #[cfg(feature = "host")]
                 managed_daemon: Mutex::new(None),
                 ready_vm_rpc: Mutex::new(HashMap::new()),

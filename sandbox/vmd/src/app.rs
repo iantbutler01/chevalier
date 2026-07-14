@@ -28,11 +28,14 @@ use crate::config::{Config, TlsServerConfig};
 use crate::image::{self, PrebuiltImageStatus};
 use crate::network;
 use crate::partition::{self, PartitionGate, PartitionPolicyConfig};
+use crate::pci::{PCI_CAPABILITY_HEADER, PciInventoryDevice, PciInventoryState};
 use crate::proto::v1::{
-    CreateSnapshotRequest, CreateVmPhase, CreateVmProgress, CreateVmRequest,
-    CreateVmStreamResponse, DeleteSnapshotRequest, DeleteVmRequest, ForkVmRequest, ForkVmResponse,
-    GetSnapshotRequest, GetVmRequest, HealthRequest, HealthResponse, InfoRequest, InfoResponse,
-    ListSnapshotsRequest, ListSnapshotsResponse, ListVMsRequest, ListVMsResponse,
+    AttachPciDeviceRequest, CreateSnapshotRequest, CreateVmPhase, CreateVmProgress,
+    CreateVmRequest, CreateVmStreamResponse, DeleteSnapshotRequest, DeleteVmRequest,
+    DetachPciDeviceRequest, ForkVmRequest, ForkVmResponse, GetSnapshotRequest, GetVmRequest,
+    HealthRequest, HealthResponse, HostPciDevice, HostPciDeviceState, HostPciFunction, InfoRequest,
+    InfoResponse, ListHostPciDevicesRequest, ListHostPciDevicesResponse, ListSnapshotsRequest,
+    ListSnapshotsResponse, ListVMsRequest, ListVMsResponse, PciDeviceActionResponse,
     PreDownloadVmImagePhase, PreDownloadVmImageRequest, PreDownloadVmImageResponse, ResourceSpec,
     RestoreSnapshotRequest, Snapshot, UpdateVmRequest, Vm, VmActionRequest, VmSource,
     VmSourceType as ProtoVmSourceType, VmState as ProtoVmState, create_vm_stream_response,
@@ -49,7 +52,8 @@ use crate::{
     control_bus, health_reconciler, public_ingress, reconcile, registry, virt,
 };
 
-pub async fn run_server(config: Config) -> Result<()> {
+pub async fn run_server(mut config: Config) -> Result<()> {
+    config.normalize().context("normalize vmd server config")?;
     let addr: SocketAddr = config
         .listen_address
         .parse()
@@ -363,6 +367,34 @@ impl GrpcService {
 
         Ok(())
     }
+
+    fn authorize_pci(&self, metadata: &MetadataMap) -> Result<(), Status> {
+        authorize_pci_metadata(self.cfg.pci.capability_token(), metadata)
+    }
+}
+
+fn authorize_pci_metadata(expected: Option<&str>, metadata: &MetadataMap) -> Result<(), Status> {
+    let expected = expected
+        .ok_or_else(|| Status::failed_precondition("PCI assignment is disabled on this vmd"))?;
+    let supplied = metadata
+        .get(PCI_CAPABILITY_HEADER)
+        .ok_or_else(|| Status::permission_denied("PCI capability token is required"))?
+        .to_str()
+        .map_err(|_| Status::permission_denied("PCI capability token is not valid ASCII"))?;
+    if !constant_time_eq(supplied.as_bytes(), expected.as_bytes()) {
+        return Err(Status::permission_denied("PCI capability token is invalid"));
+    }
+    Ok(())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    let width = left.len().max(right.len());
+    for index in 0..width {
+        difference |= usize::from(left.get(index).copied().unwrap_or_default())
+            ^ usize::from(right.get(index).copied().unwrap_or_default());
+    }
+    difference == 0
 }
 
 fn authorize_metadata(
@@ -488,6 +520,9 @@ impl VmdService for GrpcService {
         request: Request<CreateVmRequest>,
     ) -> Result<Response<Self::CreateVMStream>, Status> {
         self.authorize(&request, AccessLevel::Write).await?;
+        if !request.get_ref().pci_device_ids.is_empty() {
+            self.authorize_pci(request.metadata())?;
+        }
         let req = request.into_inner();
         let source = req
             .source
@@ -571,6 +606,7 @@ impl VmdService for GrpcService {
                     vfs_scope_path: mount.vfs_scope_path,
                 })
                 .collect(),
+            pci_device_ids: req.pci_device_ids,
         };
 
         let manager = Arc::clone(&self.manager);
@@ -728,6 +764,101 @@ impl VmdService for GrpcService {
         self.authorize(&request, AccessLevel::Write).await?;
         self.vm_action(request.into_inner(), Action::ForceStop)
             .await
+    }
+
+    async fn list_host_pci_devices(
+        &self,
+        request: Request<ListHostPciDevicesRequest>,
+    ) -> GrpcResult<ListHostPciDevicesResponse> {
+        self.authorize(&request, AccessLevel::Read).await?;
+        if !self.manager.pci_enabled() {
+            return Ok(Response::new(ListHostPciDevicesResponse {
+                enabled: false,
+                devices: Vec::new(),
+            }));
+        }
+        self.authorize_pci(request.metadata())?;
+        let devices = self
+            .manager
+            .list_host_pci_devices()
+            .await
+            .into_iter()
+            .map(build_host_pci_device)
+            .collect();
+        Ok(Response::new(ListHostPciDevicesResponse {
+            enabled: true,
+            devices,
+        }))
+    }
+
+    async fn attach_pci_device(
+        &self,
+        request: Request<AttachPciDeviceRequest>,
+    ) -> GrpcResult<PciDeviceActionResponse> {
+        self.authorize(&request, AccessLevel::Write).await?;
+        self.authorize_pci(request.metadata())?;
+        let req = request.into_inner();
+        if req.vm_id.trim().is_empty() || req.device_id.trim().is_empty() {
+            return Err(Status::invalid_argument("vm_id and device_id are required"));
+        }
+        let result = self
+            .manager
+            .attach_pci_device(&req.vm_id, &req.device_id)
+            .await
+            .map_err(status_from_error)?;
+        let (_, runtime) = self
+            .manager
+            .get_with_runtime(&req.vm_id)
+            .await
+            .map_err(status_from_error)?;
+        let device = self
+            .manager
+            .list_host_pci_devices()
+            .await
+            .into_iter()
+            .find(|device| device.id == req.device_id)
+            .map(build_host_pci_device);
+        Ok(Response::new(PciDeviceActionResponse {
+            vm: Some(build_vm(&result.metadata, Some(&runtime), true)),
+            device,
+            restart_required: result.restart_required,
+            detail: result.detail,
+        }))
+    }
+
+    async fn detach_pci_device(
+        &self,
+        request: Request<DetachPciDeviceRequest>,
+    ) -> GrpcResult<PciDeviceActionResponse> {
+        self.authorize(&request, AccessLevel::Write).await?;
+        self.authorize_pci(request.metadata())?;
+        let req = request.into_inner();
+        if req.vm_id.trim().is_empty() || req.device_id.trim().is_empty() {
+            return Err(Status::invalid_argument("vm_id and device_id are required"));
+        }
+        let result = self
+            .manager
+            .detach_pci_device(&req.vm_id, &req.device_id)
+            .await
+            .map_err(status_from_error)?;
+        let (_, runtime) = self
+            .manager
+            .get_with_runtime(&req.vm_id)
+            .await
+            .map_err(status_from_error)?;
+        let device = self
+            .manager
+            .list_host_pci_devices()
+            .await
+            .into_iter()
+            .find(|device| device.id == req.device_id)
+            .map(build_host_pci_device);
+        Ok(Response::new(PciDeviceActionResponse {
+            vm: Some(build_vm(&result.metadata, Some(&runtime), true)),
+            device,
+            restart_required: result.restart_required,
+            detail: result.detail,
+        }))
     }
 
     async fn pre_download_vm_image(
@@ -1221,6 +1352,36 @@ fn default_progress_message(phase: CreateVmPhase) -> &'static str {
     }
 }
 
+fn build_host_pci_device(device: PciInventoryDevice) -> HostPciDevice {
+    HostPciDevice {
+        id: device.id,
+        label: device.label,
+        functions: device
+            .functions
+            .into_iter()
+            .map(|function| HostPciFunction {
+                bdf: function.bdf,
+                vendor_id: function.vendor_id,
+                device_id: function.device_id,
+                class_code: function.class_code,
+                driver: function.driver,
+                iommu_group: function.iommu_group,
+            })
+            .collect(),
+        state: match device.state {
+            PciInventoryState::Unavailable => HostPciDeviceState::Unavailable as i32,
+            PciInventoryState::Host => HostPciDeviceState::Host as i32,
+            PciInventoryState::Ready => HostPciDeviceState::Ready as i32,
+            PciInventoryState::Assigned => HostPciDeviceState::Assigned as i32,
+            PciInventoryState::Error => HostPciDeviceState::Error as i32,
+        },
+        assigned_vm_id: device.assigned_vm_id,
+        managed: device.managed,
+        hotplug_capable: device.hotplug_capable,
+        unavailable_reason: device.unavailable_reason,
+    }
+}
+
 fn build_vm(
     meta: &VmMetadata,
     runtime: Option<&crate::state::VmRuntime>,
@@ -1279,6 +1440,14 @@ fn build_vm(
                 backend_profile: mount.backend_profile.clone(),
                 vfs_endpoint: mount.vfs_endpoint.clone(),
                 vfs_scope_path: mount.vfs_scope_path.clone(),
+            })
+            .collect(),
+        pci_devices: meta
+            .pci_devices
+            .iter()
+            .map(|assignment| crate::proto::v1::PciDeviceAssignment {
+                id: assignment.id.clone(),
+                bdfs: assignment.bdfs.clone(),
             })
             .collect(),
     };
@@ -1349,6 +1518,9 @@ fn status_from_error(err: ManagerError) -> Status {
         ManagerError::SnapshotNotFound => Status::not_found(err.to_string()),
         ManagerError::InvalidState => Status::failed_precondition(err.to_string()),
         ManagerError::Cancelled => Status::cancelled(err.to_string()),
+        ManagerError::PciConflict(_) => Status::already_exists(err.to_string()),
+        ManagerError::PciUnavailable(_) => Status::failed_precondition(err.to_string()),
+        ManagerError::Unsupported(_) => Status::unimplemented(err.to_string()),
         ManagerError::CapacityExceeded { .. } => {
             Status::resource_exhausted(format!("{} retry_after_ms=2000", err))
         }
@@ -1439,5 +1611,17 @@ mod tests {
             MetadataValue::try_from("Bearer admin").expect("valid metadata value"),
         );
         assert!(authorize_metadata(Some(&auth), req.metadata(), AccessLevel::Write).is_ok());
+    }
+
+    #[test]
+    fn pci_capability_is_separate_and_disabled_without_policy() {
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            PCI_CAPABILITY_HEADER,
+            MetadataValue::try_from("pci-secret").expect("valid metadata value"),
+        );
+        assert!(authorize_pci_metadata(None, request.metadata()).is_err());
+        assert!(authorize_pci_metadata(Some("different"), request.metadata()).is_err());
+        assert!(authorize_pci_metadata(Some("pci-secret"), request.metadata()).is_ok());
     }
 }

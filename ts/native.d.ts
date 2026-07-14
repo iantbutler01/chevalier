@@ -120,12 +120,18 @@ export declare class VfsStorage {
   static gateway(options: GatewayOptions): VfsStorage
   /** Read a file's bytes. */
   read(path: string): Promise<Buffer>
+  /** Read a bounded byte range without materializing the whole file. */
+  readRange(path: string, offset: bigint, length: number): Promise<Buffer>
   /** Write a file; returns the write result (JSON: content hash, changed, …). */
   write(path: string, data: Buffer, options?: VfsWriteOptions | null): Promise<any>
+  /** Atomically install a host-local staged file with bounded memory. */
+  writeFromFile(path: string, sourcePath: string, expectedContentHash: string, options?: VfsWriteOptions | null): Promise<any>
   /** Stat a path; returns typed metadata (`sizeBytes` is a `bigint`) or null. */
   stat(path: string): Promise<VfsMetadata | null>
   /** List a directory's entries with typed metadata. */
   listDir(path: string, options?: { maxHashBytes?: number | null } | null): Promise<Array<VfsMetadata>>
+  /** Read metadata for an indexed set of paths in one backend request. */
+  metadataMany(paths: Array<string>): Promise<Array<VfsMetadata | undefined | null>>
   /** Create a directory. */
   mkdir(path: string): Promise<void>
   /** Create a symbolic link. */

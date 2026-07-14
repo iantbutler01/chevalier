@@ -6,6 +6,7 @@
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 pub mod compaction;
 #[cfg(feature = "gateway")]
@@ -267,6 +268,30 @@ pub trait OptimizedVfsStorage: Send + Sync {
     ) -> VfsStorageResult<VfsStorageWriteResult> {
         let _ = options;
         self.write(path, bytes, precondition).await
+    }
+
+    /// Atomically install a host-local regular file without requiring callers to
+    /// materialize the entire payload in memory. Backends with a native streaming
+    /// path override this; the default preserves compatibility for object stores.
+    async fn write_from_local_file(
+        &self,
+        path: &str,
+        source_path: &Path,
+        expected_content_hash: Option<&str>,
+        precondition: Option<VfsStorageWritePrecondition>,
+        options: Option<VfsStorageWriteOptions>,
+    ) -> VfsStorageResult<VfsStorageWriteResult> {
+        let bytes = std::fs::read(source_path).map_err(|error| {
+            VfsStorageError::Internal(format!("read staged VFS upload: {error}"))
+        })?;
+        let actual_hash = pack::hex_hash(&bytes);
+        if expected_content_hash.is_some_and(|expected| expected != actual_hash) {
+            return Err(VfsStorageError::Conflict(format!(
+                "staged VFS upload hash mismatch for {path}"
+            )));
+        }
+        self.write_with_options(path, Bytes::from(bytes), precondition, options)
+            .await
     }
 
     async fn write_many_atomic(

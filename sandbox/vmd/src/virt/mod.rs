@@ -18,7 +18,6 @@ use tokio::task;
 use tokio::time::sleep;
 use tracing::{debug, trace, warn};
 
-pub const RAM_SNAPSHOT_FORMAT_LEGACY: &str = "legacy";
 pub const RAM_SNAPSHOT_FORMAT_MAPPED: &str = "mapped-ram";
 pub const BACKGROUND_SNAPSHOT_TIMEOUT_SECS: u64 = 600;
 
@@ -349,6 +348,7 @@ pub async fn wait_for_running_or_incoming_restore(
     let mut last_progress_at = started;
     let mut last_bytes_transferred = None;
     let mut last_migrate_status: Option<String> = None;
+    let mut resume_requested = false;
 
     loop {
         let status = monitor.query_status().await?;
@@ -358,6 +358,9 @@ pub async fn wait_for_running_or_incoming_restore(
 
         if status.status == "inmigrate" {
             incoming_seen = true;
+        }
+
+        if incoming_seen {
             match query_migrate(monitor).await {
                 Ok(migrate) => {
                     let status_changed =
@@ -399,6 +402,15 @@ pub async fn wait_for_running_or_incoming_restore(
                 }
             }
 
+            let migration_completed = last_migrate_status.as_deref() == Some("completed");
+            if migration_completed && status.status == "paused" && !resume_requested {
+                cont(monitor)
+                    .await
+                    .with_context(|| "resume VM after completed incoming restore")?;
+                resume_requested = true;
+                debug!("resumed VM after incoming migration restored paused runstate");
+            }
+
             let now = Instant::now();
             if now >= incoming_deadline {
                 bail!(
@@ -409,20 +421,15 @@ pub async fn wait_for_running_or_incoming_restore(
                     last_bytes_transferred
                 );
             }
-            if now.duration_since(last_progress_at) >= incoming_stall_timeout {
+            if !migration_completed
+                && now.duration_since(last_progress_at) >= incoming_stall_timeout
+            {
                 bail!(
                     "incoming VM restore stalled for {}s (last qmp status: {}, last migrate status: {}, bytes: {:?})",
                     incoming_stall_timeout.as_secs(),
                     status.status,
                     last_migrate_status.as_deref().unwrap_or("<unknown>"),
                     last_bytes_transferred
-                );
-            }
-        } else if incoming_seen {
-            if Instant::now() >= incoming_deadline {
-                bail!(
-                    "timeout waiting for VM to report running after incoming restore (last qmp status: {})",
-                    status.status
                 );
             }
         } else if Instant::now() >= running_deadline {
@@ -460,12 +467,10 @@ pub async fn cont(monitor: &MonitorHandle) -> Result<()> {
 ///
 /// QEMU 9+ supports the `mapped-ram` file migration format, which pairs with `direct-io`
 /// so RAM pages are written to stable offsets rather than a single sequential stream.
-/// vmd prefers that format for new snapshots and falls back to the legacy
-/// background-snapshot stream when the running qemu/kernel cannot support it.
+/// vmd requires that format for snapshots; callers cold-start when the host cannot provide it.
 #[derive(Clone, Debug)]
 pub struct BackgroundSnapshotOptions {
     pub max_bandwidth_bytes_per_sec: u64,
-    pub prefer_mapped_ram: bool,
     pub direct_io: bool,
 }
 
@@ -474,7 +479,6 @@ impl Default for BackgroundSnapshotOptions {
         Self {
             // 10 GiB/s — effectively uncapped; qemu clamps to real disk throughput anyway.
             max_bandwidth_bytes_per_sec: 10u64 * 1024 * 1024 * 1024,
-            prefer_mapped_ram: true,
             direct_io: true,
         }
     }
@@ -542,21 +546,6 @@ pub async fn blockdev_snapshot_delete_internal_sync(
         .map(|_| ())
 }
 
-async fn configure_legacy_background_snapshot(
-    monitor: &MonitorHandle,
-    opts: &BackgroundSnapshotOptions,
-) -> Result<()> {
-    let args = json!({
-        "capabilities": [
-            { "capability": "background-snapshot", "state": true }
-        ]
-    });
-    monitor
-        .execute("migrate-set-capabilities", Some(args))
-        .await?;
-    configure_background_snapshot_parameters(monitor, opts, RAM_SNAPSHOT_FORMAT_LEGACY).await
-}
-
 async fn configure_mapped_background_snapshot(
     monitor: &MonitorHandle,
     opts: &BackgroundSnapshotOptions,
@@ -570,40 +559,38 @@ async fn configure_mapped_background_snapshot(
     monitor
         .execute("migrate-set-capabilities", Some(args))
         .await?;
-    configure_background_snapshot_parameters(monitor, opts, RAM_SNAPSHOT_FORMAT_MAPPED).await
+    configure_mapped_snapshot_parameters(monitor, opts).await
 }
 
-/// Configure migration runtime parameters for a background-snapshot save.
-async fn configure_background_snapshot_parameters(
-    monitor: &MonitorHandle,
-    opts: &BackgroundSnapshotOptions,
-    ram_format: &str,
-) -> Result<()> {
-    let mut params = json!({ "max-bandwidth": opts.max_bandwidth_bytes_per_sec });
-    if ram_format == RAM_SNAPSHOT_FORMAT_MAPPED {
-        if let Some(object) = params.as_object_mut() {
-            object.insert("direct-io".to_string(), json!(opts.direct_io));
-        }
-    }
-    monitor
-        .execute("migrate-set-parameters", Some(params))
-        .await
-        .map(|_| ())
-}
-
-async fn configure_paused_file_migration(
+async fn configure_paused_mapped_snapshot(
     monitor: &MonitorHandle,
     opts: &BackgroundSnapshotOptions,
 ) -> Result<()> {
     let args = json!({
         "capabilities": [
-            { "capability": "background-snapshot", "state": false }
+            { "capability": "background-snapshot", "state": false },
+            { "capability": "mapped-ram", "state": true }
         ]
     });
     monitor
         .execute("migrate-set-capabilities", Some(args))
         .await?;
-    configure_background_snapshot_parameters(monitor, opts, RAM_SNAPSHOT_FORMAT_LEGACY).await
+    configure_mapped_snapshot_parameters(monitor, opts).await
+}
+
+/// Configure migration runtime parameters for a mapped-RAM save or restore.
+async fn configure_mapped_snapshot_parameters(
+    monitor: &MonitorHandle,
+    opts: &BackgroundSnapshotOptions,
+) -> Result<()> {
+    let params = json!({
+        "max-bandwidth": opts.max_bandwidth_bytes_per_sec,
+        "direct-io": opts.direct_io,
+    });
+    monitor
+        .execute("migrate-set-parameters", Some(params))
+        .await
+        .map(|_| ())
 }
 
 async fn poll_file_migration(
@@ -646,7 +633,7 @@ async fn poll_file_migration(
     }
 }
 
-async fn save_vm_paused_after_disk_snapshot(
+async fn save_vm_paused_mapped_after_disk_snapshot(
     monitor: &MonitorHandle,
     disk_snapshot_name: &str,
     ram_path: &Path,
@@ -660,7 +647,7 @@ async fn save_vm_paused_after_disk_snapshot(
     if was_running {
         stop(monitor)
             .await
-            .with_context(|| "pause VM before paused-file snapshot")?;
+            .with_context(|| "pause VM before mapped-ram snapshot")?;
     }
     let resume_on_error = || async {
         if was_running {
@@ -668,9 +655,9 @@ async fn save_vm_paused_after_disk_snapshot(
         }
     };
 
-    if let Err(err) = configure_paused_file_migration(monitor, opts)
+    if let Err(err) = configure_paused_mapped_snapshot(monitor, opts)
         .await
-        .with_context(|| "configure paused-file migration")
+        .with_context(|| "configure paused mapped-ram snapshot")
     {
         resume_on_error().await;
         return Err(err);
@@ -679,7 +666,7 @@ async fn save_vm_paused_after_disk_snapshot(
     if let Some(parent) = ram_path.parent() {
         if let Err(err) = tokio::fs::create_dir_all(parent)
             .await
-            .with_context(|| "create ram snapshot directory")
+            .with_context(|| "create mapped-ram snapshot directory")
         {
             resume_on_error().await;
             return Err(err);
@@ -692,13 +679,13 @@ async fn save_vm_paused_after_disk_snapshot(
         .execute("migrate", Some(json!({ "uri": migrate_uri })))
         .await
         .map(|_| ())
-        .with_context(|| "initiate paused-file migration")
+        .with_context(|| "initiate paused mapped-ram migration")
     {
         resume_on_error().await;
         return Err(err);
     }
 
-    match poll_file_migration(monitor, disk_snapshot_name, RAM_SNAPSHOT_FORMAT_LEGACY).await {
+    match poll_file_migration(monitor, disk_snapshot_name, RAM_SNAPSHOT_FORMAT_MAPPED).await {
         Ok(status) => Ok(status),
         Err(err) => {
             resume_on_error().await;
@@ -713,9 +700,18 @@ pub async fn start_incoming_migration_from_file(
     ram_format: &str,
     opts: &BackgroundSnapshotOptions,
 ) -> Result<()> {
-    if ram_format == RAM_SNAPSHOT_FORMAT_MAPPED {
-        configure_mapped_incoming_restore(monitor, opts).await?;
+    if ram_format != RAM_SNAPSHOT_FORMAT_MAPPED {
+        bail!(
+            "unsupported RAM snapshot format `{}`; only `{}` is supported",
+            if ram_format.trim().is_empty() {
+                "<missing>"
+            } else {
+                ram_format
+            },
+            RAM_SNAPSHOT_FORMAT_MAPPED,
+        );
     }
+    configure_mapped_incoming_restore(monitor, opts).await?;
 
     let migrate_uri = format!("file:{}", ram_path.display());
     monitor
@@ -736,7 +732,7 @@ async fn configure_mapped_incoming_restore(
     monitor
         .execute("migrate-set-capabilities", Some(args))
         .await?;
-    configure_background_snapshot_parameters(monitor, opts, RAM_SNAPSHOT_FORMAT_MAPPED).await
+    configure_mapped_snapshot_parameters(monitor, opts).await
 }
 
 /// Status snapshot of an in-progress migration, as returned by QMP `query-migrate`.
@@ -791,8 +787,8 @@ pub async fn query_migrate(monitor: &MonitorHandle) -> Result<MigrationStatus> {
 /// Ordering inside this function:
 ///   1. Discover the block device name via `query-block`.
 ///   2. Take an internal disk snapshot pinning the point-in-time disk state.
-///   3. Prefer `background-snapshot` + `mapped-ram`; fall back to legacy
-///      `background-snapshot` when the running qemu/kernel cannot support mapped RAM.
+///   3. Prefer live `background-snapshot` + `mapped-ram`; if the host kernel lacks
+///      background snapshots, pause briefly and write the same mapped-RAM format.
 ///   4. Configure `max-bandwidth` to an effectively-uncapped value and, for mapped RAM,
 ///      enable direct I/O.
 ///   5. Issue `migrate file:<ram_path>` — qemu installs UFFD-WP and begins the async copy.
@@ -818,73 +814,27 @@ pub async fn save_vm_background(
         .await
         .with_context(|| "blockdev-snapshot-internal-sync for background save")?;
 
-    let ram_format = if opts.prefer_mapped_ram {
-        match configure_mapped_background_snapshot(monitor, opts).await {
-            Ok(()) => RAM_SNAPSHOT_FORMAT_MAPPED,
-            Err(mapped_err) => {
-                warn!(
-                    error = %mapped_err,
-                    "mapped-ram background snapshot setup failed; falling back to legacy migration stream"
-                );
-                if let Err(err) = configure_legacy_background_snapshot(monitor, opts).await {
-                    warn!(
-                        error = %err,
-                        mapped_error = %mapped_err,
-                        "legacy background snapshot setup failed; pausing VM for file-migration snapshot"
-                    );
-                    let fallback = save_vm_paused_after_disk_snapshot(
-                        monitor,
-                        disk_snapshot_name,
-                        ram_path,
-                        opts,
-                    )
-                    .await;
-                    return match fallback {
-                        Ok(status) => Ok(status),
-                        Err(fallback_err) => {
-                            let _ = blockdev_snapshot_delete_internal_sync(
-                                monitor,
-                                &device,
-                                disk_snapshot_name,
-                            )
-                            .await;
-                            let _ = tokio::fs::remove_file(ram_path).await;
-                            Err(fallback_err.context(format!(
-                                "paused-file snapshot after legacy background setup failed: {err}; mapped setup failed: {mapped_err}"
-                            )))
-                        }
-                    };
-                }
-                RAM_SNAPSHOT_FORMAT_LEGACY
+    if let Err(err) = configure_mapped_background_snapshot(monitor, opts).await {
+        warn!(
+            error = %err,
+            "live mapped-ram snapshot unavailable; retrying mapped-ram while paused"
+        );
+        let fallback =
+            save_vm_paused_mapped_after_disk_snapshot(monitor, disk_snapshot_name, ram_path, opts)
+                .await;
+        return match fallback {
+            Ok(status) => Ok(status),
+            Err(fallback_err) => {
+                let _ =
+                    blockdev_snapshot_delete_internal_sync(monitor, &device, disk_snapshot_name)
+                        .await;
+                let _ = tokio::fs::remove_file(ram_path).await;
+                Err(fallback_err.context(format!(
+                    "paused mapped-ram snapshot failed after live setup failed: {err}"
+                )))
             }
-        }
-    } else {
-        if let Err(err) = configure_legacy_background_snapshot(monitor, opts).await {
-            warn!(
-                error = %err,
-                "legacy background snapshot setup failed; pausing VM for file-migration snapshot"
-            );
-            let fallback =
-                save_vm_paused_after_disk_snapshot(monitor, disk_snapshot_name, ram_path, opts)
-                    .await;
-            return match fallback {
-                Ok(status) => Ok(status),
-                Err(fallback_err) => {
-                    let _ = blockdev_snapshot_delete_internal_sync(
-                        monitor,
-                        &device,
-                        disk_snapshot_name,
-                    )
-                    .await;
-                    let _ = tokio::fs::remove_file(ram_path).await;
-                    Err(fallback_err.context(format!(
-                        "paused-file snapshot after legacy background setup failed: {err}"
-                    )))
-                }
-            };
-        }
-        RAM_SNAPSHOT_FORMAT_LEGACY
-    };
+        };
+    }
 
     if let Some(parent) = ram_path.parent() {
         if let Err(err) = tokio::fs::create_dir_all(parent).await {
@@ -909,7 +859,7 @@ pub async fn save_vm_background(
         return Err(err.context("initiate background-snapshot migrate"));
     }
 
-    match poll_file_migration(monitor, disk_snapshot_name, &ram_format).await {
+    match poll_file_migration(monitor, disk_snapshot_name, RAM_SNAPSHOT_FORMAT_MAPPED).await {
         Ok(status) => Ok(status),
         Err(err) => {
             let _ =
@@ -1335,6 +1285,66 @@ impl MonitorHandle {
         let mut conn = establish_connection(&self.path).await?;
         execute_raw(&mut conn, command, args).await
     }
+
+    pub async fn device_add_vfio(&self, id: &str, bdf: &str) -> Result<()> {
+        self.execute(
+            "device_add",
+            Some(json!({
+                "driver": "vfio-pci",
+                "host": bdf,
+                "id": id,
+            })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn device_del_wait(&self, id: &str, timeout: Duration) -> Result<()> {
+        let mut conn = establish_connection(&self.path).await?;
+        write_command(
+            &mut conn.writer,
+            &json!({
+                "execute": "device_del",
+                "arguments": { "id": id },
+            }),
+        )
+        .await?;
+
+        let deadline = Instant::now() + timeout;
+        let mut acknowledged = false;
+        let mut deleted = false;
+        while !(acknowledged && deleted) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("timed out waiting for DEVICE_DELETED for {id}");
+            }
+            let message = tokio::time::timeout(remaining, read_json_message(&mut conn.reader))
+                .await
+                .with_context(|| format!("timed out waiting for DEVICE_DELETED for {id}"))??;
+            if let Some(error) = message.get("error") {
+                bail!("qmp error: {error}");
+            }
+            if message.get("return").is_some() {
+                acknowledged = true;
+                continue;
+            }
+            if message.get("event").and_then(Value::as_str) == Some("DEVICE_DELETED") {
+                let data = message.get("data").and_then(Value::as_object);
+                let event_device = data
+                    .and_then(|data| data.get("device"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let event_path = data
+                    .and_then(|data| data.get("path"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if event_device == id || event_path.ends_with(&format!("/{id}")) {
+                    deleted = true;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 struct QmpConnection {
@@ -1395,25 +1405,26 @@ async fn write_command(writer: &mut tokio::net::unix::OwnedWriteHalf, value: &Va
 
 async fn read_message(reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) -> Result<Value> {
     loop {
+        let value = read_json_message(reader).await?;
+        if value.get("event").is_none() {
+            return Ok(value);
+        }
+    }
+}
+
+async fn read_json_message(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+) -> Result<Value> {
+    loop {
         let mut line = String::new();
         let bytes = reader.read_line(&mut line).await?;
         if bytes == 0 {
             bail!("qmp connection closed");
         }
         match serde_json::from_str::<Value>(&line) {
-            Ok(value) => {
-                if value.get("event").is_some() {
-                    continue;
-                }
-                return Ok(value);
-            }
-            Err(err) => {
-                // lines can be partial; continue reading
-                if err.is_data() {
-                    continue;
-                }
-                return Err(err.into());
-            }
+            Ok(value) => return Ok(value),
+            Err(err) if err.is_data() => continue,
+            Err(err) => return Err(err.into()),
         }
     }
 }
@@ -1424,11 +1435,203 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::{LazyLock, Mutex};
+    use tokio::net::UnixListener;
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    async fn serve_qmp_script(listener: UnixListener, script: Vec<(&'static str, Value)>) {
+        for (expected_command, response) in script {
+            let (stream, _) = listener.accept().await.expect("accept qmp client");
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+
+            write_command(&mut write, &json!({ "QMP": {} }))
+                .await
+                .expect("write qmp greeting");
+            let mut line = String::new();
+            read.read_line(&mut line)
+                .await
+                .expect("read qmp capabilities");
+            let capabilities: Value = serde_json::from_str(&line).expect("parse qmp capabilities");
+            assert_eq!(capabilities["execute"], "qmp_capabilities");
+            write_command(&mut write, &json!({ "return": {} }))
+                .await
+                .expect("ack qmp capabilities");
+
+            line.clear();
+            read.read_line(&mut line)
+                .await
+                .expect("read scripted qmp command");
+            let command: Value = serde_json::from_str(&line).expect("parse scripted qmp command");
+            assert_eq!(command["execute"], expected_command);
+            write_command(&mut write, &json!({ "return": response }))
+                .await
+                .expect("write scripted qmp response");
+        }
+    }
+
+    #[tokio::test]
+    async fn incoming_restore_resumes_completed_paused_snapshot_and_requires_running() {
+        let temp = tempfile::tempdir().expect("create qmp tempdir");
+        let socket = temp.path().join("qmp.sock");
+        let listener = UnixListener::bind(&socket).expect("bind qmp socket");
+        let server = tokio::spawn(serve_qmp_script(
+            listener,
+            vec![
+                (
+                    "query-status",
+                    json!({ "running": false, "status": "inmigrate" }),
+                ),
+                (
+                    "query-migrate",
+                    json!({
+                        "status": "active",
+                        "ram": { "transferred": 4096 },
+                        "total-time": 10,
+                    }),
+                ),
+                (
+                    "query-status",
+                    json!({ "running": false, "status": "paused" }),
+                ),
+                (
+                    "query-migrate",
+                    json!({
+                        "status": "completed",
+                        "ram": { "transferred": 8192 },
+                        "total-time": 20,
+                    }),
+                ),
+                ("cont", json!({})),
+                (
+                    "query-status",
+                    json!({ "running": true, "status": "running" }),
+                ),
+            ],
+        ));
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            wait_for_running_or_incoming_restore(
+                &MonitorHandle { path: socket },
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("incoming restore waiter should remain bounded")
+        .expect("completed paused restore should resume and reach running");
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("qmp script should be fully consumed")
+            .expect("qmp mock should finish");
+    }
+
+    #[tokio::test]
+    async fn legacy_incoming_restore_is_rejected_before_qmp_connect() {
+        let temp = tempfile::tempdir().expect("create qmp tempdir");
+        let socket = temp.path().join("missing-qmp.sock");
+        let ram_path = temp.path().join("snapshot.ram");
+        let error = start_incoming_migration_from_file(
+            &MonitorHandle { path: socket },
+            &ram_path,
+            "legacy",
+            &BackgroundSnapshotOptions::default(),
+        )
+        .await
+        .expect_err("legacy restore must be rejected");
+        assert!(error.to_string().contains("only `mapped-ram` is supported"));
+    }
+
+    #[tokio::test]
+    async fn paused_snapshot_fallback_still_writes_mapped_ram() {
+        let temp = tempfile::tempdir().expect("create qmp tempdir");
+        let socket = temp.path().join("qmp.sock");
+        let ram_path = temp.path().join("snapshot.ram");
+        let listener = UnixListener::bind(&socket).expect("bind qmp socket");
+        let server = tokio::spawn(serve_qmp_script(
+            listener,
+            vec![
+                (
+                    "query-status",
+                    json!({ "running": true, "status": "running" }),
+                ),
+                ("stop", json!({})),
+                ("migrate-set-capabilities", json!({})),
+                ("migrate-set-parameters", json!({})),
+                ("migrate", json!({})),
+                (
+                    "query-migrate",
+                    json!({
+                        "status": "completed",
+                        "ram": { "transferred": 8192 },
+                        "total-time": 20,
+                    }),
+                ),
+            ],
+        ));
+
+        let status = save_vm_paused_mapped_after_disk_snapshot(
+            &MonitorHandle { path: socket },
+            "snap-test",
+            &ram_path,
+            &BackgroundSnapshotOptions::default(),
+        )
+        .await
+        .expect("paused mapped-ram snapshot should complete");
+        assert_eq!(status.ram_format, RAM_SNAPSHOT_FORMAT_MAPPED);
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("qmp script should be fully consumed")
+            .expect("qmp mock should finish");
+    }
+
+    #[tokio::test]
+    async fn device_del_wait_accepts_event_before_command_acknowledgement() {
+        let temp = tempfile::tempdir().expect("create qmp tempdir");
+        let socket = temp.path().join("qmp.sock");
+        let listener = UnixListener::bind(&socket).expect("bind qmp socket");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept qmp client");
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            write
+                .write_all(b"{\"QMP\":{}}\n")
+                .await
+                .expect("write greeting");
+            let mut line = String::new();
+            read.read_line(&mut line).await.expect("read capabilities");
+            write
+                .write_all(b"{\"return\":{}}\n")
+                .await
+                .expect("ack capabilities");
+            line.clear();
+            read.read_line(&mut line).await.expect("read device_del");
+            let command: Value = serde_json::from_str(&line).expect("parse device_del");
+            assert_eq!(command["execute"], "device_del");
+            assert_eq!(command["arguments"]["id"], "pci_gpu_0");
+            write
+                .write_all(
+                    b"{\"event\":\"DEVICE_DELETED\",\"data\":{\"device\":\"pci_gpu_0\",\"path\":\"/machine/peripheral/pci_gpu_0\"}}\n",
+                )
+                .await
+                .expect("write deletion event");
+            write
+                .write_all(b"{\"return\":{}}\n")
+                .await
+                .expect("ack device_del");
+        });
+
+        MonitorHandle { path: socket }
+            .device_del_wait("pci_gpu_0", Duration::from_secs(1))
+            .await
+            .expect("device deletion should complete");
+        server.await.expect("qmp mock should finish");
+    }
 
     #[derive(Clone, Copy)]
     enum ManifestMode {

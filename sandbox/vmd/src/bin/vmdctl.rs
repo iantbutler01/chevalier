@@ -523,6 +523,7 @@ async fn create_vm(
         auto_start,
         architecture: arch.unwrap_or_default(),
         shared_mounts: Vec::new(),
+        pci_device_ids: Vec::new(),
     };
 
     let mut stream = client
