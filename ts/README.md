@@ -104,6 +104,22 @@ await rt.mcp("http://localhost:8080/mcp");            // or rt.mcpAs(uri, "label
 const client = await McpClient.http("http://localhost:8080/mcp");
 await client.callTool("search", { q: "chevalier" });
 
+// Structured connection config (headers are passed to HTTP/WS handshakes):
+const authenticated = await McpClient.connect({
+  transport: "http",
+  url: "https://mcp.example.com/mcp",
+  headers: { Authorization: `Bearer ${token}` },
+});
+
+// Stdio is spawned directly without a shell. Keep credentials in env, not args:
+const local = await McpClient.connect({
+  transport: "stdio",
+  command: "node",
+  args: ["./mcp-server.js"],
+  env: { MCP_API_TOKEN: token },
+  cwd: "/path/to/project",
+});
+
 // Serve your own:
 const server = new McpServer("my-server");
 await server.tool("greet", "Greet", { type: "object", properties: { name: { type: "string" } } },

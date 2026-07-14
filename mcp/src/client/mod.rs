@@ -6,5 +6,5 @@
 mod connection;
 mod tools;
 
-pub use connection::{McpClient, McpServer, Transport};
+pub use connection::{McpClient, McpClientConfig, McpServer, Transport};
 pub use tools::ToolInfo;

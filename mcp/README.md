@@ -89,7 +89,9 @@ Connect to any MCP server and call tools:
 
 ```rust
 use chevalier_mcp::client::McpClient;
+use chevalier_mcp::client::McpClientConfig;
 use serde_json::json;
+use std::collections::BTreeMap;
 
 #[tokio::main]
 async fn main() -> chevalier_mcp::Result<()> {
@@ -101,6 +103,16 @@ async fn main() -> chevalier_mcp::Result<()> {
 
     // Or via WebSocket
     // let client = McpClient::websocket("ws://localhost:8080/mcp").await?;
+
+    // Structured configs support generic HTTP/WebSocket headers and direct
+    // stdio command args, environment, and working directory configuration.
+    let client = McpClient::connect(McpClientConfig::Http {
+        url: "http://localhost:8080/mcp".to_string(),
+        headers: BTreeMap::from([(
+            "authorization".to_string(),
+            "Bearer token".to_string(),
+        )]),
+    }).await?;
 
     // Discover tools
     let tools = client.list_tools().await?;

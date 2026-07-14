@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use chevalier_mcp::client::McpClient as Inner;
+use chevalier_mcp::client::{McpClient as Inner, McpClientConfig as InnerConfig};
 use chevalier_mcp::server::{McpServerBuilder, ServerTransport};
 use chevalier_mcp::{CallToolResult, Content, ErrorData};
 use futures::future::BoxFuture;
@@ -41,6 +41,22 @@ pub struct McpClient {
 
 #[napi]
 impl McpClient {
+    /// Connect with a structured HTTP, WebSocket, or stdio transport config.
+    #[napi(
+        factory,
+        ts_args_type = "config: { transport: 'http' | 'websocket'; url: string; headers?: Record<string, string> } | { transport: 'stdio'; command: string; args?: string[]; env?: Record<string, string>; cwd?: string }"
+    )]
+    pub async fn connect(config: serde_json::Value) -> napi::Result<McpClient> {
+        let config = serde_json::from_value::<InnerConfig>(config).map_err(|e| {
+            napi::Error::new(
+                napi::Status::InvalidArg,
+                format!("Invalid MCP client config: {e}"),
+            )
+        })?;
+        let c = Inner::connect(config).await.map_err(mcp_err)?;
+        Ok(McpClient { inner: Arc::new(c) })
+    }
+
     /// Connect over streamable HTTP, e.g. `http://localhost:8080/mcp`.
     #[napi(factory)]
     pub async fn http(url: String) -> napi::Result<McpClient> {

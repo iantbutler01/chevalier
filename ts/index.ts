@@ -23,6 +23,20 @@ export type {
   VfsWriteOptions,
 } from "./native.js";
 
+export type McpClientConfig =
+  | {
+      transport: "http" | "websocket";
+      url: string;
+      headers?: Record<string, string>;
+    }
+  | {
+      transport: "stdio";
+      command: string;
+      args?: string[];
+      env?: Record<string, string>;
+      cwd?: string;
+    };
+
 const VFS_ERR_PREFIX = /^VFS:\s+\[([A-Z0-9_]+) status=(\d{3})\]\s*([\s\S]*)$/;
 
 function setErrorField(error: Error, field: string, value: unknown): void {

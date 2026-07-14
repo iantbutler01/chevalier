@@ -2,6 +2,8 @@
 /* eslint-disable */
 /** A connection to an MCP server. */
 export declare class McpClient {
+  /** Connect with a structured HTTP, WebSocket, or stdio transport config. */
+  static connect(config: { transport: 'http' | 'websocket'; url: string; headers?: Record<string, string> } | { transport: 'stdio'; command: string; args?: string[]; env?: Record<string, string>; cwd?: string }): Promise<McpClient>
   /** Connect over streamable HTTP, e.g. `http://localhost:8080/mcp`. */
   static http(url: string): Promise<McpClient>
   /** Connect over WebSocket, e.g. `ws://localhost:8080`. */

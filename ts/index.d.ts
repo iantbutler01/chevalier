@@ -1,6 +1,17 @@
 import * as native from "./native.js";
 import type { ZodType } from "zod";
 export type { RunResult, ToolCallJs, ToolSchemaJs, StreamEvent, Message, MediaPartInput, GatewayOptions, ProviderConfigInput, AnthropicCacheConfig, CodexSubscriptionConfigInput, VfsMetadata, VfsObjectState, VfsWriteOptions, } from "./native.js";
+export type McpClientConfig = {
+    transport: "http" | "websocket";
+    url: string;
+    headers?: Record<string, string>;
+} | {
+    transport: "stdio";
+    command: string;
+    args?: string[];
+    env?: Record<string, string>;
+    cwd?: string;
+};
 export { McpClient, McpServer, VfsStorage, version } from "./native.js";
 export { createVfsGatewayServer } from "./vfs-gateway-server.js";
 export type { VfsGatewayServerOptions } from "./vfs-gateway-server.js";

@@ -2,6 +2,9 @@
 
 #[cfg(feature = "apps")]
 use rmcp::model::ExtensionCapabilities;
+use std::{collections::BTreeMap, path::PathBuf};
+
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rmcp::{
     ClientHandler, RoleClient, ServiceExt,
     model::{
@@ -9,8 +12,12 @@ use rmcp::{
         ListToolsResult, ReadResourceRequestParams, ReadResourceResult, ServerInfo,
     },
     service::RunningService,
-    transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess},
+    transport::{
+        StreamableHttpClientTransport, TokioChildProcess,
+        streamable_http_client::StreamableHttpClientTransportConfig,
+    },
 };
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::process::Command;
 
@@ -65,6 +72,38 @@ pub enum Transport {
     WebSocket(String),
     /// Stdio transport (spawns child process)
     Stdio { command: String, args: Vec<String> },
+}
+
+/// Structured configuration for an MCP client connection.
+///
+/// Header and environment values are supplied directly to the transport and
+/// child process. Chevalier does not resolve credentials or interpret their
+/// contents.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "transport", rename_all = "lowercase", deny_unknown_fields)]
+pub enum McpClientConfig {
+    /// Streamable HTTP transport.
+    Http {
+        url: String,
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
+    },
+    /// WebSocket transport.
+    WebSocket {
+        url: String,
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
+    },
+    /// Stdio transport (spawns a child process without invoking a shell).
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+        #[serde(default)]
+        cwd: Option<PathBuf>,
+    },
 }
 
 /// MCP Server configuration for registering with a runtime
@@ -169,6 +208,22 @@ enum ClientInner {
 }
 
 impl McpClient {
+    /// Connect using a structured transport configuration.
+    pub async fn connect(config: McpClientConfig) -> Result<Self> {
+        match config {
+            McpClientConfig::Http { url, headers } => Self::http_configured(url, headers).await,
+            McpClientConfig::WebSocket { url, headers } => {
+                Self::websocket_configured(url, headers).await
+            }
+            McpClientConfig::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+            } => Self::stdio_configured(command, args, env, cwd).await,
+        }
+    }
+
     /// Connect to an MCP server via HTTP
     ///
     /// # Example
@@ -181,8 +236,19 @@ impl McpClient {
     /// # }
     /// ```
     pub async fn http(url: impl Into<String>) -> Result<Self> {
-        let url = url.into();
-        let transport = StreamableHttpClientTransport::from_uri(url.clone());
+        Self::http_configured(url.into(), BTreeMap::new()).await
+    }
+
+    async fn http_configured(url: String, headers: BTreeMap<String, String>) -> Result<Self> {
+        let headers = validate_headers(headers, "HTTP")?;
+        let http_client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .map_err(|e| Error::Transport(format!("Failed to configure HTTP client: {e}")))?;
+        let transport = StreamableHttpClientTransport::with_client(
+            http_client,
+            StreamableHttpClientTransportConfig::with_uri(url.clone()),
+        );
         let service = ChevalierClientHandler.serve(transport).await.map_err(|e| {
             Error::Transport(format!(
                 "Failed to connect to HTTP MCP server at {}: {}",
@@ -206,8 +272,12 @@ impl McpClient {
     /// # }
     /// ```
     pub async fn websocket(url: impl Into<String>) -> Result<Self> {
-        let url = url.into();
-        let transport = crate::transport::websocket::connect(&url).await?;
+        Self::websocket_configured(url.into(), BTreeMap::new()).await
+    }
+
+    async fn websocket_configured(url: String, headers: BTreeMap<String, String>) -> Result<Self> {
+        let headers = validate_headers(headers, "WebSocket")?;
+        let transport = crate::transport::websocket::connect_with_headers(&url, headers).await?;
         let service = ChevalierClientHandler.serve(transport).await.map_err(|e| {
             Error::Transport(format!(
                 "Failed to connect to WebSocket MCP server at {}: {}",
@@ -242,21 +312,13 @@ impl McpClient {
         let command = parts[0];
         let args: Vec<&str> = parts[1..].to_vec();
 
-        let transport = TokioChildProcess::new(Command::new(command).configure(|cmd| {
-            cmd.args(&args);
-        }))
-        .map_err(|e| Error::Transport(format!("Failed to spawn process '{}': {}", command, e)))?;
-
-        let service = ChevalierClientHandler.serve(transport).await.map_err(|e| {
-            Error::Transport(format!(
-                "Failed to connect to stdio MCP server '{}': {}",
-                command_line, e
-            ))
-        })?;
-
-        Ok(Self {
-            inner: ClientInner::Stdio(service),
-        })
+        Self::stdio_configured(
+            command.to_string(),
+            args.into_iter().map(str::to_string).collect(),
+            BTreeMap::new(),
+            None,
+        )
+        .await
     }
 
     /// Create a client from an McpServer configuration
@@ -270,10 +332,19 @@ impl McpClient {
 
     /// Connect to an MCP server via stdio with explicit command and args
     pub async fn stdio_with_args(command: &str, args: &[String]) -> Result<Self> {
-        let transport = TokioChildProcess::new(Command::new(command).configure(|cmd| {
-            cmd.args(args);
-        }))
-        .map_err(|e| Error::Transport(format!("Failed to spawn process '{}': {}", command, e)))?;
+        Self::stdio_configured(command.to_string(), args.to_vec(), BTreeMap::new(), None).await
+    }
+
+    async fn stdio_configured(
+        command: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+        cwd: Option<PathBuf>,
+    ) -> Result<Self> {
+        let child_command = build_stdio_command(&command, &args, &env, cwd.as_deref())?;
+        let transport = TokioChildProcess::new(child_command).map_err(|e| {
+            Error::Transport(format!("Failed to spawn process '{}': {}", command, e))
+        })?;
 
         let service = ChevalierClientHandler.serve(transport).await.map_err(|e| {
             Error::Transport(format!(
@@ -392,5 +463,88 @@ impl McpClient {
         match &self.inner {
             ClientInner::Http(s) | ClientInner::WebSocket(s) | ClientInner::Stdio(s) => s,
         }
+    }
+}
+
+fn validate_headers(headers: BTreeMap<String, String>, transport: &str) -> Result<HeaderMap> {
+    let mut validated = HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+            Error::Transport(format!("Invalid {transport} header name '{name}': {e}"))
+        })?;
+        let header_value = HeaderValue::from_str(&value).map_err(|_| {
+            Error::Transport(format!("Invalid value for {transport} header '{name}'"))
+        })?;
+        validated.insert(header_name, header_value);
+    }
+    Ok(validated)
+}
+
+fn build_stdio_command(
+    command: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: Option<&std::path::Path>,
+) -> Result<Command> {
+    if command.trim().is_empty() {
+        return Err(Error::Transport("Empty command".to_string()));
+    }
+
+    let mut child = Command::new(command);
+    child.args(args).envs(env);
+    if let Some(cwd) = cwd {
+        child.current_dir(cwd);
+    }
+    Ok(child)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdio_config_keeps_args_env_and_cwd_separate() {
+        let args = vec!["--label".to_string(), "value with spaces".to_string()];
+        let env = BTreeMap::from([(
+            "CHEVALIER_TEST_SECRET".to_string(),
+            "not-on-the-command-line".to_string(),
+        )]);
+        let cwd = std::env::temp_dir();
+
+        let command = build_stdio_command("mcp-test-server", &args, &env, Some(&cwd)).unwrap();
+        let command = command.as_std();
+
+        assert_eq!(command.get_program(), "mcp-test-server");
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            args
+        );
+        assert_eq!(command.get_current_dir(), Some(cwd.as_path()));
+        assert!(command.get_envs().any(|(name, value)| {
+            name == "CHEVALIER_TEST_SECRET"
+                && value == Some(std::ffi::OsStr::new("not-on-the-command-line"))
+        }));
+        assert!(
+            command
+                .get_args()
+                .all(|arg| arg != "not-on-the-command-line")
+        );
+    }
+
+    #[test]
+    fn invalid_header_errors_do_not_echo_values() {
+        let secret = "secret\nvalue";
+        let error = validate_headers(
+            BTreeMap::from([("authorization".to_string(), secret.to_string())]),
+            "HTTP",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("authorization"));
+        assert!(!error.contains(secret));
     }
 }

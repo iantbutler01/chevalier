@@ -7,7 +7,7 @@ use std::marker::PhantomData;
 
 use futures::{Sink, Stream};
 use rmcp::service::{RxJsonRpcMessage, ServiceRole, TxJsonRpcMessage};
-use tokio_tungstenite::tungstenite;
+use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest, http::HeaderMap};
 
 pin_project_lite::pin_project! {
     /// WebSocket transport wrapper that implements Stream + Sink for rmcp
@@ -126,9 +126,33 @@ pub async fn connect(
     >,
     crate::error::Error,
 > {
-    let (stream, response) = tokio_tungstenite::connect_async(url).await.map_err(|e| {
-        crate::error::Error::Transport(format!("WebSocket connection failed: {}", e))
-    })?;
+    connect_with_headers(url, HeaderMap::new()).await
+}
+
+/// Connect to a WebSocket MCP server with validated handshake headers.
+pub async fn connect_with_headers(
+    url: &str,
+    headers: HeaderMap,
+) -> Result<
+    WebSocketTransport<
+        rmcp::RoleClient,
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tungstenite::Error,
+    >,
+    crate::error::Error,
+> {
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| crate::error::Error::Transport(format!("Invalid WebSocket URL: {e}")))?;
+    request.headers_mut().extend(headers);
+
+    let (stream, response) = tokio_tungstenite::connect_async(request)
+        .await
+        .map_err(|e| {
+            crate::error::Error::Transport(format!("WebSocket connection failed: {}", e))
+        })?;
 
     if response.status() != tungstenite::http::StatusCode::SWITCHING_PROTOCOLS {
         return Err(crate::error::Error::Transport(format!(

@@ -406,6 +406,47 @@ test("mcp server + client end-to-end", async () => {
   assert.ok((tools.tools || []).some((t) => t.name === "echo"));
   const res = await client.callTool("echo", { m: "pong" });
   assert.ok(JSON.stringify(res).includes("pong"));
+
+  const configuredClient = await McpClient.connect({
+    transport: "http",
+    url: "http://127.0.0.1:38091/mcp",
+    headers: { "x-chevalier-test": "structured-config" },
+  });
+  const configuredTools = await configuredClient.listTools();
+  assert.ok((configuredTools.tools || []).some((t) => t.name === "echo"));
+});
+
+test("mcp structured stdio config rejects an empty command", async () => {
+  await assert.rejects(
+    McpClient.connect({
+      transport: "stdio",
+      command: "",
+      args: ["not flattened"],
+      env: { CHEVALIER_MCP_TEST_SECRET: "not-on-the-command-line" },
+      cwd: process.cwd(),
+    }),
+    /Empty command/,
+  );
+});
+
+test("mcp structured stdio config preserves args, env, and cwd", async () => {
+  const fixture = path.join(__dirname, "..", "test-fixtures", "mcp-stdio-server.cjs");
+  const cwd = path.dirname(fixture);
+  const client = await McpClient.connect({
+    transport: "stdio",
+    command: process.execPath,
+    args: [fixture, "argument with spaces"],
+    env: { CHEVALIER_MCP_TEST_SECRET: "environment-only-secret" },
+    cwd,
+  });
+
+  const result = await client.callTool("config_report", {});
+  const report = JSON.parse(result.content[0].text);
+  assert.deepStrictEqual(report, {
+    args: ["argument with spaces"],
+    cwd,
+    secret: "environment-only-secret",
+  });
 });
 
 test("agentic() injects a Runtime as the last arg", () => {

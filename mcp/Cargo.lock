@@ -149,6 +149,7 @@ dependencies = [
  "axum",
  "futures",
  "pin-project-lite",
+ "reqwest",
  "rmcp",
  "serde",
  "serde_json",

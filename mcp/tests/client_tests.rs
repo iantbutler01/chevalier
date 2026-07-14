@@ -1,13 +1,24 @@
 //! Integration tests for MCP client transports
 
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
+
 use chevalier_mcp::WebSocketTransport;
+use chevalier_mcp::client::{McpClient, McpClientConfig};
 use rmcp::{
     RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
+    transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    },
 };
 use serde_json::json;
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 // Test Calculator server - same as rmcp example
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -83,6 +94,141 @@ async fn start_ws_server(port: u16) -> tokio::task::JoinHandle<()> {
             });
         }
     })
+}
+
+async fn start_http_header_server() -> (
+    String,
+    oneshot::Receiver<Option<String>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let cancellation = CancellationToken::new();
+    let service = StreamableHttpService::new(
+        || Ok(Calculator::new()),
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig {
+            cancellation_token: cancellation,
+            stateful_mode: true,
+            ..Default::default()
+        },
+    );
+    let (header_tx, header_rx) = oneshot::channel();
+    let header_tx = Arc::new(Mutex::new(Some(header_tx)));
+    let router =
+        axum::Router::new()
+            .nest_service("/mcp", service)
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let header_tx = Arc::clone(&header_tx);
+                    async move {
+                        let value = request
+                            .headers()
+                            .get("x-chevalier-test")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        if let Some(tx) = header_tx.lock().expect("header lock poisoned").take() {
+                            let _ = tx.send(value);
+                        }
+                        next.run(request).await
+                    }
+                },
+            ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind HTTP listener");
+    let address = listener
+        .local_addr()
+        .expect("Missing HTTP listener address");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("HTTP server failed");
+    });
+
+    (format!("http://{address}/mcp"), header_rx, server)
+}
+
+async fn start_ws_header_server() -> (
+    String,
+    oneshot::Receiver<Option<String>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind WebSocket listener");
+    let address = listener
+        .local_addr()
+        .expect("Missing WebSocket listener address");
+    let (header_tx, header_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .expect("Failed to accept connection");
+        let ws_stream = tokio_tungstenite::accept_hdr_async(
+            stream,
+            move |
+                request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                response: tokio_tungstenite::tungstenite::handshake::server::Response,
+            | {
+                let value = request
+                    .headers()
+                    .get("x-chevalier-test")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                let _ = header_tx.send(value);
+                Ok(response)
+            },
+        )
+        .await
+        .expect("WebSocket handshake failed");
+        let transport: WebSocketTransport<RoleServer, _, _> = WebSocketTransport::new(ws_stream);
+        let service = Calculator::new()
+            .serve(transport)
+            .await
+            .expect("Failed to serve");
+        let _ = service.waiting().await;
+    });
+
+    (format!("ws://{address}"), header_rx, server)
+}
+
+#[tokio::test]
+async fn test_structured_http_config_passes_headers() {
+    let (url, header_rx, server) = start_http_header_server().await;
+    let client = McpClient::connect(McpClientConfig::Http {
+        url,
+        headers: BTreeMap::from([("x-chevalier-test".to_string(), "http-header".to_string())]),
+    })
+    .await
+    .expect("Failed to connect over structured HTTP config");
+
+    assert_eq!(
+        header_rx.await.expect("Header capture dropped").as_deref(),
+        Some("http-header")
+    );
+    client.close().await.expect("Failed to close");
+    server.abort();
+}
+
+#[tokio::test]
+async fn test_structured_websocket_config_passes_handshake_headers() {
+    let (url, header_rx, server) = start_ws_header_server().await;
+    let client = McpClient::connect(McpClientConfig::WebSocket {
+        url,
+        headers: BTreeMap::from([(
+            "x-chevalier-test".to_string(),
+            "websocket-header".to_string(),
+        )]),
+    })
+    .await
+    .expect("Failed to connect over structured WebSocket config");
+
+    assert_eq!(
+        header_rx.await.expect("Header capture dropped").as_deref(),
+        Some("websocket-header")
+    );
+    client.close().await.expect("Failed to close");
+    server.abort();
 }
 
 #[tokio::test]
