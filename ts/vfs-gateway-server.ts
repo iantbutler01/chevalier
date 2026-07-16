@@ -33,6 +33,7 @@
 //   - POST {owner}/rename?from=&to=&return_metadata=true -> 200 {previous,current}
 //   - POST/DELETE {owner}/lease          -> 200 {resource_key,owner_token} / 2xx
 //   - POST {owner}/{metadata-many,read-many,write-many} -> batch (per-path loop)
+//   - POST {owner}/namespace-many      -> ordered namespace mutation batch
 //   DTOs are snake_case; `kind` is exactly "file" | "directory"; errors map
 //   404->NotFound, 400->BadRequest, 409->Conflict (vfs/src/gateway.rs:1016).
 import { createHash, randomUUID } from "node:crypto";
@@ -56,6 +57,20 @@ type StreamingVfsStorage = VfsStorage & {
     expectedContentHash: string,
     options?: { ifMatch?: string | null; executable?: boolean } | null,
   ) => Promise<unknown>;
+  writeMany?: (writes: Array<{
+    path: string;
+    body: number[];
+    precondition?: { fingerprint?: string | null };
+  }>) => Promise<StreamingWriteManyResult[]>;
+};
+
+type StreamingWriteManyResult = {
+  path: string;
+  content_hash?: string;
+  contentHash?: string;
+  previous_hash?: string | null;
+  previousHash?: string | null;
+  changed: boolean;
 };
 
 export interface VfsGatewayServerOptions {
@@ -182,6 +197,14 @@ export function createVfsGatewayServer(
         return json(200, { resource_key: `rk:${ownerId}:${leasePath}`, owner_token: randomToken() });
       }
       if (op === "lease" && method === "DELETE") {
+        return new Response(null, { status: 204 });
+      }
+
+      if (method === "POST" && op === "namespace-many") {
+        const body = (await req.json()) as { mutations?: unknown };
+        const mutations = normalizeNamespaceMutations(body.mutations);
+        if (mutations instanceof Response) return mutations;
+        await store.applyNamespaceBatch(mutations);
         return new Response(null, { status: 204 });
       }
 
@@ -385,6 +408,38 @@ export function createVfsGatewayServer(
         const body = (await req.json()) as {
           writes: WriteManyRequestItem[];
         };
+        const streamingStore = store as StreamingVfsStorage;
+        if (typeof streamingStore.writeMany === "function") {
+          const writes = body.writes.map((write) => {
+            const path = normalizePath(write.path);
+            if (isGitExcludedPath(path)) throw Object.assign(new Error(`excluded path: ${path}`), {
+              code: "VFS_BAD_REQUEST",
+            });
+            const precondition = writeItemPrecondition(write);
+            return {
+              path,
+              body: write.body,
+              ...(precondition.present
+                ? { precondition: { fingerprint: precondition.fingerprint } }
+                : {}),
+            };
+          });
+          try {
+            const results = await streamingStore.writeMany(writes);
+            return json(200, {
+              results: results.map((result: StreamingWriteManyResult) => ({
+                path: result.path,
+                content_hash: result.content_hash ?? result.contentHash ?? "",
+                previous_hash: result.previous_hash ?? result.previousHash ?? null,
+                changed: result.changed,
+              })),
+            });
+          } catch (error) {
+            const conflict = conflictResponseFromStoreError(error, "write-many");
+            if (conflict !== null) return conflict;
+            throw error;
+          }
+        }
         // Atomic-ish: check all preconditions first, then apply. Any mismatch -> 409.
         for (const w of body.writes) {
           const path = normalizePath(w.path);
@@ -555,8 +610,51 @@ type WriteManyRequestItem = {
   };
 };
 
-function ownValue<T extends object, K extends PropertyKey>(obj: T | undefined, key: K): unknown {
-  if (obj === undefined || !Object.prototype.hasOwnProperty.call(obj, key)) return undefined;
+type NamespaceMutation =
+  | { kind: "create_directory"; path: string }
+  | { kind: "create_symlink"; path: string; target: string }
+  | { kind: "delete_file"; path: string }
+  | { kind: "remove_directory"; path: string }
+  | { kind: "rename"; from: string; to: string };
+
+function normalizeNamespaceMutations(value: unknown): NamespaceMutation[] | Response {
+  if (!Array.isArray(value)) return errorResponse(400, "namespace-many requires mutations[]");
+  if (value.length > 4096) return errorResponse(400, "namespace-many accepts at most 4096 mutations");
+  const out: NamespaceMutation[] = [];
+  for (const item of value) {
+    if (typeof item !== "object" || item === null || typeof (item as { kind?: unknown }).kind !== "string") {
+      return errorResponse(400, "invalid namespace mutation");
+    }
+    const mutation = item as Record<string, unknown>;
+    const kind = mutation.kind;
+    if (kind === "rename") {
+      const from = normalizePath(typeof mutation.from === "string" ? mutation.from : null);
+      const to = normalizePath(typeof mutation.to === "string" ? mutation.to : null);
+      if (from === "" || to === "") return errorResponse(400, "rename requires from + to");
+      if (isGitExcludedPath(from) || isGitExcludedPath(to)) return errorResponse(400, "excluded rename path");
+      out.push({ kind, from, to });
+      continue;
+    }
+    const path = normalizePath(typeof mutation.path === "string" ? mutation.path : null);
+    if (path === "" || isGitExcludedPath(path)) return errorResponse(400, `invalid namespace path: ${path}`);
+    if (kind === "create_directory" || kind === "delete_file" || kind === "remove_directory") {
+      out.push({ kind, path });
+      continue;
+    }
+    if (kind === "create_symlink") {
+      if (typeof mutation.target !== "string" || mutation.target === "") {
+        return errorResponse(400, "create_symlink requires target");
+      }
+      out.push({ kind, path, target: mutation.target });
+      continue;
+    }
+    return errorResponse(400, `unsupported namespace mutation: ${String(kind)}`);
+  }
+  return out;
+}
+
+function ownValue<T extends object, K extends PropertyKey>(obj: T | null | undefined, key: K): unknown {
+  if (obj == null || !Object.prototype.hasOwnProperty.call(obj, key)) return undefined;
   return (obj as Record<K, unknown>)[key];
 }
 

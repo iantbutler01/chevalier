@@ -2,11 +2,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chevalier_sandbox::vfs::{
-    CHEVALIER_VFS_COMPONENT_HEADER, CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
-    CHEVALIER_VFS_OPERATION_HEADER, CHEVALIER_VFS_RESOURCE_KEY_HEADER,
-    CHEVALIER_VFS_SURFACE_KIND_HEADER, VFS_COMPONENT_VM_RUNTIME, VfsDirEntry as RemoteDirEntry,
-    VfsLeaseAcquireRequest, VfsLeaseGrant as LeaseGrant, VfsLeaseReleaseRequest,
-    VfsMetadata as RemoteMetadata, scoped_vfs_path,
+    CHEVALIER_VFS_COMPONENT_HEADER, CHEVALIER_VFS_EXECUTABLE_HEADER,
+    CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, CHEVALIER_VFS_OPERATION_HEADER,
+    CHEVALIER_VFS_RESOURCE_KEY_HEADER, CHEVALIER_VFS_SURFACE_KIND_HEADER, VFS_COMPONENT_VM_RUNTIME,
+    VfsDirEntry as RemoteDirEntry, VfsLeaseAcquireRequest, VfsLeaseGrant as LeaseGrant,
+    VfsLeaseReleaseRequest, VfsMetadata as RemoteMetadata, VfsNamespaceMutation,
+    VfsNamespaceMutationBatchBody, VfsWriteManyBody, VfsWriteManyItem, VfsWritePrecondition,
+    scoped_vfs_path,
 };
 use reqwest::{Client, StatusCode, header};
 
@@ -16,6 +18,12 @@ pub struct RemoteVfsClient {
     endpoint: String,
     auth_token: String,
     scope_path: String,
+}
+
+pub struct RemoteWrite {
+    pub path: String,
+    pub bytes: Vec<u8>,
+    pub base_content_hash: Option<String>,
 }
 
 impl RemoteVfsClient {
@@ -114,6 +122,7 @@ impl RemoteVfsClient {
         &self,
         path: &str,
         bytes: &[u8],
+        executable: bool,
         lease: &LeaseGrant,
         surface_kind: &str,
         operation: &str,
@@ -125,6 +134,7 @@ impl RemoteVfsClient {
                 .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
                 .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
                 .header(CHEVALIER_VFS_OPERATION_HEADER, operation)
+                .header(CHEVALIER_VFS_EXECUTABLE_HEADER, executable.to_string())
                 .header(
                     CHEVALIER_VFS_RESOURCE_KEY_HEADER,
                     lease.resource_key.as_str(),
@@ -316,6 +326,135 @@ impl RemoteVfsClient {
         Ok(())
     }
 
+    pub async fn apply_namespace_batch(
+        &self,
+        mutations: &[VfsNamespaceMutation],
+        surface_kind: &str,
+    ) -> Result<()> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        let lease_path = common_namespace_parent(mutations);
+        let lease = self
+            .acquire_lease(
+                lease_path.as_str(),
+                mutations.len() as i32,
+                "apply vfs namespace batch",
+            )
+            .await?;
+        let scoped = mutations
+            .iter()
+            .map(|mutation| self.scope_namespace_mutation(mutation))
+            .collect::<Vec<_>>();
+        let result = self
+            .request(
+                self.client
+                    .post(self.url("/namespace-many"))
+                    .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
+                    .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
+                    .header(CHEVALIER_VFS_OPERATION_HEADER, "vfs_namespace_batch")
+                    .header(
+                        CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+                        lease.resource_key.as_str(),
+                    )
+                    .header(
+                        CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                        lease.owner_token.to_string(),
+                    )
+                    .json(&VfsNamespaceMutationBatchBody { mutations: scoped }),
+            )
+            .await
+            .map(|_| ());
+        let release = self.release_lease(&lease).await;
+        match (result, release) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+        }
+    }
+
+    pub async fn write_many(&self, writes: Vec<RemoteWrite>, surface_kind: &str) -> Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let lease_path = common_parent(writes.iter().map(|write| write.path.as_str()));
+        let lease = self
+            .acquire_lease(
+                lease_path.as_str(),
+                writes.len() as i32,
+                "flush vfs fuse write batch",
+            )
+            .await?;
+        let body = VfsWriteManyBody {
+            writes: writes
+                .into_iter()
+                .map(|write| VfsWriteManyItem {
+                    path: self.path_arg(write.path.as_str()),
+                    body: write.bytes,
+                    precondition: write
+                        .base_content_hash
+                        .map(|fingerprint| VfsWritePrecondition {
+                            fingerprint: Some(fingerprint),
+                            secondary_fingerprint: None,
+                        }),
+                })
+                .collect(),
+        };
+        let result = self
+            .request(
+                self.client
+                    .post(self.url("/write-many"))
+                    .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
+                    .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
+                    .header(CHEVALIER_VFS_OPERATION_HEADER, "vfs_write_many")
+                    .header(
+                        CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+                        lease.resource_key.as_str(),
+                    )
+                    .header(
+                        CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                        lease.owner_token.to_string(),
+                    )
+                    .json(&body),
+            )
+            .await
+            .map(|_| ());
+        let release = self.release_lease(&lease).await;
+        match (result, release) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+        }
+    }
+
+    fn scope_namespace_mutation(&self, mutation: &VfsNamespaceMutation) -> VfsNamespaceMutation {
+        match mutation {
+            VfsNamespaceMutation::CreateDirectory { path } => {
+                VfsNamespaceMutation::CreateDirectory {
+                    path: self.path_arg(path),
+                }
+            }
+            VfsNamespaceMutation::CreateSymlink { path, target } => {
+                VfsNamespaceMutation::CreateSymlink {
+                    path: self.path_arg(path),
+                    target: target.clone(),
+                }
+            }
+            VfsNamespaceMutation::DeleteFile { path } => VfsNamespaceMutation::DeleteFile {
+                path: self.path_arg(path),
+            },
+            VfsNamespaceMutation::RemoveDirectory { path } => {
+                VfsNamespaceMutation::RemoveDirectory {
+                    path: self.path_arg(path),
+                }
+            }
+            VfsNamespaceMutation::Rename { from, to } => VfsNamespaceMutation::Rename {
+                from: self.path_arg(from),
+                to: self.path_arg(to),
+            },
+        }
+    }
+
     fn path_arg(&self, relative: &str) -> String {
         scoped_vfs_path(self.scope_path.as_str(), relative)
     }
@@ -350,4 +489,67 @@ fn http2_prior_knowledge_enabled(_endpoint: &str) -> bool {
         ),
         Err(_) => false,
     }
+}
+
+fn common_namespace_parent(mutations: &[VfsNamespaceMutation]) -> String {
+    let mut parents = mutations.iter().flat_map(|mutation| {
+        mutation
+            .paths()
+            .into_iter()
+            .filter(|path| !path.is_empty())
+            .map(parent_path)
+    });
+    let Some(first) = parents.next() else {
+        return String::new();
+    };
+    let mut common = first
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for parent in parents {
+        let segments = parent
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        let shared = common
+            .iter()
+            .zip(segments)
+            .take_while(|(left, right)| left.as_str() == *right)
+            .count();
+        common.truncate(shared);
+    }
+    common.join("/")
+}
+
+fn parent_path(path: &str) -> String {
+    path.trim_matches('/')
+        .rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
+        .unwrap_or_default()
+}
+
+fn common_parent<'a>(paths: impl Iterator<Item = &'a str>) -> String {
+    let mut parents = paths.map(parent_path);
+    let Some(first) = parents.next() else {
+        return String::new();
+    };
+    let mut common = first
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for parent in parents {
+        let segments = parent
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        let shared = common
+            .iter()
+            .zip(segments)
+            .take_while(|(left, right)| left.as_str() == *right)
+            .count();
+        common.truncate(shared);
+    }
+    common.join("/")
 }

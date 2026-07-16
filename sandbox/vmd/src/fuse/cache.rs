@@ -10,6 +10,7 @@ const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DIRS: usize = 4_096;
 const MAX_DIR_ENTRIES: usize = 10_000;
+const MAX_ATTRS: usize = 131_072;
 
 #[derive(Clone)]
 struct CachedFile {
@@ -84,18 +85,8 @@ impl RemoteFuseCache {
         {
             put_metadata_locked(&mut inner, path, metadata);
         }
-        while inner.file_bytes > MAX_TOTAL_BYTES {
-            let Some(oldest_key) = inner
-                .files
-                .iter()
-                .min_by_key(|(_, value)| value.last_access)
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            if let Some(removed) = inner.files.remove(oldest_key.as_str()) {
-                inner.file_bytes = inner.file_bytes.saturating_sub(removed.bytes.len());
-            }
+        if inner.file_bytes > MAX_TOTAL_BYTES {
+            prune_files_locked(&mut inner, MAX_TOTAL_BYTES.saturating_mul(3) / 4);
         }
     }
 
@@ -116,7 +107,6 @@ impl RemoteFuseCache {
         }
         let mut inner = self.lock_inner();
         let now = Instant::now();
-        inner.dirs.retain(|_, value| value.expires_at > now);
         inner.dirs.insert(
             path.to_string(),
             CachedDir {
@@ -137,16 +127,8 @@ impl RemoteFuseCache {
                 metadata_from_dir_entry(entry),
             );
         }
-        while inner.dirs.len() > MAX_DIRS {
-            let Some(oldest_key) = inner
-                .dirs
-                .iter()
-                .min_by_key(|(_, value)| value.last_access)
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            inner.dirs.remove(oldest_key.as_str());
+        if inner.dirs.len() > MAX_DIRS {
+            prune_dirs_locked(&mut inner, now, MAX_DIRS.saturating_mul(3) / 4);
         }
     }
 
@@ -185,7 +167,6 @@ impl RemoteFuseCache {
 
 fn put_metadata_locked(inner: &mut CacheState, path: &str, metadata: RemoteMetadata) {
     let now = Instant::now();
-    inner.attrs.retain(|_, value| value.expires_at > now);
     inner.attrs.insert(
         path.to_string(),
         CachedMetadata {
@@ -194,6 +175,60 @@ fn put_metadata_locked(inner: &mut CacheState, path: &str, metadata: RemoteMetad
             last_access: now,
         },
     );
+    if inner.attrs.len() > MAX_ATTRS {
+        prune_attrs_locked(inner, now, MAX_ATTRS.saturating_mul(3) / 4);
+    }
+}
+
+fn prune_files_locked(inner: &mut CacheState, target_bytes: usize) {
+    let mut oldest = inner
+        .files
+        .iter()
+        .map(|(path, value)| (path.clone(), value.last_access))
+        .collect::<Vec<_>>();
+    oldest.sort_unstable_by_key(|(_, last_access)| *last_access);
+    for (path, _) in oldest {
+        if inner.file_bytes <= target_bytes {
+            break;
+        }
+        if let Some(removed) = inner.files.remove(path.as_str()) {
+            inner.file_bytes = inner.file_bytes.saturating_sub(removed.bytes.len());
+        }
+    }
+}
+
+fn prune_dirs_locked(inner: &mut CacheState, now: Instant, target_entries: usize) {
+    inner.dirs.retain(|_, value| value.expires_at > now);
+    if inner.dirs.len() <= target_entries {
+        return;
+    }
+    let mut oldest = inner
+        .dirs
+        .iter()
+        .map(|(path, value)| (path.clone(), value.last_access))
+        .collect::<Vec<_>>();
+    oldest.sort_unstable_by_key(|(_, last_access)| *last_access);
+    let remove_count = inner.dirs.len().saturating_sub(target_entries);
+    for (path, _) in oldest.into_iter().take(remove_count) {
+        inner.dirs.remove(path.as_str());
+    }
+}
+
+fn prune_attrs_locked(inner: &mut CacheState, now: Instant, target_entries: usize) {
+    inner.attrs.retain(|_, value| value.expires_at > now);
+    if inner.attrs.len() <= target_entries {
+        return;
+    }
+    let mut oldest = inner
+        .attrs
+        .iter()
+        .map(|(path, value)| (path.clone(), value.last_access))
+        .collect::<Vec<_>>();
+    oldest.sort_unstable_by_key(|(_, last_access)| *last_access);
+    let remove_count = inner.attrs.len().saturating_sub(target_entries);
+    for (path, _) in oldest.into_iter().take(remove_count) {
+        inner.attrs.remove(path.as_str());
+    }
 }
 
 fn metadata_from_dir_entry(entry: RemoteDirEntry) -> RemoteMetadata {
@@ -202,6 +237,7 @@ fn metadata_from_dir_entry(entry: RemoteDirEntry) -> RemoteMetadata {
         size_bytes: entry.size_bytes,
         link_target: entry.link_target,
         content_hash: entry.content_hash,
+        executable: entry.executable,
         updated_at: entry.updated_at,
     }
 }
@@ -228,7 +264,11 @@ fn parent_path(path: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_DIR_ENTRIES, MAX_DIRS, RemoteFuseCache};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        CacheState, CachedMetadata, MAX_DIR_ENTRIES, MAX_DIRS, RemoteFuseCache, prune_attrs_locked,
+    };
     use chevalier_sandbox::vfs::VfsDirEntry as RemoteDirEntry;
 
     fn entry(name: &str) -> RemoteDirEntry {
@@ -238,6 +278,7 @@ mod tests {
             size_bytes: 0,
             link_target: None,
             content_hash: None,
+            executable: false,
             updated_at: None,
         }
     }
@@ -249,6 +290,7 @@ mod tests {
             size_bytes: target.len() as u64,
             link_target: Some(target.to_string()),
             content_hash: None,
+            executable: false,
             updated_at: None,
         }
     }
@@ -281,5 +323,31 @@ mod tests {
         let metadata = cache.get_metadata("bin/tool").expect("cached metadata");
         assert_eq!(metadata.kind, "symlink");
         assert_eq!(metadata.link_target.as_deref(), Some("../real-tool"));
+    }
+
+    #[test]
+    fn metadata_cache_prunes_expired_and_old_entries_in_one_batch() {
+        let now = Instant::now();
+        let mut inner = CacheState::default();
+        for index in 0..4 {
+            inner.attrs.insert(
+                format!("entry-{index}"),
+                CachedMetadata {
+                    metadata: super::metadata_from_dir_entry(entry("file")),
+                    expires_at: if index == 0 {
+                        now - Duration::from_secs(1)
+                    } else {
+                        now + Duration::from_secs(1)
+                    },
+                    last_access: now + Duration::from_millis(index),
+                },
+            );
+        }
+
+        prune_attrs_locked(&mut inner, now, 2);
+
+        assert_eq!(inner.attrs.len(), 2);
+        assert!(!inner.attrs.contains_key("entry-0"));
+        assert!(inner.attrs.contains_key("entry-3"));
     }
 }

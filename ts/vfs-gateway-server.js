@@ -36,6 +36,7 @@ exports.createVfsGatewayServer = createVfsGatewayServer;
 //   - POST {owner}/rename?from=&to=&return_metadata=true -> 200 {previous,current}
 //   - POST/DELETE {owner}/lease          -> 200 {resource_key,owner_token} / 2xx
 //   - POST {owner}/{metadata-many,read-many,write-many} -> batch (per-path loop)
+//   - POST {owner}/namespace-many      -> ordered namespace mutation batch
 //   DTOs are snake_case; `kind` is exactly "file" | "directory"; errors map
 //   404->NotFound, 400->BadRequest, 409->Conflict (vfs/src/gateway.rs:1016).
 const node_crypto_1 = require("node:crypto");
@@ -162,6 +163,14 @@ function createVfsGatewayServer(opts) {
                 return json(200, { resource_key: `rk:${ownerId}:${leasePath}`, owner_token: randomToken() });
             }
             if (op === "lease" && method === "DELETE") {
+                return new Response(null, { status: 204 });
+            }
+            if (method === "POST" && op === "namespace-many") {
+                const body = (await req.json());
+                const mutations = normalizeNamespaceMutations(body.mutations);
+                if (mutations instanceof Response)
+                    return mutations;
+                await store.applyNamespaceBatch(mutations);
                 return new Response(null, { status: 204 });
             }
             // ---- single-file mutations -----------------------------------------
@@ -367,6 +376,41 @@ function createVfsGatewayServer(opts) {
             }
             if (method === "POST" && op === "write-many") {
                 const body = (await req.json());
+                const streamingStore = store;
+                if (typeof streamingStore.writeMany === "function") {
+                    const writes = body.writes.map((write) => {
+                        const path = normalizePath(write.path);
+                        if (isGitExcludedPath(path))
+                            throw Object.assign(new Error(`excluded path: ${path}`), {
+                                code: "VFS_BAD_REQUEST",
+                            });
+                        const precondition = writeItemPrecondition(write);
+                        return {
+                            path,
+                            body: write.body,
+                            ...(precondition.present
+                                ? { precondition: { fingerprint: precondition.fingerprint } }
+                                : {}),
+                        };
+                    });
+                    try {
+                        const results = await streamingStore.writeMany(writes);
+                        return json(200, {
+                            results: results.map((result) => ({
+                                path: result.path,
+                                content_hash: result.content_hash ?? result.contentHash ?? "",
+                                previous_hash: result.previous_hash ?? result.previousHash ?? null,
+                                changed: result.changed,
+                            })),
+                        });
+                    }
+                    catch (error) {
+                        const conflict = conflictResponseFromStoreError(error, "write-many");
+                        if (conflict !== null)
+                            return conflict;
+                        throw error;
+                    }
+                }
                 // Atomic-ish: check all preconditions first, then apply. Any mismatch -> 409.
                 for (const w of body.writes) {
                     const path = normalizePath(w.path);
@@ -505,8 +549,48 @@ function preconditionOptions(precondition) {
         return undefined;
     return { ifMatch: precondition.fingerprint };
 }
+function normalizeNamespaceMutations(value) {
+    if (!Array.isArray(value))
+        return errorResponse(400, "namespace-many requires mutations[]");
+    if (value.length > 4096)
+        return errorResponse(400, "namespace-many accepts at most 4096 mutations");
+    const out = [];
+    for (const item of value) {
+        if (typeof item !== "object" || item === null || typeof item.kind !== "string") {
+            return errorResponse(400, "invalid namespace mutation");
+        }
+        const mutation = item;
+        const kind = mutation.kind;
+        if (kind === "rename") {
+            const from = normalizePath(typeof mutation.from === "string" ? mutation.from : null);
+            const to = normalizePath(typeof mutation.to === "string" ? mutation.to : null);
+            if (from === "" || to === "")
+                return errorResponse(400, "rename requires from + to");
+            if (isGitExcludedPath(from) || isGitExcludedPath(to))
+                return errorResponse(400, "excluded rename path");
+            out.push({ kind, from, to });
+            continue;
+        }
+        const path = normalizePath(typeof mutation.path === "string" ? mutation.path : null);
+        if (path === "" || isGitExcludedPath(path))
+            return errorResponse(400, `invalid namespace path: ${path}`);
+        if (kind === "create_directory" || kind === "delete_file" || kind === "remove_directory") {
+            out.push({ kind, path });
+            continue;
+        }
+        if (kind === "create_symlink") {
+            if (typeof mutation.target !== "string" || mutation.target === "") {
+                return errorResponse(400, "create_symlink requires target");
+            }
+            out.push({ kind, path, target: mutation.target });
+            continue;
+        }
+        return errorResponse(400, `unsupported namespace mutation: ${String(kind)}`);
+    }
+    return out;
+}
 function ownValue(obj, key) {
-    if (obj === undefined || !Object.prototype.hasOwnProperty.call(obj, key))
+    if (obj == null || !Object.prototype.hasOwnProperty.call(obj, key))
         return undefined;
     return obj[key];
 }

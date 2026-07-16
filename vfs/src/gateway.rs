@@ -14,11 +14,11 @@ use tokio_util::io::ReaderStream;
 
 use crate::{
     OptimizedVfsStorage, VfsStorageDeleteResult, VfsStorageDirListFilter, VfsStorageEntryKind,
-    VfsStorageError, VfsStorageMetadata, VfsStorageMetadataFields, VfsStorageObjectState,
-    VfsStoragePrefetchOptions, VfsStoragePrefetchResult, VfsStorageReadIfChanged,
-    VfsStorageReadIfChangedResult, VfsStorageReadRange, VfsStorageRenameResult, VfsStorageResult,
-    VfsStorageSubtreeOptions, VfsStorageWrite, VfsStorageWriteOptions, VfsStorageWritePrecondition,
-    VfsStorageWriteResult, pack::hex_hash,
+    VfsStorageError, VfsStorageMetadata, VfsStorageMetadataFields, VfsStorageNamespaceMutation,
+    VfsStorageObjectState, VfsStoragePrefetchOptions, VfsStoragePrefetchResult,
+    VfsStorageReadIfChanged, VfsStorageReadIfChangedResult, VfsStorageReadRange,
+    VfsStorageRenameResult, VfsStorageResult, VfsStorageSubtreeOptions, VfsStorageWrite,
+    VfsStorageWriteOptions, VfsStorageWritePrecondition, VfsStorageWriteResult, pack::hex_hash,
 };
 
 const COMPONENT_HEADER: &str = "x-chevalier-vfs-component";
@@ -41,6 +41,7 @@ const OP_UNLINK: &str = "vfs_unlink";
 const OP_RMDIR: &str = "vfs_rmdir";
 const OP_RENAME: &str = "vfs_rename";
 const OP_SYMLINK: &str = "vfs_symlink";
+const OP_NAMESPACE_BATCH: &str = "vfs_namespace_batch";
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -856,6 +857,38 @@ impl OptimizedVfsStorage for GatewayVfsStorage {
         self.release_after(&lease, result).await
     }
 
+    async fn apply_namespace_batch(
+        &self,
+        mutations: Vec<VfsStorageNamespaceMutation>,
+    ) -> VfsStorageResult<()> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        let lease_path = common_namespace_parent(mutations.as_slice());
+        let lease = self
+            .acquire_lease(
+                lease_path.as_str(),
+                mutations.len() as i32,
+                self.cfg.mutation_reason.as_str(),
+            )
+            .await?;
+        let body = NamespaceBatchBody {
+            mutations: mutations
+                .into_iter()
+                .map(|mutation| NamespaceMutation::from_storage(mutation, self))
+                .collect(),
+        };
+        let result = self
+            .send(self.mutation_headers(
+                self.client.post(self.url("/namespace-many")).json(&body),
+                &lease,
+                OP_NAMESPACE_BATCH,
+            ))
+            .await
+            .map(|_| ());
+        self.release_after(&lease, result).await
+    }
+
     async fn prefetch_subtree(
         &self,
         prefix: &str,
@@ -888,6 +921,83 @@ impl OptimizedVfsStorage for GatewayVfsStorage {
 #[derive(Serialize)]
 struct PathBatchRequest {
     paths: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct NamespaceBatchBody {
+    mutations: Vec<NamespaceMutation>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum NamespaceMutation {
+    CreateDirectory { path: String },
+    CreateSymlink { path: String, target: String },
+    DeleteFile { path: String },
+    RemoveDirectory { path: String },
+    Rename { from: String, to: String },
+}
+
+impl NamespaceMutation {
+    fn from_storage(mutation: VfsStorageNamespaceMutation, storage: &GatewayVfsStorage) -> Self {
+        match mutation {
+            VfsStorageNamespaceMutation::CreateDirectory { path } => Self::CreateDirectory {
+                path: storage.path_arg(path.as_str()),
+            },
+            VfsStorageNamespaceMutation::CreateSymlink { path, target } => Self::CreateSymlink {
+                path: storage.path_arg(path.as_str()),
+                target,
+            },
+            VfsStorageNamespaceMutation::DeleteFile { path } => Self::DeleteFile {
+                path: storage.path_arg(path.as_str()),
+            },
+            VfsStorageNamespaceMutation::RemoveDirectory { path } => Self::RemoveDirectory {
+                path: storage.path_arg(path.as_str()),
+            },
+            VfsStorageNamespaceMutation::Rename { from, to } => Self::Rename {
+                from: storage.path_arg(from.as_str()),
+                to: storage.path_arg(to.as_str()),
+            },
+        }
+    }
+}
+
+fn common_namespace_parent(mutations: &[VfsStorageNamespaceMutation]) -> String {
+    let mut parents = mutations.iter().flat_map(|mutation| {
+        mutation
+            .paths()
+            .into_iter()
+            .filter(|path| !path.is_empty())
+            .map(parent_path)
+    });
+    let Some(first) = parents.next() else {
+        return String::new();
+    };
+    let mut common = first
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for parent in parents {
+        let segments = parent
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        let shared = common
+            .iter()
+            .zip(segments)
+            .take_while(|(left, right)| left.as_str() == *right)
+            .count();
+        common.truncate(shared);
+    }
+    common.join("/")
+}
+
+fn parent_path(path: &str) -> String {
+    path.trim_matches('/')
+        .rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
+        .unwrap_or_default()
 }
 
 #[derive(Serialize)]

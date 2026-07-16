@@ -144,6 +144,10 @@ export declare class VfsStorage {
   rmdir(path: string): Promise<void>
   /** Rename/move a file; returns the rename result (JSON). */
   rename(from: string, to: string): Promise<any>
+  /** Apply an ordered namespace batch in one backend operation. */
+  applyNamespaceBatch(mutations: any): Promise<void>
+  /** Write an ordered set of files through one backend operation. */
+  writeMany(writes: any): Promise<any>
 }
 
 /** Anthropic prompt-caching config. Cache markers are `"ephemeral"` or `"ephemeral1h"`. */

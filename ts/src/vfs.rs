@@ -10,11 +10,12 @@ use chevalier_vfs::gateway::{GatewayVfsStorage, GatewayVfsStorageConfig};
 use chevalier_vfs::local::LocalVfsStorage;
 use chevalier_vfs::{
     OptimizedVfsStorage, VfsStorageDirListFilter, VfsStorageEntryKind, VfsStorageError,
-    VfsStorageMetadata, VfsStorageMetadataFields, VfsStorageObjectState, VfsStorageWriteOptions,
-    VfsStorageWritePrecondition,
+    VfsStorageMetadata, VfsStorageMetadataFields, VfsStorageNamespaceMutation,
+    VfsStorageObjectState, VfsStorageWrite, VfsStorageWriteOptions, VfsStorageWritePrecondition,
 };
 use napi::bindgen_prelude::{BigInt, Buffer};
 use napi_derive::napi;
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
 fn vfs_err(e: VfsStorageError) -> napi::Error {
@@ -227,6 +228,14 @@ pub struct VfsWriteOptions {
     #[napi(ts_type = "string | null")]
     pub if_match: Option<String>,
     pub executable: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct VfsWriteManyInput {
+    path: String,
+    body: Vec<u8>,
+    #[serde(default)]
+    precondition: Option<VfsStorageWritePrecondition>,
 }
 
 /// A virtual filesystem. Construct via `VfsStorage.local(root)` or
@@ -442,5 +451,37 @@ impl VfsStorage {
             .await
             .map_err(vfs_err)?;
         to_json(r)
+    }
+
+    /// Apply an ordered namespace batch in one backend operation.
+    #[napi]
+    pub async fn apply_namespace_batch(&self, mutations: Value) -> napi::Result<()> {
+        let mutations = serde_json::from_value::<Vec<VfsStorageNamespaceMutation>>(mutations)
+            .map_err(|error| invalid_options_err(format!("invalid namespace batch: {error}")))?;
+        self.inner
+            .apply_namespace_batch(mutations)
+            .await
+            .map_err(vfs_err)
+    }
+
+    /// Write an ordered set of files through one backend operation.
+    #[napi]
+    pub async fn write_many(&self, writes: Value) -> napi::Result<Value> {
+        let writes = serde_json::from_value::<Vec<VfsWriteManyInput>>(writes)
+            .map_err(|error| invalid_options_err(format!("invalid write batch: {error}")))?
+            .into_iter()
+            .map(|write| VfsStorageWrite {
+                path: write.path,
+                bytes: Bytes::from(write.body),
+                token_count: None,
+                precondition: write.precondition,
+            })
+            .collect();
+        let result = self
+            .inner
+            .write_many_atomic(writes)
+            .await
+            .map_err(vfs_err)?;
+        to_json(result)
     }
 }

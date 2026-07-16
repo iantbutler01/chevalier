@@ -22,6 +22,7 @@ pub const CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER: &str =
     "x-chevalier-vfs-precondition-fingerprint";
 pub const CHEVALIER_VFS_PRECONDITION_SECONDARY_FINGERPRINT_HEADER: &str =
     "x-chevalier-vfs-precondition-secondary-fingerprint";
+pub const CHEVALIER_VFS_EXECUTABLE_HEADER: &str = "x-chevalier-vfs-executable";
 
 pub const VFS_COMPONENT_VM_RUNTIME: &str = "vm_runtime";
 pub const VFS_ENTRY_KIND_FILE: &str = "file";
@@ -31,11 +32,14 @@ pub const VFS_SURFACE_KIND_VM_SHARED: &str = "vm_shared_vfs";
 pub const VFS_SURFACE_KIND_VM_WORKSPACE: &str = "vm_workspace_vfs";
 pub const VFS_OPERATION_WRITE_THROUGH: &str = "vfs_write_through";
 pub const VFS_OPERATION_SETATTR_SIZE: &str = "vfs_setattr_size";
+pub const VFS_OPERATION_SETATTR_MODE: &str = "vfs_setattr_mode";
 pub const VFS_OPERATION_MKDIR: &str = "vfs_mkdir";
 pub const VFS_OPERATION_UNLINK: &str = "vfs_unlink";
 pub const VFS_OPERATION_RMDIR: &str = "vfs_rmdir";
 pub const VFS_OPERATION_RENAME: &str = "vfs_rename";
+pub const VFS_OPERATION_LINK: &str = "vfs_link";
 pub const VFS_OPERATION_SYMLINK: &str = "vfs_symlink";
+pub const VFS_OPERATION_NAMESPACE_BATCH: &str = "vfs_namespace_batch";
 
 pub const DEFAULT_VFS_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
@@ -47,6 +51,8 @@ pub struct VfsDirEntry {
     #[serde(default)]
     pub link_target: Option<String>,
     pub content_hash: Option<String>,
+    #[serde(default)]
+    pub executable: bool,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -57,6 +63,8 @@ pub struct VfsMetadata {
     #[serde(default)]
     pub link_target: Option<String>,
     pub content_hash: Option<String>,
+    #[serde(default)]
+    pub executable: bool,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -79,6 +87,33 @@ pub struct VfsDeleteMetadataResponse {
 pub struct VfsRenameMetadataResponse {
     pub previous: Option<VfsMetadata>,
     pub current: Option<VfsMetadata>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsNamespaceMutationBatchBody {
+    pub mutations: Vec<VfsNamespaceMutation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VfsNamespaceMutation {
+    CreateDirectory { path: String },
+    CreateSymlink { path: String, target: String },
+    DeleteFile { path: String },
+    RemoveDirectory { path: String },
+    Rename { from: String, to: String },
+}
+
+impl VfsNamespaceMutation {
+    pub fn paths(&self) -> [&str; 2] {
+        match self {
+            Self::CreateDirectory { path }
+            | Self::CreateSymlink { path, .. }
+            | Self::DeleteFile { path }
+            | Self::RemoveDirectory { path } => [path.as_str(), ""],
+            Self::Rename { from, to } => [from.as_str(), to.as_str()],
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -250,6 +285,7 @@ pub struct VfsWriteHeaders {
     pub surface_kind: String,
     pub operation: String,
     pub reason: String,
+    pub executable: Option<bool>,
     pub owner_token: Uuid,
 }
 
@@ -277,6 +313,14 @@ pub struct VfsNamespaceMutationRequest {
     pub headers: VfsWriteHeaders,
     pub scope: VfsWriteScope,
     pub precondition: Option<VfsWritePrecondition>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VfsNamespaceMutationBatchRequest {
+    pub owner_id: String,
+    pub mutations: Vec<VfsNamespaceMutation>,
+    pub headers: VfsWriteHeaders,
+    pub scope: VfsWriteScope,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -411,22 +455,24 @@ mod server {
     use uuid::Uuid;
 
     use super::{
-        CHEVALIER_VFS_COMPONENT_HEADER, CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
-        CHEVALIER_VFS_OPERATION_HEADER, CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER,
+        CHEVALIER_VFS_COMPONENT_HEADER, CHEVALIER_VFS_EXECUTABLE_HEADER,
+        CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, CHEVALIER_VFS_OPERATION_HEADER,
+        CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER,
         CHEVALIER_VFS_PRECONDITION_SECONDARY_FINGERPRINT_HEADER, CHEVALIER_VFS_REASON_HEADER,
         CHEVALIER_VFS_RESOURCE_KEY_HEADER, CHEVALIER_VFS_ROUTE_PREFIX, CHEVALIER_VFS_RUN_ID_HEADER,
         CHEVALIER_VFS_SURFACE_KIND_HEADER, DEFAULT_VFS_BODY_LIMIT_BYTES, VFS_COMPONENT_VM_RUNTIME,
-        VFS_ENTRY_KIND_FILE, VFS_OPERATION_MKDIR, VFS_OPERATION_RENAME, VFS_OPERATION_RMDIR,
-        VFS_OPERATION_SYMLINK, VFS_OPERATION_UNLINK, VFS_OPERATION_WRITE_THROUGH,
-        VfsDeleteMetadataResponse, VfsDirEntry, VfsGatewayError, VfsHeaderAliases, VfsLeaseAcquire,
-        VfsLeaseAcquireRequest, VfsLeaseGrant, VfsLeaseReleaseRequest, VfsListDirOptions,
-        VfsMetadata, VfsMetadataManyRequest, VfsMetadataManyResponse, VfsNamespaceMutationRequest,
-        VfsPrefetchSubtreeRequest, VfsPrefetchSubtreeResponse, VfsReadManyRequest,
-        VfsReadManyResponse, VfsReadRange, VfsRenameMetadataResponse, VfsRenameRequest, VfsResult,
-        VfsSubtreeMetadataEntry, VfsSubtreeMetadataRequest, VfsSubtreeMetadataResponse,
-        VfsSymlinkRequest, VfsWriteHeaders, VfsWriteManyBody, VfsWriteManyRequest,
-        VfsWriteManyResponse, VfsWriteManyResult, VfsWritePrecondition, VfsWriteRequest,
-        VfsWriteScope, parse_vfs_range_header,
+        VFS_ENTRY_KIND_FILE, VFS_OPERATION_MKDIR, VFS_OPERATION_NAMESPACE_BATCH,
+        VFS_OPERATION_RENAME, VFS_OPERATION_RMDIR, VFS_OPERATION_SYMLINK, VFS_OPERATION_UNLINK,
+        VFS_OPERATION_WRITE_THROUGH, VfsDeleteMetadataResponse, VfsDirEntry, VfsGatewayError,
+        VfsHeaderAliases, VfsLeaseAcquire, VfsLeaseAcquireRequest, VfsLeaseGrant,
+        VfsLeaseReleaseRequest, VfsListDirOptions, VfsMetadata, VfsMetadataManyRequest,
+        VfsMetadataManyResponse, VfsNamespaceMutation, VfsNamespaceMutationBatchBody,
+        VfsNamespaceMutationBatchRequest, VfsNamespaceMutationRequest, VfsPrefetchSubtreeRequest,
+        VfsPrefetchSubtreeResponse, VfsReadManyRequest, VfsReadManyResponse, VfsReadRange,
+        VfsRenameMetadataResponse, VfsRenameRequest, VfsResult, VfsSubtreeMetadataEntry,
+        VfsSubtreeMetadataRequest, VfsSubtreeMetadataResponse, VfsSymlinkRequest, VfsWriteHeaders,
+        VfsWriteManyBody, VfsWriteManyRequest, VfsWriteManyResponse, VfsWriteManyResult,
+        VfsWritePrecondition, VfsWriteRequest, VfsWriteScope, parse_vfs_range_header,
     };
 
     #[async_trait]
@@ -543,6 +589,66 @@ mod server {
                 current: None,
             })
         }
+        async fn apply_namespace_batch(
+            &self,
+            request: VfsNamespaceMutationBatchRequest,
+        ) -> VfsResult<()> {
+            for mutation in request.mutations {
+                match mutation {
+                    VfsNamespaceMutation::CreateDirectory { path } => {
+                        self.mkdir(VfsNamespaceMutationRequest {
+                            owner_id: request.owner_id.clone(),
+                            path,
+                            headers: request.headers.clone(),
+                            scope: request.scope.clone(),
+                            precondition: None,
+                        })
+                        .await?;
+                    }
+                    VfsNamespaceMutation::CreateSymlink { path, target } => {
+                        self.create_symlink(VfsSymlinkRequest {
+                            owner_id: request.owner_id.clone(),
+                            path,
+                            target,
+                            headers: request.headers.clone(),
+                            scope: request.scope.clone(),
+                        })
+                        .await?;
+                    }
+                    VfsNamespaceMutation::DeleteFile { path } => {
+                        self.delete_file(VfsNamespaceMutationRequest {
+                            owner_id: request.owner_id.clone(),
+                            path,
+                            headers: request.headers.clone(),
+                            scope: request.scope.clone(),
+                            precondition: None,
+                        })
+                        .await?;
+                    }
+                    VfsNamespaceMutation::RemoveDirectory { path } => {
+                        self.rmdir(VfsNamespaceMutationRequest {
+                            owner_id: request.owner_id.clone(),
+                            path,
+                            headers: request.headers.clone(),
+                            scope: request.scope.clone(),
+                            precondition: None,
+                        })
+                        .await?;
+                    }
+                    VfsNamespaceMutation::Rename { from, to } => {
+                        self.rename(VfsRenameRequest {
+                            owner_id: request.owner_id.clone(),
+                            from,
+                            to,
+                            headers: request.headers.clone(),
+                            scope: request.scope.clone(),
+                        })
+                        .await?;
+                    }
+                }
+            }
+            Ok(())
+        }
         async fn acquire_lease(&self, request: VfsLeaseAcquire) -> VfsResult<VfsLeaseGrant>;
         async fn release_lease(
             &self,
@@ -597,6 +703,10 @@ mod server {
             .route(
                 &format!("{prefix}/{{owner_id}}/write-many"),
                 post(post_write_many::<S, B>),
+            )
+            .route(
+                &format!("{prefix}/{{owner_id}}/namespace-many"),
+                post(post_namespace_many::<S, B>),
             )
             .route(
                 &format!("{prefix}/{{owner_id}}/file"),
@@ -826,6 +936,66 @@ mod server {
             })
             .await?;
         Ok(Json(VfsWriteManyResponse { results }))
+    }
+
+    async fn post_namespace_many<S, B>(
+        State(backend): State<B>,
+        Path(owner_id): Path<String>,
+        headers: HeaderMap,
+        Json(body): Json<VfsNamespaceMutationBatchBody>,
+    ) -> VfsResult<StatusCode>
+    where
+        B: VfsGatewayBackend + FromRef<S>,
+        S: Clone + Send + Sync + 'static,
+    {
+        if body.mutations.is_empty() {
+            return Ok(StatusCode::NO_CONTENT);
+        }
+        if body.mutations.len() > 4096 {
+            return Err(VfsGatewayError::BadRequest(
+                "namespace-many accepts at most 4096 mutations".to_string(),
+            ));
+        }
+        let first_path = body.mutations[0]
+            .paths()
+            .into_iter()
+            .find(|path| !path.is_empty())
+            .ok_or_else(|| {
+                VfsGatewayError::BadRequest("namespace mutation has no path".to_string())
+            })?;
+        let first_scope = backend
+            .derive_write_scope(owner_id.as_str(), first_path)
+            .await?;
+        for path in body
+            .mutations
+            .iter()
+            .flat_map(VfsNamespaceMutation::paths)
+            .filter(|path| !path.is_empty())
+        {
+            let scope = backend.derive_write_scope(owner_id.as_str(), path).await?;
+            if scope.resource_key != first_scope.resource_key {
+                return Err(VfsGatewayError::Conflict(
+                    backend.cross_scope_rename_message(),
+                ));
+            }
+        }
+        let aliases = backend.header_aliases();
+        let write_headers = parse_write_headers(
+            &headers,
+            &aliases,
+            first_scope.default_surface_kind.as_str(),
+            VFS_OPERATION_NAMESPACE_BATCH,
+        )?;
+        validate_declared_resource_key(&headers, &aliases, first_scope.resource_key.as_str())?;
+        backend
+            .apply_namespace_batch(VfsNamespaceMutationBatchRequest {
+                owner_id,
+                mutations: body.mutations,
+                headers: write_headers,
+                scope: first_scope,
+            })
+            .await?;
+        Ok(StatusCode::NO_CONTENT)
     }
 
     async fn get_file_raw<S, B>(
@@ -1230,6 +1400,15 @@ mod server {
                 .unwrap_or_else(|| default_operation.to_string()),
             reason: header_value(headers, CHEVALIER_VFS_REASON_HEADER, &aliases.reason)
                 .unwrap_or_else(|| default_operation.to_string()),
+            executable: header_value(headers, CHEVALIER_VFS_EXECUTABLE_HEADER, &[])
+                .map(|value| match value.as_str() {
+                    "true" => Ok(true),
+                    "false" => Ok(false),
+                    _ => Err(VfsGatewayError::BadRequest(format!(
+                        "invalid {CHEVALIER_VFS_EXECUTABLE_HEADER}: {value}"
+                    ))),
+                })
+                .transpose()?,
             owner_token: parse_required_uuid_header(
                 headers,
                 CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
@@ -1374,8 +1553,9 @@ mod server_tests {
         VFS_ENTRY_KIND_DIRECTORY, VFS_ENTRY_KIND_FILE, VFS_OPERATION_SETATTR_SIZE,
         VFS_SURFACE_KIND_VM_WORKSPACE, VfsDirEntry, VfsGatewayBackend, VfsGatewayError,
         VfsLeaseAcquire, VfsLeaseGrant, VfsLeaseReleaseRequest, VfsMetadata,
-        VfsMetadataManyResponse, VfsNamespaceMutationRequest, VfsReadManyResponse, VfsReadRange,
-        VfsRenameRequest, VfsResult, VfsSymlinkRequest, VfsWriteManyRequest, VfsWriteManyResponse,
+        VfsMetadataManyResponse, VfsNamespaceMutation, VfsNamespaceMutationBatchRequest,
+        VfsNamespaceMutationRequest, VfsReadManyResponse, VfsReadRange, VfsRenameRequest,
+        VfsResult, VfsSymlinkRequest, VfsWriteManyRequest, VfsWriteManyResponse,
         VfsWriteManyResult, VfsWriteRequest, VfsWriteScope, chevalier_vfs_routes,
     };
 
@@ -1390,6 +1570,7 @@ mod server_tests {
         dirs: HashSet<String>,
         writes: Vec<VfsWriteRequest>,
         write_many: Vec<VfsWriteManyRequest>,
+        namespace_batches: Vec<VfsNamespaceMutationBatchRequest>,
         deletes: Vec<VfsNamespaceMutationRequest>,
         mkdirs: Vec<VfsNamespaceMutationRequest>,
         rmdirs: Vec<VfsNamespaceMutationRequest>,
@@ -1411,6 +1592,7 @@ mod server_tests {
                 size_bytes: 5,
                 link_target: None,
                 content_hash: None,
+                executable: false,
                 updated_at: None,
             }])
         }
@@ -1424,6 +1606,7 @@ mod server_tests {
                     size_bytes: 0,
                     link_target: None,
                     content_hash: None,
+                    executable: false,
                     updated_at: None,
                 });
             }
@@ -1435,6 +1618,7 @@ mod server_tests {
                 size_bytes: bytes.len() as u64,
                 link_target: None,
                 content_hash: None,
+                executable: false,
                 updated_at: None,
             })
         }
@@ -1448,6 +1632,7 @@ mod server_tests {
                     size_bytes: 0,
                     link_target: None,
                     content_hash: None,
+                    executable: false,
                     updated_at: None,
                 });
             }
@@ -1459,6 +1644,7 @@ mod server_tests {
                 size_bytes: bytes.len() as u64,
                 link_target: None,
                 content_hash: None,
+                executable: false,
                 updated_at: None,
             })
         }
@@ -1532,6 +1718,14 @@ mod server_tests {
             }
             inner.write_many.push(request);
             Ok(results)
+        }
+
+        async fn apply_namespace_batch(
+            &self,
+            request: VfsNamespaceMutationBatchRequest,
+        ) -> VfsResult<()> {
+            self.inner.lock().unwrap().namespace_batches.push(request);
+            Ok(())
         }
 
         async fn delete_file(&self, request: VfsNamespaceMutationRequest) -> VfsResult<()> {
@@ -1823,6 +2017,59 @@ mod server_tests {
         assert!(inner.write_many[0].writes[1].precondition.is_none());
         assert_eq!(inner.files.get("first.txt").unwrap().as_ref(), b"one");
         assert_eq!(inner.files.get("second.txt").unwrap().as_ref(), b"two");
+    }
+
+    #[tokio::test]
+    async fn gateway_namespace_many_forwards_one_ordered_batch() {
+        let owner_token = Uuid::new_v4();
+        let backend = MemoryBackend::default();
+        let app =
+            chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/chevalier/vfs/owner-1/namespace-many")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(CHEVALIER_VFS_RESOURCE_KEY_HEADER, "owner:owner-1:workspace")
+                    .header(
+                        CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                        owner_token.to_string(),
+                    )
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "mutations": [
+                                {"kind": "create_directory", "path": "tree"},
+                                {"kind": "rename", "from": "source.txt", "to": "tree/result.txt"},
+                                {"kind": "delete_file", "path": "tree/result.txt"},
+                            ],
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let inner = backend.inner.lock().unwrap();
+        assert_eq!(inner.namespace_batches.len(), 1);
+        assert_eq!(
+            inner.namespace_batches[0].mutations,
+            vec![
+                VfsNamespaceMutation::CreateDirectory {
+                    path: "tree".to_string(),
+                },
+                VfsNamespaceMutation::Rename {
+                    from: "source.txt".to_string(),
+                    to: "tree/result.txt".to_string(),
+                },
+                VfsNamespaceMutation::DeleteFile {
+                    path: "tree/result.txt".to_string(),
+                },
+            ]
+        );
     }
 
     #[tokio::test]

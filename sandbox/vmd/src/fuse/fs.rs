@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
@@ -7,10 +7,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use chevalier_sandbox::vfs::{
-    VFS_OPERATION_MKDIR, VFS_OPERATION_RENAME, VFS_OPERATION_RMDIR, VFS_OPERATION_SETATTR_SIZE,
-    VFS_OPERATION_SYMLINK, VFS_OPERATION_UNLINK, VFS_OPERATION_WRITE_THROUGH,
-    VFS_SURFACE_KIND_VM_SHARED, VFS_SURFACE_KIND_VM_WORKSPACE, VfsDirEntry as RemoteDirEntry,
-    VfsLeaseGrant as LeaseGrant, VfsMetadata as RemoteMetadata, scoped_vfs_path,
+    VFS_OPERATION_LINK, VFS_OPERATION_SETATTR_MODE, VFS_OPERATION_SETATTR_SIZE,
+    VFS_OPERATION_WRITE_THROUGH, VFS_SURFACE_KIND_VM_SHARED, VFS_SURFACE_KIND_VM_WORKSPACE,
+    VfsDirEntry as RemoteDirEntry, VfsLeaseGrant as LeaseGrant, VfsMetadata as RemoteMetadata,
+    VfsNamespaceMutation, scoped_vfs_path,
 };
 use fuser::{
     BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
@@ -22,12 +22,13 @@ use tokio::runtime::Handle;
 
 use super::cache::RemoteFuseCache;
 use super::client::RemoteVfsClient;
+use super::namespace::NamespaceJournal;
+use super::write::WriteJournal;
 
 const TTL: Duration = Duration::from_secs(1);
 const ROOT_INO_RAW: u64 = 1;
 const ROOT_INO: INodeNo = INodeNo(ROOT_INO_RAW);
 const LARGE_FILE_BYTES: u64 = 10 * 1024 * 1024;
-const MAX_INODES: usize = 65_536;
 const MAX_OPEN_HANDLES: usize = 8_192;
 
 type FuseResult<T> = std::result::Result<T, Errno>;
@@ -35,20 +36,21 @@ type FuseResult<T> = std::result::Result<T, Errno>;
 #[derive(Default)]
 struct InodeTable {
     next: u64,
-    path_to_ino: HashMap<String, INodeNo>,
+    path_to_ino: BTreeMap<String, INodeNo>,
     ino_to_path: HashMap<INodeNo, InodeRecord>,
 }
 
 struct InodeRecord {
     path: String,
     last_access: Instant,
+    lookup_count: u64,
 }
 
 impl InodeTable {
     fn new() -> Self {
         let mut table = Self {
             next: ROOT_INO_RAW + 1,
-            path_to_ino: HashMap::new(),
+            path_to_ino: BTreeMap::new(),
             ino_to_path: HashMap::new(),
         };
         table.path_to_ino.insert(String::new(), ROOT_INO);
@@ -57,6 +59,7 @@ impl InodeTable {
             InodeRecord {
                 path: String::new(),
                 last_access: Instant::now(),
+                lookup_count: u64::MAX,
             },
         );
         table
@@ -77,9 +80,17 @@ impl InodeTable {
             InodeRecord {
                 path: path.to_string(),
                 last_access: Instant::now(),
+                lookup_count: 0,
             },
         );
-        self.evict_to_capacity(MAX_INODES);
+        ino
+    }
+
+    fn lookup(&mut self, path: &str) -> INodeNo {
+        let ino = self.ensure(path);
+        if let Some(record) = self.ino_to_path.get_mut(&ino) {
+            record.lookup_count = record.lookup_count.saturating_add(1);
+        }
         ino
     }
 
@@ -89,19 +100,63 @@ impl InodeTable {
         Some(record.path.clone())
     }
 
-    fn evict_to_capacity(&mut self, max_entries: usize) {
-        while self.ino_to_path.len() > max_entries.max(1) {
-            let Some(oldest_ino) = self
-                .ino_to_path
-                .iter()
-                .filter(|(ino, _)| **ino != ROOT_INO)
-                .min_by_key(|(_, record)| record.last_access)
-                .map(|(ino, _)| *ino)
-            else {
-                break;
-            };
-            if let Some(record) = self.ino_to_path.remove(&oldest_ino) {
-                self.path_to_ino.remove(record.path.as_str());
+    fn forget(&mut self, ino: INodeNo, nlookup: u64) {
+        if ino == ROOT_INO {
+            return;
+        }
+        let Some(record) = self.ino_to_path.get_mut(&ino) else {
+            return;
+        };
+        record.lookup_count = record.lookup_count.saturating_sub(nlookup);
+        if record.lookup_count == 0 {
+            let path = record.path.clone();
+            self.ino_to_path.remove(&ino);
+            if self.path_to_ino.get(path.as_str()) == Some(&ino) {
+                self.path_to_ino.remove(path.as_str());
+            }
+        }
+    }
+
+    fn detach_exact(&mut self, path: &str) {
+        let Some(ino) = self.path_to_ino.remove(path) else {
+            return;
+        };
+        self.ino_to_path.remove(&ino);
+    }
+
+    fn subtree_entries(&self, path: &str) -> Vec<(String, INodeNo)> {
+        let prefix = format!("{path}/");
+        let mut entries = self
+            .path_to_ino
+            .get(path)
+            .map(|ino| vec![(path.to_string(), *ino)])
+            .unwrap_or_default();
+        entries.extend(
+            self.path_to_ino
+                .range(prefix.clone()..)
+                .take_while(|(candidate, _)| candidate.starts_with(&prefix))
+                .map(|(candidate, ino)| (candidate.clone(), *ino)),
+        );
+        entries
+    }
+
+    fn detach_subtree(&mut self, path: &str) {
+        for (candidate, ino) in self.subtree_entries(path) {
+            self.path_to_ino.remove(candidate.as_str());
+            self.ino_to_path.remove(&ino);
+        }
+    }
+
+    fn rename_path(&mut self, from: &str, to: &str) {
+        self.detach_subtree(to);
+        for (old_path, ino) in self.subtree_entries(from) {
+            let suffix = old_path.strip_prefix(from).unwrap_or_default();
+            let new_path = format!("{to}{suffix}");
+            self.path_to_ino.remove(old_path.as_str());
+            self.path_to_ino.insert(new_path.clone(), ino);
+            if let Some(record) = self.ino_to_path.get_mut(&ino) {
+                record.path = new_path;
+                record.last_access = Instant::now();
             }
         }
     }
@@ -125,6 +180,7 @@ impl Default for HandleTable {
 struct FileState {
     path: String,
     buffer: Vec<u8>,
+    executable: bool,
     dirty: bool,
     loaded: bool,
     base_content_hash: Option<String>,
@@ -136,6 +192,8 @@ pub struct RemoteFuseFs {
     cache: RemoteFuseCache,
     inodes: Mutex<InodeTable>,
     handles: Mutex<HandleTable>,
+    namespace: Option<NamespaceJournal>,
+    writes: Option<WriteJournal>,
     read_only: bool,
     scope_path: String,
     tokio: Handle,
@@ -150,6 +208,8 @@ impl RemoteFuseFs {
             cache: RemoteFuseCache::default(),
             inodes: Mutex::new(InodeTable::new()),
             handles: Mutex::new(HandleTable::default()),
+            namespace: None,
+            writes: None,
             read_only,
             scope_path: scope_path.trim_matches('/').to_string(),
             tokio,
@@ -158,12 +218,53 @@ impl RemoteFuseFs {
         }
     }
 
+    pub fn new_with_namespace_journal(
+        client: RemoteVfsClient,
+        read_only: bool,
+        scope_path: &str,
+        journal_path: &Path,
+        tokio: Handle,
+    ) -> Result<Self> {
+        let namespace = if read_only {
+            None
+        } else {
+            Some(NamespaceJournal::open(
+                client.clone(),
+                scope_path,
+                journal_path,
+                tokio.clone(),
+            )?)
+        };
+        let writes = if read_only {
+            None
+        } else {
+            Some(WriteJournal::open(
+                client.clone(),
+                scope_path,
+                journal_path.with_extension("writes.jsonl").as_path(),
+                tokio.clone(),
+            )?)
+        };
+        Ok(Self {
+            client,
+            cache: RemoteFuseCache::default(),
+            inodes: Mutex::new(InodeTable::new()),
+            handles: Mutex::new(HandleTable::default()),
+            namespace,
+            writes,
+            read_only,
+            scope_path: scope_path.trim_matches('/').to_string(),
+            tokio,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+        })
+    }
+
     pub fn mount_options(&self, tag: &str) -> fuser::Config {
         let mut mount_options = vec![
             MountOption::FSName(tag.to_string()),
             MountOption::Subtype("chevalier-vfs".to_string()),
             MountOption::DefaultPermissions,
-            MountOption::NoExec,
         ];
         if self.read_only {
             mount_options.push(MountOption::RO);
@@ -191,8 +292,39 @@ impl RemoteFuseFs {
             .unwrap_or(ROOT_INO)
     }
 
-    fn attr_for_path(&self, path: &str, metadata: &RemoteMetadata) -> FileAttr {
-        let ino = self.ensure_ino(path);
+    fn lookup_ino(&self, path: &str) -> INodeNo {
+        self.lock_inodes()
+            .map(|mut inodes| inodes.lookup(path))
+            .unwrap_or(ROOT_INO)
+    }
+
+    fn detach_inode_path(&self, path: &str) {
+        if let Ok(mut inodes) = self.lock_inodes() {
+            inodes.detach_exact(path);
+        }
+    }
+
+    fn rename_inode_path(&self, from: &str, to: &str) {
+        if let Ok(mut inodes) = self.lock_inodes() {
+            inodes.rename_path(from, to);
+        }
+        if let Ok(mut handles) = self.lock_handles() {
+            let prefix = format!("{from}/");
+            for state in handles.files.values_mut() {
+                if state.path == from || state.path.starts_with(&prefix) {
+                    let suffix = state.path.strip_prefix(from).unwrap_or_default();
+                    state.path = format!("{to}{suffix}");
+                }
+            }
+        }
+    }
+
+    fn attr_for_path(&self, path: &str, metadata: &RemoteMetadata, lookup: bool) -> FileAttr {
+        let ino = if lookup {
+            self.lookup_ino(path)
+        } else {
+            self.ensure_ino(path)
+        };
         let kind = file_type_for_kind(&metadata.kind);
         let perm = match kind {
             FileType::Directory => {
@@ -203,7 +335,9 @@ impl RemoteFuseFs {
                 }
             }
             FileType::Symlink => 0o777,
+            _ if self.read_only && metadata.executable => 0o555,
             _ if self.read_only => 0o444,
+            _ if metadata.executable => 0o755,
             _ => 0o644,
         };
         let mtime = metadata
@@ -269,6 +403,8 @@ impl RemoteFuseFs {
     }
 
     fn dir_entries(&self, path: &str) -> FuseResult<Vec<RemoteDirEntry>> {
+        self.flush_namespace()?;
+        self.flush_writes()?;
         if let Some(entries) = self.cache.get_dir(path) {
             return Ok(entries);
         }
@@ -282,6 +418,8 @@ impl RemoteFuseFs {
     }
 
     fn stat_path(&self, path: &str) -> FuseResult<Option<RemoteMetadata>> {
+        self.flush_namespace()?;
+        self.flush_writes()?;
         if let Some(metadata) = self.cache.get_metadata(path) {
             return Ok(Some(metadata));
         }
@@ -329,6 +467,7 @@ impl RemoteFuseFs {
         initial: Vec<u8>,
         loaded: bool,
         base_content_hash: Option<String>,
+        executable: bool,
     ) -> FuseResult<u64> {
         let mut handles = self.lock_handles()?;
         if handles.files.len() >= MAX_OPEN_HANDLES {
@@ -341,6 +480,7 @@ impl RemoteFuseFs {
             FileState {
                 path: path.to_string(),
                 buffer: initial,
+                executable,
                 dirty: false,
                 loaded,
                 base_content_hash,
@@ -362,52 +502,40 @@ impl RemoteFuseFs {
             return Ok(());
         }
 
-        let lease = self
-            .tokio
-            .block_on(
-                self.client
-                    .acquire_lease(&state.path, 1, "flush vfs fuse writes"),
-            )
-            .map_err(|_| Errno::EIO)?;
-        let metadata = match self.stat_path(&state.path) {
-            Ok(Some(metadata)) => metadata,
-            Ok(None) => RemoteMetadata {
-                kind: "file".to_string(),
-                size_bytes: 0,
-                link_target: None,
-                content_hash: None,
-                updated_at: None,
-            },
-            Err(err) => {
-                let _ = self.tokio.block_on(self.client.release_lease(&lease));
-                return Err(err);
-            }
-        };
+        self.flush_namespace()?;
         let next_content_hash = content_hash_for_bytes(&state.buffer);
-        let already_persisted =
-            metadata.content_hash.as_deref() == Some(next_content_hash.as_str());
-        if content_hash_conflicts(
-            state.base_content_hash.as_deref(),
-            metadata.content_hash.as_deref(),
-        ) && !already_persisted
-        {
-            let _ = self.tokio.block_on(self.client.release_lease(&lease));
-            return Err(Errno::EBUSY);
-        }
-        let surface = self.surface_kind_for_path(&state.path);
-        let write_result = if already_persisted {
-            Ok(())
-        } else {
-            self.tokio.block_on(self.client.write_file(
+        if state.executable {
+            self.flush_writes()?;
+            let lease = self
+                .tokio
+                .block_on(self.client.acquire_lease(
+                    &state.path,
+                    1,
+                    "flush executable vfs fuse write",
+                ))
+                .map_err(|_| Errno::EIO)?;
+            let surface = self.surface_kind_for_path(&state.path);
+            let result = self.tokio.block_on(self.client.write_file(
                 &state.path,
                 &state.buffer,
+                true,
                 &lease,
                 surface,
                 VFS_OPERATION_WRITE_THROUGH,
-            ))
-        };
-        let _ = self.tokio.block_on(self.client.release_lease(&lease));
-        write_result.map_err(|_| Errno::EIO)?;
+            ));
+            let _ = self.tokio.block_on(self.client.release_lease(&lease));
+            result.map_err(|_| Errno::EIO)?;
+        } else {
+            self.writes
+                .as_ref()
+                .ok_or(Errno::EIO)?
+                .enqueue(
+                    state.path.as_str(),
+                    state.buffer.as_slice(),
+                    state.base_content_hash.clone(),
+                )
+                .map_err(|_| Errno::EIO)?;
+        }
 
         self.cache.invalidate(&state.path);
         self.cache.put_file(
@@ -418,7 +546,8 @@ impl RemoteFuseFs {
                 size_bytes: state.buffer.len() as u64,
                 link_target: None,
                 content_hash: Some(next_content_hash.clone()),
-                updated_at: metadata.updated_at,
+                executable: state.executable,
+                updated_at: None,
             }),
         );
         if let Some(handle) = self.lock_handles()?.files.get_mut(&fh) {
@@ -431,25 +560,31 @@ impl RemoteFuseFs {
         Ok(())
     }
 
-    fn resize_handle(&self, fh: u64, size: u64) -> FuseResult<(String, u64)> {
-        if self.read_only {
-            return Err(Errno::EROFS);
+    fn flush_handle_immediate(&self, fh: u64) -> FuseResult<()> {
+        self.flush_handle(fh)?;
+        self.flush_writes()
+    }
+
+    fn flush_handles_for_path(&self, path: &str) -> FuseResult<()> {
+        let handles = self
+            .lock_handles()?
+            .files
+            .iter()
+            .filter(|(_, state)| state.path == path && state.dirty)
+            .map(|(fh, _)| *fh)
+            .collect::<Vec<_>>();
+        for fh in handles {
+            self.flush_handle(fh)?;
         }
-        self.ensure_handle_loaded(fh)?;
-        let mut handles = self.lock_handles()?;
-        let state = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
-        state.buffer.resize(size as usize, 0);
-        state.dirty = true;
-        state.loaded = true;
-        state.revision = state.revision.saturating_add(1);
-        Ok((state.path.clone(), size))
+        self.flush_writes()?;
+        Ok(())
     }
 
     fn resize_path_immediate(&self, path: &str, size: u64) -> FuseResult<FileAttr> {
         if self.read_only {
             return Err(Errno::EROFS);
         }
-        self.stat_path(path)?.ok_or(Errno::ENOENT)?;
+        let prior = self.stat_path(path)?.ok_or(Errno::ENOENT)?;
         let mut bytes = self
             .tokio
             .block_on(self.client.read_file_raw(path))
@@ -463,6 +598,7 @@ impl RemoteFuseFs {
         let write_result = self.tokio.block_on(self.client.write_file(
             path,
             &bytes,
+            prior.executable,
             &lease,
             surface,
             VFS_OPERATION_SETATTR_SIZE,
@@ -475,9 +611,45 @@ impl RemoteFuseFs {
             size_bytes: size,
             link_target: None,
             content_hash: Some(content_hash_for_bytes(&bytes)),
+            executable: prior.executable,
             updated_at: None,
         };
-        Ok(self.attr_for_path(path, &metadata))
+        Ok(self.attr_for_path(path, &metadata, false))
+    }
+
+    fn set_executable_path_immediate(&self, path: &str, executable: bool) -> FuseResult<FileAttr> {
+        if self.read_only {
+            return Err(Errno::EROFS);
+        }
+        let mut metadata = self.stat_path(path)?.ok_or(Errno::ENOENT)?;
+        if metadata.kind != "file" || metadata.executable == executable {
+            return Ok(self.attr_for_path(path, &metadata, false));
+        }
+        let bytes = self
+            .tokio
+            .block_on(self.client.read_file_raw(path))
+            .map_err(|_| Errno::EIO)?;
+        let lease = self
+            .tokio
+            .block_on(
+                self.client
+                    .acquire_lease(path, 1, "change vfs fuse executable mode"),
+            )
+            .map_err(|_| Errno::EIO)?;
+        let surface = self.surface_kind_for_path(path);
+        let write_result = self.tokio.block_on(self.client.write_file(
+            path,
+            &bytes,
+            executable,
+            &lease,
+            surface,
+            VFS_OPERATION_SETATTR_MODE,
+        ));
+        let _ = self.tokio.block_on(self.client.release_lease(&lease));
+        write_result.map_err(|_| Errno::EIO)?;
+        self.cache.invalidate(path);
+        metadata.executable = executable;
+        Ok(self.attr_for_path(path, &metadata, false))
     }
 
     fn mutate_namespace<F>(&self, path: &str, op: F) -> FuseResult<()>
@@ -500,6 +672,36 @@ impl RemoteFuseFs {
         result.map_err(|_| Errno::EIO)?;
         self.cache.invalidate(path);
         Ok(())
+    }
+
+    fn enqueue_namespace(&self, mutation: VfsNamespaceMutation) -> FuseResult<()> {
+        if self.read_only {
+            return Err(Errno::EROFS);
+        }
+        if matches!(
+            &mutation,
+            VfsNamespaceMutation::DeleteFile { .. }
+                | VfsNamespaceMutation::RemoveDirectory { .. }
+                | VfsNamespaceMutation::Rename { .. }
+        ) {
+            self.flush_writes()?;
+        }
+        let namespace = self.namespace.as_ref().ok_or(Errno::EIO)?;
+        namespace.enqueue(mutation).map_err(|_| Errno::EIO)
+    }
+
+    fn flush_namespace(&self) -> FuseResult<()> {
+        match self.namespace.as_ref() {
+            Some(namespace) => namespace.flush().map_err(|_| Errno::EIO),
+            None => Ok(()),
+        }
+    }
+
+    fn flush_writes(&self) -> FuseResult<()> {
+        match self.writes.as_ref() {
+            Some(writes) => writes.flush().map_err(|_| Errno::EIO),
+            None => Ok(()),
+        }
     }
 
     fn ensure_handle_loaded(&self, fh: u64) -> FuseResult<()> {
@@ -540,32 +742,6 @@ impl RemoteFuseFs {
         }
     }
 
-    fn same_scope(from: &str, to: &str) -> bool {
-        match (Self::scope_key(from), Self::scope_key(to)) {
-            (Some(from), Some(to)) => from == to,
-            _ => false,
-        }
-    }
-
-    fn scope_key(path: &str) -> Option<String> {
-        let segments = path
-            .trim_matches('/')
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-            .collect::<Vec<_>>();
-        if segments.len() >= 3 && segments[0] == "conversations" && segments[2] == "shared" {
-            return Some(format!("conversation:{}", segments[1]));
-        }
-        if segments.len() >= 4
-            && segments[0] == "conversations"
-            && segments[2].ends_with("_assistant")
-            && segments[3] == "mount"
-        {
-            return Some(format!("task:{}:{}", segments[1], segments[2]));
-        }
-        None
-    }
-
     fn lock_inodes(&self) -> FuseResult<MutexGuard<'_, InodeTable>> {
         self.inodes.lock().map_err(|_| Errno::EIO)
     }
@@ -575,6 +751,7 @@ impl RemoteFuseFs {
     }
 }
 
+#[cfg(test)]
 fn content_hash_conflicts(base: Option<&str>, current: Option<&str>) -> bool {
     matches!((base, current), (Some(base), Some(current)) if base != current)
 }
@@ -623,18 +800,6 @@ mod tests {
     };
 
     #[test]
-    fn same_scope_accepts_same_task_workspace_and_rejects_cross_scope_rename() {
-        assert!(RemoteFuseFs::same_scope(
-            "conversations/11111111-1111-1111-1111-111111111111/0001_assistant/mount/a.txt",
-            "conversations/11111111-1111-1111-1111-111111111111/0001_assistant/mount/b.txt"
-        ));
-        assert!(!RemoteFuseFs::same_scope(
-            "conversations/11111111-1111-1111-1111-111111111111/0001_assistant/mount/a.txt",
-            "conversations/11111111-1111-1111-1111-111111111111/shared/a.txt"
-        ));
-    }
-
-    #[test]
     fn surface_kind_uses_scoped_path_not_mount_relative_path() {
         assert_eq!(
             RemoteFuseFs::surface_kind_for_scoped_path(
@@ -663,15 +828,53 @@ mod tests {
     }
 
     #[test]
-    fn inode_table_evicts_lru_without_removing_root() {
+    fn inode_table_keeps_live_lookups_past_the_previous_capacity_boundary() {
         let mut table = InodeTable::new();
-        let first = table.ensure("a");
-        let _second = table.ensure("b");
+        let first = table.lookup("package-0");
+        for index in 1..=70_000 {
+            table.ensure(format!("package-{index}").as_str());
+        }
 
-        table.evict_to_capacity(2);
-
+        assert_eq!(table.path(first).as_deref(), Some("package-0"));
         assert_eq!(table.path(ROOT_INO).as_deref(), Some(""));
+
+        table.forget(first, 1);
         assert!(table.path(first).is_none());
+        assert_eq!(table.path(ROOT_INO).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn inode_table_tracks_directory_renames_and_detaches_deleted_subtrees() {
+        let mut table = InodeTable::new();
+        let directory = table.lookup("node_modules/pkg_tmp");
+        let child = table.lookup("node_modules/pkg_tmp/index.js");
+
+        table.rename_path("node_modules/pkg_tmp", "node_modules/pkg");
+
+        assert_eq!(table.path(directory).as_deref(), Some("node_modules/pkg"));
+        assert_eq!(
+            table.path(child).as_deref(),
+            Some("node_modules/pkg/index.js")
+        );
+
+        table.detach_subtree("node_modules/pkg");
+        assert!(table.path(directory).is_none());
+        assert!(table.path(child).is_none());
+    }
+
+    #[test]
+    fn inode_table_exact_detach_does_not_scan_or_remove_neighboring_paths() {
+        let mut table = InodeTable::new();
+        let removed = table.lookup("node_modules/pkg/index.js");
+        let neighbor = table.lookup("node_modules/pkg-extra/index.js");
+
+        table.detach_exact("node_modules/pkg/index.js");
+
+        assert!(table.path(removed).is_none());
+        assert_eq!(
+            table.path(neighbor).as_deref(),
+            Some("node_modules/pkg-extra/index.js")
+        );
     }
 
     #[test]
@@ -707,6 +910,12 @@ impl Filesystem for RemoteFuseFs {
         Ok(())
     }
 
+    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        if let Ok(mut inodes) = self.lock_inodes() {
+            inodes.forget(ino, nlookup);
+        }
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let result: FuseResult<FileAttr> = (|| {
             let parent_path = self.path_for_ino(parent)?;
@@ -714,7 +923,7 @@ impl Filesystem for RemoteFuseFs {
             let Some(metadata) = self.stat_path(&child_path)? else {
                 return Err(Errno::ENOENT);
             };
-            Ok(self.attr_for_path(&child_path, &metadata))
+            Ok(self.attr_for_path(&child_path, &metadata, true))
         })();
         match result {
             Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
@@ -730,7 +939,7 @@ impl Filesystem for RemoteFuseFs {
         let result: FuseResult<FileAttr> = (|| {
             let path = self.path_for_ino(ino)?;
             let metadata = self.stat_path(&path)?.ok_or(Errno::ENOENT)?;
-            Ok(self.attr_for_path(&path, &metadata))
+            Ok(self.attr_for_path(&path, &metadata, false))
         })();
         match result {
             Ok(attr) => reply.attr(&TTL, &attr),
@@ -758,7 +967,7 @@ impl Filesystem for RemoteFuseFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _mode: Option<u32>,
+        mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
@@ -780,25 +989,22 @@ impl Filesystem for RemoteFuseFs {
                 return Ok(self.root_attr());
             }
 
-            if let Some(size) = size {
-                if let Some(fh) = fh {
-                    let (path, size_bytes) = self.resize_handle(fh.0, size)?;
-                    return Ok(self.attr_for_path(
-                        &path,
-                        &RemoteMetadata {
-                            kind: "file".to_string(),
-                            size_bytes,
-                            link_target: None,
-                            content_hash: None,
-                            updated_at: None,
-                        },
-                    ));
-                }
-                let path = self.path_for_ino(ino)?;
-                return self.resize_path_immediate(&path, size);
-            }
-
             if let Some(fh) = fh {
+                let executable = mode.map(|value| value & 0o111 != 0);
+                if size.is_some() || executable.is_some() {
+                    self.ensure_handle_loaded(fh.0)?;
+                    let mut handles = self.lock_handles()?;
+                    let state = handles.files.get_mut(&fh.0).ok_or(Errno::ENOENT)?;
+                    if let Some(size) = size {
+                        state.buffer.resize(size as usize, 0);
+                    }
+                    if let Some(executable) = executable {
+                        state.executable = executable;
+                    }
+                    state.dirty = true;
+                    state.loaded = true;
+                    state.revision = state.revision.saturating_add(1);
+                }
                 if let Some(state) = self.lock_handles()?.files.get(&fh.0).cloned() {
                     if state.loaded || state.dirty {
                         return Ok(self.attr_for_path(
@@ -808,18 +1014,29 @@ impl Filesystem for RemoteFuseFs {
                                 size_bytes: state.buffer.len() as u64,
                                 link_target: None,
                                 content_hash: state.base_content_hash,
+                                executable: state.executable,
                                 updated_at: None,
                             },
+                            false,
                         ));
                     }
                     let metadata = self.stat_path(&state.path)?.ok_or(Errno::ENOENT)?;
-                    return Ok(self.attr_for_path(&state.path, &metadata));
+                    return Ok(self.attr_for_path(&state.path, &metadata, false));
                 }
             }
 
             let path = self.path_for_ino(ino)?;
+            if let Some(size) = size {
+                let attr = self.resize_path_immediate(&path, size)?;
+                if mode.is_none() {
+                    return Ok(attr);
+                }
+            }
+            if let Some(mode) = mode {
+                return self.set_executable_path_immediate(&path, mode & 0o111 != 0);
+            }
             let metadata = self.stat_path(&path)?.ok_or(Errno::ENOENT)?;
-            Ok(self.attr_for_path(&path, &metadata))
+            Ok(self.attr_for_path(&path, &metadata, false))
         })();
         match result {
             Ok(attr) => reply.attr(&TTL, &attr),
@@ -898,7 +1115,13 @@ impl Filesystem for RemoteFuseFs {
             } else {
                 metadata.content_hash.clone()
             };
-            let fh = self.next_handle(&path, initial, loaded, base_content_hash)?;
+            let fh = self.next_handle(
+                &path,
+                initial,
+                loaded,
+                base_content_hash,
+                metadata.executable,
+            )?;
             if dirty {
                 let mut handles = self.lock_handles()?;
                 let state = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
@@ -1003,7 +1226,7 @@ impl Filesystem for RemoteFuseFs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        match self.flush_handle(fh.0) {
+        match self.flush_handle_immediate(fh.0) {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(err),
         }
@@ -1041,14 +1264,17 @@ impl Filesystem for RemoteFuseFs {
         let result: FuseResult<FileAttr> = (|| {
             let parent_path = self.path_for_ino(parent)?;
             let path = Self::child_path(parent_path.as_str(), name)?;
-            self.mutate_namespace(&path, |lease, surface| {
-                self.tokio.block_on(
-                    self.client
-                        .mkdir(&path, lease, surface, VFS_OPERATION_MKDIR),
-                )
-            })?;
-            let metadata = self.stat_path(&path)?.ok_or(Errno::EIO)?;
-            Ok(self.attr_for_path(&path, &metadata))
+            self.enqueue_namespace(VfsNamespaceMutation::CreateDirectory { path: path.clone() })?;
+            self.cache.invalidate(&path);
+            let metadata = RemoteMetadata {
+                kind: "directory".to_string(),
+                size_bytes: 0,
+                link_target: None,
+                content_hash: None,
+                executable: false,
+                updated_at: None,
+            };
+            Ok(self.attr_for_path(&path, &metadata, true))
         })();
         match result {
             Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
@@ -1071,26 +1297,20 @@ impl Filesystem for RemoteFuseFs {
             let target = target.to_str().ok_or(Errno::EINVAL)?.to_string();
             let parent_path = self.path_for_ino(parent)?;
             let path = Self::child_path(parent_path.as_str(), link_name)?;
-            let surface = self.surface_kind_for_path(&path);
-            let lease = self
-                .tokio
-                .block_on(
-                    self.client
-                        .acquire_lease(&path, 1, "create vfs fuse symlink"),
-                )
-                .map_err(|_| Errno::EIO)?;
-            let create_result = self.tokio.block_on(self.client.create_symlink(
-                &path,
-                &target,
-                &lease,
-                surface,
-                VFS_OPERATION_SYMLINK,
-            ));
-            let _ = self.tokio.block_on(self.client.release_lease(&lease));
-            create_result.map_err(|_| Errno::EPERM)?;
+            self.enqueue_namespace(VfsNamespaceMutation::CreateSymlink {
+                path: path.clone(),
+                target: target.clone(),
+            })?;
             self.cache.invalidate(&path);
-            let metadata = self.stat_path(&path)?.ok_or(Errno::EIO)?;
-            Ok(self.attr_for_path(&path, &metadata))
+            let metadata = RemoteMetadata {
+                kind: "symlink".to_string(),
+                size_bytes: target.len() as u64,
+                link_target: Some(target),
+                content_hash: None,
+                executable: false,
+                updated_at: None,
+            };
+            Ok(self.attr_for_path(&path, &metadata, true))
         })();
         match result {
             Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
@@ -1102,14 +1322,10 @@ impl Filesystem for RemoteFuseFs {
         let result: FuseResult<()> = (|| {
             let parent_path = self.path_for_ino(parent)?;
             let path = Self::child_path(parent_path.as_str(), name)?;
-            self.mutate_namespace(&path, |lease, surface| {
-                self.tokio.block_on(self.client.delete_file(
-                    &path,
-                    lease,
-                    surface,
-                    VFS_OPERATION_UNLINK,
-                ))
-            })
+            self.enqueue_namespace(VfsNamespaceMutation::DeleteFile { path: path.clone() })?;
+            self.cache.invalidate(&path);
+            self.detach_inode_path(&path);
+            Ok(())
         })();
         match result {
             Ok(()) => reply.ok(),
@@ -1121,12 +1337,10 @@ impl Filesystem for RemoteFuseFs {
         let result: FuseResult<()> = (|| {
             let parent_path = self.path_for_ino(parent)?;
             let path = Self::child_path(parent_path.as_str(), name)?;
-            self.mutate_namespace(&path, |lease, surface| {
-                self.tokio.block_on(
-                    self.client
-                        .rmdir(&path, lease, surface, VFS_OPERATION_RMDIR),
-                )
-            })
+            self.enqueue_namespace(VfsNamespaceMutation::RemoveDirectory { path: path.clone() })?;
+            self.cache.invalidate(&path);
+            self.detach_inode_path(&path);
+            Ok(())
         })();
         match result {
             Ok(()) => reply.ok(),
@@ -1149,18 +1363,12 @@ impl Filesystem for RemoteFuseFs {
             let newparent_path = self.path_for_ino(newparent)?;
             let from = Self::child_path(parent_path.as_str(), name)?;
             let to = Self::child_path(newparent_path.as_str(), newname)?;
-            if !Self::same_scope(&self.scoped_path(&from), &self.scoped_path(&to)) {
-                return Err(Errno::EXDEV);
-            }
-            self.mutate_namespace(&from, |lease, surface| {
-                self.tokio.block_on(self.client.rename(
-                    &from,
-                    &to,
-                    lease,
-                    surface,
-                    VFS_OPERATION_RENAME,
-                ))
+            self.enqueue_namespace(VfsNamespaceMutation::Rename {
+                from: from.clone(),
+                to: to.clone(),
             })?;
+            self.rename_inode_path(&from, &to);
+            self.cache.invalidate(&from);
             self.cache.invalidate(&to);
             Ok(())
         })();
@@ -1170,12 +1378,65 @@ impl Filesystem for RemoteFuseFs {
         }
     }
 
+    fn link(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let result: FuseResult<FileAttr> = (|| {
+            if self.read_only {
+                return Err(Errno::EROFS);
+            }
+            let source = self.path_for_ino(ino)?;
+            let parent = self.path_for_ino(newparent)?;
+            let destination = Self::child_path(parent.as_str(), newname)?;
+            if self.stat_path(&destination)?.is_some() {
+                return Err(Errno::EEXIST);
+            }
+            self.flush_handles_for_path(&source)?;
+            let source_metadata = self.stat_path(&source)?.ok_or(Errno::ENOENT)?;
+            if source_metadata.kind != "file" {
+                return Err(Errno::EPERM);
+            }
+            let bytes = self
+                .tokio
+                .block_on(self.client.read_file_raw(&source))
+                .map_err(|_| Errno::EIO)?;
+            self.mutate_namespace(&destination, |lease, surface| {
+                self.tokio.block_on(self.client.write_file(
+                    &destination,
+                    &bytes,
+                    source_metadata.executable,
+                    lease,
+                    surface,
+                    VFS_OPERATION_LINK,
+                ))
+            })?;
+            let metadata = self.stat_path(&destination)?.unwrap_or(RemoteMetadata {
+                kind: "file".to_string(),
+                size_bytes: bytes.len() as u64,
+                link_target: None,
+                content_hash: source_metadata.content_hash,
+                executable: source_metadata.executable,
+                updated_at: source_metadata.updated_at,
+            });
+            Ok(self.attr_for_path(&destination, &metadata, true))
+        })();
+        match result {
+            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Err(err) => reply.error(err),
+        }
+    }
+
     fn create(
         &self,
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
-        _mode: u32,
+        mode: u32,
         _umask: u32,
         _flags: i32,
         reply: ReplyCreate,
@@ -1183,27 +1444,21 @@ impl Filesystem for RemoteFuseFs {
         let result: FuseResult<(FileAttr, u64)> = (|| {
             let parent_path = self.path_for_ino(parent)?;
             let path = Self::child_path(parent_path.as_str(), name)?;
-            if self.stat_path(&path)?.is_some() {
-                return Err(Errno::EEXIST);
-            }
-            self.mutate_namespace(&path, |lease, surface| {
-                self.tokio.block_on(self.client.write_file(
-                    &path,
-                    &[],
-                    lease,
-                    surface,
-                    "fuse_create",
-                ))
-            })?;
-            let metadata = self.stat_path(&path)?.unwrap_or(RemoteMetadata {
+            let metadata = RemoteMetadata {
                 kind: "file".to_string(),
                 size_bytes: 0,
                 link_target: None,
                 content_hash: None,
+                executable: mode & 0o111 != 0,
                 updated_at: None,
-            });
-            let attr = self.attr_for_path(&path, &metadata);
-            let fh = self.next_handle(&path, Vec::new(), true, None)?;
+            };
+            let attr = self.attr_for_path(&path, &metadata, true);
+            let fh = self.next_handle(&path, Vec::new(), true, None, metadata.executable)?;
+            if let Ok(mut handles) = self.lock_handles()
+                && let Some(state) = handles.files.get_mut(&fh)
+            {
+                state.dirty = true;
+            }
             Ok((attr, fh))
         })();
         match result {

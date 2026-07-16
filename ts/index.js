@@ -85,6 +85,8 @@ if (!vfsStorageProto[VFS_ERROR_PATCHED]) {
         "remove",
         "rmdir",
         "rename",
+        "applyNamespaceBatch",
+        "writeMany",
     ]) {
         const original = vfsStorageProto[method];
         if (typeof original === "function") {

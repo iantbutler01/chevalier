@@ -17,16 +17,16 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use sha2::Digest;
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as AsyncRwLock};
 use uuid::Uuid;
 
 use crate::{
     OptimizedVfsStorage, VfsStorageDeleteResult, VfsStorageDirListFilter, VfsStorageDirListOrder,
     VfsStorageEntryKind, VfsStorageError, VfsStorageMetadata, VfsStorageMetadataFields,
-    VfsStorageObjectState, VfsStoragePrefetchOptions, VfsStoragePrefetchResult,
-    VfsStorageReadIfChanged, VfsStorageReadIfChangedResult, VfsStorageReadRange,
-    VfsStorageRenameResult, VfsStorageResult, VfsStorageSubtreeOptions, VfsStorageWrite,
-    VfsStorageWriteOptions, VfsStorageWritePrecondition, VfsStorageWriteResult,
+    VfsStorageNamespaceMutation, VfsStorageObjectState, VfsStoragePrefetchOptions,
+    VfsStoragePrefetchResult, VfsStorageReadIfChanged, VfsStorageReadIfChangedResult,
+    VfsStorageReadRange, VfsStorageRenameResult, VfsStorageResult, VfsStorageSubtreeOptions,
+    VfsStorageWrite, VfsStorageWriteOptions, VfsStorageWritePrecondition, VfsStorageWriteResult,
     pack::{SlotCompression, hex_hash},
 };
 
@@ -50,6 +50,7 @@ struct CachedFileHash {
     change_ns: i128,
     cached_at: SystemTime,
     hash: String,
+    trusted_write: bool,
 }
 
 /// Per-path async mutual exclusion for the check+install critical section.
@@ -62,13 +63,24 @@ struct CachedFileHash {
 /// fetch-or-create, never across an `.await`.
 #[derive(Clone, Default)]
 struct PathLockTable {
-    inner: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    inner: Arc<Mutex<HashMap<String, Arc<AsyncRwLock<()>>>>>,
 }
 
 struct PathLocks {
-    guards: Vec<OwnedMutexGuard<()>>,
+    guards: Vec<PathLockGuard>,
     keys: Vec<String>,
     table: PathLockTable,
+}
+
+enum PathLockGuard {
+    Read { _guard: OwnedRwLockReadGuard<()> },
+    Write { _guard: OwnedRwLockWriteGuard<()> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathLockMode {
+    Read,
+    Write,
 }
 
 const HASH_CACHE_RECENCY_GUARD: Duration = Duration::from_secs(2);
@@ -81,33 +93,73 @@ impl std::fmt::Debug for PathLockTable {
 }
 
 impl PathLockTable {
-    /// Acquire exclusive locks for every path in `paths`, awaiting (never blocking the
-    /// worker) until each is free. Keys are sorted+deduped so a multi-path acquisition
-    /// can never deadlock against another one acquiring an overlapping set.
+    /// Acquire intent-read locks for ancestors and exclusive locks for mutation
+    /// targets. Sibling mutations remain concurrent, while an ancestor rename or
+    /// removal excludes every descendant mutation. Keys are acquired in global
+    /// lexical order so overlapping multi-path operations cannot deadlock.
     async fn lock(&self, paths: impl IntoIterator<Item = String>) -> PathLocks {
-        let mut keys = paths
-            .into_iter()
-            .map(|path| path.trim_matches('/').to_string())
-            .collect::<Vec<_>>();
-        keys.sort();
-        keys.dedup();
-        let mutexes = {
+        let mut modes = HashMap::new();
+        for path in paths {
+            let path = path.trim_matches('/');
+            let mut current = String::new();
+            modes.entry(current.clone()).or_insert(PathLockMode::Read);
+            let components = path
+                .split('/')
+                .filter(|component| !component.is_empty())
+                .collect::<Vec<_>>();
+            if components.is_empty() {
+                modes.insert(current, PathLockMode::Write);
+                continue;
+            }
+            for (index, component) in components.iter().enumerate() {
+                if !current.is_empty() {
+                    current.push('/');
+                }
+                current.push_str(component);
+                let mode = if index + 1 == components.len() {
+                    PathLockMode::Write
+                } else {
+                    PathLockMode::Read
+                };
+                modes
+                    .entry(current.clone())
+                    .and_modify(|existing| {
+                        if mode == PathLockMode::Write {
+                            *existing = PathLockMode::Write;
+                        }
+                    })
+                    .or_insert(mode);
+            }
+        }
+        let mut requested = modes.into_iter().collect::<Vec<_>>();
+        requested.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let locks = {
             let mut map = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-            keys.iter()
-                .map(|key| {
-                    map.entry(key.clone())
-                        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                        .clone()
+            requested
+                .iter()
+                .map(|(key, mode)| {
+                    let lock = map
+                        .entry(key.clone())
+                        .or_insert_with(|| Arc::new(AsyncRwLock::new(())))
+                        .clone();
+                    (lock, *mode)
                 })
                 .collect::<Vec<_>>()
         };
-        let mut guards = Vec::with_capacity(mutexes.len());
-        for mutex in mutexes {
-            guards.push(mutex.lock_owned().await);
+        let mut guards = Vec::with_capacity(locks.len());
+        for (lock, mode) in locks {
+            guards.push(match mode {
+                PathLockMode::Read => PathLockGuard::Read {
+                    _guard: lock.read_owned().await,
+                },
+                PathLockMode::Write => PathLockGuard::Write {
+                    _guard: lock.write_owned().await,
+                },
+            });
         }
         PathLocks {
             guards,
-            keys,
+            keys: requested.into_iter().map(|(key, _)| key).collect(),
             table: self.clone(),
         }
     }
@@ -404,36 +456,49 @@ impl LocalVfsStorage {
         }
         let mtime_ns = metadata_mtime_ns(metadata);
         let change_ns = metadata_change_ns(metadata);
-        if !metadata_is_recent(metadata) {
-            if let Some(cached) = self
-                .hash_cache
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .get(path)
-                .cloned()
+        if let Some(cached) = self
+            .hash_cache
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(path)
+            .cloned()
+        {
+            let cache_fresh = SystemTime::now()
+                .duration_since(cached.cached_at)
+                .is_ok_and(|age| age < HASH_CACHE_MAX_AGE);
+            if (trusted_write_cache_reusable(&cached) || !metadata_is_recent(metadata))
+                && cache_fresh
+                && cached.size_bytes == metadata.len()
+                && cached.mtime_ns == mtime_ns
+                && cached.change_ns == change_ns
             {
-                let cache_fresh = SystemTime::now()
-                    .duration_since(cached.cached_at)
-                    .is_ok_and(|age| age < HASH_CACHE_MAX_AGE);
-                if cache_fresh
-                    && cached.size_bytes == metadata.len()
-                    && cached.mtime_ns == mtime_ns
-                    && cached.change_ns == change_ns
-                {
-                    return Ok(Some(cached.hash));
-                }
+                return Ok(Some(cached.hash));
             }
         }
         let hash = hash_file_if_present_uncached(self, path)?;
         if let Some(hash) = hash.as_ref() {
-            self.remember_hash(path, metadata, hash.clone());
+            self.remember_observed_hash(path, metadata, hash.clone());
         } else {
             self.invalidate_hash(path);
         }
         Ok(hash)
     }
 
-    fn remember_hash(&self, path: &Path, metadata: &fs::Metadata, hash: String) {
+    fn remember_observed_hash(&self, path: &Path, metadata: &fs::Metadata, hash: String) {
+        self.remember_hash(path, metadata, hash, false);
+    }
+
+    fn remember_written_hash(&self, path: &Path, metadata: &fs::Metadata, hash: String) {
+        self.remember_hash(path, metadata, hash, true);
+    }
+
+    fn remember_hash(
+        &self,
+        path: &Path,
+        metadata: &fs::Metadata,
+        hash: String,
+        trusted_write: bool,
+    ) {
         let mut cache = self
             .hash_cache
             .lock()
@@ -446,6 +511,7 @@ impl LocalVfsStorage {
                 change_ns: metadata_change_ns(metadata),
                 cached_at: SystemTime::now(),
                 hash,
+                trusted_write,
             },
         );
     }
@@ -787,7 +853,7 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         };
         let metadata = fs::symlink_metadata(&abs_path)
             .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
-        self.remember_hash(&abs_path, &metadata, content_hash.clone());
+        self.remember_written_hash(&abs_path, &metadata, content_hash.clone());
         Ok(VfsStorageWriteResult {
             path: path.to_string(),
             changed: previous_hash.as_deref() != Some(content_hash.as_str()),
@@ -844,12 +910,14 @@ impl OptimizedVfsStorage for LocalVfsStorage {
     }
 
     async fn mkdir(&self, path: &str) -> VfsStorageResult<()> {
+        let _locks = self.lock_write_paths([path.to_string()]).await;
         let abs_path = self.abs_path(path)?;
         self.assert_no_symlink_ancestor(&abs_path)?;
         fs::create_dir_all(abs_path).map_err(|err| VfsStorageError::Internal(err.to_string()))
     }
 
     async fn create_symlink(&self, path: &str, target: &str) -> VfsStorageResult<()> {
+        let _locks = self.lock_write_paths([path.to_string()]).await;
         create_symlink_impl(self, path, target)
     }
 
@@ -881,6 +949,7 @@ impl OptimizedVfsStorage for LocalVfsStorage {
     }
 
     async fn rmdir(&self, path: &str) -> VfsStorageResult<()> {
+        let _locks = self.lock_write_paths([path.to_string()]).await;
         let Some(metadata) = self.metadata_for_path(path)? else {
             return Ok(());
         };
@@ -905,6 +974,9 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         from: &str,
         to: &str,
     ) -> VfsStorageResult<VfsStorageRenameResult> {
+        let _locks = self
+            .lock_write_paths([from.to_string(), to.to_string()])
+            .await;
         let previous = self.metadata_for_path(from)?;
         let Some(_) = previous else {
             return Err(VfsStorageError::NotFound(from.to_string()));
@@ -921,6 +993,93 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         self.invalidate_hash(&to_abs);
         let current = self.metadata_for_abs(&to_abs)?;
         Ok(VfsStorageRenameResult { previous, current })
+    }
+
+    async fn apply_namespace_batch(
+        &self,
+        mutations: Vec<VfsStorageNamespaceMutation>,
+    ) -> VfsStorageResult<()> {
+        let lock_paths = mutations
+            .iter()
+            .flat_map(VfsStorageNamespaceMutation::paths)
+            .filter(|path| !path.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let _locks = self.lock_write_paths(lock_paths).await;
+
+        for mutation in mutations {
+            match mutation {
+                VfsStorageNamespaceMutation::CreateDirectory { path } => {
+                    let abs_path = self.abs_path(path.as_str())?;
+                    self.assert_no_symlink_ancestor(&abs_path)?;
+                    fs::create_dir_all(abs_path)
+                        .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+                }
+                VfsStorageNamespaceMutation::CreateSymlink { path, target } => {
+                    match self.metadata_for_path(path.as_str())? {
+                        Some(metadata)
+                            if metadata.kind == VfsStorageEntryKind::Symlink
+                                && metadata.link_target.as_deref() == Some(target.as_str()) => {}
+                        Some(_) => {
+                            return Err(VfsStorageError::Conflict(format!(
+                                "vfs path {path} already exists"
+                            )));
+                        }
+                        None => create_symlink_impl(self, path.as_str(), target.as_str())?,
+                    }
+                }
+                VfsStorageNamespaceMutation::DeleteFile { path } => {
+                    let abs_path = self.abs_path(path.as_str())?;
+                    self.assert_no_symlink_ancestor(&abs_path)?;
+                    match fs::remove_file(&abs_path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(VfsStorageError::Internal(error.to_string()));
+                        }
+                    }
+                    self.invalidate_hash(&abs_path);
+                }
+                VfsStorageNamespaceMutation::RemoveDirectory { path } => {
+                    let abs_path = self.abs_path(path.as_str())?;
+                    self.assert_no_symlink_ancestor(&abs_path)?;
+                    match fs::remove_dir(&abs_path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                            return Err(VfsStorageError::Conflict(format!(
+                                "vfs directory {path} is not empty"
+                            )));
+                        }
+                        Err(error) => {
+                            return Err(VfsStorageError::Internal(error.to_string()));
+                        }
+                    }
+                }
+                VfsStorageNamespaceMutation::Rename { from, to } => {
+                    let from_abs = self.abs_path(from.as_str())?;
+                    let to_abs = self.abs_path(to.as_str())?;
+                    self.assert_no_symlink_ancestor(&from_abs)?;
+                    self.assert_no_symlink_ancestor(&to_abs)?;
+                    // Batch callers validate the source before journaling. A replay may
+                    // observe neither path when a later mutation in the same completed
+                    // batch already removed the destination, so a missing source is a
+                    // successful no-op here.
+                    if !from_abs.exists() {
+                        continue;
+                    }
+                    if let Some(parent) = to_abs.parent() {
+                        fs::create_dir_all(parent)
+                            .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+                    }
+                    fs::rename(&from_abs, &to_abs)
+                        .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+                    self.invalidate_hash(&from_abs);
+                    self.invalidate_hash(&to_abs);
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn prefetch_subtree(
@@ -999,7 +1158,7 @@ fn install_writes_with_options(
         apply_executable_option(&abs_path, executable, previous_mode)?;
         let metadata = fs::symlink_metadata(&abs_path)
             .map_err(|err| VfsStorageError::Internal(err.to_string()))?;
-        storage.remember_hash(&abs_path, &metadata, content_hash.clone());
+        storage.remember_written_hash(&abs_path, &metadata, content_hash.clone());
         results.push(VfsStorageWriteResult {
             path,
             content_hash,
@@ -1157,6 +1316,19 @@ fn metadata_is_recent(metadata: &fs::Metadata) -> bool {
         Ok(elapsed) => elapsed < HASH_CACHE_RECENCY_GUARD,
         Err(_) => true,
     }
+}
+
+#[cfg(unix)]
+fn trusted_write_cache_reusable(cached: &CachedFileHash) -> bool {
+    cached.trusted_write
+}
+
+#[cfg(not(unix))]
+fn trusted_write_cache_reusable(_cached: &CachedFileHash) -> bool {
+    // Unix ctime lets us detect an out-of-band same-size write even when an
+    // application preserves mtime. Other platforms keep the conservative
+    // recency rehash until an equivalent change-generation signal is available.
+    false
 }
 
 #[cfg(unix)]
@@ -1384,6 +1556,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn path_locks_allow_siblings_and_exclude_ancestor_mutations() {
+        let table = PathLockTable::default();
+        let first_sibling = table.lock(["tree/a.txt".to_string()]).await;
+        let tree_lock = table
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get("tree")
+            .expect("tree intent lock")
+            .clone();
+        assert!(
+            tree_lock.clone().try_read_owned().is_ok(),
+            "sibling mutation should be able to share the ancestor intent lock",
+        );
+        assert!(
+            tree_lock.clone().try_write_owned().is_err(),
+            "ancestor mutation must wait for descendant mutations",
+        );
+        let second_sibling = table.lock(["tree/b.txt".to_string()]).await;
+
+        drop(second_sibling);
+        drop(first_sibling);
+        assert!(
+            tree_lock.try_write_owned().is_ok(),
+            "ancestor mutation should proceed after descendants release",
+        );
+    }
+
+    #[tokio::test]
     async fn local_storage_round_trips_batch_and_range_reads() {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = LocalVfsStorage::new(dir.path());
@@ -1428,6 +1629,49 @@ mod tests {
         assert_eq!(many.len(), 2);
         assert_eq!(&many[0].1[..], b"abcdef");
         assert_eq!(&many[1].1[..], b"ghijkl");
+    }
+
+    #[tokio::test]
+    async fn namespace_batch_is_ordered_and_replay_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        storage
+            .write("incoming.txt", Bytes::from_static(b"payload"), None)
+            .await
+            .expect("seed file");
+        let mutations = vec![
+            VfsStorageNamespaceMutation::CreateDirectory {
+                path: "tree".to_string(),
+            },
+            VfsStorageNamespaceMutation::Rename {
+                from: "incoming.txt".to_string(),
+                to: "tree/result.txt".to_string(),
+            },
+            VfsStorageNamespaceMutation::DeleteFile {
+                path: "tree/result.txt".to_string(),
+            },
+            VfsStorageNamespaceMutation::RemoveDirectory {
+                path: "tree".to_string(),
+            },
+        ];
+
+        storage
+            .apply_namespace_batch(mutations.clone())
+            .await
+            .expect("apply namespace batch");
+        storage
+            .apply_namespace_batch(mutations)
+            .await
+            .expect("replay namespace batch");
+
+        assert!(
+            storage
+                .stat("incoming.txt")
+                .await
+                .expect("stat source")
+                .is_none()
+        );
+        assert!(storage.stat("tree").await.expect("stat tree").is_none());
     }
 
     #[tokio::test]
@@ -1927,6 +2171,47 @@ mod tests {
 
         assert_eq!(storage.hash_read_count(), 1);
         assert_eq!(first[0].content_hash, second[0].content_hash);
+    }
+
+    #[tokio::test]
+    async fn local_storage_reuses_trusted_write_hash_immediately() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        storage
+            .write("cached.txt", Bytes::from_static(b"cached"), None)
+            .await
+            .expect("write");
+
+        let first = storage
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .expect("first list");
+        let second = storage
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .expect("second list");
+
+        assert_eq!(storage.hash_read_count(), 0);
+        assert_eq!(first[0].content_hash, second[0].content_hash);
+    }
+
+    #[tokio::test]
+    async fn local_storage_rehashes_recent_observed_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cached.txt");
+        fs::write(&path, b"cached").expect("write");
+        let storage = LocalVfsStorage::new(dir.path());
+
+        storage
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .expect("first list");
+        storage
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .expect("second list");
+
+        assert_eq!(storage.hash_read_count(), 2);
     }
 
     #[tokio::test]

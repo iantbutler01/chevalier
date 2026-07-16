@@ -205,6 +205,28 @@ pub struct VfsStorageRenameResult {
     pub current: Option<VfsStorageMetadata>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VfsStorageNamespaceMutation {
+    CreateDirectory { path: String },
+    CreateSymlink { path: String, target: String },
+    DeleteFile { path: String },
+    RemoveDirectory { path: String },
+    Rename { from: String, to: String },
+}
+
+impl VfsStorageNamespaceMutation {
+    pub fn paths(&self) -> [&str; 2] {
+        match self {
+            Self::CreateDirectory { path }
+            | Self::CreateSymlink { path, .. }
+            | Self::DeleteFile { path }
+            | Self::RemoveDirectory { path } => [path.as_str(), ""],
+            Self::Rename { from, to } => [from.as_str(), to.as_str()],
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct VfsStoragePrefetchOptions {
     pub include_small_file_bytes: bool,
@@ -330,6 +352,36 @@ pub trait OptimizedVfsStorage: Send + Sync {
         from: &str,
         to: &str,
     ) -> VfsStorageResult<VfsStorageRenameResult>;
+
+    /// Apply ordered namespace mutations through one backend call. Implementations
+    /// must make successfully applied entries idempotent so an interrupted caller
+    /// can replay the whole ordered batch without corrupting namespace state.
+    async fn apply_namespace_batch(
+        &self,
+        mutations: Vec<VfsStorageNamespaceMutation>,
+    ) -> VfsStorageResult<()> {
+        for mutation in mutations {
+            match mutation {
+                VfsStorageNamespaceMutation::CreateDirectory { path } => {
+                    self.mkdir(path.as_str()).await?;
+                }
+                VfsStorageNamespaceMutation::CreateSymlink { path, target } => {
+                    self.create_symlink(path.as_str(), target.as_str()).await?;
+                }
+                VfsStorageNamespaceMutation::DeleteFile { path } => {
+                    self.delete_file_with_metadata(path.as_str(), None).await?;
+                }
+                VfsStorageNamespaceMutation::RemoveDirectory { path } => {
+                    self.rmdir(path.as_str()).await?;
+                }
+                VfsStorageNamespaceMutation::Rename { from, to } => {
+                    self.rename_with_metadata(from.as_str(), to.as_str())
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
 
     async fn prefetch_subtree(
         &self,

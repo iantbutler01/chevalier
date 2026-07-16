@@ -79,7 +79,17 @@ pub async fn mount_remote_vfs_fuse(
         .with_context(|| format!("create fuse mountpoint {}", mountpoint.display()))?;
 
     let client = RemoteVfsClient::new(endpoint, auth_token, scope_path)?;
-    let filesystem = RemoteFuseFs::new(client, read_only, scope_path, Handle::current());
+    let journal_path = mountpoint
+        .parent()
+        .unwrap_or(mountpoint)
+        .join(format!(".{}-namespace.jsonl", mount_tag));
+    let filesystem = RemoteFuseFs::new_with_namespace_journal(
+        client,
+        read_only,
+        scope_path,
+        journal_path.as_path(),
+        Handle::current(),
+    )?;
     let options = filesystem.mount_options(mount_tag);
     let session = fuser::spawn_mount2(filesystem, mountpoint, &options)
         .with_context(|| format!("mount fuse filesystem at {}", mountpoint.display()))?;

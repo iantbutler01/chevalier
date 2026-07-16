@@ -389,6 +389,24 @@ test("vfs gateway aliases If-Match and ifMatch into canonical 409 preconditions"
     options: { ifMatch: null },
   });
   assert.strictEqual(files.get("created-by-batch.txt")?.toString("utf8"), "batch-created");
+
+  const rustWireBody = Buffer.from("rust-wire");
+  const omittedPreconditionBody = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/write-many", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        writes: [{ path: "rust-wire-batch.txt", body: [...rustWireBody], precondition: null }],
+      }),
+    }),
+  );
+  assert.strictEqual(omittedPreconditionBody.status, 200);
+  assert.deepStrictEqual(optionsSeen.at(-1), {
+    op: "write",
+    path: "rust-wire-batch.txt",
+    options: undefined,
+  });
+  assert.strictEqual(files.get("rust-wire-batch.txt")?.toString("utf8"), "rust-wire");
 });
 
 test("mcp server + client end-to-end", async () => {
