@@ -1007,6 +1007,26 @@ impl OptimizedVfsStorage for LocalVfsStorage {
             .collect::<Vec<_>>();
         let _locks = self.lock_write_paths(lock_paths).await;
 
+        // Namespace batches are replayable, but delete preconditions must be
+        // checked as one snapshot before the first path is removed. Holding all
+        // path locks across this preflight and apply phase makes a conditional
+        // delete-only batch all-or-none with respect to concurrent VFS writers.
+        for mutation in &mutations {
+            if let VfsStorageNamespaceMutation::DeleteFile { path, precondition } = mutation {
+                self.assert_precondition(path.as_str(), precondition.as_ref())?;
+                if matches!(
+                    self.metadata_for_path(path.as_str())?
+                        .as_ref()
+                        .map(|metadata| metadata.kind),
+                    Some(VfsStorageEntryKind::Directory)
+                ) {
+                    return Err(VfsStorageError::BadRequest(format!(
+                        "vfs path {path} is not a file"
+                    )));
+                }
+            }
+        }
+
         for mutation in mutations {
             match mutation {
                 VfsStorageNamespaceMutation::CreateDirectory { path } => {
@@ -1028,7 +1048,10 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                         None => create_symlink_impl(self, path.as_str(), target.as_str())?,
                     }
                 }
-                VfsStorageNamespaceMutation::DeleteFile { path } => {
+                VfsStorageNamespaceMutation::DeleteFile {
+                    path,
+                    precondition: _,
+                } => {
                     let abs_path = self.abs_path(path.as_str())?;
                     self.assert_no_symlink_ancestor(&abs_path)?;
                     match fs::remove_file(&abs_path) {
@@ -1649,6 +1672,7 @@ mod tests {
             },
             VfsStorageNamespaceMutation::DeleteFile {
                 path: "tree/result.txt".to_string(),
+                precondition: None,
             },
             VfsStorageNamespaceMutation::RemoveDirectory {
                 path: "tree".to_string(),
@@ -1672,6 +1696,65 @@ mod tests {
                 .is_none()
         );
         assert!(storage.stat("tree").await.expect("stat tree").is_none());
+    }
+
+    #[tokio::test]
+    async fn namespace_delete_batch_preflights_all_preconditions_before_mutating() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        storage
+            .write("a.txt", Bytes::from_static(b"a"), None)
+            .await
+            .expect("seed a");
+        storage
+            .write("b.txt", Bytes::from_static(b"b"), None)
+            .await
+            .expect("seed b");
+        let hash_a = hex_hash(b"a");
+
+        let failed = storage
+            .apply_namespace_batch(vec![
+                VfsStorageNamespaceMutation::DeleteFile {
+                    path: "a.txt".to_string(),
+                    precondition: Some(VfsStorageWritePrecondition {
+                        fingerprint: Some(hash_a.clone()),
+                        secondary_fingerprint: None,
+                    }),
+                },
+                VfsStorageNamespaceMutation::DeleteFile {
+                    path: "b.txt".to_string(),
+                    precondition: Some(VfsStorageWritePrecondition {
+                        fingerprint: Some("stale".to_string()),
+                        secondary_fingerprint: None,
+                    }),
+                },
+            ])
+            .await;
+        assert!(matches!(failed, Err(VfsStorageError::Conflict(_))));
+        assert!(storage.stat("a.txt").await.expect("stat a").is_some());
+        assert!(storage.stat("b.txt").await.expect("stat b").is_some());
+
+        storage
+            .apply_namespace_batch(vec![
+                VfsStorageNamespaceMutation::DeleteFile {
+                    path: "a.txt".to_string(),
+                    precondition: Some(VfsStorageWritePrecondition {
+                        fingerprint: Some(hash_a),
+                        secondary_fingerprint: None,
+                    }),
+                },
+                VfsStorageNamespaceMutation::DeleteFile {
+                    path: "b.txt".to_string(),
+                    precondition: Some(VfsStorageWritePrecondition {
+                        fingerprint: Some(hex_hash(b"b")),
+                        secondary_fingerprint: None,
+                    }),
+                },
+            ])
+            .await
+            .expect("conditional delete batch");
+        assert!(storage.stat("a.txt").await.expect("stat a").is_none());
+        assert!(storage.stat("b.txt").await.expect("stat b").is_none());
     }
 
     #[tokio::test]

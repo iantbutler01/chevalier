@@ -931,11 +931,25 @@ struct NamespaceBatchBody {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum NamespaceMutation {
-    CreateDirectory { path: String },
-    CreateSymlink { path: String, target: String },
-    DeleteFile { path: String },
-    RemoveDirectory { path: String },
-    Rename { from: String, to: String },
+    CreateDirectory {
+        path: String,
+    },
+    CreateSymlink {
+        path: String,
+        target: String,
+    },
+    DeleteFile {
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        precondition: Option<WritePrecondition>,
+    },
+    RemoveDirectory {
+        path: String,
+    },
+    Rename {
+        from: String,
+        to: String,
+    },
 }
 
 impl NamespaceMutation {
@@ -948,8 +962,9 @@ impl NamespaceMutation {
                 path: storage.path_arg(path.as_str()),
                 target,
             },
-            VfsStorageNamespaceMutation::DeleteFile { path } => Self::DeleteFile {
+            VfsStorageNamespaceMutation::DeleteFile { path, precondition } => Self::DeleteFile {
                 path: storage.path_arg(path.as_str()),
+                precondition: precondition.map(WritePrecondition::from),
             },
             VfsStorageNamespaceMutation::RemoveDirectory { path } => Self::RemoveDirectory {
                 path: storage.path_arg(path.as_str()),
@@ -1657,6 +1672,47 @@ mod tests {
             delete_request
                 .headers
                 .contains("x-chevalier-vfs-precondition-secondary-fingerprint: secondary-a")
+        );
+
+        let release_request = requests.recv().expect("release request");
+        assert_eq!(release_request.method, "DELETE");
+        assert_eq!(release_request.target, "/lease");
+    }
+
+    #[tokio::test]
+    async fn gateway_namespace_batch_serializes_delete_preconditions() {
+        let (endpoint, requests) = serve_sequence(vec![
+            r#"{"resource_key":"rk","owner_token":"ot"}"#.to_string(),
+            String::new(),
+            String::new(),
+        ]);
+        let storage =
+            GatewayVfsStorage::new(GatewayVfsStorageConfig::new(endpoint).with_scope_path("scope"));
+
+        storage
+            .apply_namespace_batch(vec![VfsStorageNamespaceMutation::DeleteFile {
+                path: "a.txt".to_string(),
+                precondition: Some(VfsStorageWritePrecondition {
+                    fingerprint: Some("version-a".to_string()),
+                    secondary_fingerprint: Some("secondary-a".to_string()),
+                }),
+            }])
+            .await
+            .expect("namespace batch");
+
+        let lease_request = requests.recv().expect("lease request");
+        assert_eq!(lease_request.method, "POST");
+        assert_eq!(lease_request.target, "/lease");
+
+        let batch_request = requests.recv().expect("namespace request");
+        assert_eq!(batch_request.method, "POST");
+        assert_eq!(batch_request.target, "/namespace-many");
+        assert!(batch_request.body.contains(r#""path":"scope/a.txt""#));
+        assert!(batch_request.body.contains(r#""fingerprint":"version-a""#));
+        assert!(
+            batch_request
+                .body
+                .contains(r#""secondary_fingerprint":"secondary-a""#)
         );
 
         let release_request = requests.recv().expect("release request");

@@ -170,7 +170,15 @@ function createVfsGatewayServer(opts) {
                 const mutations = normalizeNamespaceMutations(body.mutations);
                 if (mutations instanceof Response)
                     return mutations;
-                await store.applyNamespaceBatch(mutations);
+                try {
+                    await store.applyNamespaceBatch(mutations);
+                }
+                catch (error) {
+                    const conflict = conflictResponseFromStoreError(error, "namespace-many");
+                    if (conflict !== null)
+                        return conflict;
+                    throw error;
+                }
                 return new Response(null, { status: 204 });
             }
             // ---- single-file mutations -----------------------------------------
@@ -574,7 +582,18 @@ function normalizeNamespaceMutations(value) {
         const path = normalizePath(typeof mutation.path === "string" ? mutation.path : null);
         if (path === "" || isGitExcludedPath(path))
             return errorResponse(400, `invalid namespace path: ${path}`);
-        if (kind === "create_directory" || kind === "delete_file" || kind === "remove_directory") {
+        if (kind === "delete_file") {
+            const precondition = writeItemPrecondition(mutation);
+            out.push({
+                kind,
+                path,
+                ...(precondition.present
+                    ? { precondition: { fingerprint: precondition.fingerprint } }
+                    : {}),
+            });
+            continue;
+        }
+        if (kind === "create_directory" || kind === "remove_directory") {
             out.push({ kind, path });
             continue;
         }

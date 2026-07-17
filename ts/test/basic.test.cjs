@@ -409,6 +409,47 @@ test("vfs gateway aliases If-Match and ifMatch into canonical 409 preconditions"
   assert.strictEqual(files.get("rust-wire-batch.txt")?.toString("utf8"), "rust-wire");
 });
 
+test("vfs gateway forwards conditional namespace batches and maps CAS races to 409", async () => {
+  const seen = [];
+  let fail = false;
+  const store = {
+    async applyNamespaceBatch(mutations) {
+      seen.push(mutations);
+      if (fail) throw new Error("VFS: [VFS_CONFLICT status=409] conflict: stale delete");
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+  const request = () =>
+    handler(
+      new Request("http://local/internal/chevalier/vfs/owner/namespace-many", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          mutations: [
+            {
+              kind: "delete_file",
+              path: "a.txt",
+              precondition: { fingerprint: '"sha256:old"' },
+            },
+            { kind: "delete_file", path: "b.txt", precondition: { fingerprint: null } },
+          ],
+        }),
+      }),
+    );
+
+  const matched = await request();
+  assert.strictEqual(matched.status, 204);
+  assert.deepStrictEqual(seen[0], [
+    { kind: "delete_file", path: "a.txt", precondition: { fingerprint: "old" } },
+    { kind: "delete_file", path: "b.txt", precondition: { fingerprint: null } },
+  ]);
+
+  fail = true;
+  const stale = await request();
+  assert.strictEqual(stale.status, 409);
+  assert.match(await stale.text(), /precondition failed/);
+});
+
 test("mcp server + client end-to-end", async () => {
   const server = new McpServer("test", { version: "0.0.1" });
   await server.tool(

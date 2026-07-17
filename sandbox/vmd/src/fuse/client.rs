@@ -440,9 +440,12 @@ impl RemoteVfsClient {
                     target: target.clone(),
                 }
             }
-            VfsNamespaceMutation::DeleteFile { path } => VfsNamespaceMutation::DeleteFile {
-                path: self.path_arg(path),
-            },
+            VfsNamespaceMutation::DeleteFile { path, precondition } => {
+                VfsNamespaceMutation::DeleteFile {
+                    path: self.path_arg(path),
+                    precondition: precondition.clone(),
+                }
+            }
             VfsNamespaceMutation::RemoveDirectory { path } => {
                 VfsNamespaceMutation::RemoveDirectory {
                     path: self.path_arg(path),

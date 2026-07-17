@@ -1322,7 +1322,10 @@ impl Filesystem for RemoteFuseFs {
         let result: FuseResult<()> = (|| {
             let parent_path = self.path_for_ino(parent)?;
             let path = Self::child_path(parent_path.as_str(), name)?;
-            self.enqueue_namespace(VfsNamespaceMutation::DeleteFile { path: path.clone() })?;
+            self.enqueue_namespace(VfsNamespaceMutation::DeleteFile {
+                path: path.clone(),
+                precondition: None,
+            })?;
             self.cache.invalidate(&path);
             self.detach_inode_path(&path);
             Ok(())

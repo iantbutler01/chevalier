@@ -97,11 +97,25 @@ pub struct VfsNamespaceMutationBatchBody {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VfsNamespaceMutation {
-    CreateDirectory { path: String },
-    CreateSymlink { path: String, target: String },
-    DeleteFile { path: String },
-    RemoveDirectory { path: String },
-    Rename { from: String, to: String },
+    CreateDirectory {
+        path: String,
+    },
+    CreateSymlink {
+        path: String,
+        target: String,
+    },
+    DeleteFile {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        precondition: Option<VfsWritePrecondition>,
+    },
+    RemoveDirectory {
+        path: String,
+    },
+    Rename {
+        from: String,
+        to: String,
+    },
 }
 
 impl VfsNamespaceMutation {
@@ -109,7 +123,7 @@ impl VfsNamespaceMutation {
         match self {
             Self::CreateDirectory { path }
             | Self::CreateSymlink { path, .. }
-            | Self::DeleteFile { path }
+            | Self::DeleteFile { path, .. }
             | Self::RemoveDirectory { path } => [path.as_str(), ""],
             Self::Rename { from, to } => [from.as_str(), to.as_str()],
         }
@@ -615,13 +629,13 @@ mod server {
                         })
                         .await?;
                     }
-                    VfsNamespaceMutation::DeleteFile { path } => {
+                    VfsNamespaceMutation::DeleteFile { path, precondition } => {
                         self.delete_file(VfsNamespaceMutationRequest {
                             owner_id: request.owner_id.clone(),
                             path,
                             headers: request.headers.clone(),
                             scope: request.scope.clone(),
-                            precondition: None,
+                            precondition,
                         })
                         .await?;
                     }
@@ -1556,7 +1570,8 @@ mod server_tests {
         VfsMetadataManyResponse, VfsNamespaceMutation, VfsNamespaceMutationBatchRequest,
         VfsNamespaceMutationRequest, VfsReadManyResponse, VfsReadRange, VfsRenameRequest,
         VfsResult, VfsSymlinkRequest, VfsWriteManyRequest, VfsWriteManyResponse,
-        VfsWriteManyResult, VfsWriteRequest, VfsWriteScope, chevalier_vfs_routes,
+        VfsWriteManyResult, VfsWritePrecondition, VfsWriteRequest, VfsWriteScope,
+        chevalier_vfs_routes,
     };
 
     #[derive(Clone, Default)]
@@ -2042,7 +2057,11 @@ mod server_tests {
                             "mutations": [
                                 {"kind": "create_directory", "path": "tree"},
                                 {"kind": "rename", "from": "source.txt", "to": "tree/result.txt"},
-                                {"kind": "delete_file", "path": "tree/result.txt"},
+                                {
+                                    "kind": "delete_file",
+                                    "path": "tree/result.txt",
+                                    "precondition": {"fingerprint": "version-1"}
+                                },
                             ],
                         }))
                         .unwrap(),
@@ -2067,6 +2086,10 @@ mod server_tests {
                 },
                 VfsNamespaceMutation::DeleteFile {
                     path: "tree/result.txt".to_string(),
+                    precondition: Some(VfsWritePrecondition {
+                        fingerprint: Some("version-1".to_string()),
+                        secondary_fingerprint: None,
+                    }),
                 },
             ]
         );

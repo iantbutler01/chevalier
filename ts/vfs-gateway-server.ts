@@ -204,7 +204,13 @@ export function createVfsGatewayServer(
         const body = (await req.json()) as { mutations?: unknown };
         const mutations = normalizeNamespaceMutations(body.mutations);
         if (mutations instanceof Response) return mutations;
-        await store.applyNamespaceBatch(mutations);
+        try {
+          await store.applyNamespaceBatch(mutations);
+        } catch (error) {
+          const conflict = conflictResponseFromStoreError(error, "namespace-many");
+          if (conflict !== null) return conflict;
+          throw error;
+        }
         return new Response(null, { status: 204 });
       }
 
@@ -613,7 +619,11 @@ type WriteManyRequestItem = {
 type NamespaceMutation =
   | { kind: "create_directory"; path: string }
   | { kind: "create_symlink"; path: string; target: string }
-  | { kind: "delete_file"; path: string }
+  | {
+      kind: "delete_file";
+      path: string;
+      precondition?: { fingerprint?: string | null };
+    }
   | { kind: "remove_directory"; path: string }
   | { kind: "rename"; from: string; to: string };
 
@@ -637,7 +647,18 @@ function normalizeNamespaceMutations(value: unknown): NamespaceMutation[] | Resp
     }
     const path = normalizePath(typeof mutation.path === "string" ? mutation.path : null);
     if (path === "" || isGitExcludedPath(path)) return errorResponse(400, `invalid namespace path: ${path}`);
-    if (kind === "create_directory" || kind === "delete_file" || kind === "remove_directory") {
+    if (kind === "delete_file") {
+      const precondition = writeItemPrecondition(mutation as WriteManyRequestItem);
+      out.push({
+        kind,
+        path,
+        ...(precondition.present
+          ? { precondition: { fingerprint: precondition.fingerprint } }
+          : {}),
+      });
+      continue;
+    }
+    if (kind === "create_directory" || kind === "remove_directory") {
       out.push({ kind, path });
       continue;
     }

@@ -208,11 +208,25 @@ pub struct VfsStorageRenameResult {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VfsStorageNamespaceMutation {
-    CreateDirectory { path: String },
-    CreateSymlink { path: String, target: String },
-    DeleteFile { path: String },
-    RemoveDirectory { path: String },
-    Rename { from: String, to: String },
+    CreateDirectory {
+        path: String,
+    },
+    CreateSymlink {
+        path: String,
+        target: String,
+    },
+    DeleteFile {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        precondition: Option<VfsStorageWritePrecondition>,
+    },
+    RemoveDirectory {
+        path: String,
+    },
+    Rename {
+        from: String,
+        to: String,
+    },
 }
 
 impl VfsStorageNamespaceMutation {
@@ -220,7 +234,7 @@ impl VfsStorageNamespaceMutation {
         match self {
             Self::CreateDirectory { path }
             | Self::CreateSymlink { path, .. }
-            | Self::DeleteFile { path }
+            | Self::DeleteFile { path, .. }
             | Self::RemoveDirectory { path } => [path.as_str(), ""],
             Self::Rename { from, to } => [from.as_str(), to.as_str()],
         }
@@ -368,8 +382,9 @@ pub trait OptimizedVfsStorage: Send + Sync {
                 VfsStorageNamespaceMutation::CreateSymlink { path, target } => {
                     self.create_symlink(path.as_str(), target.as_str()).await?;
                 }
-                VfsStorageNamespaceMutation::DeleteFile { path } => {
-                    self.delete_file_with_metadata(path.as_str(), None).await?;
+                VfsStorageNamespaceMutation::DeleteFile { path, precondition } => {
+                    self.delete_file_with_metadata(path.as_str(), precondition)
+                        .await?;
                 }
                 VfsStorageNamespaceMutation::RemoveDirectory { path } => {
                     self.rmdir(path.as_str()).await?;
