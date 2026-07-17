@@ -404,7 +404,6 @@ impl RemoteFuseFs {
 
     fn dir_entries(&self, path: &str) -> FuseResult<Vec<RemoteDirEntry>> {
         self.flush_namespace()?;
-        self.flush_writes()?;
         if let Some(entries) = self.cache.get_dir(path) {
             return Ok(entries);
         }
@@ -419,9 +418,21 @@ impl RemoteFuseFs {
 
     fn stat_path(&self, path: &str) -> FuseResult<Option<RemoteMetadata>> {
         self.flush_namespace()?;
-        self.flush_writes()?;
+        if let Some(metadata) = self.open_handle_metadata(path)? {
+            return Ok(Some(metadata));
+        }
         if let Some(metadata) = self.cache.get_metadata(path) {
             return Ok(Some(metadata));
+        }
+        if let Some(metadata) = self.cache.get_file_metadata(path) {
+            return Ok(Some(metadata));
+        }
+        if self
+            .writes
+            .as_ref()
+            .is_some_and(|writes| writes.has_pending_path(path))
+        {
+            self.flush_writes()?;
         }
         let metadata = self
             .tokio
@@ -431,6 +442,32 @@ impl RemoteFuseFs {
             self.cache.put_metadata(path, metadata.clone());
         }
         Ok(metadata)
+    }
+
+    fn open_handle_metadata(&self, path: &str) -> FuseResult<Option<RemoteMetadata>> {
+        let handles = self.lock_handles()?;
+        let Some(state) = handles
+            .files
+            .values()
+            .find(|state| state.path == path && (state.loaded || state.dirty))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(RemoteMetadata {
+            kind: "file".to_string(),
+            size_bytes: state.buffer.len() as u64,
+            link_target: None,
+            content_hash: Some(if state.dirty {
+                content_hash_for_bytes(&state.buffer)
+            } else {
+                state
+                    .base_content_hash
+                    .clone()
+                    .unwrap_or_else(|| content_hash_for_bytes(&state.buffer))
+            }),
+            executable: state.executable,
+            updated_at: None,
+        }))
     }
 
     fn read_bytes(&self, path: &str, offset: u64, size: u32) -> FuseResult<Vec<u8>> {
@@ -571,6 +608,24 @@ impl RemoteFuseFs {
             .files
             .iter()
             .filter(|(_, state)| state.path == path && state.dirty)
+            .map(|(fh, _)| *fh)
+            .collect::<Vec<_>>();
+        for fh in handles {
+            self.flush_handle(fh)?;
+        }
+        self.flush_writes()?;
+        Ok(())
+    }
+
+    fn flush_handles_for_subtree(&self, path: &str) -> FuseResult<()> {
+        let prefix = format!("{path}/");
+        let handles = self
+            .lock_handles()?
+            .files
+            .iter()
+            .filter(|(_, state)| {
+                state.dirty && (state.path == path || state.path.starts_with(&prefix))
+            })
             .map(|(fh, _)| *fh)
             .collect::<Vec<_>>();
         for fh in handles {
@@ -1005,7 +1060,11 @@ impl Filesystem for RemoteFuseFs {
                     state.loaded = true;
                     state.revision = state.revision.saturating_add(1);
                 }
-                if let Some(state) = self.lock_handles()?.files.get(&fh.0).cloned() {
+                let handle_state = {
+                    let handles = self.lock_handles()?;
+                    handles.files.get(&fh.0).cloned()
+                };
+                if let Some(state) = handle_state {
                     if state.loaded || state.dirty {
                         return Ok(self.attr_for_path(
                             &state.path,
@@ -1148,7 +1207,11 @@ impl Filesystem for RemoteFuseFs {
         reply: ReplyData,
     ) {
         let result: FuseResult<Vec<u8>> = (|| {
-            if let Some(state) = self.lock_handles()?.files.get(&fh.0).cloned() {
+            let handle_state = {
+                let handles = self.lock_handles()?;
+                handles.files.get(&fh.0).cloned()
+            };
+            if let Some(state) = handle_state {
                 if state.loaded || state.dirty {
                     let start = (offset as usize).min(state.buffer.len());
                     let end = start.saturating_add(size as usize).min(state.buffer.len());
@@ -1366,6 +1429,7 @@ impl Filesystem for RemoteFuseFs {
             let newparent_path = self.path_for_ino(newparent)?;
             let from = Self::child_path(parent_path.as_str(), name)?;
             let to = Self::child_path(newparent_path.as_str(), newname)?;
+            self.flush_handles_for_subtree(&from)?;
             self.enqueue_namespace(VfsNamespaceMutation::Rename {
                 from: from.clone(),
                 to: to.clone(),

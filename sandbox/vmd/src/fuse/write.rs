@@ -14,7 +14,8 @@ use tokio::runtime::Handle;
 use super::client::{RemoteVfsClient, RemoteWrite};
 
 const BATCH_DELAY: Duration = Duration::from_millis(8);
-const RETRY_DELAY: Duration = Duration::from_millis(100);
+const RETRY_DELAY_MIN: Duration = Duration::from_millis(100);
+const RETRY_DELAY_MAX: Duration = Duration::from_secs(5);
 const FLUSH_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BATCH_WRITES: usize = 256;
 const MAX_BATCH_BYTES: u64 = 16 * 1024 * 1024;
@@ -171,6 +172,14 @@ impl WriteJournal {
         }
         Ok(())
     }
+
+    pub fn has_pending_path(&self, path: &str) -> bool {
+        self.shared
+            .state
+            .lock()
+            .map(|state| state.pending.iter().any(|write| write.path == path))
+            .unwrap_or(true)
+    }
 }
 
 impl Drop for WriteJournal {
@@ -190,6 +199,7 @@ impl Drop for WriteJournal {
 }
 
 fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, tokio: Handle) {
+    let mut retry_delay = RETRY_DELAY_MIN;
     loop {
         let (batch, surface) = {
             let mut state = match shared.state.lock() {
@@ -276,6 +286,7 @@ fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, 
                 } else {
                     state.last_error = None;
                 }
+                retry_delay = RETRY_DELAY_MIN;
             }
             Err(error) => state.last_error = Some(error.to_string()),
         }
@@ -287,7 +298,8 @@ fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, 
             return;
         }
         if failed {
-            std::thread::sleep(RETRY_DELAY);
+            std::thread::sleep(retry_delay);
+            retry_delay = retry_delay.saturating_mul(2).min(RETRY_DELAY_MAX);
         }
     }
 }
@@ -492,5 +504,48 @@ mod tests {
                 .to_string(),
             "rewrite failed",
         );
+    }
+
+    #[test]
+    fn pending_path_check_is_path_scoped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("writes.jsonl");
+        let staging_dir = dir.path().join("writes");
+        fs::create_dir_all(&staging_dir).expect("staging dir");
+        let shared = Arc::new(Shared {
+            state: Mutex::new(JournalState {
+                pending: VecDeque::from([JournalWrite {
+                    id: 1,
+                    path: "logs/api.log".to_string(),
+                    staged_file: "1.bin".to_string(),
+                    size_bytes: 4,
+                    base_content_hash: None,
+                }]),
+                journal: open_append(&journal_path).expect("journal"),
+                next_id: 2,
+                force_flush: false,
+                flushing: false,
+                stop: false,
+                last_error: None,
+            }),
+            changed: Condvar::new(),
+            journal_path,
+            staging_dir,
+        });
+        let journal = WriteJournal {
+            shared,
+            worker: Mutex::new(None),
+        };
+
+        assert!(journal.has_pending_path("logs/api.log"));
+        assert!(!journal.has_pending_path("src/main.rs"));
+
+        journal
+            .shared
+            .state
+            .lock()
+            .expect("journal state")
+            .pending
+            .clear();
     }
 }

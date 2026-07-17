@@ -143,6 +143,18 @@ impl RemoteFuseCache {
         Some(entry.metadata.clone())
     }
 
+    pub fn get_file_metadata(&self, path: &str) -> Option<RemoteMetadata> {
+        let mut inner = self.lock_inner();
+        let entry = inner.files.get_mut(path)?;
+        if entry.expires_at <= Instant::now() {
+            let removed = inner.files.remove(path)?;
+            inner.file_bytes = inner.file_bytes.saturating_sub(removed.bytes.len());
+            return None;
+        }
+        entry.last_access = Instant::now();
+        entry.metadata.clone()
+    }
+
     pub fn put_metadata(&self, path: &str, metadata: RemoteMetadata) {
         let mut inner = self.lock_inner();
         put_metadata_locked(&mut inner, path, metadata);
