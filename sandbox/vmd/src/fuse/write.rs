@@ -276,6 +276,7 @@ fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, 
         state.flushing = false;
         match result {
             Ok(()) => {
+                let recovered = state.last_error.take();
                 for _ in 0..batch.len() {
                     if let Some(write) = state.pending.pop_front() {
                         let _ = fs::remove_file(shared.staging_dir.join(write.staged_file));
@@ -285,10 +286,30 @@ fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, 
                     state.last_error = Some(error.to_string());
                 } else {
                     state.last_error = None;
+                    if let Some(error) = recovered {
+                        tracing::info!(
+                            journal = %shared.journal_path.display(),
+                            write_count = batch.len(),
+                            previous_error = %error,
+                            "vfs write journal replay recovered"
+                        );
+                    }
                 }
                 retry_delay = RETRY_DELAY_MIN;
             }
-            Err(error) => state.last_error = Some(error.to_string()),
+            Err(error) => {
+                let error = error.to_string();
+                if state.last_error.as_deref() != Some(error.as_str()) {
+                    tracing::warn!(
+                        journal = %shared.journal_path.display(),
+                        write_count = batch.len(),
+                        first_path = batch.first().map(|write| write.path.as_str()),
+                        error = %error,
+                        "vfs write journal replay failed; retaining writes for retry"
+                    );
+                }
+                state.last_error = Some(error);
+            }
         }
         shared.changed.notify_all();
         let failed = state.last_error.is_some();
@@ -306,17 +327,21 @@ fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, 
 
 fn coalesce_batch(batch: &[JournalWrite]) -> Vec<JournalWrite> {
     let mut writes = Vec::<JournalWrite>::new();
-    let mut positions = HashMap::<&str, usize>::new();
+    let mut positions = HashMap::<String, usize>::new();
     for write in batch {
+        // An open-time hash is stale as soon as another descriptor truncates or
+        // writes the same path. The journal already serializes each batch with a
+        // gateway lease, so applying that stale hash as an optimistic precondition
+        // turns ordinary POSIX last-writer-wins behavior into a permanent retry.
+        let write = JournalWrite {
+            base_content_hash: None,
+            ..write.clone()
+        };
         if let Some(position) = positions.get(write.path.as_str()).copied() {
-            let base_content_hash = writes[position].base_content_hash.clone();
-            writes[position] = JournalWrite {
-                base_content_hash,
-                ..write.clone()
-            };
+            writes[position] = write;
         } else {
-            positions.insert(write.path.as_str(), writes.len());
-            writes.push(write.clone());
+            positions.insert(write.path.clone(), writes.len());
+            writes.push(write);
         }
     }
     writes
@@ -388,7 +413,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coalescing_keeps_first_precondition_and_latest_bytes() {
+    fn coalescing_drops_stale_preconditions_and_keeps_latest_bytes() {
         let batch = vec![
             JournalWrite {
                 id: 1,
@@ -417,8 +442,9 @@ mod tests {
         assert_eq!(coalesced.len(), 2);
         assert_eq!(coalesced[0].staged_file, "3.bin");
         assert_eq!(coalesced[0].size_bytes, 30);
-        assert_eq!(coalesced[0].base_content_hash.as_deref(), Some("base"));
+        assert_eq!(coalesced[0].base_content_hash, None);
         assert_eq!(coalesced[1].path, "README.md");
+        assert_eq!(coalesced[1].base_content_hash, None);
     }
 
     #[test]
