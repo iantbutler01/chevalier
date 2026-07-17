@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use chevalier_sandbox::vfs::{VFS_SURFACE_KIND_VM_SHARED, VFS_SURFACE_KIND_VM_WORKSPACE};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
 
 use super::client::{RemoteVfsClient, RemoteWrite};
@@ -256,7 +257,8 @@ fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, 
             (batch, surface)
         };
 
-        let writes = coalesce_batch(&batch)
+        let coalesced = coalesce_batch(&batch);
+        let writes = coalesced
             .iter()
             .map(|write| {
                 fs::read(shared.staging_dir.join(write.staged_file.as_str()))
@@ -268,6 +270,20 @@ fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, 
                     .with_context(|| format!("read staged vfs write {}", write.staged_file))
             })
             .collect::<Result<Vec<_>>>();
+        let committed_hashes = writes
+            .as_ref()
+            .map(|writes| {
+                writes
+                    .iter()
+                    .map(|write| {
+                        (
+                            write.path.clone(),
+                            content_hash_for_bytes(write.bytes.as_slice()),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
         let result = writes.and_then(|writes| tokio.block_on(client.write_many(writes, surface)));
         let mut state = match shared.state.lock() {
             Ok(state) => state,
@@ -282,6 +298,11 @@ fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, 
                         let _ = fs::remove_file(shared.staging_dir.join(write.staged_file));
                     }
                 }
+                rebase_pending_after_commit(
+                    &mut state.pending,
+                    coalesced.as_slice(),
+                    &committed_hashes,
+                );
                 if let Err(error) = rewrite_journal(&shared.journal_path, &mut state) {
                     state.last_error = Some(error.to_string());
                 } else {
@@ -329,22 +350,62 @@ fn coalesce_batch(batch: &[JournalWrite]) -> Vec<JournalWrite> {
     let mut writes = Vec::<JournalWrite>::new();
     let mut positions = HashMap::<String, usize>::new();
     for write in batch {
-        // An open-time hash is stale as soon as another descriptor truncates or
-        // writes the same path. The journal already serializes each batch with a
-        // gateway lease, so applying that stale hash as an optimistic precondition
-        // turns ordinary POSIX last-writer-wins behavior into a permanent retry.
-        let write = JournalWrite {
-            base_content_hash: None,
-            ..write.clone()
-        };
         if let Some(position) = positions.get(write.path.as_str()).copied() {
-            writes[position] = write;
+            let base_content_hash = writes[position].base_content_hash.clone();
+            writes[position] = JournalWrite {
+                base_content_hash,
+                ..write.clone()
+            };
         } else {
             positions.insert(write.path.clone(), writes.len());
-            writes.push(write);
+            writes.push(write.clone());
         }
     }
     writes
+}
+
+fn rebase_pending_after_commit(
+    pending: &mut VecDeque<JournalWrite>,
+    committed_batch: &[JournalWrite],
+    committed_hashes: &HashMap<String, String>,
+) {
+    let mut committed_bases = HashMap::<String, HashSet<Option<String>>>::new();
+    for write in committed_batch {
+        committed_bases
+            .entry(write.path.clone())
+            .or_default()
+            .insert(write.base_content_hash.clone());
+    }
+    for write in pending {
+        let Some(committed_hash) = committed_hashes.get(write.path.as_str()) else {
+            continue;
+        };
+        if write.base_content_hash.as_ref() == Some(committed_hash) {
+            continue;
+        }
+        if committed_bases
+            .get(write.path.as_str())
+            .is_some_and(|bases| bases.contains(&write.base_content_hash))
+        {
+            write.base_content_hash = Some(committed_hash.clone());
+        }
+    }
+}
+
+fn content_hash_for_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex_encode(hasher.finalize().as_ref())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn path_surface(scope_path: &str, path: &str) -> &'static str {
@@ -413,7 +474,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coalescing_drops_stale_preconditions_and_keeps_latest_bytes() {
+    fn coalescing_keeps_first_precondition_and_latest_bytes() {
         let batch = vec![
             JournalWrite {
                 id: 1,
@@ -442,9 +503,60 @@ mod tests {
         assert_eq!(coalesced.len(), 2);
         assert_eq!(coalesced[0].staged_file, "3.bin");
         assert_eq!(coalesced[0].size_bytes, 30);
-        assert_eq!(coalesced[0].base_content_hash, None);
+        assert_eq!(coalesced[0].base_content_hash.as_deref(), Some("base"));
         assert_eq!(coalesced[1].path, "README.md");
         assert_eq!(coalesced[1].base_content_hash, None);
+    }
+
+    #[test]
+    fn successful_batch_rebases_only_its_queued_write_chain() {
+        let committed = vec![JournalWrite {
+            id: 1,
+            path: "src/main.rs".to_string(),
+            staged_file: "1.bin".to_string(),
+            size_bytes: 10,
+            base_content_hash: Some("base".to_string()),
+        }];
+        let mut pending = VecDeque::from([
+            JournalWrite {
+                id: 2,
+                path: "src/main.rs".to_string(),
+                staged_file: "2.bin".to_string(),
+                size_bytes: 20,
+                base_content_hash: Some("base".to_string()),
+            },
+            JournalWrite {
+                id: 3,
+                path: "src/main.rs".to_string(),
+                staged_file: "3.bin".to_string(),
+                size_bytes: 30,
+                base_content_hash: Some("external".to_string()),
+            },
+            JournalWrite {
+                id: 4,
+                path: "README.md".to_string(),
+                staged_file: "4.bin".to_string(),
+                size_bytes: 40,
+                base_content_hash: Some("readme-base".to_string()),
+            },
+        ]);
+        rebase_pending_after_commit(
+            &mut pending,
+            &committed,
+            &HashMap::from([("src/main.rs".to_string(), "committed".to_string())]),
+        );
+
+        assert_eq!(pending[0].base_content_hash.as_deref(), Some("committed"));
+        assert_eq!(pending[1].base_content_hash.as_deref(), Some("external"));
+        assert_eq!(pending[2].base_content_hash.as_deref(), Some("readme-base"));
+    }
+
+    #[test]
+    fn content_hash_matches_sha256_hex() {
+        assert_eq!(
+            content_hash_for_bytes(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[test]

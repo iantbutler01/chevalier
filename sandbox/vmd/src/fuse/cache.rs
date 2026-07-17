@@ -6,6 +6,7 @@ use chevalier_sandbox::vfs::{VfsDirEntry as RemoteDirEntry, VfsMetadata as Remot
 
 const FILE_TTL: Duration = Duration::from_secs(60);
 const DIR_TTL: Duration = Duration::from_secs(5);
+const ATTR_TTL: Duration = Duration::from_secs(1);
 const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DIRS: usize = 4_096;
@@ -48,16 +49,18 @@ pub struct RemoteFuseCache {
 }
 
 impl RemoteFuseCache {
-    pub fn get_file(&self, path: &str) -> Option<(Vec<u8>, Option<RemoteMetadata>)> {
+    pub fn get_file_matching(&self, path: &str, metadata: &RemoteMetadata) -> Option<Vec<u8>> {
         let mut inner = self.lock_inner();
         let entry = inner.files.get_mut(path)?;
-        if entry.expires_at <= Instant::now() {
+        if entry.expires_at <= Instant::now()
+            || !cached_metadata_matches(entry.metadata.as_ref(), metadata)
+        {
             let removed = inner.files.remove(path)?;
             inner.file_bytes = inner.file_bytes.saturating_sub(removed.bytes.len());
             return None;
         }
         entry.last_access = Instant::now();
-        Some((entry.bytes.clone(), entry.metadata.clone()))
+        Some(entry.bytes.clone())
     }
 
     pub fn put_file(&self, path: &str, bytes: Vec<u8>, metadata: Option<RemoteMetadata>) {
@@ -143,18 +146,6 @@ impl RemoteFuseCache {
         Some(entry.metadata.clone())
     }
 
-    pub fn get_file_metadata(&self, path: &str) -> Option<RemoteMetadata> {
-        let mut inner = self.lock_inner();
-        let entry = inner.files.get_mut(path)?;
-        if entry.expires_at <= Instant::now() {
-            let removed = inner.files.remove(path)?;
-            inner.file_bytes = inner.file_bytes.saturating_sub(removed.bytes.len());
-            return None;
-        }
-        entry.last_access = Instant::now();
-        entry.metadata.clone()
-    }
-
     pub fn put_metadata(&self, path: &str, metadata: RemoteMetadata) {
         let mut inner = self.lock_inner();
         put_metadata_locked(&mut inner, path, metadata);
@@ -183,12 +174,31 @@ fn put_metadata_locked(inner: &mut CacheState, path: &str, metadata: RemoteMetad
         path.to_string(),
         CachedMetadata {
             metadata,
-            expires_at: now + DIR_TTL,
+            expires_at: now + ATTR_TTL,
             last_access: now,
         },
     );
     if inner.attrs.len() > MAX_ATTRS {
         prune_attrs_locked(inner, now, MAX_ATTRS.saturating_mul(3) / 4);
+    }
+}
+
+fn cached_metadata_matches(cached: Option<&RemoteMetadata>, current: &RemoteMetadata) -> bool {
+    let Some(cached) = cached else {
+        return false;
+    };
+    match (
+        cached.content_hash.as_deref(),
+        current.content_hash.as_deref(),
+    ) {
+        (Some(cached_hash), Some(current_hash)) => cached_hash == current_hash,
+        (None, None) => {
+            cached.kind == current.kind
+                && cached.size_bytes == current.size_bytes
+                && cached.link_target == current.link_target
+                && cached.executable == current.executable
+        }
+        _ => false,
     }
 }
 
@@ -281,7 +291,7 @@ mod tests {
     use super::{
         CacheState, CachedMetadata, MAX_DIR_ENTRIES, MAX_DIRS, RemoteFuseCache, prune_attrs_locked,
     };
-    use chevalier_sandbox::vfs::VfsDirEntry as RemoteDirEntry;
+    use chevalier_sandbox::vfs::{VfsDirEntry as RemoteDirEntry, VfsMetadata as RemoteMetadata};
 
     fn entry(name: &str) -> RemoteDirEntry {
         RemoteDirEntry {
@@ -302,6 +312,17 @@ mod tests {
             size_bytes: target.len() as u64,
             link_target: Some(target.to_string()),
             content_hash: None,
+            executable: false,
+            updated_at: None,
+        }
+    }
+
+    fn metadata(content_hash: &str, size_bytes: u64) -> RemoteMetadata {
+        RemoteMetadata {
+            kind: "file".to_string(),
+            size_bytes,
+            link_target: None,
+            content_hash: Some(content_hash.to_string()),
             executable: false,
             updated_at: None,
         }
@@ -335,6 +356,31 @@ mod tests {
         let metadata = cache.get_metadata("bin/tool").expect("cached metadata");
         assert_eq!(metadata.kind, "symlink");
         assert_eq!(metadata.link_target.as_deref(), Some("../real-tool"));
+    }
+
+    #[test]
+    fn file_cache_requires_matching_authoritative_metadata() {
+        let cache = RemoteFuseCache::default();
+        cache.put_file(
+            "Cargo.toml",
+            b"complete".to_vec(),
+            Some(metadata("complete-hash", 8)),
+        );
+
+        assert_eq!(
+            cache.get_file_matching("Cargo.toml", &metadata("complete-hash", 8)),
+            Some(b"complete".to_vec())
+        );
+        assert!(
+            cache
+                .get_file_matching("Cargo.toml", &metadata("truncated-hash", 1))
+                .is_none()
+        );
+        assert!(
+            cache
+                .get_file_matching("Cargo.toml", &metadata("complete-hash", 8))
+                .is_none()
+        );
     }
 
     #[test]

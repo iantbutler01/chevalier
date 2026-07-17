@@ -424,9 +424,6 @@ impl RemoteFuseFs {
         if let Some(metadata) = self.cache.get_metadata(path) {
             return Ok(Some(metadata));
         }
-        if let Some(metadata) = self.cache.get_file_metadata(path) {
-            return Ok(Some(metadata));
-        }
         if self
             .writes
             .as_ref()
@@ -449,7 +446,7 @@ impl RemoteFuseFs {
         let Some(state) = handles
             .files
             .values()
-            .find(|state| state.path == path && (state.loaded || state.dirty))
+            .find(|state| state.path == path && state.dirty)
         else {
             return Ok(None);
         };
@@ -457,27 +454,20 @@ impl RemoteFuseFs {
             kind: "file".to_string(),
             size_bytes: state.buffer.len() as u64,
             link_target: None,
-            content_hash: Some(if state.dirty {
-                content_hash_for_bytes(&state.buffer)
-            } else {
-                state
-                    .base_content_hash
-                    .clone()
-                    .unwrap_or_else(|| content_hash_for_bytes(&state.buffer))
-            }),
+            content_hash: Some(content_hash_for_bytes(&state.buffer)),
             executable: state.executable,
             updated_at: None,
         }))
     }
 
     fn read_bytes(&self, path: &str, offset: u64, size: u32) -> FuseResult<Vec<u8>> {
-        if let Some((bytes, _)) = self.cache.get_file(path) {
+        let metadata = self.stat_path(path)?.ok_or(Errno::ENOENT)?;
+        if let Some(bytes) = self.cache.get_file_matching(path, &metadata) {
             let start = (offset as usize).min(bytes.len());
             let end = start.saturating_add(size as usize).min(bytes.len());
             return Ok(bytes[start..end].to_vec());
         }
 
-        let metadata = self.stat_path(path)?.ok_or(Errno::ENOENT)?;
         let bytes = if metadata.size_bytes > LARGE_FILE_BYTES {
             self.tokio
                 .block_on(self.client.read_file_range(path, offset, size as u64))
@@ -559,6 +549,7 @@ impl RemoteFuseFs {
                 &lease,
                 surface,
                 VFS_OPERATION_WRITE_THROUGH,
+                state.base_content_hash.as_deref(),
             ));
             let _ = self.tokio.block_on(self.client.release_lease(&lease));
             result.map_err(|_| Errno::EIO)?;
@@ -657,6 +648,7 @@ impl RemoteFuseFs {
             &lease,
             surface,
             VFS_OPERATION_SETATTR_SIZE,
+            prior.content_hash.as_deref(),
         ));
         let _ = self.tokio.block_on(self.client.release_lease(&lease));
         write_result.map_err(|_| Errno::EIO)?;
@@ -699,6 +691,7 @@ impl RemoteFuseFs {
             &lease,
             surface,
             VFS_OPERATION_SETATTR_MODE,
+            metadata.content_hash.as_deref(),
         ));
         let _ = self.tokio.block_on(self.client.release_lease(&lease));
         write_result.map_err(|_| Errno::EIO)?;
@@ -838,9 +831,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 impl RemoteFuseFs {
     fn requested_init_capabilities_for(read_only: bool) -> InitFlags {
         if read_only {
-            InitFlags::empty()
+            InitFlags::FUSE_AUTO_INVAL_DATA
         } else {
-            InitFlags::FUSE_WRITEBACK_CACHE
+            InitFlags::FUSE_WRITEBACK_CACHE | InitFlags::FUSE_AUTO_INVAL_DATA
         }
     }
 }
@@ -871,14 +864,14 @@ mod tests {
     }
 
     #[test]
-    fn writable_mounts_request_writeback_cache_capability() {
+    fn mounts_request_automatic_data_invalidation() {
         assert_eq!(
             RemoteFuseFs::requested_init_capabilities_for(false),
-            InitFlags::FUSE_WRITEBACK_CACHE
+            InitFlags::FUSE_WRITEBACK_CACHE | InitFlags::FUSE_AUTO_INVAL_DATA
         );
         assert_eq!(
             RemoteFuseFs::requested_init_capabilities_for(true),
-            InitFlags::empty()
+            InitFlags::FUSE_AUTO_INVAL_DATA
         );
     }
 
@@ -1065,7 +1058,7 @@ impl Filesystem for RemoteFuseFs {
                     handles.files.get(&fh.0).cloned()
                 };
                 if let Some(state) = handle_state {
-                    if state.loaded || state.dirty {
+                    if state.dirty {
                         return Ok(self.attr_for_path(
                             &state.path,
                             &RemoteMetadata {
@@ -1165,15 +1158,11 @@ impl Filesystem for RemoteFuseFs {
                 (Vec::new(), true, true)
             } else {
                 self.cache
-                    .get_file(&path)
-                    .map(|(bytes, _)| (bytes, true, false))
+                    .get_file_matching(&path, &metadata)
+                    .map(|bytes| (bytes, true, false))
                     .unwrap_or_else(|| (Vec::new(), false, false))
             };
-            let base_content_hash = if truncate {
-                None
-            } else {
-                metadata.content_hash.clone()
-            };
+            let base_content_hash = metadata.content_hash.clone();
             let fh = self.next_handle(
                 &path,
                 initial,
@@ -1212,7 +1201,7 @@ impl Filesystem for RemoteFuseFs {
                 handles.files.get(&fh.0).cloned()
             };
             if let Some(state) = handle_state {
-                if state.loaded || state.dirty {
+                if state.dirty {
                     let start = (offset as usize).min(state.buffer.len());
                     let end = start.saturating_add(size as usize).min(state.buffer.len());
                     return Ok(state.buffer[start..end].to_vec());
@@ -1480,6 +1469,7 @@ impl Filesystem for RemoteFuseFs {
                     lease,
                     surface,
                     VFS_OPERATION_LINK,
+                    None,
                 ))
             })?;
             let metadata = self.stat_path(&destination)?.unwrap_or(RemoteMetadata {

@@ -4,11 +4,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use chevalier_sandbox::vfs::{
     CHEVALIER_VFS_COMPONENT_HEADER, CHEVALIER_VFS_EXECUTABLE_HEADER,
     CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, CHEVALIER_VFS_OPERATION_HEADER,
-    CHEVALIER_VFS_RESOURCE_KEY_HEADER, CHEVALIER_VFS_SURFACE_KIND_HEADER, VFS_COMPONENT_VM_RUNTIME,
-    VfsDirEntry as RemoteDirEntry, VfsLeaseAcquireRequest, VfsLeaseGrant as LeaseGrant,
-    VfsLeaseReleaseRequest, VfsMetadata as RemoteMetadata, VfsNamespaceMutation,
-    VfsNamespaceMutationBatchBody, VfsWriteManyBody, VfsWriteManyItem, VfsWritePrecondition,
-    scoped_vfs_path,
+    CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER, CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+    CHEVALIER_VFS_SURFACE_KIND_HEADER, VFS_COMPONENT_VM_RUNTIME, VfsDirEntry as RemoteDirEntry,
+    VfsLeaseAcquireRequest, VfsLeaseGrant as LeaseGrant, VfsLeaseReleaseRequest,
+    VfsMetadata as RemoteMetadata, VfsNamespaceMutation, VfsNamespaceMutationBatchBody,
+    VfsWriteManyBody, VfsWriteManyItem, VfsWritePrecondition, scoped_vfs_path,
 };
 use reqwest::{Client, StatusCode, header};
 
@@ -126,26 +126,31 @@ impl RemoteVfsClient {
         lease: &LeaseGrant,
         surface_kind: &str,
         operation: &str,
+        base_content_hash: Option<&str>,
     ) -> Result<()> {
-        self.request(
-            self.client
-                .put(self.url("/file"))
-                .query(&[("path", self.path_arg(path))])
-                .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
-                .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
-                .header(CHEVALIER_VFS_OPERATION_HEADER, operation)
-                .header(CHEVALIER_VFS_EXECUTABLE_HEADER, executable.to_string())
-                .header(
-                    CHEVALIER_VFS_RESOURCE_KEY_HEADER,
-                    lease.resource_key.as_str(),
-                )
-                .header(
-                    CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
-                    lease.owner_token.to_string(),
-                )
-                .body(bytes.to_vec()),
-        )
-        .await?;
+        let mut request = self
+            .client
+            .put(self.url("/file"))
+            .query(&[("path", self.path_arg(path))])
+            .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
+            .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
+            .header(CHEVALIER_VFS_OPERATION_HEADER, operation)
+            .header(CHEVALIER_VFS_EXECUTABLE_HEADER, executable.to_string())
+            .header(
+                CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+                lease.resource_key.as_str(),
+            )
+            .header(
+                CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                lease.owner_token.to_string(),
+            );
+        if let Some(base_content_hash) = base_content_hash {
+            request = request.header(
+                CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER,
+                base_content_hash,
+            );
+        }
+        self.request(request.body(bytes.to_vec())).await?;
         Ok(())
     }
 
