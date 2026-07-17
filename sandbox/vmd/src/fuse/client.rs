@@ -1,6 +1,6 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use chevalier_sandbox::vfs::{
     CHEVALIER_VFS_COMPONENT_HEADER, CHEVALIER_VFS_EXECUTABLE_HEADER,
     CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, CHEVALIER_VFS_OPERATION_HEADER,
@@ -11,6 +11,12 @@ use chevalier_sandbox::vfs::{
     VfsWriteManyBody, VfsWriteManyItem, VfsWritePrecondition, scoped_vfs_path,
 };
 use reqwest::{Client, StatusCode, header};
+
+const READ_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+const METADATA_READ_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+const FILE_READ_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
+const READ_RETRY_DELAY_MIN: Duration = Duration::from_millis(50);
+const READ_RETRY_DELAY_MAX: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug)]
 pub struct RemoteVfsClient {
@@ -46,76 +52,65 @@ impl RemoteVfsClient {
     }
 
     pub async fn list_dir(&self, path: &str) -> Result<Option<Vec<RemoteDirEntry>>> {
-        let response = self
-            .request(
-                self.client
-                    .get(self.url("/tree"))
-                    .query(&[("path", self.path_arg(path))]),
-            )
-            .await?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        response
-            .json()
-            .await
-            .context("decode vfs tree response")
-            .map(Some)
+        self.read_decoded(
+            self.client
+                .get(self.url("/tree"))
+                .query(&[("path", self.path_arg(path))])
+                .timeout(METADATA_READ_ATTEMPT_TIMEOUT),
+            |status, body| {
+                if status == StatusCode::NOT_FOUND {
+                    return Ok(None);
+                }
+                serde_json::from_slice(body)
+                    .context("decode vfs tree response")
+                    .map(Some)
+            },
+        )
+        .await
     }
 
     pub async fn stat(&self, path: &str) -> Result<Option<RemoteMetadata>> {
-        let response = self
-            .request(
-                self.client
-                    .get(self.url("/stat"))
-                    .query(&[("path", self.path_arg(path))]),
-            )
-            .await?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !response.status().is_success() {
-            bail!("vfs stat failed: {}", response.status());
-        }
-        response
-            .json()
-            .await
-            .context("decode vfs stat response")
-            .map(Some)
+        self.read_decoded(
+            self.client
+                .get(self.url("/stat"))
+                .query(&[("path", self.path_arg(path))])
+                .timeout(METADATA_READ_ATTEMPT_TIMEOUT),
+            |status, body| {
+                if status == StatusCode::NOT_FOUND {
+                    return Ok(None);
+                }
+                serde_json::from_slice(body)
+                    .context("decode vfs stat response")
+                    .map(Some)
+            },
+        )
+        .await
     }
 
     pub async fn read_file_raw(&self, path: &str) -> Result<Vec<u8>> {
-        let response = self
-            .request(
-                self.client
-                    .get(self.url("/file/raw"))
-                    .query(&[("path", self.path_arg(path))]),
-            )
-            .await?;
-        response
-            .bytes()
-            .await
-            .map(|bytes| bytes.to_vec())
-            .context("read vfs raw bytes")
+        self.read_decoded(
+            self.client
+                .get(self.url("/file/raw"))
+                .query(&[("path", self.path_arg(path))])
+                .timeout(FILE_READ_ATTEMPT_TIMEOUT),
+            |_status, body| Ok(body.to_vec()),
+        )
+        .await
     }
 
     pub async fn read_file_range(&self, path: &str, offset: u64, length: u64) -> Result<Vec<u8>> {
-        let response = self
-            .request(
-                self.client
-                    .get(self.url("/file/raw"))
-                    .query(&[("path", self.path_arg(path))])
-                    .header(
-                        header::RANGE,
-                        format!("bytes={offset}-{}", offset + length.saturating_sub(1)),
-                    ),
-            )
-            .await?;
-        response
-            .bytes()
-            .await
-            .map(|bytes| bytes.to_vec())
-            .context("read vfs ranged bytes")
+        self.read_decoded(
+            self.client
+                .get(self.url("/file/raw"))
+                .query(&[("path", self.path_arg(path))])
+                .header(
+                    header::RANGE,
+                    format!("bytes={offset}-{}", offset + length.saturating_sub(1)),
+                )
+                .timeout(FILE_READ_ATTEMPT_TIMEOUT),
+            |_status, body| Ok(body.to_vec()),
+        )
+        .await
     }
 
     pub async fn write_file(
@@ -486,6 +481,36 @@ impl RemoteVfsClient {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         Err(anyhow!("vfs request failed: {status} {body}"))
+    }
+
+    async fn read_decoded<T>(
+        &self,
+        builder: reqwest::RequestBuilder,
+        mut decode: impl FnMut(StatusCode, &[u8]) -> Result<T>,
+    ) -> Result<T> {
+        let deadline = Instant::now() + READ_RETRY_TIMEOUT;
+        let mut retry_delay = READ_RETRY_DELAY_MIN;
+        loop {
+            let request = builder
+                .try_clone()
+                .ok_or_else(|| anyhow!("cannot clone vfs read request for retry"))?;
+            let attempt = async {
+                let response = self.request(request).await?;
+                let status = response.status();
+                let body = response.bytes().await.context("read vfs response body")?;
+                decode(status, body.as_ref())
+            }
+            .await;
+            match attempt {
+                Ok(value) => return Ok(value),
+                Err(error) if Instant::now() < deadline => {
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = retry_delay.saturating_mul(2).min(READ_RETRY_DELAY_MAX);
+                    tracing::debug!(error = %error, "retrying transient vfs read request");
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 

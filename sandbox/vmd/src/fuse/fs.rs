@@ -30,6 +30,9 @@ const ROOT_INO_RAW: u64 = 1;
 const ROOT_INO: INodeNo = INodeNo(ROOT_INO_RAW);
 const LARGE_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_OPEN_HANDLES: usize = 8_192;
+const SETATTR_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+const SETATTR_RETRY_DELAY_MIN: Duration = Duration::from_millis(50);
+const SETATTR_RETRY_DELAY_MAX: Duration = Duration::from_millis(500);
 
 type FuseResult<T> = std::result::Result<T, Errno>;
 
@@ -668,36 +671,111 @@ impl RemoteFuseFs {
         if self.read_only {
             return Err(Errno::EROFS);
         }
-        let mut metadata = self.stat_path(path)?.ok_or(Errno::ENOENT)?;
-        if metadata.kind != "file" || metadata.executable == executable {
-            return Ok(self.attr_for_path(path, &metadata, false));
-        }
-        let bytes = self
-            .tokio
-            .block_on(self.client.read_file_raw(path))
-            .map_err(|_| Errno::EIO)?;
-        let lease = self
-            .tokio
-            .block_on(
-                self.client
-                    .acquire_lease(path, 1, "change vfs fuse executable mode"),
-            )
-            .map_err(|_| Errno::EIO)?;
+        self.flush_namespace()?;
+        self.flush_writes()?;
+        let deadline = Instant::now() + SETATTR_RETRY_TIMEOUT;
+        let mut retry_delay = SETATTR_RETRY_DELAY_MIN;
         let surface = self.surface_kind_for_path(path);
-        let write_result = self.tokio.block_on(self.client.write_file(
-            path,
-            &bytes,
-            executable,
-            &lease,
-            surface,
-            VFS_OPERATION_SETATTR_MODE,
-            metadata.content_hash.as_deref(),
-        ));
-        let _ = self.tokio.block_on(self.client.release_lease(&lease));
-        write_result.map_err(|_| Errno::EIO)?;
-        self.cache.invalidate(path);
-        metadata.executable = executable;
-        Ok(self.attr_for_path(path, &metadata, false))
+
+        loop {
+            self.cache.invalidate(path);
+            let metadata = match self.tokio.block_on(self.client.stat(path)) {
+                Ok(Some(metadata)) => metadata,
+                Ok(None) => return Err(Errno::ENOENT),
+                Err(error) if Instant::now() < deadline => {
+                    tracing::debug!(
+                        path,
+                        error = %error,
+                        "retrying vfs setattr after stat failure"
+                    );
+                    std::thread::sleep(retry_delay);
+                    retry_delay = retry_delay.saturating_mul(2).min(SETATTR_RETRY_DELAY_MAX);
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(path, error = %error, "vfs setattr stat failed");
+                    return Err(Errno::EIO);
+                }
+            };
+            if metadata.kind != "file" || metadata.executable == executable {
+                self.cache.put_metadata(path, metadata.clone());
+                return Ok(self.attr_for_path(path, &metadata, false));
+            }
+
+            let bytes = match self.tokio.block_on(self.client.read_file_raw(path)) {
+                Ok(bytes) => bytes,
+                Err(error) if Instant::now() < deadline => {
+                    tracing::debug!(
+                        path,
+                        error = %error,
+                        "retrying vfs setattr after read failure"
+                    );
+                    std::thread::sleep(retry_delay);
+                    retry_delay = retry_delay.saturating_mul(2).min(SETATTR_RETRY_DELAY_MAX);
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(path, error = %error, "vfs setattr read failed");
+                    return Err(Errno::EIO);
+                }
+            };
+            let lease = match self.tokio.block_on(self.client.acquire_lease(
+                path,
+                1,
+                "change vfs fuse executable mode",
+            )) {
+                Ok(lease) => lease,
+                Err(error) if Instant::now() < deadline => {
+                    tracing::debug!(
+                        path,
+                        error = %error,
+                        "retrying vfs setattr after lease failure"
+                    );
+                    std::thread::sleep(retry_delay);
+                    retry_delay = retry_delay.saturating_mul(2).min(SETATTR_RETRY_DELAY_MAX);
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(path, error = %error, "vfs setattr lease failed");
+                    return Err(Errno::EIO);
+                }
+            };
+            let write_result = self.tokio.block_on(self.client.write_file(
+                path,
+                &bytes,
+                executable,
+                &lease,
+                surface,
+                VFS_OPERATION_SETATTR_MODE,
+                metadata.content_hash.as_deref(),
+            ));
+            let _ = self.tokio.block_on(self.client.release_lease(&lease));
+            match write_result {
+                Ok(()) => {
+                    let mut updated = metadata;
+                    updated.executable = executable;
+                    self.cache.invalidate(path);
+                    self.cache.put_metadata(path, updated.clone());
+                    return Ok(self.attr_for_path(path, &updated, false));
+                }
+                Err(error) if Instant::now() < deadline => {
+                    // The gateway may have committed the idempotent mode update
+                    // before the response connection failed. The next iteration
+                    // re-reads metadata and treats that state as success.
+                    tracing::debug!(
+                        path,
+                        error = %error,
+                        "retrying ambiguous vfs setattr write"
+                    );
+                    std::thread::sleep(retry_delay);
+                    retry_delay = retry_delay.saturating_mul(2).min(SETATTR_RETRY_DELAY_MAX);
+                }
+                Err(error) => {
+                    tracing::warn!(path, error = %error, "vfs setattr write failed");
+                    return Err(Errno::EIO);
+                }
+            }
+        }
     }
 
     fn mutate_namespace<F>(&self, path: &str, op: F) -> FuseResult<()>
