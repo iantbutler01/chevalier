@@ -261,12 +261,21 @@ impl OptimizedVfsStorage for GatewayVfsStorage {
     }
 
     async fn stat(&self, path: &str) -> VfsStorageResult<Option<VfsStorageMetadata>> {
+        self.stat_with_metadata_fields(path, VfsStorageMetadataFields::default())
+            .await
+    }
+
+    async fn stat_with_metadata_fields(
+        &self,
+        path: &str,
+        fields: VfsStorageMetadataFields,
+    ) -> VfsStorageResult<Option<VfsStorageMetadata>> {
+        let mut query = vec![("path", self.path_arg(path))];
+        if let Some(max_hash_bytes) = fields.max_hash_bytes {
+            query.push(("max_hash_bytes", max_hash_bytes.to_string()));
+        }
         let response = match self
-            .send(
-                self.client
-                    .get(self.url("/stat"))
-                    .query(&[("path", self.path_arg(path))]),
-            )
+            .send(self.client.get(self.url("/stat")).query(&query))
             .await
         {
             Ok(response) => response,
@@ -1327,6 +1336,34 @@ mod tests {
         assert_query_value(&request.target, "limit", "2");
         assert_query_value(&request.target, "order", "name_desc");
         assert_query_value(&request.target, "max_hash_bytes", "64");
+    }
+
+    #[tokio::test]
+    async fn gateway_stat_forwards_hash_limit() {
+        let (endpoint, requests) =
+            serve_one(r#"{"kind":"file","size_bytes":3,"content_hash":null,"updated_at":null}"#);
+        let storage =
+            GatewayVfsStorage::new(GatewayVfsStorageConfig::new(endpoint).with_scope_path("scope"));
+
+        let metadata = storage
+            .stat_with_metadata_fields(
+                "jobs/a.txt",
+                VfsStorageMetadataFields {
+                    max_hash_bytes: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("stat")
+            .expect("metadata");
+
+        assert_eq!(metadata.path, "jobs/a.txt");
+        assert_eq!(metadata.content_hash, None);
+        let request = requests.recv().expect("captured request");
+        assert_eq!(request.method, "GET");
+        assert!(request.target.starts_with("/stat?"));
+        assert_query_value(&request.target, "path", "scope/jobs/a.txt");
+        assert_query_value(&request.target, "max_hash_bytes", "0");
     }
 
     #[tokio::test]

@@ -146,6 +146,27 @@ fn list_filter_from_options(options: Option<&Value>) -> napi::Result<VfsStorageD
     })
 }
 
+fn metadata_fields_from_options(options: Option<&Value>) -> napi::Result<VfsStorageMetadataFields> {
+    let Some(options) = options_object(options)? else {
+        return Ok(VfsStorageMetadataFields::default());
+    };
+    let max_hash_bytes = match option_field(options, "maxHashBytes", "max_hash_bytes") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(value)) => Some(value.as_u64().ok_or_else(|| {
+            invalid_options_err("invalid VFS options: maxHashBytes must be a non-negative integer")
+        })?),
+        Some(_) => {
+            return Err(invalid_options_err(
+                "invalid VFS options: maxHashBytes must be a non-negative integer",
+            ));
+        }
+    };
+    Ok(VfsStorageMetadataFields {
+        max_hash_bytes,
+        ..Default::default()
+    })
+}
+
 /// Pack-slot location for an object-backed file.
 #[napi(object)]
 pub struct VfsObjectState {
@@ -362,11 +383,16 @@ impl VfsStorage {
     }
 
     /// Stat a path; returns typed metadata (`sizeBytes` is a `bigint`) or null.
-    #[napi]
-    pub async fn stat(&self, path: String) -> napi::Result<Option<VfsMetadata>> {
+    #[napi(ts_args_type = "path: string, options?: { maxHashBytes?: number | null } | null")]
+    pub async fn stat(
+        &self,
+        path: String,
+        options: Option<Value>,
+    ) -> napi::Result<Option<VfsMetadata>> {
+        let fields = metadata_fields_from_options(options.as_ref())?;
         Ok(self
             .inner
-            .stat(&path)
+            .stat_with_metadata_fields(&path, fields)
             .await
             .map_err(vfs_err)?
             .map(VfsMetadata::from))

@@ -201,6 +201,21 @@ impl LocalVfsStorage {
         &self.root
     }
 
+    async fn run_blocking<T>(
+        &self,
+        operation: impl FnOnce(Self) -> VfsStorageResult<T> + Send + 'static,
+    ) -> VfsStorageResult<T>
+    where
+        T: Send + 'static,
+    {
+        let storage = self.clone();
+        tokio::task::spawn_blocking(move || operation(storage))
+            .await
+            .map_err(|error| {
+                VfsStorageError::Internal(format!("local vfs blocking task failed: {error}"))
+            })?
+    }
+
     fn abs_path(&self, logical_path: &str) -> VfsStorageResult<PathBuf> {
         let logical_path = logical_path.trim_matches('/');
         let mut out = self.root.clone();
@@ -548,18 +563,40 @@ impl OptimizedVfsStorage for LocalVfsStorage {
     }
 
     async fn stat(&self, path: &str) -> VfsStorageResult<Option<VfsStorageMetadata>> {
-        self.metadata_for_path(path)
+        let path = path.to_string();
+        self.run_blocking(move |storage| storage.metadata_for_path(&path))
+            .await
+    }
+
+    async fn stat_with_metadata_fields(
+        &self,
+        path: &str,
+        fields: VfsStorageMetadataFields,
+    ) -> VfsStorageResult<Option<VfsStorageMetadata>> {
+        let path = path.to_string();
+        self.run_blocking(move |storage| {
+            let abs_path = storage.abs_path(&path)?;
+            storage.metadata_for_abs_with_hash_limit(&abs_path, fields.max_hash_bytes)
+        })
+        .await
     }
 
     async fn metadata_many(
         &self,
         paths: &[String],
-        _fields: VfsStorageMetadataFields,
+        fields: VfsStorageMetadataFields,
     ) -> VfsStorageResult<Vec<Option<VfsStorageMetadata>>> {
-        paths
-            .iter()
-            .map(|path| self.metadata_for_path(path))
-            .collect()
+        let paths = paths.to_vec();
+        self.run_blocking(move |storage| {
+            paths
+                .iter()
+                .map(|path| {
+                    let abs_path = storage.abs_path(path)?;
+                    storage.metadata_for_abs_with_hash_limit(&abs_path, fields.max_hash_bytes)
+                })
+                .collect()
+        })
+        .await
     }
 
     async fn list_dir_with_metadata(
@@ -567,58 +604,63 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         path: &str,
         filter: VfsStorageDirListFilter,
     ) -> VfsStorageResult<Vec<VfsStorageMetadata>> {
-        let abs_path = self.abs_path(path)?;
-        self.assert_no_symlink_ancestor(&abs_path)?;
-        let directory_metadata = match fs::symlink_metadata(&abs_path) {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(VfsStorageError::NotFound(path.to_string()));
+        let path = path.to_string();
+        self.run_blocking(move |storage| {
+            let abs_path = storage.abs_path(&path)?;
+            storage.assert_no_symlink_ancestor(&abs_path)?;
+            let directory_metadata = match fs::symlink_metadata(&abs_path) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(VfsStorageError::NotFound(path));
+                }
+                Err(err) => return Err(VfsStorageError::Internal(err.to_string())),
+            };
+            if directory_metadata.file_type().is_symlink()
+                || (!directory_metadata.is_file() && !directory_metadata.is_dir())
+            {
+                return Ok(Vec::new());
             }
-            Err(err) => return Err(VfsStorageError::Internal(err.to_string())),
-        };
-        if directory_metadata.file_type().is_symlink()
-            || (!directory_metadata.is_file() && !directory_metadata.is_dir())
-        {
-            return Ok(Vec::new());
-        }
-        if !directory_metadata.is_dir() {
-            return Err(VfsStorageError::BadRequest(format!(
-                "vfs path {path} is not a directory"
-            )));
-        }
-        let read_dir = fs::read_dir(&abs_path).map_err(|err| match err.kind() {
-            std::io::ErrorKind::NotFound => VfsStorageError::NotFound(path.to_string()),
-            _ => VfsStorageError::Internal(err.to_string()),
-        })?;
-        let mut entries = Vec::new();
-        for entry in read_dir {
-            let entry = entry.map_err(|err| VfsStorageError::Internal(err.to_string()))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !filter_name(&name, &filter) {
-                continue;
+            if !directory_metadata.is_dir() {
+                return Err(VfsStorageError::BadRequest(format!(
+                    "vfs path {path} is not a directory"
+                )));
             }
-            let metadata =
-                match self.metadata_for_abs_with_hash_limit(&entry.path(), filter.max_hash_bytes) {
+            let read_dir = fs::read_dir(&abs_path).map_err(|err| match err.kind() {
+                std::io::ErrorKind::NotFound => VfsStorageError::NotFound(path.clone()),
+                _ => VfsStorageError::Internal(err.to_string()),
+            })?;
+            let mut entries = Vec::new();
+            for entry in read_dir {
+                let entry = entry.map_err(|err| VfsStorageError::Internal(err.to_string()))?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !filter_name(&name, &filter) {
+                    continue;
+                }
+                let metadata = match storage
+                    .metadata_for_abs_with_hash_limit(&entry.path(), filter.max_hash_bytes)
+                {
                     Ok(Some(metadata)) => metadata,
                     Ok(None) => continue,
                     Err(err) if is_excluded_listing_error(&err) => continue,
                     Err(err) => return Err(err),
                 };
-            if is_excluded_listing_kind(metadata.kind) {
-                continue;
-            }
-            if let Some(kind) = filter.entry_kind {
-                if metadata.kind != kind {
+                if is_excluded_listing_kind(metadata.kind) {
                     continue;
                 }
+                if let Some(kind) = filter.entry_kind {
+                    if metadata.kind != kind {
+                        continue;
+                    }
+                }
+                entries.push(metadata);
             }
-            entries.push(metadata);
-        }
-        sort_entries(&mut entries, filter.order);
-        if let Some(limit) = filter.limit {
-            entries.truncate(limit.max(0) as usize);
-        }
-        Ok(entries)
+            sort_entries(&mut entries, filter.order);
+            if let Some(limit) = filter.limit {
+                entries.truncate(limit.max(0) as usize);
+            }
+            Ok(entries)
+        })
+        .await
     }
 
     async fn list_subtree_file_metadata(
@@ -626,125 +668,149 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         prefix: &str,
         options: VfsStorageSubtreeOptions,
     ) -> VfsStorageResult<Vec<VfsStorageMetadata>> {
-        let root = self.abs_path(prefix)?;
-        self.assert_no_symlink_ancestor(&root)?;
-        let mut stack = vec![root];
-        let mut out = Vec::new();
-        while let Some(path) = stack.pop() {
-            let metadata = match fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(VfsStorageError::Internal(err.to_string())),
-            };
-            let file_type = metadata.file_type();
-            if file_type.is_symlink() {
-                match self.metadata_for_abs(&path) {
-                    Ok(Some(link_metadata)) => out.push(link_metadata),
-                    Ok(None) => {}
-                    Err(err) if is_excluded_listing_error(&err) => {}
-                    Err(err) => return Err(err),
+        let prefix = prefix.to_string();
+        self.run_blocking(move |storage| {
+            let root = storage.abs_path(&prefix)?;
+            storage.assert_no_symlink_ancestor(&root)?;
+            let mut stack = vec![root];
+            let mut out = Vec::new();
+            while let Some(path) = stack.pop() {
+                let metadata = match fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => return Err(VfsStorageError::Internal(err.to_string())),
+                };
+                let file_type = metadata.file_type();
+                if file_type.is_symlink() {
+                    match storage.metadata_for_abs(&path) {
+                        Ok(Some(link_metadata)) => out.push(link_metadata),
+                        Ok(None) => {}
+                        Err(err) if is_excluded_listing_error(&err) => {}
+                        Err(err) => return Err(err),
+                    }
+                    if let Some(limit) = options.limit {
+                        if out.len() >= limit.max(0) as usize {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if !metadata.is_file() && !metadata.is_dir() {
+                    continue;
+                }
+                if metadata.is_dir() {
+                    for entry in fs::read_dir(&path)
+                        .map_err(|err| VfsStorageError::Internal(err.to_string()))?
+                    {
+                        stack.push(
+                            entry
+                                .map_err(|err| VfsStorageError::Internal(err.to_string()))?
+                                .path(),
+                        );
+                    }
+                    continue;
+                }
+                if metadata.is_file() {
+                    if let Some(file_metadata) =
+                        storage.metadata_for_abs_with_hash_limit(&path, options.max_hash_bytes)?
+                    {
+                        out.push(file_metadata);
+                    }
                 }
                 if let Some(limit) = options.limit {
                     if out.len() >= limit.max(0) as usize {
                         break;
                     }
                 }
-                continue;
             }
-            if !metadata.is_file() && !metadata.is_dir() {
-                continue;
-            }
-            if metadata.is_dir() {
-                for entry in
-                    fs::read_dir(&path).map_err(|err| VfsStorageError::Internal(err.to_string()))?
-                {
-                    stack.push(
-                        entry
-                            .map_err(|err| VfsStorageError::Internal(err.to_string()))?
-                            .path(),
-                    );
-                }
-                continue;
-            }
-            if metadata.is_file() {
-                if let Some(file_metadata) =
-                    self.metadata_for_abs_with_hash_limit(&path, options.max_hash_bytes)?
-                {
-                    out.push(file_metadata);
-                }
-            }
-            if let Some(limit) = options.limit {
-                if out.len() >= limit.max(0) as usize {
-                    break;
-                }
-            }
-        }
-        out.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(out)
+            out.sort_by(|a, b| a.path.cmp(&b.path));
+            Ok(out)
+        })
+        .await
     }
 
     async fn read(&self, path: &str) -> VfsStorageResult<Bytes> {
-        let abs_path = self.abs_path(path)?;
-        self.assert_no_symlink_ancestor(&abs_path)?;
-        read_file(&abs_path).map(Bytes::from)
+        let path = path.to_string();
+        self.run_blocking(move |storage| {
+            let abs_path = storage.abs_path(&path)?;
+            storage.assert_no_symlink_ancestor(&abs_path)?;
+            read_file(&abs_path).map(Bytes::from)
+        })
+        .await
     }
 
     async fn read_range(&self, path: &str, range: VfsStorageReadRange) -> VfsStorageResult<Bytes> {
-        let abs_path = self.abs_path(path)?;
-        self.assert_no_symlink_ancestor(&abs_path)?;
-        let mut file = open_regular_file(&abs_path)?;
-        file.seek(SeekFrom::Start(range.offset))
-            .map_err(|err| VfsStorageError::Internal(err.to_string()))?;
-        let mut bytes = Vec::with_capacity(range.length as usize);
-        file.take(range.length)
-            .read_to_end(&mut bytes)
-            .map_err(|err| VfsStorageError::Internal(err.to_string()))?;
-        Ok(Bytes::from(bytes))
+        let path = path.to_string();
+        self.run_blocking(move |storage| {
+            let abs_path = storage.abs_path(&path)?;
+            storage.assert_no_symlink_ancestor(&abs_path)?;
+            let mut file = open_regular_file(&abs_path)?;
+            file.seek(SeekFrom::Start(range.offset))
+                .map_err(|err| VfsStorageError::Internal(err.to_string()))?;
+            let mut bytes = Vec::with_capacity(range.length as usize);
+            file.take(range.length)
+                .read_to_end(&mut bytes)
+                .map_err(|err| VfsStorageError::Internal(err.to_string()))?;
+            Ok(Bytes::from(bytes))
+        })
+        .await
     }
 
     async fn read_many(&self, paths: &[String]) -> VfsStorageResult<Vec<(String, Bytes)>> {
-        let mut out = Vec::with_capacity(paths.len());
-        for path in paths {
-            match self.read(path).await {
-                Ok(bytes) => out.push((path.clone(), bytes)),
-                Err(VfsStorageError::NotFound(_)) => {}
-                Err(error) => return Err(error),
+        let paths = paths.to_vec();
+        self.run_blocking(move |storage| {
+            let mut out = Vec::with_capacity(paths.len());
+            for path in paths {
+                let abs_path = storage.abs_path(&path)?;
+                storage.assert_no_symlink_ancestor(&abs_path)?;
+                match read_file(&abs_path).map(Bytes::from) {
+                    Ok(bytes) => out.push((path, bytes)),
+                    Err(VfsStorageError::NotFound(_)) => {}
+                    Err(error) => return Err(error),
+                }
             }
-        }
-        Ok(out)
+            Ok(out)
+        })
+        .await
     }
 
     async fn read_many_if_etag_mismatch(
         &self,
         requests: &[VfsStorageReadIfChanged],
     ) -> VfsStorageResult<Vec<VfsStorageReadIfChangedResult>> {
-        let mut out = Vec::with_capacity(requests.len());
-        for request in requests {
-            let metadata = self.metadata_for_path(&request.path)?;
-            let Some(metadata) = metadata else {
+        let requests = requests.to_vec();
+        self.run_blocking(move |storage| {
+            let mut out = Vec::with_capacity(requests.len());
+            for request in requests {
+                let metadata = storage.metadata_for_path(&request.path)?;
+                let Some(metadata) = metadata else {
+                    out.push(VfsStorageReadIfChangedResult {
+                        path: request.path,
+                        content_hash: None,
+                        bytes: None,
+                    });
+                    continue;
+                };
+                let hash = metadata.content_hash.clone();
+                if hash == request.known_content_hash {
+                    out.push(VfsStorageReadIfChangedResult {
+                        path: request.path,
+                        content_hash: hash,
+                        bytes: None,
+                    });
+                    continue;
+                }
+                let abs_path = storage.abs_path(&request.path)?;
+                storage.assert_no_symlink_ancestor(&abs_path)?;
                 out.push(VfsStorageReadIfChangedResult {
-                    path: request.path.clone(),
-                    content_hash: None,
-                    bytes: None,
-                });
-                continue;
-            };
-            let hash = metadata.content_hash.clone();
-            if hash == request.known_content_hash {
-                out.push(VfsStorageReadIfChangedResult {
-                    path: request.path.clone(),
+                    path: request.path,
                     content_hash: hash,
-                    bytes: None,
+                    bytes: Some(Bytes::from(read_file(&abs_path)?)),
                 });
-                continue;
             }
-            out.push(VfsStorageReadIfChangedResult {
-                path: request.path.clone(),
-                content_hash: hash,
-                bytes: Some(self.read(&request.path).await?),
-            });
-        }
-        Ok(out)
+            Ok(out)
+        })
+        .await
     }
 
     async fn write(
@@ -771,12 +837,15 @@ impl OptimizedVfsStorage for LocalVfsStorage {
             precondition,
         };
         let _locks = self.lock_write_paths([write.path.clone()]).await;
-        self.assert_precondition(&write.path, write.precondition.as_ref())?;
-        let result = install_writes_with_options(self, vec![(write, options)])?;
-        result
-            .into_iter()
-            .next()
-            .ok_or_else(|| VfsStorageError::Internal("write returned no result".to_string()))
+        self.run_blocking(move |storage| {
+            storage.assert_precondition(&write.path, write.precondition.as_ref())?;
+            let result = install_writes_with_options(&storage, vec![(write, options)])?;
+            result
+                .into_iter()
+                .next()
+                .ok_or_else(|| VfsStorageError::Internal("write returned no result".to_string()))
+        })
+        .await
     }
 
     async fn write_from_local_file(
@@ -787,79 +856,88 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         precondition: Option<VfsStorageWritePrecondition>,
         options: Option<VfsStorageWriteOptions>,
     ) -> VfsStorageResult<VfsStorageWriteResult> {
-        assert_supported_read_target(source_path)?;
-        let _locks = self.lock_write_paths([path.to_string()]).await;
-        self.assert_precondition(path, precondition.as_ref())?;
+        let path = path.to_string();
+        let source_path = source_path.to_path_buf();
+        let expected_content_hash = expected_content_hash.map(str::to_string);
+        let _locks = self.lock_write_paths([path.clone()]).await;
+        self.run_blocking(move |storage| {
+            assert_supported_read_target(&source_path)?;
+            storage.assert_precondition(&path, precondition.as_ref())?;
 
-        let abs_path = self.abs_path(path)?;
-        self.assert_no_symlink_ancestor(&abs_path)?;
-        let previous_hash = self
-            .metadata_for_abs(&abs_path)?
-            .and_then(|metadata| metadata.content_hash);
-        let previous_mode = existing_regular_file_mode(&abs_path)?;
-        if let Some(parent) = abs_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
-        }
-        let tmp_path = abs_path.with_file_name(format!(
-            ".{}.{}.tmp",
-            abs_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("vfs"),
-            Uuid::new_v4()
-        ));
-
-        let install = (|| -> VfsStorageResult<String> {
-            let mut source = open_regular_file(source_path)?;
-            let mut staged = fs::File::create(&tmp_path)
-                .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
-            let mut hasher = sha2::Sha256::new();
-            let mut buffer = vec![0_u8; 1024 * 1024];
-            loop {
-                let read = source
-                    .read(&mut buffer)
+            let abs_path = storage.abs_path(&path)?;
+            storage.assert_no_symlink_ancestor(&abs_path)?;
+            let previous_hash = storage
+                .metadata_for_abs(&abs_path)?
+                .and_then(|metadata| metadata.content_hash);
+            let previous_mode = existing_regular_file_mode(&abs_path)?;
+            if let Some(parent) = abs_path.parent() {
+                fs::create_dir_all(parent)
                     .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
-                if read == 0 {
-                    break;
+            }
+            let tmp_path = abs_path.with_file_name(format!(
+                ".{}.{}.tmp",
+                abs_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("vfs"),
+                Uuid::new_v4()
+            ));
+
+            let install = (|| -> VfsStorageResult<String> {
+                let mut source = open_regular_file(&source_path)?;
+                let mut staged = fs::File::create(&tmp_path)
+                    .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+                let mut hasher = sha2::Sha256::new();
+                let mut buffer = vec![0_u8; 1024 * 1024];
+                loop {
+                    let read = source
+                        .read(&mut buffer)
+                        .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+                    if read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..read]);
+                    staged
+                        .write_all(&buffer[..read])
+                        .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
                 }
-                hasher.update(&buffer[..read]);
                 staged
-                    .write_all(&buffer[..read])
+                    .sync_all()
                     .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
-            }
-            staged
-                .sync_all()
-                .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
-            let content_hash = format!("{:x}", hasher.finalize());
-            if expected_content_hash.is_some_and(|expected| expected != content_hash) {
-                return Err(VfsStorageError::Conflict(format!(
-                    "staged VFS upload hash mismatch for {path}"
-                )));
-            }
-            fs::rename(&tmp_path, &abs_path)
-                .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
-            let executable = options.as_ref().is_some_and(|value| value.executable);
-            apply_executable_option(&abs_path, executable, previous_mode)?;
-            Ok(content_hash)
-        })();
+                let content_hash = format!("{:x}", hasher.finalize());
+                if expected_content_hash
+                    .as_deref()
+                    .is_some_and(|expected| expected != content_hash)
+                {
+                    return Err(VfsStorageError::Conflict(format!(
+                        "staged VFS upload hash mismatch for {path}"
+                    )));
+                }
+                fs::rename(&tmp_path, &abs_path)
+                    .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+                let executable = options.as_ref().is_some_and(|value| value.executable);
+                apply_executable_option(&abs_path, executable, previous_mode)?;
+                Ok(content_hash)
+            })();
 
-        let content_hash = match install {
-            Ok(content_hash) => content_hash,
-            Err(error) => {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(error);
-            }
-        };
-        let metadata = fs::symlink_metadata(&abs_path)
-            .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
-        self.remember_written_hash(&abs_path, &metadata, content_hash.clone());
-        Ok(VfsStorageWriteResult {
-            path: path.to_string(),
-            changed: previous_hash.as_deref() != Some(content_hash.as_str()),
-            previous_hash,
-            content_hash,
+            let content_hash = match install {
+                Ok(content_hash) => content_hash,
+                Err(error) => {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(error);
+                }
+            };
+            let metadata = fs::symlink_metadata(&abs_path)
+                .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+            storage.remember_written_hash(&abs_path, &metadata, content_hash.clone());
+            Ok(VfsStorageWriteResult {
+                path,
+                changed: previous_hash.as_deref() != Some(content_hash.as_str()),
+                previous_hash,
+                content_hash,
+            })
         })
+        .await
     }
 
     async fn write_many_atomic(
@@ -869,10 +947,13 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         let _locks = self
             .lock_write_paths(writes.iter().map(|write| write.path.clone()))
             .await;
-        for write in &writes {
-            self.assert_precondition(&write.path, write.precondition.as_ref())?;
-        }
-        install_writes(self, writes)
+        self.run_blocking(move |storage| {
+            for write in &writes {
+                storage.assert_precondition(&write.path, write.precondition.as_ref())?;
+            }
+            install_writes(&storage, writes)
+        })
+        .await
     }
 
     async fn write_many_if_changed_atomic(
@@ -882,43 +963,53 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         let _locks = self
             .lock_write_paths(writes.iter().map(|write| write.path.clone()))
             .await;
-        for write in &writes {
-            self.assert_precondition(&write.path, write.precondition.as_ref())?;
-        }
-        let mut changed = Vec::new();
-        let mut unchanged = Vec::new();
-        for write in writes {
-            let previous_hash = self
-                .metadata_for_path(&write.path)?
-                .and_then(|metadata| metadata.content_hash);
-            let next_hash = hex_hash(&write.bytes);
-            if previous_hash.as_deref() == Some(next_hash.as_str()) {
-                unchanged.push(VfsStorageWriteResult {
-                    path: write.path,
-                    content_hash: next_hash,
-                    previous_hash,
-                    changed: false,
-                });
-            } else {
-                changed.push(write);
+        self.run_blocking(move |storage| {
+            for write in &writes {
+                storage.assert_precondition(&write.path, write.precondition.as_ref())?;
             }
-        }
-        let mut out = install_writes(self, changed)?;
-        out.extend(unchanged);
-        out.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(out)
+            let mut changed = Vec::new();
+            let mut unchanged = Vec::new();
+            for write in writes {
+                let previous_hash = storage
+                    .metadata_for_path(&write.path)?
+                    .and_then(|metadata| metadata.content_hash);
+                let next_hash = hex_hash(&write.bytes);
+                if previous_hash.as_deref() == Some(next_hash.as_str()) {
+                    unchanged.push(VfsStorageWriteResult {
+                        path: write.path,
+                        content_hash: next_hash,
+                        previous_hash,
+                        changed: false,
+                    });
+                } else {
+                    changed.push(write);
+                }
+            }
+            let mut out = install_writes(&storage, changed)?;
+            out.extend(unchanged);
+            out.sort_by(|a, b| a.path.cmp(&b.path));
+            Ok(out)
+        })
+        .await
     }
 
     async fn mkdir(&self, path: &str) -> VfsStorageResult<()> {
-        let _locks = self.lock_write_paths([path.to_string()]).await;
-        let abs_path = self.abs_path(path)?;
-        self.assert_no_symlink_ancestor(&abs_path)?;
-        fs::create_dir_all(abs_path).map_err(|err| VfsStorageError::Internal(err.to_string()))
+        let path = path.to_string();
+        let _locks = self.lock_write_paths([path.clone()]).await;
+        self.run_blocking(move |storage| {
+            let abs_path = storage.abs_path(&path)?;
+            storage.assert_no_symlink_ancestor(&abs_path)?;
+            fs::create_dir_all(abs_path).map_err(|err| VfsStorageError::Internal(err.to_string()))
+        })
+        .await
     }
 
     async fn create_symlink(&self, path: &str, target: &str) -> VfsStorageResult<()> {
-        let _locks = self.lock_write_paths([path.to_string()]).await;
-        create_symlink_impl(self, path, target)
+        let path = path.to_string();
+        let target = target.to_string();
+        let _locks = self.lock_write_paths([path.clone()]).await;
+        self.run_blocking(move |storage| create_symlink_impl(&storage, &path, &target))
+            .await
     }
 
     async fn delete_file_with_metadata(
@@ -926,47 +1017,55 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         path: &str,
         precondition: Option<VfsStorageWritePrecondition>,
     ) -> VfsStorageResult<VfsStorageDeleteResult> {
-        let _locks = self.lock_write_paths([path.to_string()]).await;
-        self.assert_precondition(path, precondition.as_ref())?;
-        let previous = self.metadata_for_path(path)?;
-        if matches!(
-            previous.as_ref().map(|metadata| metadata.kind),
-            Some(VfsStorageEntryKind::Directory)
-        ) {
-            return Err(VfsStorageError::BadRequest(format!(
-                "vfs path {path} is not a file"
-            )));
-        }
-        let abs_path = self.abs_path(path)?;
-        self.assert_no_symlink_ancestor(&abs_path)?;
-        match fs::remove_file(&abs_path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(VfsStorageError::Internal(err.to_string())),
-        }
-        self.invalidate_hash(&abs_path);
-        Ok(VfsStorageDeleteResult { previous })
+        let path = path.to_string();
+        let _locks = self.lock_write_paths([path.clone()]).await;
+        self.run_blocking(move |storage| {
+            storage.assert_precondition(&path, precondition.as_ref())?;
+            let previous = storage.metadata_for_path(&path)?;
+            if matches!(
+                previous.as_ref().map(|metadata| metadata.kind),
+                Some(VfsStorageEntryKind::Directory)
+            ) {
+                return Err(VfsStorageError::BadRequest(format!(
+                    "vfs path {path} is not a file"
+                )));
+            }
+            let abs_path = storage.abs_path(&path)?;
+            storage.assert_no_symlink_ancestor(&abs_path)?;
+            match fs::remove_file(&abs_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(VfsStorageError::Internal(err.to_string())),
+            }
+            storage.invalidate_hash(&abs_path);
+            Ok(VfsStorageDeleteResult { previous })
+        })
+        .await
     }
 
     async fn rmdir(&self, path: &str) -> VfsStorageResult<()> {
-        let _locks = self.lock_write_paths([path.to_string()]).await;
-        let Some(metadata) = self.metadata_for_path(path)? else {
-            return Ok(());
-        };
-        if metadata.kind != VfsStorageEntryKind::Directory {
-            return Err(VfsStorageError::BadRequest(format!(
-                "vfs path {path} is not a directory"
-            )));
-        }
-        let abs_path = self.abs_path(path)?;
-        self.assert_no_symlink_ancestor(&abs_path)?;
-        match fs::remove_dir(abs_path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => Err(
-                VfsStorageError::Conflict(format!("vfs directory {path} is not empty")),
-            ),
-            Err(err) => Err(VfsStorageError::Internal(err.to_string())),
-        }
+        let path = path.to_string();
+        let _locks = self.lock_write_paths([path.clone()]).await;
+        self.run_blocking(move |storage| {
+            let Some(metadata) = storage.metadata_for_path(&path)? else {
+                return Ok(());
+            };
+            if metadata.kind != VfsStorageEntryKind::Directory {
+                return Err(VfsStorageError::BadRequest(format!(
+                    "vfs path {path} is not a directory"
+                )));
+            }
+            let abs_path = storage.abs_path(&path)?;
+            storage.assert_no_symlink_ancestor(&abs_path)?;
+            match fs::remove_dir(abs_path) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => Err(
+                    VfsStorageError::Conflict(format!("vfs directory {path} is not empty")),
+                ),
+                Err(err) => Err(VfsStorageError::Internal(err.to_string())),
+            }
+        })
+        .await
     }
 
     async fn rename_with_metadata(
@@ -974,25 +1073,30 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         from: &str,
         to: &str,
     ) -> VfsStorageResult<VfsStorageRenameResult> {
-        let _locks = self
-            .lock_write_paths([from.to_string(), to.to_string()])
-            .await;
-        let previous = self.metadata_for_path(from)?;
-        let Some(_) = previous else {
-            return Err(VfsStorageError::NotFound(from.to_string()));
-        };
-        let from_abs = self.abs_path(from)?;
-        self.assert_no_symlink_ancestor(&from_abs)?;
-        let to_abs = self.abs_path(to)?;
-        self.assert_no_symlink_ancestor(&to_abs)?;
-        if let Some(parent) = to_abs.parent() {
-            fs::create_dir_all(parent).map_err(|err| VfsStorageError::Internal(err.to_string()))?;
-        }
-        fs::rename(&from_abs, &to_abs).map_err(|err| VfsStorageError::Internal(err.to_string()))?;
-        self.invalidate_hash(&from_abs);
-        self.invalidate_hash(&to_abs);
-        let current = self.metadata_for_abs(&to_abs)?;
-        Ok(VfsStorageRenameResult { previous, current })
+        let from = from.to_string();
+        let to = to.to_string();
+        let _locks = self.lock_write_paths([from.clone(), to.clone()]).await;
+        self.run_blocking(move |storage| {
+            let previous = storage.metadata_for_path(&from)?;
+            let Some(_) = previous else {
+                return Err(VfsStorageError::NotFound(from));
+            };
+            let from_abs = storage.abs_path(&from)?;
+            storage.assert_no_symlink_ancestor(&from_abs)?;
+            let to_abs = storage.abs_path(&to)?;
+            storage.assert_no_symlink_ancestor(&to_abs)?;
+            if let Some(parent) = to_abs.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| VfsStorageError::Internal(err.to_string()))?;
+            }
+            fs::rename(&from_abs, &to_abs)
+                .map_err(|err| VfsStorageError::Internal(err.to_string()))?;
+            storage.invalidate_hash(&from_abs);
+            storage.invalidate_hash(&to_abs);
+            let current = storage.metadata_for_abs(&to_abs)?;
+            Ok(VfsStorageRenameResult { previous, current })
+        })
+        .await
     }
 
     async fn apply_namespace_batch(
@@ -1006,103 +1110,124 @@ impl OptimizedVfsStorage for LocalVfsStorage {
             .map(str::to_string)
             .collect::<Vec<_>>();
         let _locks = self.lock_write_paths(lock_paths).await;
-
-        // Namespace batches are replayable, but delete preconditions must be
-        // checked as one snapshot before the first path is removed. Holding all
-        // path locks across this preflight and apply phase makes a conditional
-        // delete-only batch all-or-none with respect to concurrent VFS writers.
-        for mutation in &mutations {
-            if let VfsStorageNamespaceMutation::DeleteFile { path, precondition } = mutation {
-                self.assert_precondition(path.as_str(), precondition.as_ref())?;
-                if matches!(
-                    self.metadata_for_path(path.as_str())?
-                        .as_ref()
-                        .map(|metadata| metadata.kind),
-                    Some(VfsStorageEntryKind::Directory)
-                ) {
-                    return Err(VfsStorageError::BadRequest(format!(
-                        "vfs path {path} is not a file"
-                    )));
+        self.run_blocking(move |storage| {
+            // Namespace batches are replayable, but delete preconditions must be
+            // checked as one snapshot before the first path is removed. Holding all
+            // path locks across this preflight and apply phase makes a conditional
+            // delete-only batch all-or-none with respect to concurrent VFS writers.
+            for mutation in &mutations {
+                if let VfsStorageNamespaceMutation::DeleteFile { path, precondition } = mutation {
+                    storage.assert_precondition(path.as_str(), precondition.as_ref())?;
+                    if matches!(
+                        storage
+                            .metadata_for_path(path.as_str())?
+                            .as_ref()
+                            .map(|metadata| metadata.kind),
+                        Some(VfsStorageEntryKind::Directory)
+                    ) {
+                        return Err(VfsStorageError::BadRequest(format!(
+                            "vfs path {path} is not a file"
+                        )));
+                    }
                 }
             }
-        }
 
-        for mutation in mutations {
-            match mutation {
-                VfsStorageNamespaceMutation::CreateDirectory { path } => {
-                    let abs_path = self.abs_path(path.as_str())?;
-                    self.assert_no_symlink_ancestor(&abs_path)?;
-                    fs::create_dir_all(abs_path)
-                        .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
-                }
-                VfsStorageNamespaceMutation::CreateSymlink { path, target } => {
-                    match self.metadata_for_path(path.as_str())? {
-                        Some(metadata)
-                            if metadata.kind == VfsStorageEntryKind::Symlink
-                                && metadata.link_target.as_deref() == Some(target.as_str()) => {}
-                        Some(_) => {
-                            return Err(VfsStorageError::Conflict(format!(
-                                "vfs path {path} already exists"
-                            )));
-                        }
-                        None => create_symlink_impl(self, path.as_str(), target.as_str())?,
-                    }
-                }
-                VfsStorageNamespaceMutation::DeleteFile {
-                    path,
-                    precondition: _,
-                } => {
-                    let abs_path = self.abs_path(path.as_str())?;
-                    self.assert_no_symlink_ancestor(&abs_path)?;
-                    match fs::remove_file(&abs_path) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => {
-                            return Err(VfsStorageError::Internal(error.to_string()));
-                        }
-                    }
-                    self.invalidate_hash(&abs_path);
-                }
-                VfsStorageNamespaceMutation::RemoveDirectory { path } => {
-                    let abs_path = self.abs_path(path.as_str())?;
-                    self.assert_no_symlink_ancestor(&abs_path)?;
-                    match fs::remove_dir(&abs_path) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
-                            return Err(VfsStorageError::Conflict(format!(
-                                "vfs directory {path} is not empty"
-                            )));
-                        }
-                        Err(error) => {
-                            return Err(VfsStorageError::Internal(error.to_string()));
-                        }
-                    }
-                }
-                VfsStorageNamespaceMutation::Rename { from, to } => {
-                    let from_abs = self.abs_path(from.as_str())?;
-                    let to_abs = self.abs_path(to.as_str())?;
-                    self.assert_no_symlink_ancestor(&from_abs)?;
-                    self.assert_no_symlink_ancestor(&to_abs)?;
-                    // Batch callers validate the source before journaling. A replay may
-                    // observe neither path when a later mutation in the same completed
-                    // batch already removed the destination, so a missing source is a
-                    // successful no-op here.
-                    if !from_abs.exists() {
-                        continue;
-                    }
-                    if let Some(parent) = to_abs.parent() {
-                        fs::create_dir_all(parent)
+            for mutation in mutations {
+                match mutation {
+                    VfsStorageNamespaceMutation::CreateDirectory { path } => {
+                        let abs_path = storage.abs_path(path.as_str())?;
+                        storage.assert_no_symlink_ancestor(&abs_path)?;
+                        fs::create_dir_all(abs_path)
                             .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
                     }
-                    fs::rename(&from_abs, &to_abs)
-                        .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
-                    self.invalidate_hash(&from_abs);
-                    self.invalidate_hash(&to_abs);
+                    VfsStorageNamespaceMutation::CreateSymlink { path, target } => {
+                        match storage.metadata_for_path(path.as_str())? {
+                            Some(metadata)
+                                if metadata.kind == VfsStorageEntryKind::Symlink
+                                    && metadata.link_target.as_deref() == Some(target.as_str()) => {}
+                            Some(_) => {
+                                return Err(VfsStorageError::Conflict(format!(
+                                    "vfs path {path} already exists"
+                                )));
+                            }
+                            None => {
+                                create_symlink_impl(&storage, path.as_str(), target.as_str())?
+                            }
+                        }
+                    }
+                    VfsStorageNamespaceMutation::DeleteFile {
+                        path,
+                        precondition: _,
+                    } => {
+                        let abs_path = storage.abs_path(path.as_str())?;
+                        storage.assert_no_symlink_ancestor(&abs_path)?;
+                        match fs::remove_file(&abs_path) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => {
+                                return Err(VfsStorageError::Internal(error.to_string()));
+                            }
+                        }
+                        storage.invalidate_hash(&abs_path);
+                    }
+                    VfsStorageNamespaceMutation::RemoveDirectory { path } => {
+                        let abs_path = storage.abs_path(path.as_str())?;
+                        storage.assert_no_symlink_ancestor(&abs_path)?;
+                        match fs::remove_dir(&abs_path) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                                return Err(VfsStorageError::Conflict(format!(
+                                    "vfs directory {path} is not empty"
+                                )));
+                            }
+                            Err(error) => {
+                                return Err(VfsStorageError::Internal(error.to_string()));
+                            }
+                        }
+                    }
+                    VfsStorageNamespaceMutation::Rename { from, to } => {
+                        let from_abs = storage.abs_path(from.as_str())?;
+                        let to_abs = storage.abs_path(to.as_str())?;
+                        storage.assert_no_symlink_ancestor(&from_abs)?;
+                        storage.assert_no_symlink_ancestor(&to_abs)?;
+                        // Batch callers validate the source before journaling. A replay may
+                        // observe neither path when a later mutation in the same completed
+                        // batch already removed the destination, so a missing source is a
+                        // successful no-op here.
+                        if !from_abs.exists() {
+                            continue;
+                        }
+                        if to_abs.exists()
+                            && paths_have_equivalent_contents(&from_abs, &to_abs)?
+                        {
+                            sync_path_permissions(&from_abs, &to_abs)?;
+                            remove_path_for_replayed_rename(&from_abs)?;
+                            storage.invalidate_hash(&from_abs);
+                            storage.invalidate_hash(&to_abs);
+                            continue;
+                        }
+                        if let Some(parent) = to_abs.parent() {
+                            fs::create_dir_all(parent)
+                                .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+                        }
+                        fs::rename(&from_abs, &to_abs).map_err(|error| {
+                            if error.kind() == std::io::ErrorKind::DirectoryNotEmpty {
+                                VfsStorageError::Conflict(format!(
+                                    "cannot replay rename {from} -> {to}: destination differs and is not empty"
+                                ))
+                            } else {
+                                VfsStorageError::Internal(error.to_string())
+                            }
+                        })?;
+                        storage.invalidate_hash(&from_abs);
+                        storage.invalidate_hash(&to_abs);
+                    }
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     async fn prefetch_subtree(
@@ -1198,6 +1323,94 @@ fn read_file(path: &Path) -> VfsStorageResult<Vec<u8>> {
     file.read_to_end(&mut bytes)
         .map_err(|err| VfsStorageError::Internal(err.to_string()))?;
     Ok(bytes)
+}
+
+fn paths_have_equivalent_contents(left: &Path, right: &Path) -> VfsStorageResult<bool> {
+    let left_metadata =
+        fs::symlink_metadata(left).map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+    let right_metadata = fs::symlink_metadata(right)
+        .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+    let left_type = left_metadata.file_type();
+    let right_type = right_metadata.file_type();
+    if left_type.is_file() != right_type.is_file()
+        || left_type.is_dir() != right_type.is_dir()
+        || left_type.is_symlink() != right_type.is_symlink()
+    {
+        return Ok(false);
+    }
+    if left_type.is_symlink() {
+        return Ok(fs::read_link(left)
+            .map_err(|error| VfsStorageError::Internal(error.to_string()))?
+            == fs::read_link(right)
+                .map_err(|error| VfsStorageError::Internal(error.to_string()))?);
+    }
+    if left_type.is_file() {
+        if left_metadata.len() != right_metadata.len() {
+            return Ok(false);
+        }
+        return Ok(hash_regular_file(left)? == hash_regular_file(right)?);
+    }
+    if !left_type.is_dir() {
+        return Ok(false);
+    }
+
+    let mut left_entries = fs::read_dir(left)
+        .map_err(|error| VfsStorageError::Internal(error.to_string()))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name())
+                .map_err(|error| VfsStorageError::Internal(error.to_string()))
+        })
+        .collect::<VfsStorageResult<Vec<_>>>()?;
+    let mut right_entries = fs::read_dir(right)
+        .map_err(|error| VfsStorageError::Internal(error.to_string()))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name())
+                .map_err(|error| VfsStorageError::Internal(error.to_string()))
+        })
+        .collect::<VfsStorageResult<Vec<_>>>()?;
+    left_entries.sort();
+    right_entries.sort();
+    if left_entries != right_entries {
+        return Ok(false);
+    }
+    for name in left_entries {
+        if !paths_have_equivalent_contents(&left.join(&name), &right.join(&name))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn sync_path_permissions(source: &Path, destination: &Path) -> VfsStorageResult<()> {
+    let source_metadata = fs::symlink_metadata(source)
+        .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+    if source_metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    fs::set_permissions(destination, source_metadata.permissions())
+        .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+    if !source_metadata.is_dir() {
+        return Ok(());
+    }
+    for entry in
+        fs::read_dir(source).map_err(|error| VfsStorageError::Internal(error.to_string()))?
+    {
+        let entry = entry.map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+        sync_path_permissions(&entry.path(), &destination.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+fn remove_path_for_replayed_rename(path: &Path) -> VfsStorageResult<()> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+    if metadata.is_dir() {
+        fs::remove_dir_all(path).map_err(|error| VfsStorageError::Internal(error.to_string()))
+    } else {
+        fs::remove_file(path).map_err(|error| VfsStorageError::Internal(error.to_string()))
+    }
 }
 
 fn hash_file_if_present_uncached(
@@ -1696,6 +1909,144 @@ mod tests {
                 .is_none()
         );
         assert!(storage.stat("tree").await.expect("stat tree").is_none());
+    }
+
+    #[tokio::test]
+    async fn namespace_rename_replay_converges_identical_directory_trees() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        for root in ["source", "destination"] {
+            storage
+                .write(
+                    format!("{root}/nested/package.json").as_str(),
+                    Bytes::from_static(br#"{"name":"same"}"#),
+                    None,
+                )
+                .await
+                .expect("seed identical tree");
+        }
+
+        storage
+            .apply_namespace_batch(vec![VfsStorageNamespaceMutation::Rename {
+                from: "source".to_string(),
+                to: "destination".to_string(),
+            }])
+            .await
+            .expect("replay identical rename");
+
+        assert!(storage.stat("source").await.expect("stat source").is_none());
+        assert!(
+            storage
+                .stat("destination/nested/package.json")
+                .await
+                .expect("stat destination")
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn namespace_rename_replay_converges_content_with_different_permissions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        for root in ["source", "destination"] {
+            storage
+                .write(
+                    format!("{root}/package.json").as_str(),
+                    Bytes::from_static(br#"{"name":"same"}"#),
+                    None,
+                )
+                .await
+                .expect("seed identical content");
+        }
+        fs::set_permissions(dir.path().join("source"), fs::Permissions::from_mode(0o700))
+            .expect("chmod source directory");
+        fs::set_permissions(
+            dir.path().join("source/package.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod source file");
+        fs::set_permissions(
+            dir.path().join("destination"),
+            fs::Permissions::from_mode(0o775),
+        )
+        .expect("chmod destination directory");
+        fs::set_permissions(
+            dir.path().join("destination/package.json"),
+            fs::Permissions::from_mode(0o664),
+        )
+        .expect("chmod destination file");
+
+        storage
+            .apply_namespace_batch(vec![VfsStorageNamespaceMutation::Rename {
+                from: "source".to_string(),
+                to: "destination".to_string(),
+            }])
+            .await
+            .expect("replay content-equivalent rename");
+
+        assert!(storage.stat("source").await.expect("stat source").is_none());
+        assert_eq!(
+            fs::symlink_metadata(dir.path().join("destination"))
+                .expect("destination directory")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::symlink_metadata(dir.path().join("destination/package.json"))
+                .expect("destination file")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_rename_replay_preserves_different_directory_trees() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        storage
+            .write(
+                "source/package.json",
+                Bytes::from_static(br#"{"name":"source"}"#),
+                None,
+            )
+            .await
+            .expect("seed source");
+        storage
+            .write(
+                "destination/package.json",
+                Bytes::from_static(br#"{"name":"destination"}"#),
+                None,
+            )
+            .await
+            .expect("seed destination");
+
+        let result = storage
+            .apply_namespace_batch(vec![VfsStorageNamespaceMutation::Rename {
+                from: "source".to_string(),
+                to: "destination".to_string(),
+            }])
+            .await;
+
+        assert!(matches!(result, Err(VfsStorageError::Conflict(_))));
+        assert!(
+            storage
+                .stat("source/package.json")
+                .await
+                .expect("stat source")
+                .is_some()
+        );
+        assert!(
+            storage
+                .stat("destination/package.json")
+                .await
+                .expect("stat destination")
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -2377,6 +2728,29 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].size_bytes, 5);
         assert_eq!(entries[0].content_hash, None);
+        assert_eq!(storage.hash_read_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn local_storage_skips_hash_for_lightweight_stat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("package.json"), b"{}").expect("write");
+        let storage = LocalVfsStorage::new(dir.path());
+
+        let metadata = storage
+            .stat_with_metadata_fields(
+                "package.json",
+                VfsStorageMetadataFields {
+                    max_hash_bytes: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("stat")
+            .expect("metadata");
+
+        assert_eq!(metadata.size_bytes, 2);
+        assert_eq!(metadata.content_hash, None);
         assert_eq!(storage.hash_read_count(), 0);
     }
 

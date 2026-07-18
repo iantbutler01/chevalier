@@ -129,7 +129,7 @@ export declare class VfsStorage {
   /** Atomically install a host-local staged file with bounded memory. */
   writeFromFile(path: string, sourcePath: string, expectedContentHash: string, options?: VfsWriteOptions | null): Promise<any>
   /** Stat a path; returns typed metadata (`sizeBytes` is a `bigint`) or null. */
-  stat(path: string): Promise<VfsMetadata | null>
+  stat(path: string, options?: { maxHashBytes?: number | null } | null): Promise<VfsMetadata | null>
   /** List a directory's entries with typed metadata. */
   listDir(path: string, options?: { maxHashBytes?: number | null } | null): Promise<Array<VfsMetadata>>
   /** Read metadata for an indexed set of paths in one backend request. */

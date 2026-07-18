@@ -123,6 +123,8 @@ pub struct VfsStorageWritePrecondition {
 pub struct VfsStorageMetadataFields {
     pub include_object_state: bool,
     pub include_token_count: bool,
+    #[serde(default)]
+    pub max_hash_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -258,6 +260,15 @@ pub trait OptimizedVfsStorage: Send + Sync {
     fn backend_name(&self) -> &'static str;
 
     async fn stat(&self, path: &str) -> VfsStorageResult<Option<VfsStorageMetadata>>;
+
+    async fn stat_with_metadata_fields(
+        &self,
+        path: &str,
+        fields: VfsStorageMetadataFields,
+    ) -> VfsStorageResult<Option<VfsStorageMetadata>> {
+        let _ = fields;
+        self.stat(path).await
+    }
 
     async fn metadata_many(
         &self,
