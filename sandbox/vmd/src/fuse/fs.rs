@@ -751,6 +751,45 @@ impl RemoteFuseFs {
         if self.read_only {
             return Err(Errno::EROFS);
         }
+        // A path-based truncate must never race the ordered write journal
+        // with a side-channel PUT: the PUT commits a new content hash at the
+        // gateway while journaled writes still carry the pre-truncate base,
+        // permanently 409ing them (the original stale-precondition wedge).
+        //
+        // If any open handle owns this path, resize its buffer; the normal
+        // flush publishes it through the journal with correct base chaining.
+        let open_handle = {
+            let handles = self.lock_handles()?;
+            handles
+                .files
+                .iter()
+                .find(|(_, state)| state.path == path)
+                .map(|(fh, _)| *fh)
+        };
+        if let Some(fh) = open_handle {
+            self.ensure_handle_loaded(fh)?;
+            let mut handles = self.lock_handles()?;
+            if let Some(state) = handles.files.get_mut(&fh) {
+                state.buffer.resize(size as usize, 0);
+                state.dirty = true;
+                state.loaded = true;
+                state.revision = state.revision.saturating_add(1);
+                let metadata = RemoteMetadata {
+                    kind: "file".to_string(),
+                    size_bytes: size,
+                    link_target: None,
+                    content_hash: Some(content_hash_for_bytes(&state.buffer)),
+                    executable: state.executable,
+                    updated_at: None,
+                };
+                return Ok(self.attr_for_path(path, &metadata, false));
+            }
+        }
+        // No open handle: read the current content (draining any pending
+        // journal writes first so the gateway is current), then publish the
+        // resized content through the same journal as ordinary writes.
+        self.flush_namespace()?;
+        self.flush_writes()?;
         let prior = self.stat_path(path)?.ok_or(Errno::ENOENT)?;
         let mut bytes = self
             .tokio
@@ -758,31 +797,39 @@ impl RemoteFuseFs {
             .map_err(|_| Errno::EIO)?
             .ok_or(Errno::ENOENT)?;
         bytes.resize(size as usize, 0);
-        let lease = self
-            .tokio
-            .block_on(self.client.acquire_lease(path, 1, "resize vfs fuse file"))
-            .map_err(|_| Errno::EIO)?;
-        let surface = self.surface_kind_for_path(path);
-        let write_result = self.tokio.block_on(self.client.write_file(
-            path,
-            &bytes,
-            prior.executable,
-            &lease,
-            surface,
-            VFS_OPERATION_SETATTR_SIZE,
-            prior.content_hash.as_deref(),
-        ));
-        let _ = self.tokio.block_on(self.client.release_lease(&lease));
-        write_result.map_err(|_| Errno::EIO)?;
+        let next_hash = content_hash_for_bytes(&bytes);
+        if let Some(writes) = self.writes.as_ref() {
+            writes
+                .enqueue(path, bytes.as_slice(), prior.content_hash.clone())
+                .map_err(|_| Errno::EIO)?;
+        } else {
+            let lease = self
+                .tokio
+                .block_on(self.client.acquire_lease(path, 1, "resize vfs fuse file"))
+                .map_err(|_| Errno::EIO)?;
+            let surface = self.surface_kind_for_path(path);
+            let write_result = self.tokio.block_on(self.client.write_file(
+                path,
+                &bytes,
+                prior.executable,
+                &lease,
+                surface,
+                VFS_OPERATION_SETATTR_SIZE,
+                prior.content_hash.as_deref(),
+            ));
+            let _ = self.tokio.block_on(self.client.release_lease(&lease));
+            write_result.map_err(|_| Errno::EIO)?;
+        }
         self.cache.invalidate(path);
         let metadata = RemoteMetadata {
             kind: "file".to_string(),
             size_bytes: size,
             link_target: None,
-            content_hash: Some(content_hash_for_bytes(&bytes)),
+            content_hash: Some(next_hash.clone()),
             executable: prior.executable,
             updated_at: None,
         };
+        self.cache.put_file(path, bytes, Some(metadata.clone()));
         Ok(self.attr_for_path(path, &metadata, false))
     }
 
@@ -1236,6 +1283,36 @@ mod tests {
             ..metadata
         };
         assert_eq!(range_fingerprint(&unstamped), "123:-1");
+    }
+
+    #[test]
+    fn path_truncate_resizes_open_handle_buffer_instead_of_racing_the_journal() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let client =
+            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
+        let fs = RemoteFuseFs::new(client, false, "test-scope", runtime.handle().clone());
+        let path = "api/nym.toml";
+        let content = b"committed contents".to_vec();
+        let writer = fs
+            .next_handle(
+                path,
+                content.clone(),
+                true,
+                Some(content_hash_for_bytes(&content)),
+                false,
+                false,
+            )
+            .unwrap();
+
+        // Must resolve entirely against the open handle — any network call
+        // would error against the unroutable endpoint and fail the resize.
+        let attr = fs.resize_path_immediate(path, 4).unwrap();
+        assert_eq!(attr.size, 4);
+
+        let handles = fs.lock_handles().unwrap();
+        let state = handles.files.get(&writer).unwrap();
+        assert_eq!(state.buffer, content[..4].to_vec());
+        assert!(state.dirty, "resize must flow through the ordinary flush");
     }
 
     #[test]
