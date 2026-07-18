@@ -12,7 +12,7 @@ use chevalier_sandbox::vfs::{
 };
 use tokio::runtime::Handle;
 
-use super::client::RemoteVfsClient;
+use super::client::{RemoteVfsClient, rejected_request_status};
 
 const BATCH_DELAY: Duration = Duration::from_millis(8);
 const RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -199,13 +199,37 @@ fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, 
         };
 
         let result = tokio.block_on(client.apply_namespace_batch(batch.0.as_slice(), batch.1));
+        // A 4xx rejection can never succeed by retrying the same batch. Replay
+        // the batch one mutation at a time, in order, so a single rejected
+        // mutation is recorded and dropped instead of wedging the journal.
+        let resolution = match &result {
+            Err(error) if rejected_request_status(error).is_some() => Some(
+                resolve_rejected_namespace_batch(&client, &tokio, batch.0.as_slice(), batch.1),
+            ),
+            _ => None,
+        };
         let mut state = match shared.state.lock() {
             Ok(state) => state,
             Err(_) => return,
         };
         state.flushing = false;
+        if let Some(resolution) = resolution {
+            apply_namespace_resolution(&shared, &mut state, resolution);
+            shared.changed.notify_all();
+            let failed = state.last_error.is_some();
+            let stop = state.stop;
+            drop(state);
+            if stop && failed {
+                return;
+            }
+            if failed {
+                std::thread::sleep(RETRY_DELAY);
+            }
+            continue;
+        }
         match result {
             Ok(()) => {
+                let recovered = state.last_error.take();
                 for _ in 0..batch.0.len() {
                     state.pending.pop_front();
                 }
@@ -213,10 +237,28 @@ fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, 
                     state.last_error = Some(error.to_string());
                 } else {
                     state.last_error = None;
+                    if let Some(error) = recovered {
+                        tracing::info!(
+                            journal = %shared.journal_path.display(),
+                            mutation_count = batch.0.len(),
+                            previous_error = %error,
+                            "vfs namespace journal replay recovered"
+                        );
+                    }
                 }
             }
             Err(error) => {
-                state.last_error = Some(error.to_string());
+                let error = error.to_string();
+                if state.last_error.as_deref() != Some(error.as_str()) {
+                    tracing::warn!(
+                        journal = %shared.journal_path.display(),
+                        mutation_count = batch.0.len(),
+                        first_mutation = ?batch.0.first(),
+                        error = %error,
+                        "vfs namespace journal replay failed; retaining mutations for retry"
+                    );
+                }
+                state.last_error = Some(error);
             }
         }
         shared.changed.notify_all();
@@ -230,6 +272,99 @@ fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, 
             std::thread::sleep(RETRY_DELAY);
         }
     }
+}
+
+struct NamespaceResolution {
+    /// Leading mutations conclusively handled (applied or dead-lettered).
+    resolved: usize,
+    /// Mutations the gateway rejected with a 4xx, with the error text.
+    dead_lettered: Vec<(VfsNamespaceMutation, String)>,
+    /// First transient failure; this and later mutations stay pending.
+    transient_error: Option<String>,
+}
+
+fn resolve_rejected_namespace_batch(
+    client: &RemoteVfsClient,
+    tokio: &Handle,
+    batch: &[VfsNamespaceMutation],
+    surface: &'static str,
+) -> NamespaceResolution {
+    let mut resolution = NamespaceResolution {
+        resolved: 0,
+        dead_lettered: Vec::new(),
+        transient_error: None,
+    };
+    for mutation in batch {
+        match tokio.block_on(client.apply_namespace_batch(std::slice::from_ref(mutation), surface))
+        {
+            Ok(()) => resolution.resolved += 1,
+            Err(error) if rejected_request_status(&error).is_some() => {
+                resolution
+                    .dead_lettered
+                    .push((mutation.clone(), error.to_string()));
+                resolution.resolved += 1;
+            }
+            Err(error) => {
+                resolution.transient_error = Some(error.to_string());
+                break;
+            }
+        }
+    }
+    resolution
+}
+
+fn apply_namespace_resolution(
+    shared: &Shared,
+    state: &mut JournalState,
+    resolution: NamespaceResolution,
+) {
+    for (mutation, error) in &resolution.dead_lettered {
+        match dead_letter_mutation(&shared.journal_path, mutation, error) {
+            Ok(record_path) => tracing::error!(
+                journal = %shared.journal_path.display(),
+                mutation = ?mutation,
+                dead_letter = %record_path.display(),
+                error = %error,
+                "vfs namespace mutation rejected by gateway; recorded and dropped from journal"
+            ),
+            Err(record_error) => tracing::error!(
+                journal = %shared.journal_path.display(),
+                mutation = ?mutation,
+                error = %error,
+                record_error = %record_error,
+                "vfs namespace mutation rejected by gateway; failed to record dead letter"
+            ),
+        }
+    }
+    for _ in 0..resolution.resolved {
+        state.pending.pop_front();
+    }
+    if let Err(error) = rewrite_journal(&shared.journal_path, state) {
+        state.last_error = Some(error.to_string());
+        return;
+    }
+    state.last_error = resolution.transient_error;
+}
+
+fn dead_letter_mutation(
+    journal_path: &Path,
+    mutation: &VfsNamespaceMutation,
+    error: &str,
+) -> Result<PathBuf> {
+    let record_path = journal_path.with_extension("dead-letter.jsonl");
+    let unix_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    let record = serde_json::json!({
+        "mutation": mutation,
+        "error": error,
+        "dead_lettered_at_unix": unix_seconds,
+    });
+    let mut file = open_append(&record_path)?;
+    serde_json::to_writer(&mut file, &record).context("append vfs dead letter record")?;
+    file.write_all(b"\n").context("append vfs dead letter record")?;
+    Ok(record_path)
 }
 
 fn mutation_surface(scope_path: &str, mutation: &VfsNamespaceMutation) -> &'static str {
@@ -347,6 +482,54 @@ mod tests {
             .flush()
             .expect("flush should survive transient error");
         recovery.join().expect("recovery thread");
+    }
+
+    #[test]
+    fn namespace_resolution_drops_resolved_prefix_and_records_rejections() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("namespace.jsonl");
+        let mkdir = VfsNamespaceMutation::CreateDirectory {
+            path: "src".to_string(),
+        };
+        let rejected = VfsNamespaceMutation::RemoveDirectory {
+            path: "probe".to_string(),
+        };
+        let retained = VfsNamespaceMutation::CreateDirectory {
+            path: "src/later".to_string(),
+        };
+        let shared = Shared {
+            state: Mutex::new(JournalState {
+                pending: VecDeque::from([mkdir, rejected.clone(), retained.clone()]),
+                journal: open_append(&journal_path).expect("journal"),
+                force_flush: false,
+                flushing: false,
+                stop: false,
+                last_error: Some("vfs request failed: 409".to_string()),
+            }),
+            changed: Condvar::new(),
+            journal_path: journal_path.clone(),
+        };
+        let resolution = NamespaceResolution {
+            resolved: 2,
+            dead_lettered: vec![(rejected, "vfs request failed: 409 Conflict".to_string())],
+            transient_error: None,
+        };
+
+        let mut state = shared.state.lock().expect("state");
+        apply_namespace_resolution(&shared, &mut state, resolution);
+
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(state.pending[0], retained);
+        assert_eq!(state.last_error, None);
+        drop(state);
+
+        let records = fs::read_to_string(journal_path.with_extension("dead-letter.jsonl"))
+            .expect("dead letter records");
+        assert!(records.contains("probe"));
+        assert!(records.contains("409"));
+        let journal_after = fs::read_to_string(&journal_path).expect("journal contents");
+        assert!(journal_after.contains("src/later"));
+        assert!(!journal_after.contains("probe"));
     }
 
     #[test]

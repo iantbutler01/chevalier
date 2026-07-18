@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
 
 use super::cache::RemoteFuseCache;
-use super::client::RemoteVfsClient;
+use super::client::{RangeRead, RemoteVfsClient};
 use super::namespace::NamespaceJournal;
 use super::write::WriteJournal;
 
@@ -30,7 +30,7 @@ const ROOT_INO_RAW: u64 = 1;
 const ROOT_INO: INodeNo = INodeNo(ROOT_INO_RAW);
 const LARGE_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_OPEN_HANDLES: usize = 8_192;
-const SETATTR_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+const SETATTR_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
 const SETATTR_RETRY_DELAY_MIN: Duration = Duration::from_millis(50);
 const SETATTR_RETRY_DELAY_MAX: Duration = Duration::from_millis(500);
 
@@ -184,6 +184,7 @@ struct FileState {
     path: String,
     buffer: Vec<u8>,
     executable: bool,
+    created: bool,
     dirty: bool,
     loaded: bool,
     base_content_hash: Option<String>,
@@ -425,7 +426,9 @@ impl RemoteFuseFs {
             return Ok(Some(metadata));
         }
         if let Some(metadata) = self.cache.get_metadata(path) {
-            return Ok(Some(metadata));
+            if metadata.kind != "file" || metadata.content_hash.is_some() {
+                return Ok(Some(metadata));
+            }
         }
         if self
             .writes
@@ -444,12 +447,37 @@ impl RemoteFuseFs {
         Ok(metadata)
     }
 
+    fn stat_path_attributes(&self, path: &str) -> FuseResult<Option<RemoteMetadata>> {
+        self.flush_namespace()?;
+        if let Some(metadata) = self.open_handle_metadata(path)? {
+            return Ok(Some(metadata));
+        }
+        if let Some(metadata) = self.cache.get_metadata(path) {
+            return Ok(Some(metadata));
+        }
+        if self
+            .writes
+            .as_ref()
+            .is_some_and(|writes| writes.has_pending_path(path))
+        {
+            self.flush_writes()?;
+        }
+        let metadata = self
+            .tokio
+            .block_on(self.client.stat_attributes(path))
+            .map_err(|_| Errno::EIO)?;
+        if let Some(metadata) = metadata.as_ref() {
+            self.cache.put_metadata(path, metadata.clone());
+        }
+        Ok(metadata)
+    }
+
     fn open_handle_metadata(&self, path: &str) -> FuseResult<Option<RemoteMetadata>> {
         let handles = self.lock_handles()?;
         let Some(state) = handles
             .files
             .values()
-            .find(|state| state.path == path && state.dirty)
+            .find(|state| state.path == path && state.created && state.dirty)
         else {
             return Ok(None);
         };
@@ -464,6 +492,14 @@ impl RemoteFuseFs {
     }
 
     fn read_bytes(&self, path: &str, offset: u64, size: u32) -> FuseResult<Vec<u8>> {
+        // Large files never need a content hash (ranged reads are pinned by
+        // fingerprint), so route them off the cheap attribute stat before
+        // paying for a hashed stat.
+        if let Some(attributes) = self.stat_path_attributes(path)? {
+            if attributes.kind == "file" && attributes.size_bytes > LARGE_FILE_BYTES {
+                return self.read_large_range(path, &attributes, offset, size);
+            }
+        }
         let metadata = self.stat_path(path)?.ok_or(Errno::ENOENT)?;
         if let Some(bytes) = self.cache.get_file_matching(path, &metadata) {
             let start = (offset as usize).min(bytes.len());
@@ -471,24 +507,65 @@ impl RemoteFuseFs {
             return Ok(bytes[start..end].to_vec());
         }
 
-        let bytes = if metadata.size_bytes > LARGE_FILE_BYTES {
-            self.tokio
-                .block_on(self.client.read_file_range(path, offset, size as u64))
-                .map_err(|_| Errno::EIO)?
-        } else {
-            self.tokio
-                .block_on(self.client.read_file_raw(path))
-                .map_err(|_| Errno::EIO)?
-        };
-
-        if metadata.size_bytes <= LARGE_FILE_BYTES {
-            self.cache.put_file(path, bytes.clone(), Some(metadata));
-            let start = (offset as usize).min(bytes.len());
-            let end = start.saturating_add(size as usize).min(bytes.len());
-            return Ok(bytes[start..end].to_vec());
+        if metadata.size_bytes > LARGE_FILE_BYTES {
+            return self.read_large_range(path, &metadata, offset, size);
         }
+        let bytes = self
+            .tokio
+            .block_on(self.client.read_file_raw(path))
+            .map_err(|_| Errno::EIO)?
+            .ok_or(Errno::ENOENT)?;
 
-        Ok(bytes)
+        // The stat and the content fetch are separate requests; if the file
+        // changed between them, cache metadata derived from the bytes we
+        // actually hold so attrs and content can never disagree.
+        let metadata = if bytes.len() as u64 == metadata.size_bytes {
+            metadata
+        } else {
+            RemoteMetadata {
+                size_bytes: bytes.len() as u64,
+                content_hash: Some(content_hash_for_bytes(&bytes)),
+                ..metadata
+            }
+        };
+        self.cache.put_metadata(path, metadata.clone());
+        self.cache.put_file(path, bytes.clone(), Some(metadata));
+        let start = (offset as usize).min(bytes.len());
+        let end = start.saturating_add(size as usize).min(bytes.len());
+        Ok(bytes[start..end].to_vec())
+    }
+
+    fn read_large_range(
+        &self,
+        path: &str,
+        metadata: &RemoteMetadata,
+        offset: u64,
+        size: u32,
+    ) -> FuseResult<Vec<u8>> {
+        let mut fingerprint = range_fingerprint(metadata);
+        for _ in 0..2 {
+            let outcome = self
+                .tokio
+                .block_on(self.client.read_file_range(
+                    path,
+                    offset,
+                    size as u64,
+                    Some(fingerprint.as_str()),
+                ))
+                .map_err(|_| Errno::EIO)?;
+            match outcome {
+                RangeRead::Bytes(bytes) => return Ok(bytes),
+                RangeRead::NotFound => return Err(Errno::ENOENT),
+                RangeRead::Stale => {
+                    // The file was replaced under the read; refresh identity and
+                    // retry once so the kernel sees one file, never a splice.
+                    self.cache.invalidate(path);
+                    let refreshed = self.stat_path_attributes(path)?.ok_or(Errno::ENOENT)?;
+                    fingerprint = range_fingerprint(&refreshed);
+                }
+            }
+        }
+        Err(Errno::EIO)
     }
 
     fn next_handle(
@@ -498,6 +575,7 @@ impl RemoteFuseFs {
         loaded: bool,
         base_content_hash: Option<String>,
         executable: bool,
+        created: bool,
     ) -> FuseResult<u64> {
         let mut handles = self.lock_handles()?;
         if handles.files.len() >= MAX_OPEN_HANDLES {
@@ -511,6 +589,7 @@ impl RemoteFuseFs {
                 path: path.to_string(),
                 buffer: initial,
                 executable,
+                created,
                 dirty: false,
                 loaded,
                 base_content_hash,
@@ -637,7 +716,8 @@ impl RemoteFuseFs {
         let mut bytes = self
             .tokio
             .block_on(self.client.read_file_raw(path))
-            .map_err(|_| Errno::EIO)?;
+            .map_err(|_| Errno::EIO)?
+            .ok_or(Errno::ENOENT)?;
         bytes.resize(size as usize, 0);
         let lease = self
             .tokio
@@ -703,7 +783,8 @@ impl RemoteFuseFs {
             }
 
             let bytes = match self.tokio.block_on(self.client.read_file_raw(path)) {
-                Ok(bytes) => bytes,
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => return Err(Errno::ENOENT),
                 Err(error) if Instant::now() < deadline => {
                     tracing::debug!(
                         path,
@@ -841,7 +922,8 @@ impl RemoteFuseFs {
         let bytes = self
             .tokio
             .block_on(self.client.read_file_raw(&state.path))
-            .map_err(|_| Errno::EIO)?;
+            .map_err(|_| Errno::EIO)?
+            .ok_or(Errno::ENOENT)?;
         let mut handles = self.lock_handles()?;
         let handle = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
         if handle.loaded || handle.dirty || handle.revision != state.revision {
@@ -882,6 +964,16 @@ fn content_hash_conflicts(base: Option<&str>, current: Option<&str>) -> bool {
     matches!((base, current), (Some(base), Some(current)) if base != current)
 }
 
+/// Cheap file-identity fingerprint for pinning ranged reads; must mirror
+/// `rangeFingerprint` in ts/vfs-gateway-server.ts exactly (epoch millis).
+fn range_fingerprint(metadata: &RemoteMetadata) -> String {
+    let millis = metadata
+        .updated_at
+        .map(|updated| updated.timestamp_millis())
+        .unwrap_or(-1);
+    format!("{}:{millis}", metadata.size_bytes)
+}
+
 fn content_hash_for_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -919,10 +1011,14 @@ impl RemoteFuseFs {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
+    use chevalier_sandbox::vfs::VfsMetadata as RemoteMetadata;
     use fuser::InitFlags;
+    use tokio::runtime::Builder;
 
+    use super::super::client::RemoteVfsClient;
     use super::{
         InodeTable, ROOT_INO, RemoteFuseFs, content_hash_conflicts, content_hash_for_bytes,
+        range_fingerprint,
     };
 
     #[test]
@@ -1019,6 +1115,107 @@ mod tests {
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
+
+    #[test]
+    fn path_readers_keep_committed_bytes_while_existing_file_is_replaced() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let client =
+            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
+        let fs = RemoteFuseFs::new(client, false, "test-scope", runtime.handle().clone());
+        let path = "api/nym.toml";
+        let committed = vec![b'a'; 64 * 1024];
+        let committed_metadata = RemoteMetadata {
+            kind: "file".to_string(),
+            size_bytes: committed.len() as u64,
+            link_target: None,
+            content_hash: Some(content_hash_for_bytes(&committed)),
+            executable: false,
+            updated_at: None,
+        };
+        fs.cache
+            .put_file(path, committed.clone(), Some(committed_metadata.clone()));
+
+        let writer = fs
+            .next_handle(
+                path,
+                Vec::new(),
+                true,
+                committed_metadata.content_hash.clone(),
+                false,
+                false,
+            )
+            .unwrap();
+        {
+            let mut handles = fs.lock_handles().unwrap();
+            let state = handles.files.get_mut(&writer).unwrap();
+            state.buffer = vec![b'b'; 2 * 1024];
+            state.dirty = true;
+            state.revision += 1;
+        }
+
+        assert_eq!(
+            fs.stat_path(path).unwrap(),
+            Some(committed_metadata.clone())
+        );
+        assert_eq!(
+            fs.stat_path_attributes(path).unwrap(),
+            Some(committed_metadata)
+        );
+        assert_eq!(
+            fs.read_bytes(path, 0, committed.len() as u32).unwrap(),
+            committed
+        );
+
+        let handles = fs.lock_handles().unwrap();
+        assert_eq!(handles.files.get(&writer).unwrap().buffer.len(), 2 * 1024);
+    }
+
+    #[test]
+    fn range_fingerprint_matches_gateway_epoch_millis_contract() {
+        // Vector shared with ts/test/basic.test.cjs — both sides must produce
+        // exactly this string for the same instant.
+        let updated_at = chrono::DateTime::parse_from_rfc3339("2026-07-17T23:26:26.500Z")
+            .expect("parse")
+            .with_timezone(&chrono::Utc);
+        let metadata = RemoteMetadata {
+            kind: "file".to_string(),
+            size_bytes: 123,
+            link_target: None,
+            content_hash: None,
+            executable: false,
+            updated_at: Some(updated_at),
+        };
+        assert_eq!(range_fingerprint(&metadata), "123:1784330786500");
+
+        let unstamped = RemoteMetadata {
+            updated_at: None,
+            ..metadata
+        };
+        assert_eq!(range_fingerprint(&unstamped), "123:-1");
+    }
+
+    #[test]
+    fn path_readers_can_see_an_uncommitted_new_file() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let client =
+            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
+        let fs = RemoteFuseFs::new(client, false, "test-scope", runtime.handle().clone());
+        let path = "new-file.txt";
+        let bytes = b"new file contents".to_vec();
+        let writer = fs
+            .next_handle(path, bytes.clone(), true, None, false, true)
+            .unwrap();
+        {
+            let mut handles = fs.lock_handles().unwrap();
+            let state = handles.files.get_mut(&writer).unwrap();
+            state.dirty = true;
+            state.revision += 1;
+        }
+
+        let metadata = fs.stat_path(path).unwrap().unwrap();
+        assert_eq!(metadata.size_bytes, bytes.len() as u64);
+        assert_eq!(metadata.content_hash, Some(content_hash_for_bytes(&bytes)));
+    }
 }
 
 impl Filesystem for RemoteFuseFs {
@@ -1046,7 +1243,7 @@ impl Filesystem for RemoteFuseFs {
         let result: FuseResult<FileAttr> = (|| {
             let parent_path = self.path_for_ino(parent)?;
             let child_path = Self::child_path(parent_path.as_str(), name)?;
-            let Some(metadata) = self.stat_path(&child_path)? else {
+            let Some(metadata) = self.stat_path_attributes(&child_path)? else {
                 return Err(Errno::ENOENT);
             };
             Ok(self.attr_for_path(&child_path, &metadata, true))
@@ -1064,7 +1261,7 @@ impl Filesystem for RemoteFuseFs {
         }
         let result: FuseResult<FileAttr> = (|| {
             let path = self.path_for_ino(ino)?;
-            let metadata = self.stat_path(&path)?.ok_or(Errno::ENOENT)?;
+            let metadata = self.stat_path_attributes(&path)?.ok_or(Errno::ENOENT)?;
             Ok(self.attr_for_path(&path, &metadata, false))
         })();
         match result {
@@ -1076,7 +1273,7 @@ impl Filesystem for RemoteFuseFs {
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
         let result: FuseResult<Vec<u8>> = (|| {
             let path = self.path_for_ino(ino)?;
-            let metadata = self.stat_path(&path)?.ok_or(Errno::ENOENT)?;
+            let metadata = self.stat_path_attributes(&path)?.ok_or(Errno::ENOENT)?;
             if metadata.kind != "symlink" {
                 return Err(Errno::EINVAL);
             }
@@ -1247,6 +1444,7 @@ impl Filesystem for RemoteFuseFs {
                 loaded,
                 base_content_hash,
                 metadata.executable,
+                false,
             )?;
             if dirty {
                 let mut handles = self.lock_handles()?;
@@ -1538,7 +1736,8 @@ impl Filesystem for RemoteFuseFs {
             let bytes = self
                 .tokio
                 .block_on(self.client.read_file_raw(&source))
-                .map_err(|_| Errno::EIO)?;
+                .map_err(|_| Errno::EIO)?
+                .ok_or(Errno::ENOENT)?;
             self.mutate_namespace(&destination, |lease, surface| {
                 self.tokio.block_on(self.client.write_file(
                     &destination,
@@ -1588,7 +1787,7 @@ impl Filesystem for RemoteFuseFs {
                 updated_at: None,
             };
             let attr = self.attr_for_path(&path, &metadata, true);
-            let fh = self.next_handle(&path, Vec::new(), true, None, metadata.executable)?;
+            let fh = self.next_handle(&path, Vec::new(), true, None, metadata.executable, true)?;
             if let Ok(mut handles) = self.lock_handles()
                 && let Some(state) = handles.files.get_mut(&fh)
             {

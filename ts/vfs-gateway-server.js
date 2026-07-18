@@ -49,6 +49,7 @@ const IF_MATCH_HEADER = "if-match";
 const EXECUTABLE_HEADER = "x-chevalier-vfs-executable";
 const EXPECTED_CONTENT_HASH_HEADER = "x-chevalier-vfs-expected-content-sha256";
 const STREAM_UPLOAD_HEADER = "x-chevalier-vfs-stream-upload";
+const RANGE_FINGERPRINT_HEADER = "x-chevalier-vfs-range-fingerprint";
 /** Build a WHATWG `(Request) => Promise<Response>` handler that serves chevalier's
  *  VFS gateway protocol, delegating storage to `resolveStore(ownerId)`. */
 function createVfsGatewayServer(opts) {
@@ -78,7 +79,10 @@ function createVfsGatewayServer(opts) {
             if (method === "GET" && op === "stat") {
                 if (isGitExcludedPath(relPath))
                     return errorResponse(404, `not found: ${relPath}`);
-                const md = await store.stat(relPath);
+                const maxHashBytes = parseOptionalNonNegativeInteger(q.get("max_hash_bytes") ?? q.get("maxHashBytes"), "max_hash_bytes");
+                if (maxHashBytes instanceof Response)
+                    return maxHashBytes;
+                const md = await store.stat(relPath, maxHashBytes === null ? undefined : { maxHashBytes });
                 if (md === null)
                     return errorResponse(404, `not found: ${relPath}`);
                 return json(200, toRemoteMetadata(md));
@@ -88,9 +92,14 @@ function createVfsGatewayServer(opts) {
                     return errorResponse(404, `not found: ${relPath}`);
                 const requestedRange = req.headers.get("range");
                 if (requestedRange !== null) {
+                    // Ranged reads are path-addressed across many requests, so they carry
+                    // a cheap (size, mtime) fingerprint instead of a content hash: the
+                    // client pins the file identity it started reading, and a replace in
+                    // between surfaces as 412 rather than a spliced old/new file. The
+                    // hashless stat also avoids re-hashing large files per range.
                     let metadata;
                     try {
-                        metadata = await store.stat(relPath);
+                        metadata = await store.stat(relPath, { maxHashBytes: 0 });
                     }
                     catch (error) {
                         if (isVfsNotFoundError(error))
@@ -99,6 +108,11 @@ function createVfsGatewayServer(opts) {
                     }
                     if (metadata === null)
                         return errorResponse(404, `not found: ${relPath}`);
+                    const fingerprint = rangeFingerprint(metadata);
+                    const expectedFingerprint = req.headers.get(RANGE_FINGERPRINT_HEADER);
+                    if (expectedFingerprint !== null && expectedFingerprint !== fingerprint) {
+                        return staleRangeResponse(relPath, fingerprint);
+                    }
                     const size = Number(metadata.sizeBytes);
                     const range = parseRange(requestedRange, size);
                     if (range === null)
@@ -108,12 +122,30 @@ function createVfsGatewayServer(opts) {
                     const slice = typeof streamingStore.readRange === "function"
                         ? await streamingStore.readRange(relPath, BigInt(range.start), length)
                         : (await store.read(relPath)).subarray(range.start, range.end + 1);
+                    // Bracket the read: if the file changed while we were reading it, the
+                    // slice may mix old and new bytes. Never return it.
+                    let after;
+                    try {
+                        after = await store.stat(relPath, { maxHashBytes: 0 });
+                    }
+                    catch (error) {
+                        if (isVfsNotFoundError(error))
+                            return errorResponse(404, `not found: ${relPath}`);
+                        throw error;
+                    }
+                    if (after === null)
+                        return errorResponse(404, `not found: ${relPath}`);
+                    const afterFingerprint = rangeFingerprint(after);
+                    if (afterFingerprint !== fingerprint) {
+                        return staleRangeResponse(relPath, afterFingerprint);
+                    }
                     return new Response(asBody(slice), {
                         status: 206,
                         headers: {
                             "content-type": "application/octet-stream",
                             "content-range": `bytes ${range.start}-${range.end}/${size}`,
                             "content-length": String(slice.byteLength),
+                            [RANGE_FINGERPRINT_HEADER]: fingerprint,
                         },
                     });
                 }
@@ -700,6 +732,23 @@ function toRemoteDirEntry(md) {
         content_hash: md.contentHash ?? null,
         updated_at: md.updatedAt ?? null,
     };
+}
+/** Cheap file-identity fingerprint for pinning ranged reads. Epoch millis is
+ *  the canonical form on both sides — the Rust FUSE client mirrors this in
+ *  `range_fingerprint` (sandbox/vmd/src/fuse/fs.rs); keep them identical. */
+function rangeFingerprint(metadata) {
+    const raw = metadata.updatedAt ?? null;
+    const millis = raw === null ? -1 : Date.parse(raw);
+    return `${Number(metadata.sizeBytes)}:${Number.isNaN(millis) ? -1 : millis}`;
+}
+function staleRangeResponse(path, currentFingerprint) {
+    return new Response(`range fingerprint mismatch for ${path}`, {
+        status: 412,
+        headers: {
+            "content-type": "text/plain",
+            [RANGE_FINGERPRINT_HEADER]: currentFingerprint,
+        },
+    });
 }
 function parseRange(header, len) {
     if (header === null)

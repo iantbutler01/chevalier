@@ -45,6 +45,10 @@ test("vfs local round-trip", async () => {
   assert.strictEqual((await vfs.read("a.txt")).toString(), "hi chevalier");
   const st = await vfs.stat("a.txt");
   assert.strictEqual(st.kind, "File");
+  assert.match(st.contentHash, /^[a-f0-9]{64}$/);
+  const attrs = await vfs.stat("a.txt", { maxHashBytes: 0 });
+  assert.strictEqual(attrs.kind, "File");
+  assert.strictEqual(attrs.contentHash, undefined);
 });
 
 test("vfs bulk metadata preserves request order and missing entries", async () => {
@@ -228,6 +232,99 @@ test("vfs gateway reports backing-store listing failures as 500, not an empty-lo
 
   assert.strictEqual(response.status, 500);
   assert.match(await response.text(), /disk read failed/);
+});
+
+test("vfs gateway forwards lightweight stat metadata options", async () => {
+  const seen = [];
+  const store = {
+    async stat(path, options) {
+      seen.push({ path, options });
+      return {
+        path,
+        kind: "File",
+        sizeBytes: 3n,
+        contentHash: options?.maxHashBytes === 0 ? undefined : "hash",
+      };
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+
+  const response = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/stat?path=a.txt&max_hash_bytes=0"),
+  );
+
+  assert.strictEqual(response.status, 200);
+  assert.strictEqual((await response.json()).content_hash, null);
+  assert.deepStrictEqual(seen, [{ path: "a.txt", options: { maxHashBytes: 0 } }]);
+});
+
+test("vfs gateway pins ranged reads with an epoch-millis fingerprint", async () => {
+  // Vector shared with sandbox/vmd/src/fuse/fs.rs range_fingerprint tests.
+  const updatedAt = "2026-07-17T23:26:26.500Z";
+  const expectedFingerprint = "123:1784330786500";
+  const store = {
+    async stat() {
+      return { path: "big.bin", kind: "File", sizeBytes: 123n, updatedAt };
+    },
+    async read() {
+      return Buffer.alloc(123, 7);
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+
+  const pinned = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/file/raw?path=big.bin", {
+      headers: {
+        range: "bytes=0-9",
+        "x-chevalier-vfs-range-fingerprint": expectedFingerprint,
+      },
+    }),
+  );
+  assert.strictEqual(pinned.status, 206);
+  assert.strictEqual(
+    pinned.headers.get("x-chevalier-vfs-range-fingerprint"),
+    expectedFingerprint,
+  );
+  assert.strictEqual((await pinned.arrayBuffer()).byteLength, 10);
+
+  const stale = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/file/raw?path=big.bin", {
+      headers: {
+        range: "bytes=0-9",
+        "x-chevalier-vfs-range-fingerprint": "999:0",
+      },
+    }),
+  );
+  assert.strictEqual(stale.status, 412);
+  assert.strictEqual(
+    stale.headers.get("x-chevalier-vfs-range-fingerprint"),
+    expectedFingerprint,
+  );
+});
+
+test("vfs gateway rejects a ranged read when the file changes during the read", async () => {
+  let statCalls = 0;
+  const store = {
+    async stat() {
+      statCalls += 1;
+      // First stat (pre-read) sees the old file; the post-read bracket stat
+      // sees a replacement that landed mid-read.
+      return statCalls === 1
+        ? { path: "big.bin", kind: "File", sizeBytes: 100n, updatedAt: "2026-07-17T00:00:00Z" }
+        : { path: "big.bin", kind: "File", sizeBytes: 80n, updatedAt: "2026-07-17T00:00:01Z" };
+    },
+    async read() {
+      return Buffer.alloc(100, 7);
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+
+  const response = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/file/raw?path=big.bin", {
+      headers: { range: "bytes=0-9" },
+    }),
+  );
+  assert.strictEqual(response.status, 412, "a splice-risk read must never return bytes");
 });
 
 test("vfs gateway CAS fingerprints symbolic-link targets", async () => {
