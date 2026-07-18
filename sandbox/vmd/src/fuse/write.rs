@@ -38,13 +38,21 @@ struct JournalState {
     flushing: bool,
     stop: bool,
     last_error: Option<String>,
+    /// Latched when writes were dead-lettered; consumed by the next flush()
+    /// so exactly one fsync/close waiter observes the failure (POSIX
+    /// deferred-writeback semantics) without wedging later flushes.
+    dead_letter_error: Option<String>,
 }
+
+type DeadLetterHook = Box<dyn Fn(&str) + Send + Sync>;
 
 struct Shared {
     state: Mutex<JournalState>,
     changed: Condvar,
     journal_path: PathBuf,
     staging_dir: PathBuf,
+    /// Invalidates reader-visible caches for a path whose write was dropped.
+    on_dead_letter: Option<DeadLetterHook>,
 }
 
 pub struct WriteJournal {
@@ -58,6 +66,7 @@ impl WriteJournal {
         scope_path: &str,
         journal_path: &Path,
         tokio: Handle,
+        on_dead_letter: Option<DeadLetterHook>,
     ) -> Result<Self> {
         let staging_dir = journal_path.with_extension("writes");
         fs::create_dir_all(&staging_dir).with_context(|| {
@@ -83,10 +92,12 @@ impl WriteJournal {
                 flushing: false,
                 stop: false,
                 last_error: None,
+                dead_letter_error: None,
             }),
             changed: Condvar::new(),
             journal_path: journal_path.to_path_buf(),
             staging_dir,
+            on_dead_letter,
         });
         let worker_shared = Arc::clone(&shared);
         let scope_path = scope_path.trim_matches('/').to_string();
@@ -167,6 +178,9 @@ impl WriteJournal {
                 .wait_timeout(state, remaining)
                 .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
             state = waited.0;
+        }
+        if let Some(error) = state.dead_letter_error.take() {
+            return Err(anyhow!(error));
         }
         if let Some(error) = state.last_error.clone() {
             return Err(anyhow!(error));
@@ -413,7 +427,25 @@ fn resolve_rejected_batch(
                 resolution.committed.insert(write.path.clone(), content_hash);
             }
             Err(error) if rejected_request_status(&error).is_some() => {
-                resolution.dead_lettered.push((write.clone(), error.to_string()));
+                // A 409 can mean the write already landed (lost response on a
+                // prior attempt, or a batch that partially committed before
+                // rejection). If the gateway's current content IS this write,
+                // it is committed, not dead.
+                match tokio.block_on(client.stat(write.path.as_str())) {
+                    Ok(Some(metadata))
+                        if metadata.content_hash.as_deref() == Some(content_hash.as_str()) =>
+                    {
+                        resolution.committed.insert(write.path.clone(), content_hash);
+                    }
+                    Ok(_) => {
+                        resolution
+                            .dead_lettered
+                            .push((write.clone(), error.to_string()));
+                    }
+                    // Cannot tell committed from rejected without the stat —
+                    // keep the write pending rather than guessing.
+                    Err(_) => resolution.retained.push(write.path.clone()),
+                }
             }
             Err(_) => resolution.retained.push(write.path.clone()),
         }
@@ -430,24 +462,35 @@ fn apply_batch_resolution(
 ) {
     let mut resolved_paths = HashSet::<&str>::new();
     resolved_paths.extend(resolution.committed.keys().map(String::as_str));
+    let mut dead_lettered_paths = Vec::<String>::new();
+    let mut preservation_failures = Vec::<String>::new();
     for (write, error) in &resolution.dead_lettered {
-        resolved_paths.insert(write.path.as_str());
+        // Only count the entry resolved once its bytes are safely preserved.
+        // If preservation fails (disk full, permissions), the entry stays in
+        // the journal and the worker retries the whole resolution later.
         match dead_letter_write(shared, write, error) {
-            Ok(record_path) => tracing::error!(
-                journal = %shared.journal_path.display(),
-                path = %write.path,
-                staged_bytes = write.size_bytes,
-                dead_letter = %record_path.display(),
-                error = %error,
-                "vfs write rejected by gateway; preserved in dead letter and dropped from journal"
-            ),
-            Err(record_error) => tracing::error!(
-                journal = %shared.journal_path.display(),
-                path = %write.path,
-                error = %error,
-                record_error = %record_error,
-                "vfs write rejected by gateway; failed to record dead letter"
-            ),
+            Ok(record_path) => {
+                resolved_paths.insert(write.path.as_str());
+                dead_lettered_paths.push(write.path.clone());
+                tracing::error!(
+                    journal = %shared.journal_path.display(),
+                    path = %write.path,
+                    staged_bytes = write.size_bytes,
+                    dead_letter = %record_path.display(),
+                    error = %error,
+                    "vfs write rejected by gateway; preserved in dead letter and dropped from journal"
+                );
+            }
+            Err(record_error) => {
+                preservation_failures.push(write.path.clone());
+                tracing::error!(
+                    journal = %shared.journal_path.display(),
+                    path = %write.path,
+                    error = %error,
+                    record_error = %record_error,
+                    "vfs write rejected by gateway; dead-letter preservation failed, retaining entry"
+                );
+            }
         }
     }
     let resolved_ids = batch
@@ -471,17 +514,31 @@ fn apply_batch_resolution(
         .cloned()
         .collect::<Vec<_>>();
     rebase_pending_after_commit(&mut state.pending, &committed_batch, &resolution.committed);
+    if !dead_lettered_paths.is_empty() {
+        state.dead_letter_error = Some(format!(
+            "vfs write(s) rejected by the gateway and dead-lettered under {}: {}",
+            shared.journal_path.with_extension("dead-letter").display(),
+            dead_lettered_paths.join(", "),
+        ));
+        if let Some(on_dead_letter) = shared.on_dead_letter.as_ref() {
+            for path in &dead_lettered_paths {
+                on_dead_letter(path.as_str());
+            }
+        }
+    }
     if let Err(error) = rewrite_journal(&shared.journal_path, state) {
         state.last_error = Some(error.to_string());
         return;
     }
-    state.last_error = if resolution.retained.is_empty() {
+    let mut unresolved = resolution.retained.clone();
+    unresolved.extend(preservation_failures);
+    state.last_error = if unresolved.is_empty() {
         None
     } else {
         Some(format!(
             "transient vfs write failure for {} path(s), retrying: {}",
-            resolution.retained.len(),
-            resolution.retained.join(", "),
+            unresolved.len(),
+            unresolved.join(", "),
         ))
     };
 }
@@ -494,19 +551,28 @@ fn dead_letter_write(shared: &Shared, write: &JournalWrite, error: &str) -> Resu
             dead_letter_dir.display()
         )
     })?;
-    let staged = shared.staging_dir.join(write.staged_file.as_str());
-    let preserved = dead_letter_dir.join(write.staged_file.as_str());
-    fs::rename(&staged, &preserved)
-        .with_context(|| format!("preserve rejected vfs write {}", staged.display()))?;
-    let record_path = dead_letter_dir.join("records.jsonl");
     let unix_seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or_default();
+    let staged = shared.staging_dir.join(write.staged_file.as_str());
+    // Journal ids restart after a drained-journal reboot, so id alone is not
+    // unique in the persistent dead-letter directory. Never clobber an
+    // earlier preserved file.
+    let mut preserved_name = format!("{unix_seconds}-{}.bin", write.id);
+    let mut suffix = 0u32;
+    while dead_letter_dir.join(preserved_name.as_str()).exists() {
+        suffix += 1;
+        preserved_name = format!("{unix_seconds}-{}-{suffix}.bin", write.id);
+    }
+    let preserved = dead_letter_dir.join(preserved_name.as_str());
+    fs::rename(&staged, &preserved)
+        .with_context(|| format!("preserve rejected vfs write {}", staged.display()))?;
+    let record_path = dead_letter_dir.join("records.jsonl");
     let record = serde_json::json!({
         "id": write.id,
         "path": write.path,
-        "preserved_file": write.staged_file,
+        "preserved_file": preserved_name,
         "size_bytes": write.size_bytes,
         "base_content_hash": write.base_content_hash,
         "error": error,
@@ -752,10 +818,12 @@ mod tests {
                 flushing: false,
                 stop: false,
                 last_error: None,
+                dead_letter_error: None,
             }),
             changed: Condvar::new(),
             journal_path,
             staging_dir,
+            on_dead_letter: None,
         });
         let worker_state = Arc::clone(&shared);
         let recovery = std::thread::spawn(move || {
@@ -797,10 +865,12 @@ mod tests {
                 flushing: false,
                 stop: false,
                 last_error: Some("rewrite failed".to_string()),
+                dead_letter_error: None,
             }),
             changed: Condvar::new(),
             journal_path,
             staging_dir,
+            on_dead_letter: None,
         });
         let journal = WriteJournal {
             shared,
@@ -870,10 +940,12 @@ mod tests {
                 flushing: false,
                 stop: false,
                 last_error: Some("vfs request failed: 409".to_string()),
+                dead_letter_error: None,
             }),
             changed: Condvar::new(),
             journal_path: journal_path.clone(),
             staging_dir: staging_dir.clone(),
+            on_dead_letter: None,
         };
         let resolution = BatchResolution {
             committed: HashMap::from([("src/main.rs".to_string(), "committed-hash".to_string())]),
@@ -896,17 +968,27 @@ mod tests {
                 "follow-on write for the committed path must rebase onto the committed hash"
             );
             assert_eq!(state.last_error, None, "resolved batch must clear the error");
+            assert!(
+                state
+                    .dead_letter_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("probe.txt")),
+                "a dead-letter must latch an error for the next flush waiter"
+            );
         }
 
         let dead_letter_dir = journal_path.with_extension("dead-letter");
-        assert_eq!(
-            fs::read(dead_letter_dir.join("2.bin")).expect("preserved bytes"),
-            b"rejected bytes",
-            "rejected bytes must be preserved, not lost"
-        );
         let records = fs::read_to_string(dead_letter_dir.join("records.jsonl")).expect("records");
         assert!(records.contains("probe.txt"));
         assert!(records.contains("409"));
+        let record: serde_json::Value =
+            serde_json::from_str(records.lines().next().expect("one record")).expect("json");
+        let preserved_file = record["preserved_file"].as_str().expect("preserved_file");
+        assert_eq!(
+            fs::read(dead_letter_dir.join(preserved_file)).expect("preserved bytes"),
+            b"rejected bytes",
+            "rejected bytes must be preserved, not lost"
+        );
         assert!(
             !staging_dir.join("1.bin").exists(),
             "committed staged file is cleaned up"
@@ -922,6 +1004,109 @@ mod tests {
         let journal_after = fs::read_to_string(&journal_path).expect("journal contents");
         assert!(journal_after.contains("\"id\":3"));
         assert!(!journal_after.contains("probe.txt"));
+    }
+
+    #[test]
+    fn preservation_failure_retains_entry_instead_of_dropping_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("writes.jsonl");
+        let staging_dir = dir.path().join("writes");
+        fs::create_dir_all(&staging_dir).expect("staging dir");
+        fs::write(staging_dir.join("1.bin"), b"rejected bytes").expect("stage 1");
+        // Occupy the dead-letter directory path with a FILE so preservation
+        // (create_dir_all) deterministically fails.
+        fs::write(journal_path.with_extension("dead-letter"), b"blocker").expect("blocker");
+        let entry = JournalWrite {
+            id: 1,
+            path: "probe.txt".to_string(),
+            staged_file: "1.bin".to_string(),
+            size_bytes: 14,
+            base_content_hash: Some("stale".to_string()),
+        };
+        let shared = Shared {
+            state: Mutex::new(JournalState {
+                pending: VecDeque::from([entry.clone()]),
+                journal: open_append(&journal_path).expect("journal"),
+                next_id: 2,
+                force_flush: false,
+                flushing: false,
+                stop: false,
+                last_error: Some("vfs request failed: 409".to_string()),
+                dead_letter_error: None,
+            }),
+            changed: Condvar::new(),
+            journal_path: journal_path.clone(),
+            staging_dir: staging_dir.clone(),
+            on_dead_letter: None,
+        };
+        let resolution = BatchResolution {
+            committed: HashMap::new(),
+            dead_lettered: vec![(entry.clone(), "vfs request failed: 409".to_string())],
+            retained: Vec::new(),
+        };
+
+        let mut state = shared.state.lock().expect("state");
+        apply_batch_resolution(&shared, &mut state, &[entry], &[], resolution);
+
+        assert_eq!(state.pending.len(), 1, "entry must stay pending");
+        assert!(state.last_error.is_some(), "failure must stay loud");
+        assert_eq!(state.dead_letter_error, None);
+        drop(state);
+        assert_eq!(
+            fs::read(staging_dir.join("1.bin")).expect("staged bytes survive"),
+            b"rejected bytes"
+        );
+    }
+
+    #[test]
+    fn dead_letter_invokes_cache_invalidation_hook() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("writes.jsonl");
+        let staging_dir = dir.path().join("writes");
+        fs::create_dir_all(&staging_dir).expect("staging dir");
+        fs::write(staging_dir.join("1.bin"), b"rejected bytes").expect("stage 1");
+        let invalidated = Arc::new(Mutex::new(Vec::<String>::new()));
+        let hook_log = Arc::clone(&invalidated);
+        let entry = JournalWrite {
+            id: 1,
+            path: "probe.txt".to_string(),
+            staged_file: "1.bin".to_string(),
+            size_bytes: 14,
+            base_content_hash: Some("stale".to_string()),
+        };
+        let shared = Shared {
+            state: Mutex::new(JournalState {
+                pending: VecDeque::from([entry.clone()]),
+                journal: open_append(&journal_path).expect("journal"),
+                next_id: 2,
+                force_flush: false,
+                flushing: false,
+                stop: false,
+                last_error: Some("vfs request failed: 409".to_string()),
+                dead_letter_error: None,
+            }),
+            changed: Condvar::new(),
+            journal_path: journal_path.clone(),
+            staging_dir: staging_dir.clone(),
+            on_dead_letter: Some(Box::new(move |path| {
+                hook_log.lock().expect("hook log").push(path.to_string());
+            })),
+        };
+        let resolution = BatchResolution {
+            committed: HashMap::new(),
+            dead_lettered: vec![(entry.clone(), "vfs request failed: 409".to_string())],
+            retained: Vec::new(),
+        };
+
+        let mut state = shared.state.lock().expect("state");
+        apply_batch_resolution(&shared, &mut state, &[entry], &[], resolution);
+        assert!(state.pending.is_empty());
+        drop(state);
+
+        assert_eq!(
+            invalidated.lock().expect("hook log").as_slice(),
+            ["probe.txt".to_string()]
+        );
     }
 
     #[test]
@@ -945,10 +1130,12 @@ mod tests {
                 flushing: false,
                 stop: false,
                 last_error: None,
+                dead_letter_error: None,
             }),
             changed: Condvar::new(),
             journal_path,
             staging_dir,
+            on_dead_letter: None,
         });
         let journal = WriteJournal {
             shared,

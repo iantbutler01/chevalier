@@ -1137,8 +1137,23 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                     VfsStorageNamespaceMutation::CreateDirectory { path } => {
                         let abs_path = storage.abs_path(path.as_str())?;
                         storage.assert_no_symlink_ancestor(&abs_path)?;
-                        fs::create_dir_all(abs_path)
-                            .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+                        fs::create_dir_all(abs_path).map_err(|error| {
+                            // A file occupying the leaf or an ancestor can
+                            // never resolve by retrying: report Conflict so
+                            // replaying journals dead-letter instead of
+                            // retrying a deterministic failure forever.
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::AlreadyExists
+                                    | std::io::ErrorKind::NotADirectory
+                            ) {
+                                VfsStorageError::Conflict(format!(
+                                    "vfs path {path} is blocked by a non-directory: {error}"
+                                ))
+                            } else {
+                                VfsStorageError::Internal(error.to_string())
+                            }
+                        })?;
                     }
                     VfsStorageNamespaceMutation::CreateSymlink { path, target } => {
                         match storage.metadata_for_path(path.as_str())? {
@@ -1164,6 +1179,11 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                         match fs::remove_file(&abs_path) {
                             Ok(()) => {}
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::IsADirectory => {
+                                return Err(VfsStorageError::Conflict(format!(
+                                    "vfs path {path} is a directory, not a file"
+                                )));
+                            }
                             Err(error) => {
                                 return Err(VfsStorageError::Internal(error.to_string()));
                             }
@@ -1179,6 +1199,11 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                             Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
                                 return Err(VfsStorageError::Conflict(format!(
                                     "vfs directory {path} is not empty"
+                                )));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
+                                return Err(VfsStorageError::Conflict(format!(
+                                    "vfs path {path} is not a directory"
                                 )));
                             }
                             Err(error) => {
@@ -1212,9 +1237,14 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                                 .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
                         }
                         fs::rename(&from_abs, &to_abs).map_err(|error| {
-                            if error.kind() == std::io::ErrorKind::DirectoryNotEmpty {
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::DirectoryNotEmpty
+                                    | std::io::ErrorKind::NotADirectory
+                                    | std::io::ErrorKind::IsADirectory
+                            ) {
                                 VfsStorageError::Conflict(format!(
-                                    "cannot replay rename {from} -> {to}: destination differs and is not empty"
+                                    "cannot replay rename {from} -> {to}: destination kind conflicts ({error})"
                                 ))
                             } else {
                                 VfsStorageError::Internal(error.to_string())

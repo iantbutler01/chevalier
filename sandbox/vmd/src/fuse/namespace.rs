@@ -26,6 +26,9 @@ struct JournalState {
     flushing: bool,
     stop: bool,
     last_error: Option<String>,
+    /// Latched when mutations were dead-lettered; consumed by the next
+    /// flush() so one waiter observes the failure without wedging later ones.
+    dead_letter_error: Option<String>,
 }
 
 struct Shared {
@@ -64,6 +67,7 @@ impl NamespaceJournal {
                 flushing: false,
                 stop: false,
                 last_error: None,
+                dead_letter_error: None,
             }),
             changed: Condvar::new(),
             journal_path: journal_path.to_path_buf(),
@@ -124,6 +128,9 @@ impl NamespaceJournal {
                 .wait_timeout(state, remaining)
                 .map_err(|_| anyhow!("vfs namespace journal lock poisoned"))?;
             state = waited.0;
+        }
+        if let Some(error) = state.dead_letter_error.take() {
+            return Err(anyhow!(error));
         }
         if let Some(error) = state.last_error.clone() {
             return Err(anyhow!(error));
@@ -339,6 +346,17 @@ fn apply_namespace_resolution(
     for _ in 0..resolution.resolved {
         state.pending.pop_front();
     }
+    if !resolution.dead_lettered.is_empty() {
+        state.dead_letter_error = Some(format!(
+            "vfs namespace mutation(s) rejected by the gateway and dead-lettered: {}",
+            resolution
+                .dead_lettered
+                .iter()
+                .map(|(mutation, _)| format!("{mutation:?}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
     if let Err(error) = rewrite_journal(&shared.journal_path, state) {
         state.last_error = Some(error.to_string());
         return;
@@ -455,6 +473,7 @@ mod tests {
                 flushing: false,
                 stop: false,
                 last_error: None,
+                dead_letter_error: None,
             }),
             changed: Condvar::new(),
             journal_path,
@@ -505,6 +524,7 @@ mod tests {
                 flushing: false,
                 stop: false,
                 last_error: Some("vfs request failed: 409".to_string()),
+                dead_letter_error: None,
             }),
             changed: Condvar::new(),
             journal_path: journal_path.clone(),
@@ -521,6 +541,10 @@ mod tests {
         assert_eq!(state.pending.len(), 1);
         assert_eq!(state.pending[0], retained);
         assert_eq!(state.last_error, None);
+        assert!(
+            state.dead_letter_error.is_some(),
+            "a dead-letter must latch an error for the next flush waiter"
+        );
         drop(state);
 
         let records = fs::read_to_string(journal_path.with_extension("dead-letter.jsonl"))
@@ -544,6 +568,7 @@ mod tests {
                 flushing: false,
                 stop: false,
                 last_error: Some("rewrite failed".to_string()),
+                dead_letter_error: None,
             }),
             changed: Condvar::new(),
             journal_path,

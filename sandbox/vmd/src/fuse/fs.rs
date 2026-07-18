@@ -193,7 +193,7 @@ struct FileState {
 
 pub struct RemoteFuseFs {
     client: RemoteVfsClient,
-    cache: RemoteFuseCache,
+    cache: std::sync::Arc<RemoteFuseCache>,
     inodes: Mutex<InodeTable>,
     handles: Mutex<HandleTable>,
     namespace: Option<NamespaceJournal>,
@@ -209,7 +209,7 @@ impl RemoteFuseFs {
     pub fn new(client: RemoteVfsClient, read_only: bool, scope_path: &str, tokio: Handle) -> Self {
         Self {
             client,
-            cache: RemoteFuseCache::default(),
+            cache: std::sync::Arc::new(RemoteFuseCache::default()),
             inodes: Mutex::new(InodeTable::new()),
             handles: Mutex::new(HandleTable::default()),
             namespace: None,
@@ -239,19 +239,25 @@ impl RemoteFuseFs {
                 tokio.clone(),
             )?)
         };
+        let cache = std::sync::Arc::new(RemoteFuseCache::default());
         let writes = if read_only {
             None
         } else {
+            let dead_letter_cache = std::sync::Arc::clone(&cache);
             Some(WriteJournal::open(
                 client.clone(),
                 scope_path,
                 journal_path.with_extension("writes.jsonl").as_path(),
                 tokio.clone(),
+                // A dead-lettered write's content was installed into the read
+                // cache at flush time; drop it so readers converge on the
+                // gateway's authoritative content instead of the dropped bytes.
+                Some(Box::new(move |path: &str| dead_letter_cache.invalidate(path))),
             )?)
         };
         Ok(Self {
             client,
-            cache: RemoteFuseCache::default(),
+            cache,
             inodes: Mutex::new(InodeTable::new()),
             handles: Mutex::new(HandleTable::default()),
             namespace,
@@ -491,7 +497,27 @@ impl RemoteFuseFs {
         }))
     }
 
+    /// Content counterpart of `open_handle_metadata`: a newly created file
+    /// exists only in its creator's handle buffer until flush, so readers
+    /// that were shown its metadata must also be served its bytes.
+    fn open_handle_content(&self, path: &str) -> FuseResult<Option<Vec<u8>>> {
+        let handles = self.lock_handles()?;
+        Ok(handles
+            .files
+            .values()
+            .find(|state| state.path == path && state.created && state.dirty)
+            .map(|state| state.buffer.clone()))
+    }
+
     fn read_bytes(&self, path: &str, offset: u64, size: u32) -> FuseResult<Vec<u8>> {
+        // A created-but-unflushed file has no gateway content yet; serve the
+        // creator's buffer (checked first so an oversized created buffer never
+        // routes into the ranged-read path, which would 404).
+        if let Some(bytes) = self.open_handle_content(path)? {
+            let start = (offset as usize).min(bytes.len());
+            let end = start.saturating_add(size as usize).min(bytes.len());
+            return Ok(bytes[start..end].to_vec());
+        }
         // Large files never need a content hash (ranged reads are pinned by
         // fingerprint), so route them off the cheap attribute stat before
         // paying for a hashed stat.
@@ -518,13 +544,21 @@ impl RemoteFuseFs {
 
         // The stat and the content fetch are separate requests; if the file
         // changed between them, cache metadata derived from the bytes we
-        // actually hold so attrs and content can never disagree.
-        let metadata = if bytes.len() as u64 == metadata.size_bytes {
+        // actually hold so attrs and content can never disagree. Same-size
+        // replacements are common (counters, locks, fixed-width status), so
+        // the hash must be verified, not just the length; a corrected entry
+        // drops updated_at because the pre-replacement mtime no longer
+        // describes these bytes.
+        let fetched_hash = content_hash_for_bytes(&bytes);
+        let metadata = if bytes.len() as u64 == metadata.size_bytes
+            && metadata.content_hash.as_deref() == Some(fetched_hash.as_str())
+        {
             metadata
         } else {
             RemoteMetadata {
                 size_bytes: bytes.len() as u64,
-                content_hash: Some(content_hash_for_bytes(&bytes)),
+                content_hash: Some(fetched_hash),
+                updated_at: None,
                 ..metadata
             }
         };
@@ -543,7 +577,8 @@ impl RemoteFuseFs {
         size: u32,
     ) -> FuseResult<Vec<u8>> {
         let mut fingerprint = range_fingerprint(metadata);
-        for _ in 0..2 {
+        let mut retry_delay = Duration::from_millis(10);
+        for _ in 0..4 {
             let outcome = self
                 .tokio
                 .block_on(self.client.read_file_range(
@@ -557,8 +592,12 @@ impl RemoteFuseFs {
                 RangeRead::Bytes(bytes) => return Ok(bytes),
                 RangeRead::NotFound => return Err(Errno::ENOENT),
                 RangeRead::Stale => {
-                    // The file was replaced under the read; refresh identity and
-                    // retry once so the kernel sees one file, never a splice.
+                    // The file was replaced under the read; refresh identity
+                    // and retry so the kernel sees one file, never a splice.
+                    // The cached fingerprint can be up to ATTR_TTL stale, so
+                    // budget enough attempts to converge under write churn.
+                    std::thread::sleep(retry_delay);
+                    retry_delay = retry_delay.saturating_mul(2).min(Duration::from_millis(100));
                     self.cache.invalidate(path);
                     let refreshed = self.stat_path_attributes(path)?.ok_or(Errno::ENOENT)?;
                     fingerprint = range_fingerprint(&refreshed);
@@ -919,11 +958,16 @@ impl RemoteFuseFs {
         if state.loaded {
             return Ok(());
         }
-        let bytes = self
-            .tokio
-            .block_on(self.client.read_file_raw(&state.path))
-            .map_err(|_| Errno::EIO)?
-            .ok_or(Errno::ENOENT)?;
+        // A created-but-unflushed file exists only in its creator's buffer;
+        // seed this handle from it instead of 404ing at the gateway.
+        let bytes = match self.open_handle_content(&state.path)? {
+            Some(bytes) => bytes,
+            None => self
+                .tokio
+                .block_on(self.client.read_file_raw(&state.path))
+                .map_err(|_| Errno::EIO)?
+                .ok_or(Errno::ENOENT)?,
+        };
         let mut handles = self.lock_handles()?;
         let handle = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
         if handle.loaded || handle.dirty || handle.revision != state.revision {
@@ -1215,6 +1259,13 @@ mod tests {
         let metadata = fs.stat_path(path).unwrap().unwrap();
         assert_eq!(metadata.size_bytes, bytes.len() as u64);
         assert_eq!(metadata.content_hash, Some(content_hash_for_bytes(&bytes)));
+        // Content must match the visible metadata: a reader that was shown the
+        // created file's stat must get its bytes, not gateway ENOENT.
+        assert_eq!(
+            fs.read_bytes(path, 0, bytes.len() as u32).unwrap(),
+            bytes,
+            "path readers must be served a created file's uncommitted bytes"
+        );
     }
 }
 

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use chevalier_sandbox::vfs::{
@@ -12,12 +12,15 @@ use chevalier_sandbox::vfs::{
 };
 use reqwest::{Client, StatusCode, header};
 
-const READ_TRANSPORT_ATTEMPTS: u32 = 3;
 pub const RANGE_FINGERPRINT_HEADER: &str = "x-chevalier-vfs-range-fingerprint";
+/// Transient-failure budget sized to ride out a gateway restart, not mask a
+/// broken one: only transport failures and 5xx/429/408 consume it — hard 4xx
+/// rejections fail on the first attempt.
+const READ_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
 const METADATA_READ_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const FILE_READ_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_RETRY_DELAY_MIN: Duration = Duration::from_millis(50);
-const READ_RETRY_DELAY_MAX: Duration = Duration::from_millis(200);
+const READ_RETRY_DELAY_MAX: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug)]
 pub struct RemoteVfsClient {
@@ -538,10 +541,9 @@ impl RemoteVfsClient {
         builder: reqwest::RequestBuilder,
         mut decode: impl FnMut(StatusCode, &[u8]) -> Result<T>,
     ) -> Result<T> {
+        let deadline = Instant::now() + READ_RETRY_TIMEOUT;
         let mut retry_delay = READ_RETRY_DELAY_MIN;
-        let mut attempt = 0u32;
         loop {
-            attempt += 1;
             let request = builder
                 .try_clone()
                 .ok_or_else(|| anyhow!("cannot clone vfs read request for retry"))?;
@@ -567,13 +569,12 @@ impl RemoteVfsClient {
                 }
                 let body = response.text().await.unwrap_or_default();
                 let error = anyhow!("vfs read failed: {status} {body}");
-                if matches!(
-                    status,
-                    StatusCode::TOO_MANY_REQUESTS
-                        | StatusCode::BAD_GATEWAY
-                        | StatusCode::SERVICE_UNAVAILABLE
-                        | StatusCode::GATEWAY_TIMEOUT
-                ) {
+                if status.is_server_error()
+                    || matches!(
+                        status,
+                        StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT
+                    )
+                {
                     Err(ReadFailure::transient(error))
                 } else {
                     Err(ReadFailure::terminal(error))
@@ -582,7 +583,7 @@ impl RemoteVfsClient {
             .await;
             match outcome {
                 Ok((status, body)) => return decode(status, body.as_ref()),
-                Err(failure) if failure.transient && attempt < READ_TRANSPORT_ATTEMPTS => {
+                Err(failure) if failure.transient && Instant::now() < deadline => {
                     tracing::debug!(error = %failure.error, "retrying transient vfs read failure");
                     tokio::time::sleep(retry_delay).await;
                     retry_delay = retry_delay.saturating_mul(2).min(READ_RETRY_DELAY_MAX);
@@ -613,7 +614,16 @@ pub fn rejected_request_status(error: &anyhow::Error) -> Option<StatusCode> {
         .chain()
         .find_map(|cause| cause.downcast_ref::<VfsRequestStatusError>())
         .map(|status_error| status_error.status)
-        .filter(|status| status.is_client_error())
+        .filter(|status| {
+            // Only statuses that mean "this exact payload can never succeed".
+            // Auth failures (401/403), route skew during deploys (404), rate
+            // limits (429), and timeouts (408) are transient conditions and
+            // must retain-and-retry, never dead-letter.
+            matches!(
+                *status,
+                StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED
+            )
+        })
 }
 
 struct ReadFailure {
