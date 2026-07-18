@@ -91,6 +91,9 @@ pub async fn mount_remote_vfs_fuse(
         Handle::current(),
     )?;
     let options = filesystem.mount_options(mount_tag);
+    // Concurrent dispatch: the single-threaded fuser session loop only decodes
+    // requests; ops fan out to workers (see fuse/dispatch.rs).
+    let filesystem = super::dispatch::SpawnedFuseFs::new(filesystem);
     let session = fuser::spawn_mount2(filesystem, mountpoint, &options)
         .with_context(|| format!("mount fuse filesystem at {}", mountpoint.display()))?;
 

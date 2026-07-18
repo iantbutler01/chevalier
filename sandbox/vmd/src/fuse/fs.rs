@@ -13,9 +13,9 @@ use chevalier_sandbox::vfs::{
     VfsNamespaceMutation, scoped_vfs_path,
 };
 use fuser::{
-    BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, InitFlags, KernelConfig, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    BsdFileFlags, Errno, FileAttr, FileHandle, FileType, FopenFlags, Generation, INodeNo,
+    InitFlags, KernelConfig, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, TimeOrNow,
 };
 use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
@@ -89,7 +89,7 @@ impl InodeTable {
         ino
     }
 
-    fn lookup(&mut self, path: &str) -> INodeNo {
+    pub(super) fn lookup(&mut self, path: &str) -> INodeNo {
         let ino = self.ensure(path);
         if let Some(record) = self.ino_to_path.get_mut(&ino) {
             record.lookup_count = record.lookup_count.saturating_add(1);
@@ -103,7 +103,7 @@ impl InodeTable {
         Some(record.path.clone())
     }
 
-    fn forget(&mut self, ino: INodeNo, nlookup: u64) {
+    pub(super) fn forget(&mut self, ino: INodeNo, nlookup: u64) {
         if ino == ROOT_INO {
             return;
         }
@@ -268,6 +268,10 @@ impl RemoteFuseFs {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
         })
+    }
+
+    pub(super) fn tokio_handle(&self) -> Handle {
+        self.tokio.clone()
     }
 
     pub fn mount_options(&self, tag: &str) -> fuser::Config {
@@ -1346,8 +1350,11 @@ mod tests {
     }
 }
 
-impl Filesystem for RemoteFuseFs {
-    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> io::Result<()> {
+/// FUSE operation bodies. Dispatched concurrently by `SpawnedFuseFs`
+/// (fuse/dispatch.rs), which owns the actual `fuser::Filesystem` impl —
+/// every method here may run on a worker thread and must stay `&self`-safe.
+impl RemoteFuseFs {
+    pub(super) fn init_op(&self, config: &mut KernelConfig) -> io::Result<()> {
         let requested = self.requested_init_capabilities();
         if requested.is_empty() {
             return Ok(());
@@ -1361,13 +1368,13 @@ impl Filesystem for RemoteFuseFs {
         Ok(())
     }
 
-    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+    pub(super) fn forget(&self, ino: INodeNo, nlookup: u64) {
         if let Ok(mut inodes) = self.lock_inodes() {
             inodes.forget(ino, nlookup);
         }
     }
 
-    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+    pub(super) fn lookup(&self, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let result: FuseResult<FileAttr> = (|| {
             let parent_path = self.path_for_ino(parent)?;
             let child_path = Self::child_path(parent_path.as_str(), name)?;
@@ -1382,7 +1389,7 @@ impl Filesystem for RemoteFuseFs {
         }
     }
 
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+    pub(super) fn getattr(&self, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         if ino == ROOT_INO {
             reply.attr(&TTL, &self.root_attr());
             return;
@@ -1398,7 +1405,7 @@ impl Filesystem for RemoteFuseFs {
         }
     }
 
-    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+    pub(super) fn readlink(&self, ino: INodeNo, reply: ReplyData) {
         let result: FuseResult<Vec<u8>> = (|| {
             let path = self.path_for_ino(ino)?;
             let metadata = self.stat_path_attributes(&path)?.ok_or(Errno::ENOENT)?;
@@ -1414,9 +1421,8 @@ impl Filesystem for RemoteFuseFs {
         }
     }
 
-    fn setattr(
+    pub(super) fn setattr(
         &self,
-        _req: &Request,
         ino: INodeNo,
         mode: Option<u32>,
         _uid: Option<u32>,
@@ -1499,13 +1505,12 @@ impl Filesystem for RemoteFuseFs {
         }
     }
 
-    fn opendir(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+    pub(super) fn opendir(&self, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         reply.opened(FileHandle(0), FopenFlags::empty());
     }
 
-    fn readdir(
+    pub(super) fn readdir(
         &self,
-        _req: &Request,
         ino: INodeNo,
         _fh: FileHandle,
         offset: u64,
@@ -1546,7 +1551,78 @@ impl Filesystem for RemoteFuseFs {
         }
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+    /// One directory listing primes every child's inode and metadata cache
+    /// entry, so a tree scan costs one wire call per directory instead of one
+    /// per file (the kernel skips per-child lookup/getattr for entries
+    /// returned here).
+    pub(super) fn readdirplus(
+        &self,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        mut reply: fuser::ReplyDirectoryPlus,
+    ) {
+        let directory_metadata = || RemoteMetadata {
+            kind: "directory".to_string(),
+            size_bytes: 0,
+            link_target: None,
+            content_hash: None,
+            executable: false,
+            updated_at: None,
+        };
+        let result: FuseResult<()> = (|| {
+            let path = self.path_for_ino(ino)?;
+            let parent_ino = self.ensure_ino(Self::parent_path(&path).as_str());
+            let mut entries: Vec<(INodeNo, String, RemoteMetadata)> = vec![
+                (ino, ".".to_string(), directory_metadata()),
+                (parent_ino, "..".to_string(), directory_metadata()),
+            ];
+            for entry in self.dir_entries(&path)? {
+                let child_path = if path.is_empty() {
+                    entry.name.clone()
+                } else {
+                    format!("{}/{}", path, entry.name)
+                };
+                let child_ino = self.ensure_ino(&child_path);
+                let metadata = RemoteMetadata {
+                    kind: entry.kind,
+                    size_bytes: entry.size_bytes,
+                    link_target: entry.link_target,
+                    content_hash: entry.content_hash,
+                    executable: entry.executable,
+                    updated_at: entry.updated_at,
+                };
+                self.cache.put_metadata(&child_path, metadata.clone());
+                entries.push((child_ino, entry.name, metadata));
+            }
+            for (index, (entry_ino, name, metadata)) in
+                entries.into_iter().enumerate().skip(offset as usize)
+            {
+                let dot_entry = name == "." || name == "..";
+                let entry_path = if dot_entry {
+                    path.clone()
+                } else if path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}/{}", path, name)
+                };
+                // Children count as kernel lookups (a forget arrives for each
+                // later); dot entries never do.
+                let mut attr = self.attr_for_path(&entry_path, &metadata, !dot_entry);
+                attr.ino = entry_ino;
+                if reply.add(entry_ino, (index + 1) as u64, name, &TTL, &attr, Generation(0)) {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => reply.ok(),
+            Err(err) => reply.error(err),
+        }
+    }
+
+    pub(super) fn open(&self, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let result: FuseResult<u64> = (|| {
             let path = self.path_for_ino(ino)?;
             let metadata = self.stat_path(&path)?.ok_or(Errno::ENOENT)?;
@@ -1588,9 +1664,8 @@ impl Filesystem for RemoteFuseFs {
         }
     }
 
-    fn read(
+    pub(super) fn read(
         &self,
-        _req: &Request,
         ino: INodeNo,
         fh: FileHandle,
         offset: u64,
@@ -1621,9 +1696,8 @@ impl Filesystem for RemoteFuseFs {
         }
     }
 
-    fn write(
+    pub(super) fn write(
         &self,
-        _req: &Request,
         _ino: INodeNo,
         fh: FileHandle,
         offset: u64,
@@ -1660,9 +1734,8 @@ impl Filesystem for RemoteFuseFs {
         }
     }
 
-    fn flush(
+    pub(super) fn flush(
         &self,
-        _req: &Request,
         _ino: INodeNo,
         fh: FileHandle,
         _lock_owner: fuser::LockOwner,
@@ -1674,9 +1747,8 @@ impl Filesystem for RemoteFuseFs {
         }
     }
 
-    fn fsync(
+    pub(super) fn fsync(
         &self,
-        _req: &Request,
         _ino: INodeNo,
         fh: FileHandle,
         _datasync: bool,
@@ -1688,9 +1760,8 @@ impl Filesystem for RemoteFuseFs {
         }
     }
 
-    fn release(
+    pub(super) fn release(
         &self,
-        _req: &Request,
         _ino: INodeNo,
         fh: FileHandle,
         _flags: OpenFlags,
@@ -1708,9 +1779,8 @@ impl Filesystem for RemoteFuseFs {
         }
     }
 
-    fn mkdir(
+    pub(super) fn mkdir(
         &self,
-        _req: &Request,
         parent: INodeNo,
         name: &OsStr,
         _mode: u32,
@@ -1738,9 +1808,8 @@ impl Filesystem for RemoteFuseFs {
         }
     }
 
-    fn symlink(
+    pub(super) fn symlink(
         &self,
-        _req: &Request,
         parent: INodeNo,
         link_name: &OsStr,
         target: &Path,
@@ -1774,7 +1843,7 @@ impl Filesystem for RemoteFuseFs {
         }
     }
 
-    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    pub(super) fn unlink(&self, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let result: FuseResult<()> = (|| {
             let parent_path = self.path_for_ino(parent)?;
             let path = Self::child_path(parent_path.as_str(), name)?;
@@ -1792,7 +1861,7 @@ impl Filesystem for RemoteFuseFs {
         }
     }
 
-    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    pub(super) fn rmdir(&self, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let result: FuseResult<()> = (|| {
             let parent_path = self.path_for_ino(parent)?;
             let path = Self::child_path(parent_path.as_str(), name)?;
@@ -1807,9 +1876,8 @@ impl Filesystem for RemoteFuseFs {
         }
     }
 
-    fn rename(
+    pub(super) fn rename(
         &self,
-        _req: &Request,
         parent: INodeNo,
         name: &OsStr,
         newparent: INodeNo,
@@ -1838,9 +1906,8 @@ impl Filesystem for RemoteFuseFs {
         }
     }
 
-    fn link(
+    pub(super) fn link(
         &self,
-        _req: &Request,
         ino: INodeNo,
         newparent: INodeNo,
         newname: &OsStr,
@@ -1893,9 +1960,8 @@ impl Filesystem for RemoteFuseFs {
         }
     }
 
-    fn create(
+    pub(super) fn create(
         &self,
-        _req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,

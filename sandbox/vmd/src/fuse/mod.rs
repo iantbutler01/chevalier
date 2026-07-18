@@ -1,4 +1,5 @@
 pub mod cache;
+mod dispatch;
 pub mod client;
 pub mod fs;
 pub mod handle;
