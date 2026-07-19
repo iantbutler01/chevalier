@@ -217,6 +217,7 @@ pub struct Manager {
     resource_bounds: VmResourceBounds,
     base_image_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
     vms: RwLock<HashMap<String, Arc<Vm>>>,
+    vm_capacity_lock: Mutex<()>,
     session_registry: RwLock<HashMap<String, String>>,
     snapshots: RwLock<HashMap<String, SnapshotRecord>>,
     volumes: RwLock<HashMap<String, DurableVolumeMetadata>>,
@@ -250,6 +251,7 @@ impl Manager {
             resource_bounds,
             base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
+            vm_capacity_lock: Mutex::new(()),
             session_registry: RwLock::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
@@ -487,10 +489,14 @@ impl Manager {
         Ok(())
     }
 
+    async fn vm_refs(&self) -> Vec<Arc<Vm>> {
+        self.vms.read().await.values().cloned().collect()
+    }
+
     async fn attached_vm_ids_for_volume(&self, owner_key: &str) -> Vec<String> {
-        let guard = self.vms.read().await;
+        let vms = self.vm_refs().await;
         let mut attached = Vec::new();
-        for vm in guard.values() {
+        for vm in vms {
             let inner = vm.lock().await;
             if inner
                 .metadata
@@ -506,9 +512,9 @@ impl Manager {
     }
 
     async fn visible_attached_vm_ids_for_volume(&self, owner_key: &str) -> Vec<String> {
-        let guard = self.vms.read().await;
+        let vms = self.vm_refs().await;
         let mut attached = Vec::new();
-        for vm in guard.values() {
+        for vm in vms {
             // Inventory is observational and must remain available while a VM
             // operation owns its runtime lock. Mutation paths use the blocking
             // helper above so a busy VM can never make deletion look safe.
@@ -814,9 +820,9 @@ impl Manager {
     }
 
     async fn rehydrate_session_registry(&self) -> usize {
-        let guard = self.vms.read().await;
+        let vms = self.vm_refs().await;
         let mut registry = HashMap::new();
-        for vm in guard.values() {
+        for vm in vms {
             let inner = vm.lock().await;
             if matches!(inner.metadata.state, VmState::Error) {
                 continue;
@@ -994,13 +1000,12 @@ impl Manager {
     }
 
     pub async fn list(&self) -> Vec<VmMetadata> {
-        let guard = self.vms.read().await;
-        let mut snapshots = Vec::with_capacity(guard.len());
-        for vm in guard.values() {
+        let vms = self.vm_refs().await;
+        let mut snapshots = Vec::with_capacity(vms.len());
+        for vm in vms {
             let inner = vm.lock().await;
             snapshots.push(inner.metadata.clone());
         }
-        drop(guard);
 
         let mut vms = Vec::with_capacity(snapshots.len());
         for metadata in snapshots {
@@ -1528,9 +1533,9 @@ impl Manager {
     }
 
     async fn active_vm_count(&self) -> usize {
-        let guard = self.vms.read().await;
+        let vms = self.vm_refs().await;
         let mut count = 0usize;
-        for vm in guard.values() {
+        for vm in vms {
             let inner = vm.lock().await;
             if matches!(
                 inner.metadata.state,
@@ -1558,10 +1563,14 @@ impl Manager {
     }
 
     async fn insert_creating_vm_with_capacity(&self, id: String, vm: Arc<Vm>) -> ManagerResult<()> {
-        let mut guard = self.vms.write().await;
+        // Serialize only the capacity decision and insertion. Snapshotting the VM
+        // references before awaiting their runtime locks keeps the global VM map
+        // available to observational reads while another VM is busy.
+        let _capacity_guard = self.vm_capacity_lock.lock().await;
         if let Some(limit) = self.cfg.max_active_vms {
+            let existing_vms = self.vm_refs().await;
             let mut current = 0usize;
-            for existing in guard.values() {
+            for existing in existing_vms {
                 let inner = existing.lock().await;
                 if matches!(
                     inner.metadata.state,
@@ -1578,7 +1587,7 @@ impl Manager {
                 });
             }
         }
-        guard.insert(id, vm);
+        self.vms.write().await.insert(id, vm);
         Ok(())
     }
 
@@ -6210,15 +6219,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_volume_inventory_does_not_wait_for_busy_vm_runtime() {
+    async fn durable_volume_inventory_does_not_wait_behind_capacity_insertion() {
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let manager = Manager::new(Config {
-            listen_address: "127.0.0.1:0".to_string(),
-            data_dir: tmp.path().join("vmd").to_string_lossy().to_string(),
-            ..Config::default()
-        })
-        .await
-        .expect("create manager");
+        let manager = Arc::new(
+            Manager::new(Config {
+                listen_address: "127.0.0.1:0".to_string(),
+                data_dir: tmp.path().join("vmd").to_string_lossy().to_string(),
+                max_active_vms: Some(2),
+                ..Config::default()
+            })
+            .await
+            .expect("create manager"),
+        );
         let attachment = DurableVolumeAttachment {
             owner_key: "workspace:test:thread:busy-runtime".to_string(),
             volume_id: "busy-runtime".to_string(),
@@ -6238,35 +6250,9 @@ mod tests {
         let vm_id = "busy-volume-vm".to_string();
         let vm_dir = tmp.path().join("vmd").join(&vm_id);
         fs::create_dir_all(&vm_dir).expect("create vm dir");
-        let metadata = VmMetadata {
-            id: vm_id.clone(),
-            name: "busy-volume".to_string(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            state: VmState::Running,
-            architecture: ARCH_AMD64.to_string(),
-            source: VmSource {
-                source_type: VmSourceType::Docker,
-                reference: "mock/image:latest".to_string(),
-            },
-            resources: crate::state::ResourceSpec {
-                vcpu: 1,
-                memory_mb: 512,
-                disk_gb: 10,
-            },
-            network: NetworkSpec {
-                mac: "02:00:00:00:00:04".to_string(),
-                proxy_port: 0,
-                rpc_port: 0,
-            },
-            metadata: HashMap::new(),
-            snapshots: Vec::new(),
-            shared_mounts: Vec::new(),
-            pci_devices: Vec::new(),
-            durable_volume: Some(attachment),
-            boot_incoming_ram_path: String::new(),
-            started_at: None,
-        };
+        let mut metadata = qemu_test_metadata(&vm_id);
+        metadata.state = VmState::Running;
+        metadata.durable_volume = Some(attachment);
         let vm = Arc::new(Vm::new(metadata, VmRuntime::new(&vm_dir), vm_dir));
         manager
             .vms
@@ -6275,14 +6261,42 @@ mod tests {
             .insert(vm_id.clone(), Arc::clone(&vm));
 
         let busy_guard = vm.lock().await;
+        let candidate_id = "capacity-candidate".to_string();
+        let candidate_dir = tmp.path().join("vmd").join(&candidate_id);
+        fs::create_dir_all(&candidate_dir).expect("create candidate VM dir");
+        let mut candidate_metadata = qemu_test_metadata(&candidate_id);
+        candidate_metadata.state = VmState::Creating;
+        let candidate = Arc::new(Vm::new(
+            candidate_metadata,
+            VmRuntime::new(&candidate_dir),
+            candidate_dir,
+        ));
+        let insert_manager = Arc::clone(&manager);
+        let insert_id = candidate_id.clone();
+        let insertion = tokio::spawn(async move {
+            insert_manager
+                .insert_creating_vm_with_capacity(insert_id, candidate)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !insertion.is_finished(),
+            "capacity insertion should be waiting on the busy VM runtime"
+        );
+
         let listed =
             tokio::time::timeout(Duration::from_millis(200), manager.list_durable_volumes())
                 .await
-                .expect("inventory must not wait for a busy VM runtime");
+                .expect("inventory must not wait behind capacity insertion");
         assert_eq!(listed.len(), 1);
         assert!(listed[0].1.is_empty());
         drop(busy_guard);
 
+        insertion
+            .await
+            .expect("join capacity insertion")
+            .expect("capacity insertion should succeed");
+        assert!(manager.vms.read().await.contains_key(&candidate_id));
         let listed = manager.list_durable_volumes().await;
         assert_eq!(listed[0].1, vec![vm_id]);
     }
@@ -6508,6 +6522,7 @@ mod tests {
             resource_bounds: VmResourceBounds::default(),
             base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
+            vm_capacity_lock: Mutex::new(()),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
             volume_operation_locks: Mutex::new(HashMap::new()),
@@ -6791,6 +6806,7 @@ mod tests {
             resource_bounds: VmResourceBounds::default(),
             base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
+            vm_capacity_lock: Mutex::new(()),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
             volume_operation_locks: Mutex::new(HashMap::new()),
@@ -6958,6 +6974,7 @@ mod tests {
             resource_bounds: VmResourceBounds::default(),
             base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
+            vm_capacity_lock: Mutex::new(()),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
             volume_operation_locks: Mutex::new(HashMap::new()),
@@ -7022,6 +7039,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_capacity_insertions_cannot_oversubscribe_limit() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let manager = Arc::new(
+            Manager::new(Config {
+                listen_address: "127.0.0.1:0".to_string(),
+                data_dir: tmp.path().join("vmd").to_string_lossy().to_string(),
+                max_active_vms: Some(1),
+                ..Config::default()
+            })
+            .await
+            .expect("create manager"),
+        );
+
+        let candidate = |id: &str| {
+            let dir = tmp.path().join("vmd").join(id);
+            fs::create_dir_all(&dir).expect("create candidate VM dir");
+            let mut metadata = qemu_test_metadata(id);
+            metadata.state = VmState::Creating;
+            Arc::new(Vm::new(metadata, VmRuntime::new(&dir), dir))
+        };
+        let first_manager = Arc::clone(&manager);
+        let second_manager = Arc::clone(&manager);
+        let (first, second) = tokio::join!(
+            first_manager.insert_creating_vm_with_capacity(
+                "capacity-first".to_string(),
+                candidate("capacity-first"),
+            ),
+            second_manager.insert_creating_vm_with_capacity(
+                "capacity-second".to_string(),
+                candidate("capacity-second"),
+            ),
+        );
+
+        assert_eq!(
+            usize::from(first.is_ok()) + usize::from(second.is_ok()),
+            1,
+            "exactly one concurrent insertion should reserve the only slot"
+        );
+        assert_eq!(manager.vms.read().await.len(), 1);
+        let rejected = if let Err(error) = first {
+            error
+        } else {
+            second.expect_err("second insertion should be the rejected candidate")
+        };
+        assert!(matches!(
+            rejected,
+            ManagerError::CapacityExceeded {
+                resource: "active_vms",
+                limit: 1,
+                current: 1,
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn fork_vm_rejects_when_chain_depth_limit_exceeded() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let data_dir = tmp.path().to_path_buf();
@@ -7062,6 +7134,7 @@ mod tests {
             resource_bounds: VmResourceBounds::default(),
             base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
+            vm_capacity_lock: Mutex::new(()),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
             volume_operation_locks: Mutex::new(HashMap::new()),
@@ -7181,6 +7254,7 @@ mod tests {
             resource_bounds: VmResourceBounds::default(),
             base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
+            vm_capacity_lock: Mutex::new(()),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
             volume_operation_locks: Mutex::new(HashMap::new()),
@@ -7284,6 +7358,7 @@ mod tests {
             resource_bounds: VmResourceBounds::default(),
             base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
+            vm_capacity_lock: Mutex::new(()),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
             volume_operation_locks: Mutex::new(HashMap::new()),
@@ -8124,6 +8199,7 @@ mod tests {
             resource_bounds: VmResourceBounds::default(),
             base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
+            vm_capacity_lock: Mutex::new(()),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
             volume_operation_locks: Mutex::new(HashMap::new()),
