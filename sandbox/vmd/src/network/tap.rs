@@ -67,13 +67,27 @@ impl VmTapNetworkHandle {
         for stop in stops {
             let _ = stop.send(());
         }
-        if let Err(err) = cleanup_vm_tap_network(&self.spec) {
-            warn!(
-                vm_id = %self.spec.vm_id,
-                tap = %self.spec.tap_name,
-                error = %err,
-                "failed cleaning up tap network"
-            );
+        let spec = self.spec.clone();
+        let vm_id = spec.vm_id.clone();
+        let tap = spec.tap_name.clone();
+        match tokio::task::spawn_blocking(move || cleanup_vm_tap_network(&spec)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                warn!(
+                    vm_id = %vm_id,
+                    tap = %tap,
+                    error = %err,
+                    "failed cleaning up tap network"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    vm_id = %vm_id,
+                    tap = %tap,
+                    error = %err,
+                    "tap network cleanup worker failed"
+                );
+            }
         }
     }
 }

@@ -34,21 +34,25 @@ use crate::fuse;
 use crate::image::{self, BASE_IMAGE_EXT, BASE_IMAGE_SIZE_GB, PrebuiltImageStatus};
 use crate::network;
 use crate::pci::{self, PciDeviceAssignmentSpec, PciInventoryDevice, PciInventoryState};
-use crate::state::metadata::{load_metadata, save_metadata};
+use crate::state::metadata::{
+    load_metadata, load_volume_metadata, save_metadata, save_volume_metadata, volume_metadata_path,
+};
 use crate::state::runtime::VmRuntime;
 use crate::state::types::{
-    CreateVmParams, ForkVmParams, NetworkSpec, SharedMountAvailability, SharedMountContinuity,
-    SharedMountSpec, SnapshotMetadata, SnapshotRecord, UpdateVmParams, Vm, VmInner, VmMetadata,
-    VmSource, VmSourceType, VmState, new_snapshot_metadata, sanitize_name,
+    CreateVmParams, DurableVolumeAttachment, DurableVolumeMetadata, ForkVmParams, NetworkSpec,
+    SharedMountAvailability, SharedMountContinuity, SharedMountSpec, SnapshotMetadata,
+    SnapshotRecord, UpdateVmParams, Vm, VmInner, VmMetadata, VmSource, VmSourceType, VmState,
+    new_snapshot_metadata, sanitize_name,
 };
 use crate::virt;
 
 const ARCH_AMD64: &str = "amd64";
 const ARCH_ARM64: &str = "arm64";
 const FORK_BASES_DIR_NAME: &str = "_fork_bases";
+const VOLUMES_DIR_NAME: &str = "volumes";
+const VOLUME_FORK_BASES_DIR_NAME: &str = "_fork_bases";
 const META_FORK_ID: &str = "chevalier.fork_id";
 const META_SESSION_ID: &str = "chevalier.session_id";
-const META_BRANCH_ID: &str = "chevalier.branch_id";
 const META_PARENT_SESSION_ID: &str = "chevalier.parent_session_id";
 const META_FORK_BASE_PATH: &str = "chevalier.fork_base_path";
 const META_PARENT_VM_ID: &str = "chevalier.parent_vm_id";
@@ -152,6 +156,10 @@ pub enum ManagerError {
     VmNotFound,
     #[error("snapshot not found")]
     SnapshotNotFound,
+    #[error("durable volume not found")]
+    VolumeNotFound,
+    #[error("durable volume is attached to VM(s): {0}")]
+    VolumeInUse(String),
     #[error("invalid VM state for operation")]
     InvalidState,
     #[error("operation cancelled")]
@@ -207,8 +215,11 @@ pub struct Manager {
     cfg: Config,
     host_arch: String,
     resource_bounds: VmResourceBounds,
+    base_image_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
     vms: RwLock<HashMap<String, Arc<Vm>>>,
+    session_registry: RwLock<HashMap<String, String>>,
     snapshots: RwLock<HashMap<String, SnapshotRecord>>,
+    volumes: RwLock<HashMap<String, DurableVolumeMetadata>>,
     pci_leases: Mutex<HashMap<String, String>>,
 }
 
@@ -236,11 +247,15 @@ impl Manager {
             cfg,
             host_arch,
             resource_bounds,
+            base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
+            session_registry: RwLock::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
+            volumes: RwLock::new(HashMap::new()),
             pci_leases: Mutex::new(HashMap::new()),
         };
 
+        manager.discover_volumes().await?;
         manager.discover().await?;
         Ok(manager)
     }
@@ -251,6 +266,18 @@ impl Manager {
 
     pub fn normalize_architecture(&self, arch: &str) -> ManagerResult<String> {
         normalize_arch(arch)
+    }
+
+    pub async fn lock_base_image(&self, path: &Path) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.base_image_locks.lock().await;
+            Arc::clone(
+                locks
+                    .entry(path.to_path_buf())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        lock.lock_owned().await
     }
 
     async fn metadata_with_runtime_network_snapshot(&self, mut metadata: VmMetadata) -> VmMetadata {
@@ -291,7 +318,6 @@ impl Manager {
     ) {
         for key in [
             META_SESSION_ID,
-            META_BRANCH_ID,
             META_PARENT_SESSION_ID,
             META_PARENT_VM_ID,
             META_FORK_ID,
@@ -356,6 +382,409 @@ impl Manager {
         Ok(())
     }
 
+    fn volumes_dir(&self) -> PathBuf {
+        PathBuf::from(&self.cfg.data_dir).join(VOLUMES_DIR_NAME)
+    }
+
+    fn volume_disk_path(&self, volume_id: &str) -> PathBuf {
+        self.volumes_dir().join(format!("{volume_id}.qcow2"))
+    }
+
+    fn validate_volume_owner_key(owner_key: &str) -> ManagerResult<()> {
+        let valid = !owner_key.is_empty()
+            && owner_key.len() <= 200
+            && owner_key
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'));
+        if !valid {
+            return Err(ManagerError::Other(anyhow!(
+                "durable volume owner key must use only ASCII letters, digits, '.', '_', '-', or ':'"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn discover_volumes(&self) -> ManagerResult<()> {
+        let dir = self.volumes_dir();
+        fs::create_dir_all(&dir)?;
+        let mut discovered: HashMap<String, DurableVolumeMetadata> = HashMap::new();
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            match load_volume_metadata(&path) {
+                Ok(meta) => {
+                    if let Err(error) = Self::validate_volume_owner_key(&meta.owner_key) {
+                        warn!(path = %path.display(), error = %error, "skipping invalid durable volume metadata");
+                        continue;
+                    }
+                    let disk_path = self.volume_disk_path(&meta.volume_id);
+                    if !disk_path.is_file() {
+                        warn!(
+                            owner_key = %meta.owner_key,
+                            volume_id = %meta.volume_id,
+                            path = %disk_path.display(),
+                            "durable volume metadata has no qcow2; surfacing metadata was skipped"
+                        );
+                        continue;
+                    }
+                    if let Some(kept) = discovered.get(&meta.owner_key) {
+                        // One inconsistent metadata file must never brick daemon
+                        // startup (and all VM discovery with it) — keep the first
+                        // record, surface the duplicate loudly, and continue, like
+                        // every other per-volume problem in this loop.
+                        warn!(
+                            owner_key = %meta.owner_key,
+                            kept_volume_id = %kept.volume_id,
+                            skipped_volume_id = %meta.volume_id,
+                            "duplicate durable volume owner key discovered; keeping first record"
+                        );
+                        continue;
+                    }
+                    discovered.insert(meta.owner_key.clone(), meta);
+                }
+                Err(error) => {
+                    warn!(path = %path.display(), error = %error, "failed to load durable volume metadata");
+                }
+            }
+        }
+        *self.volumes.write().await = discovered;
+        info!(
+            count = self.volumes.read().await.len(),
+            "rehydrated durable volume registry"
+        );
+        Ok(())
+    }
+
+    async fn attached_vm_ids_for_volume(&self, owner_key: &str) -> Vec<String> {
+        let guard = self.vms.read().await;
+        let mut attached = Vec::new();
+        for vm in guard.values() {
+            let inner = vm.lock().await;
+            if inner
+                .metadata
+                .durable_volume
+                .as_ref()
+                .is_some_and(|volume| volume.owner_key == owner_key)
+            {
+                attached.push(inner.metadata.id.clone());
+            }
+        }
+        attached.sort();
+        attached
+    }
+
+    async fn ensure_durable_volume(
+        &self,
+        owner_key: &str,
+        size_gb: i32,
+    ) -> ManagerResult<DurableVolumeAttachment> {
+        Self::validate_volume_owner_key(owner_key)?;
+        if size_gb <= 0 || size_gb > self.resource_bounds.max_disk_gb {
+            return Err(ManagerError::Other(anyhow!(
+                "durable volume size must be between 1 and {} GB",
+                self.resource_bounds.max_disk_gb
+            )));
+        }
+        let mut volumes = self.volumes.write().await;
+        if let Some(existing) = volumes.get(owner_key) {
+            let attached = self.attached_vm_ids_for_volume(owner_key).await;
+            if !attached.is_empty() {
+                return Err(ManagerError::VolumeInUse(attached.join(",")));
+            }
+            return Ok(DurableVolumeAttachment {
+                owner_key: existing.owner_key.clone(),
+                volume_id: existing.volume_id.clone(),
+                size_gb: existing.size_gb,
+            });
+        }
+
+        let dir = self.volumes_dir();
+        fs::create_dir_all(&dir)?;
+        let volume_id = owner_key.to_string();
+        let disk_path = self.volume_disk_path(&volume_id);
+        if disk_path.exists() {
+            return Err(ManagerError::Other(anyhow!(
+                "untracked durable volume disk already exists at {}",
+                disk_path.display()
+            )));
+        }
+        virt::create_qcow2(&self.cfg.qemu_img_bin, &disk_path, size_gb)
+            .await
+            .map_err(ManagerError::Other)?;
+        let now = Utc::now();
+        let mut meta = DurableVolumeMetadata {
+            owner_key: owner_key.to_string(),
+            volume_id: volume_id.clone(),
+            size_gb,
+            created_at: now,
+            updated_at: now,
+            backing_volume_id: None,
+        };
+        if let Err(error) = save_volume_metadata(&dir, &mut meta) {
+            let _ = fs::remove_file(&disk_path);
+            return Err(ManagerError::Other(error));
+        }
+        volumes.insert(owner_key.to_string(), meta);
+        info!(
+            owner_key = %owner_key,
+            volume_id = %volume_id,
+            size_gb,
+            "created durable data volume"
+        );
+        Ok(DurableVolumeAttachment {
+            owner_key: owner_key.to_string(),
+            volume_id,
+            size_gb,
+        })
+    }
+
+    pub async fn list_durable_volumes(&self) -> Vec<(DurableVolumeMetadata, Vec<String>)> {
+        let volumes = self
+            .volumes
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut out = Vec::with_capacity(volumes.len());
+        for volume in volumes {
+            let attached = self.attached_vm_ids_for_volume(&volume.owner_key).await;
+            out.push((volume, attached));
+        }
+        out.sort_by(|left, right| left.0.owner_key.cmp(&right.0.owner_key));
+        out
+    }
+
+    pub async fn delete_durable_volume(&self, owner_key: &str) -> ManagerResult<()> {
+        Self::validate_volume_owner_key(owner_key)?;
+        let attached = self.attached_vm_ids_for_volume(owner_key).await;
+        if !attached.is_empty() {
+            return Err(ManagerError::VolumeInUse(attached.join(",")));
+        }
+        let mut volumes = self.volumes.write().await;
+        let meta = volumes
+            .remove(owner_key)
+            .ok_or(ManagerError::VolumeNotFound)?;
+        let disk_path = self.volume_disk_path(&meta.volume_id);
+        if let Err(error) = fs::remove_file(&disk_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                volumes.insert(owner_key.to_string(), meta);
+                return Err(ManagerError::Io(error));
+            }
+        }
+        let metadata_path = volume_metadata_path(&self.volumes_dir(), &meta.volume_id);
+        if let Err(error) = fs::remove_file(&metadata_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    owner_key = %owner_key,
+                    path = %metadata_path.display(),
+                    error = %error,
+                    "durable volume disk deleted but metadata cleanup failed"
+                );
+            }
+        }
+        info!(owner_key = %owner_key, volume_id = %meta.volume_id, "deleted durable data volume");
+        drop(volumes);
+        if let Some(backing_id) = meta.backing_volume_id.as_deref() {
+            self.cleanup_volume_fork_base_if_unreferenced(backing_id)
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn fork_durable_volume(
+        &self,
+        parent: &DurableVolumeAttachment,
+        child: &DurableVolumeAttachment,
+        fork_id: &str,
+    ) -> ManagerResult<()> {
+        Self::validate_volume_owner_key(&child.owner_key)?;
+        let mut volumes = self.volumes.write().await;
+        if volumes.contains_key(&child.owner_key) {
+            return Err(ManagerError::Other(anyhow!(
+                "durable child volume owner already exists: {}",
+                child.owner_key
+            )));
+        }
+        let mut parent_meta = volumes
+            .get(&parent.owner_key)
+            .cloned()
+            .ok_or(ManagerError::VolumeNotFound)?;
+        let parent_path = self.volume_disk_path(&parent.volume_id);
+        let fork_root = self
+            .volumes_dir()
+            .join(VOLUME_FORK_BASES_DIR_NAME)
+            .join(fork_id);
+        fs::create_dir_all(&fork_root)?;
+        let base_path = fork_root.join("base.qcow2");
+        fs::rename(&parent_path, &base_path)?;
+
+        let child_path = self.volume_disk_path(&child.volume_id);
+        let create_parent = virt::create_overlay(
+            &self.cfg.qemu_img_bin,
+            &base_path,
+            &parent_path,
+            parent.size_gb,
+        )
+        .await;
+        if let Err(error) = create_parent {
+            let _ = fs::rename(&base_path, &parent_path);
+            let _ = fs::remove_dir_all(&fork_root);
+            return Err(ManagerError::Other(error));
+        }
+        let create_child = virt::create_overlay(
+            &self.cfg.qemu_img_bin,
+            &base_path,
+            &child_path,
+            child.size_gb,
+        )
+        .await;
+        if let Err(error) = create_child {
+            let _ = fs::remove_file(&parent_path);
+            let _ = fs::rename(&base_path, &parent_path);
+            let _ = fs::remove_dir_all(&fork_root);
+            return Err(ManagerError::Other(error));
+        }
+
+        let backing_id = format!("fork-base:{fork_id}");
+        parent_meta.backing_volume_id = Some(backing_id.clone());
+        let mut child_meta = DurableVolumeMetadata {
+            owner_key: child.owner_key.clone(),
+            volume_id: child.volume_id.clone(),
+            size_gb: child.size_gb,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            backing_volume_id: Some(backing_id),
+        };
+        if let Err(error) = save_volume_metadata(&self.volumes_dir(), &mut parent_meta)
+            .and_then(|_| save_volume_metadata(&self.volumes_dir(), &mut child_meta))
+        {
+            let _ = fs::remove_file(&parent_path);
+            let _ = fs::remove_file(&child_path);
+            let _ = fs::rename(&base_path, &parent_path);
+            let _ = fs::remove_dir_all(&fork_root);
+            return Err(ManagerError::Other(error));
+        }
+        volumes.insert(parent.owner_key.clone(), parent_meta);
+        volumes.insert(child.owner_key.clone(), child_meta);
+        info!(
+            parent_owner_key = %parent.owner_key,
+            child_owner_key = %child.owner_key,
+            fork_id = %fork_id,
+            "forked durable volume through immutable qcow2 backing"
+        );
+        Ok(())
+    }
+
+    async fn rollback_durable_volume_fork(
+        &self,
+        parent: &DurableVolumeAttachment,
+        child: &DurableVolumeAttachment,
+        fork_id: &str,
+    ) {
+        let mut volumes = self.volumes.write().await;
+        let parent_path = self.volume_disk_path(&parent.volume_id);
+        let child_path = self.volume_disk_path(&child.volume_id);
+        let fork_root = self
+            .volumes_dir()
+            .join(VOLUME_FORK_BASES_DIR_NAME)
+            .join(fork_id);
+        let base_path = fork_root.join("base.qcow2");
+        let _ = fs::remove_file(&parent_path);
+        let _ = fs::remove_file(&child_path);
+        let _ = fs::rename(&base_path, &parent_path);
+        let _ = fs::remove_dir_all(&fork_root);
+        volumes.remove(&child.owner_key);
+        if let Some(parent_meta) = volumes.get_mut(&parent.owner_key) {
+            parent_meta.backing_volume_id = None;
+            let _ = save_volume_metadata(&self.volumes_dir(), parent_meta);
+        }
+        let _ = fs::remove_file(volume_metadata_path(&self.volumes_dir(), &child.volume_id));
+    }
+
+    async fn cleanup_volume_fork_base_if_unreferenced(&self, backing_id: &str) {
+        let Some(fork_id) = backing_id.strip_prefix("fork-base:") else {
+            return;
+        };
+        if self
+            .volumes
+            .read()
+            .await
+            .values()
+            .any(|volume| volume.backing_volume_id.as_deref() == Some(backing_id))
+        {
+            return;
+        }
+        let fork_root = self
+            .volumes_dir()
+            .join(VOLUME_FORK_BASES_DIR_NAME)
+            .join(fork_id);
+        if let Err(error) = fs::remove_dir_all(&fork_root) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    backing_id = %backing_id,
+                    path = %fork_root.display(),
+                    error = %error,
+                    "failed removing unreferenced durable volume fork base"
+                );
+            }
+        }
+    }
+
+    async fn rehydrate_session_registry(&self) -> usize {
+        let guard = self.vms.read().await;
+        let mut registry = HashMap::new();
+        for vm in guard.values() {
+            let inner = vm.lock().await;
+            if matches!(inner.metadata.state, VmState::Error) {
+                continue;
+            }
+            let Some(session_id) = inner.metadata.metadata.get(META_SESSION_ID) else {
+                continue;
+            };
+            if session_id.trim().is_empty() {
+                continue;
+            }
+            if let Some(previous) = registry.insert(session_id.clone(), inner.metadata.id.clone()) {
+                warn!(
+                    session_id = %session_id,
+                    first_vm_id = %previous,
+                    replacement_vm_id = %inner.metadata.id,
+                    "duplicate session id found while rehydrating registry"
+                );
+            }
+        }
+        let count = registry.len();
+        *self.session_registry.write().await = registry;
+        count
+    }
+
+    pub async fn get_by_session_id(&self, session_id: &str) -> ManagerResult<VmMetadata> {
+        let lookup = || async {
+            let vm_id = self.session_registry.read().await.get(session_id).cloned();
+            match vm_id {
+                Some(vm_id) => self.get(&vm_id).await.ok(),
+                None => None,
+            }
+        };
+        if let Some(meta) = lookup().await {
+            return Ok(meta);
+        }
+        let count = self.rehydrate_session_registry().await;
+        info!(
+            session_id = %session_id,
+            registered_sessions = count,
+            "session lookup missed; rehydrated registry once before confirming absence"
+        );
+        lookup().await.ok_or(ManagerError::VmNotFound)
+    }
+
     async fn discover(&self) -> ManagerResult<()> {
         let entries = fs::read_dir(&self.cfg.data_dir)?;
         for entry in entries {
@@ -367,6 +796,9 @@ impl Manager {
                 continue;
             }
             if entry.file_name() == FORK_BASES_DIR_NAME {
+                continue;
+            }
+            if entry.file_name() == VOLUMES_DIR_NAME {
                 continue;
             }
 
@@ -446,6 +878,32 @@ impl Manager {
                     }
 
                     self.vms.write().await.insert(meta.id.clone(), vm);
+                    if !matches!(meta.state, VmState::Error) {
+                        if let Some(session_id) = meta
+                            .metadata
+                            .get(META_SESSION_ID)
+                            .filter(|value| !value.trim().is_empty())
+                        {
+                            let replaced = self
+                                .session_registry
+                                .write()
+                                .await
+                                .insert(session_id.clone(), meta.id.clone());
+                            if let Some(previous) = replaced {
+                                warn!(
+                                    session_id = %session_id,
+                                    previous_vm_id = %previous,
+                                    vm_id = %meta.id,
+                                    "duplicate session mapping replaced during discovery"
+                                );
+                            }
+                            info!(
+                                session_id = %session_id,
+                                vm_id = %meta.id,
+                                "rehydrated persisted session mapping"
+                            );
+                        }
+                    }
                 }
                 Err(err) => {
                     warn!(
@@ -1129,6 +1587,37 @@ impl Manager {
             )));
         }
 
+        let storage_profile = match params.storage_profile.trim() {
+            "" => "local-ephemeral",
+            "local-ephemeral" => "local-ephemeral",
+            "durable-data" => "durable-data",
+            other => {
+                return Err(ManagerError::Other(anyhow!(
+                    "unsupported VM storage profile `{other}`"
+                )));
+            }
+        };
+        let durable_volume = match (storage_profile, params.volume_owner_key.as_deref()) {
+            ("durable-data", Some(owner_key)) if !owner_key.trim().is_empty() => Some(
+                self.ensure_durable_volume(
+                    owner_key,
+                    params.volume_size_gb.unwrap_or(params.resources.disk_gb),
+                )
+                .await?,
+            ),
+            ("durable-data", _) => {
+                return Err(ManagerError::Other(anyhow!(
+                    "durable-data storage profile requires volume_owner_key"
+                )));
+            }
+            (_, Some(_)) => {
+                return Err(ManagerError::Other(anyhow!(
+                    "volume_owner_key requires durable-data storage profile"
+                )));
+            }
+            _ => None,
+        };
+
         let id = Uuid::new_v4().to_string();
         let vm_dir = PathBuf::from(&self.cfg.data_dir).join(&id);
         fs::create_dir_all(&vm_dir)?;
@@ -1154,6 +1643,7 @@ impl Manager {
             snapshots: Vec::new(),
             shared_mounts: params.shared_mounts.clone(),
             pci_devices: Vec::new(),
+            durable_volume,
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -1178,7 +1668,7 @@ impl Manager {
         }
         meta.metadata.insert(
             META_STORAGE_PROFILE.to_string(),
-            self.cfg.storage_profile.as_str().to_string(),
+            storage_profile.to_string(),
         );
         assign_new_portproxy_auth_token(&mut meta.metadata);
 
@@ -1245,6 +1735,18 @@ impl Manager {
         let vm_name = created_metadata.name.clone();
         drop(vm_guard);
 
+        if let Some(session_id) = created_metadata
+            .metadata
+            .get(META_SESSION_ID)
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.session_registry
+                .write()
+                .await
+                .insert(session_id.clone(), id.clone());
+            info!(session_id = %session_id, vm_id = %id, "registered newly created session");
+        }
+
         if params.auto_start {
             emit_stage_progress(
                 &progress,
@@ -1298,9 +1800,12 @@ impl Manager {
 
     pub async fn delete_vm(&self, id: &str, _purge_snapshots: bool) -> ManagerResult<()> {
         let vm = self.vm_by_id(id).await?;
-        let fork_base_path = {
+        let (fork_base_path, session_id) = {
             let inner = vm.lock().await;
-            inner.metadata.metadata.get(META_FORK_BASE_PATH).cloned()
+            (
+                inner.metadata.metadata.get(META_FORK_BASE_PATH).cloned(),
+                inner.metadata.metadata.get(META_SESSION_ID).cloned(),
+            )
         };
         let state = {
             let inner = vm.lock().await;
@@ -1332,6 +1837,9 @@ impl Manager {
         fs::remove_dir_all(&vm.dir)?;
         let _ = fs::remove_dir_all(runtime_dir);
         self.vms.write().await.remove(id);
+        if let Some(session_id) = session_id {
+            self.session_registry.write().await.remove(&session_id);
+        }
         self.snapshots
             .write()
             .await
@@ -1381,18 +1889,12 @@ impl Manager {
             self.force_stop_vm(parent_id).await?;
             fork_snapshot = Some(snapshot);
         }
-        // @dive: Child VM keeps its own snapshot identity (new id, same snapshot name)
-        //        so restore-by-id resolves correctly after failover.
-        let child_restore_snapshot = fork_snapshot.as_ref().map(|snapshot| SnapshotMetadata {
-            id: Uuid::new_v4().to_string(),
-            name: snapshot.name.clone(),
-            label: snapshot.label.clone(),
-            description: snapshot.description.clone(),
-            created_at: snapshot.created_at,
-            ram_file_name: snapshot.ram_file_name.clone(),
-            ram_format: snapshot.ram_format.clone(),
-            guest_runtime_fingerprint: snapshot.guest_runtime_fingerprint.clone(),
-        });
+        // @dive: A forked child must cold-boot its own bootstrap ISO so its network,
+        //        auth token, and instance identity replace the parent's running guest
+        //        configuration. The parent still resumes its RAM snapshot; the child
+        //        starts from the exact qcow2 disk/volume fork point without inheriting
+        //        the parent's live userspace or NIC state.
+        let child_restore_snapshot = None::<SnapshotMetadata>;
 
         let (
             parent_name,
@@ -1401,6 +1903,7 @@ impl Manager {
             parent_source,
             parent_metadata,
             parent_shared_mounts,
+            parent_durable_volume,
             parent_depth,
         ) = {
             let inner = parent_vm.lock().await;
@@ -1420,6 +1923,7 @@ impl Manager {
                 inner.metadata.source.clone(),
                 inner.metadata.metadata.clone(),
                 inner.metadata.shared_mounts.clone(),
+                inner.metadata.durable_volume.clone(),
                 parent_depth,
             )
         };
@@ -1444,13 +1948,14 @@ impl Manager {
         );
         let mut child_metadata = parent_metadata;
         child_metadata.extend(params.child_metadata);
+        let vm_storage_profile = child_metadata
+            .get(META_STORAGE_PROFILE)
+            .cloned()
+            .unwrap_or_else(|| self.cfg.storage_profile.as_str().to_string());
         child_metadata.insert(META_FORK_ID.to_string(), fork_id.clone());
         child_metadata.insert(META_PARENT_VM_ID.to_string(), parent_id.to_string());
         child_metadata.insert(META_FORK_DEPTH.to_string(), child_depth.to_string());
-        child_metadata.insert(
-            META_STORAGE_PROFILE.to_string(),
-            self.cfg.storage_profile.as_str().to_string(),
-        );
+        child_metadata.insert(META_STORAGE_PROFILE.to_string(), vm_storage_profile.clone());
         child_metadata.insert(
             META_FORK_DURABILITY_CLASS.to_string(),
             fork_durability_class.to_string(),
@@ -1463,17 +1968,18 @@ impl Manager {
         child_metadata.remove(META_FORK_BASE_PATH);
         child_metadata.remove(META_EXEC_RESTORE_SNAPSHOT_ID);
         child_metadata.remove(META_EXEC_RESTORE_SNAPSHOT_NAME);
-        if let Some(snapshot) = child_restore_snapshot.as_ref() {
-            child_metadata.insert(META_FORK_SNAPSHOT.to_string(), snapshot.name.clone());
-            child_metadata.insert(
-                META_EXEC_RESTORE_SNAPSHOT_NAME.to_string(),
-                snapshot.name.clone(),
-            );
-            child_metadata.insert(
-                META_EXEC_RESTORE_SNAPSHOT_ID.to_string(),
-                snapshot.id.clone(),
-            );
-        }
+        let child_durable_volume = parent_durable_volume.as_ref().map(|parent_volume| {
+            let child_owner_key = child_metadata
+                .get(META_SESSION_ID)
+                .filter(|value| !value.trim().is_empty())
+                .map(|session_id| format!("fork:{session_id}"))
+                .unwrap_or_else(|| format!("fork:{child_id}"));
+            DurableVolumeAttachment {
+                volume_id: child_owner_key.clone(),
+                owner_key: child_owner_key,
+                size_gb: parent_volume.size_gb,
+            }
+        });
 
         let child_dir = PathBuf::from(&self.cfg.data_dir).join(&child_id);
         let parent_disk = parent_vm.disk_path();
@@ -1499,6 +2005,7 @@ impl Manager {
             snapshots: child_restore_snapshot.clone().into_iter().collect(),
             shared_mounts: parent_shared_mounts,
             pci_devices: Vec::new(),
+            durable_volume: child_durable_volume.clone(),
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -1520,43 +2027,79 @@ impl Manager {
                 let _ = self.start_vm(parent_id).await;
                 return Err(ManagerError::Io(err));
             }
-            // @dive: Pre-create the child's snapshots dir so the RAM reflink below has
-            //        somewhere to land, and so the child's vm_dir layout mirrors the
-            //        parent's (both store snapshot RAM files at <vm_dir>/snapshots/<name>).
+            // Keep the ordinary VM directory layout even though the child cold-boots
+            // from the disk/volume fork and therefore owns no RAM snapshot.
             if let Err(err) = fs::create_dir_all(child_dir.join("snapshots")) {
                 let _ = fs::remove_dir_all(&child_dir);
                 let _ = self.start_vm(parent_id).await;
                 return Err(ManagerError::Io(err));
             }
 
-            let child_disk = child_dir.join("disk.qcow2");
-            if let Err(err) =
-                virt::clone_file_cow(parent_disk.as_path(), child_disk.as_path()).await
-            {
+            // @dive: The production data path may be ext4 or another filesystem without
+            //        FICLONE support. Move the stopped point-in-time disk into an
+            //        immutable qcow2 base and give parent/child separate overlays, the
+            //        same portable CoW model used for stopped forks and durable volumes.
+            let fork_root = self.fork_base_root().join(&fork_id);
+            if let Err(err) = fs::create_dir_all(&fork_root) {
                 let _ = fs::remove_dir_all(&child_dir);
+                let _ = self.start_vm(parent_id).await;
+                return Err(ManagerError::Io(err));
+            }
+            let fork_base = fork_root.join("base.qcow2");
+            if let Err(err) = fs::rename(&parent_disk, &fork_base) {
+                let _ = fs::remove_dir_all(&fork_root);
+                let _ = fs::remove_dir_all(&child_dir);
+                let _ = self.start_vm(parent_id).await;
+                return Err(ManagerError::Io(err));
+            }
+
+            let parent_size_gb = parent_resources.disk_gb.max(BASE_IMAGE_SIZE_GB);
+            if let Err(err) = virt::create_overlay(
+                &self.cfg.qemu_img_bin,
+                fork_base.as_path(),
+                parent_disk.as_path(),
+                parent_size_gb,
+            )
+            .await
+            {
+                Self::rollback_stopped_fork_artifacts(
+                    parent_disk.as_path(),
+                    fork_base.as_path(),
+                    fork_root.as_path(),
+                    child_dir.as_path(),
+                );
                 let _ = self.start_vm(parent_id).await;
                 return Err(ManagerError::Other(err));
             }
 
-            // @dive: Reflink-clone the parent's external RAM file into the child's
-            //        snapshots dir. Same CoW semantic as the disk reflink above —
-            //        filesystem-level FICLONE where supported, byte copy fallback
-            //        otherwise. Child and parent will each relaunch with their own
-            //        -incoming file:<path> pointing at their own copy, and writes to
-            //        RAM diverge at the filesystem level on the first page touch.
+            let child_disk = child_dir.join("disk.qcow2");
+            let child_size_gb = child_meta.resources.disk_gb.max(BASE_IMAGE_SIZE_GB);
+            if let Err(err) = virt::create_overlay(
+                &self.cfg.qemu_img_bin,
+                fork_base.as_path(),
+                child_disk.as_path(),
+                child_size_gb,
+            )
+            .await
+            {
+                Self::rollback_stopped_fork_artifacts(
+                    parent_disk.as_path(),
+                    fork_base.as_path(),
+                    fork_root.as_path(),
+                    child_dir.as_path(),
+                );
+                let _ = self.start_vm(parent_id).await;
+                return Err(ManagerError::Other(err));
+            }
+            child_meta.metadata.insert(
+                META_FORK_BASE_PATH.to_string(),
+                fork_base.to_string_lossy().to_string(),
+            );
+
             let parent_ram_path = parent_vm
                 .dir
                 .join("snapshots")
                 .join(&snapshot_ram_file_name);
-            let child_ram_path = child_dir.join("snapshots").join(&snapshot_ram_file_name);
-            if let Err(err) =
-                virt::clone_file_cow(parent_ram_path.as_path(), child_ram_path.as_path()).await
-            {
-                let _ = fs::remove_dir_all(&child_dir);
-                let _ = self.start_vm(parent_id).await;
-                return Err(ManagerError::Other(err));
-            }
-            child_meta.boot_incoming_ram_path = child_ram_path.to_string_lossy().into_owned();
 
             let bootstrap_path = child_dir.join("bootstrap.iso");
             if let Err(err) = bootstrap::create_iso(
@@ -1577,14 +2120,25 @@ impl Manager {
                         .metadata
                         .get(META_PORTPROXY_AUTH_TOKEN)
                         .cloned(),
+                    durable_volume: child_meta.durable_volume.is_some(),
                 },
             ) {
-                let _ = fs::remove_dir_all(&child_dir);
+                Self::rollback_stopped_fork_artifacts(
+                    parent_disk.as_path(),
+                    fork_base.as_path(),
+                    fork_root.as_path(),
+                    child_dir.as_path(),
+                );
                 let _ = self.start_vm(parent_id).await;
                 return Err(ManagerError::Other(err));
             }
             if let Err(err) = save_metadata(&child_dir, &mut child_meta) {
-                let _ = fs::remove_dir_all(&child_dir);
+                Self::rollback_stopped_fork_artifacts(
+                    parent_disk.as_path(),
+                    fork_base.as_path(),
+                    fork_root.as_path(),
+                    child_dir.as_path(),
+                );
                 let _ = self.start_vm(parent_id).await;
                 return Err(ManagerError::Other(err));
             }
@@ -1599,10 +2153,10 @@ impl Manager {
                     .metadata
                     .metadata
                     .insert(META_FORK_DEPTH.to_string(), parent_depth.to_string());
-                inner.metadata.metadata.insert(
-                    META_STORAGE_PROFILE.to_string(),
-                    self.cfg.storage_profile.as_str().to_string(),
-                );
+                inner
+                    .metadata
+                    .metadata
+                    .insert(META_STORAGE_PROFILE.to_string(), vm_storage_profile.clone());
                 inner.metadata.metadata.insert(
                     META_FORK_DURABILITY_CLASS.to_string(),
                     fork_durability_class.to_string(),
@@ -1615,22 +2169,65 @@ impl Manager {
                     .metadata
                     .metadata
                     .insert(META_FORK_SNAPSHOT.to_string(), snapshot_name.clone());
-                inner.metadata.metadata.remove(META_FORK_BASE_PATH);
-                // @dive: Parent relaunches from the snapshot via -incoming, consuming
-                //        its own (unchanged, parent-dir) copy of the RAM file. The
-                //        child got its own reflink-cloned copy above.
+                inner.metadata.metadata.insert(
+                    META_FORK_BASE_PATH.to_string(),
+                    fork_base.to_string_lossy().to_string(),
+                );
+                // @dive: Parent relaunches from the snapshot via -incoming. Parent
+                //        and child have separate path links to the immutable RAM file.
                 inner.metadata.boot_incoming_ram_path =
                     parent_ram_path.to_string_lossy().into_owned();
                 if let Err(err) = save_metadata(&parent_vm.dir, &mut inner.metadata) {
-                    let _ = fs::remove_dir_all(&child_dir);
+                    inner.metadata = parent_before_metadata.clone();
+                    Self::rollback_stopped_fork_artifacts(
+                        parent_disk.as_path(),
+                        fork_base.as_path(),
+                        fork_root.as_path(),
+                        child_dir.as_path(),
+                    );
+                    drop(inner);
                     let _ = self.start_vm(parent_id).await;
                     return Err(ManagerError::Other(err));
                 }
             }
 
+            if let (Some(parent_volume), Some(child_volume)) = (
+                parent_durable_volume.as_ref(),
+                child_durable_volume.as_ref(),
+            ) {
+                if let Err(err) = self
+                    .fork_durable_volume(parent_volume, child_volume, &fork_id)
+                    .await
+                {
+                    Self::rollback_stopped_fork_artifacts(
+                        parent_disk.as_path(),
+                        fork_base.as_path(),
+                        fork_root.as_path(),
+                        child_dir.as_path(),
+                    );
+                    let mut inner = parent_vm.lock().await;
+                    inner.metadata = parent_before_metadata.clone();
+                    let _ = save_metadata(&parent_vm.dir, &mut inner.metadata);
+                    drop(inner);
+                    let _ = self.start_vm(parent_id).await;
+                    return Err(err);
+                }
+            }
             let started_parent = self.start_vm(parent_id).await;
             if let Err(err) = started_parent {
-                let _ = fs::remove_dir_all(&child_dir);
+                if let (Some(parent_volume), Some(child_volume)) = (
+                    parent_durable_volume.as_ref(),
+                    child_durable_volume.as_ref(),
+                ) {
+                    self.rollback_durable_volume_fork(parent_volume, child_volume, &fork_id)
+                        .await;
+                }
+                Self::rollback_stopped_fork_artifacts(
+                    parent_disk.as_path(),
+                    fork_base.as_path(),
+                    fork_root.as_path(),
+                    child_dir.as_path(),
+                );
                 let mut inner = parent_vm.lock().await;
                 inner.metadata = parent_before_metadata.clone();
                 let _ = save_metadata(&parent_vm.dir, &mut inner.metadata);
@@ -1726,6 +2323,7 @@ impl Manager {
                         .metadata
                         .get(META_PORTPROXY_AUTH_TOKEN)
                         .cloned(),
+                    durable_volume: child_meta.durable_volume.is_some(),
                 },
             ) {
                 Self::rollback_stopped_fork_artifacts(
@@ -1756,10 +2354,10 @@ impl Manager {
                     .metadata
                     .metadata
                     .insert(META_FORK_DEPTH.to_string(), parent_depth.to_string());
-                inner.metadata.metadata.insert(
-                    META_STORAGE_PROFILE.to_string(),
-                    self.cfg.storage_profile.as_str().to_string(),
-                );
+                inner
+                    .metadata
+                    .metadata
+                    .insert(META_STORAGE_PROFILE.to_string(), vm_storage_profile);
                 inner.metadata.metadata.insert(
                     META_FORK_DURABILITY_CLASS.to_string(),
                     fork_durability_class.to_string(),
@@ -1784,6 +2382,23 @@ impl Manager {
                 }
                 parent_after = inner.metadata.clone();
             }
+            if let (Some(parent_volume), Some(child_volume)) = (
+                parent_durable_volume.as_ref(),
+                child_durable_volume.as_ref(),
+            ) {
+                if let Err(err) = self
+                    .fork_durable_volume(parent_volume, child_volume, &fork_id)
+                    .await
+                {
+                    Self::rollback_stopped_fork_artifacts(
+                        parent_disk.as_path(),
+                        fork_base.as_path(),
+                        fork_root.as_path(),
+                        child_dir.as_path(),
+                    );
+                    return Err(err);
+                }
+            }
         }
 
         let child_vm = Arc::new(Vm::new(
@@ -1792,6 +2407,17 @@ impl Manager {
             child_dir,
         ));
         self.vms.write().await.insert(child_id.clone(), child_vm);
+        if let Some(session_id) = child_meta
+            .metadata
+            .get(META_SESSION_ID)
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.session_registry
+                .write()
+                .await
+                .insert(session_id.clone(), child_id.clone());
+            info!(session_id = %session_id, vm_id = %child_id, "registered forked session");
+        }
         if let Some(snapshot) = child_restore_snapshot {
             self.snapshots.write().await.insert(
                 snapshot.id.clone(),
@@ -2530,6 +3156,7 @@ impl Manager {
                     .metadata
                     .get(META_PORTPROXY_AUTH_TOKEN)
                     .cloned(),
+                durable_volume: meta_snapshot.durable_volume.is_some(),
             },
         ) {
             let _ = network::unregister_vm_proxy_policy(id).await;
@@ -2712,9 +3339,25 @@ impl Manager {
                 return Err(ManagerError::Other(err));
             }
         }
-        if let Err(err) =
-            configure_qemu_process_identity(&mut cmd, vm_dir.as_path(), runtime_dir.as_path(), &cfg)
-        {
+        let additional_qemu_writable_paths = meta_snapshot
+            .durable_volume
+            .as_ref()
+            .and_then(|volume| {
+                vm_dir.parent().map(|data_dir| {
+                    data_dir
+                        .join(VOLUMES_DIR_NAME)
+                        .join(format!("{}.qcow2", volume.volume_id))
+                })
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        if let Err(err) = configure_qemu_process_identity(
+            &mut cmd,
+            vm_dir.as_path(),
+            runtime_dir.as_path(),
+            &additional_qemu_writable_paths,
+            &cfg,
+        ) {
             if let Some(cgroup) = qemu_cgroup.take() {
                 cgroup.cleanup();
             }
@@ -3129,7 +3772,15 @@ impl Manager {
         let mut force_reclaimed_runtime = false;
         if matches!(runtime_state, VmState::Running | VmState::Paused) {
             if let Some(monitor) = monitor {
-                let quit_result = virt::quit(&monitor).await;
+                let quit_result = match tokio::time::timeout(
+                    Duration::from_secs(3),
+                    virt::quit(&monitor),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow!("timed out sending qmp quit command")),
+                };
                 if quit_result.is_err() && pid > 0 {
                     kill_process(pid).map_err(ManagerError::Other)?;
                 }
@@ -3358,6 +4009,7 @@ impl Manager {
         let abs_base_path = base_path
             .canonicalize()
             .unwrap_or_else(|_| base_path.clone());
+        let _base_image_guard = self.lock_base_image(&abs_base_path).await;
 
         emit_stage_progress(
             &progress,
@@ -3569,6 +4221,7 @@ impl Manager {
                 .metadata
                 .get(META_PORTPROXY_AUTH_TOKEN)
                 .cloned(),
+            durable_volume: guard.metadata.durable_volume.is_some(),
         };
         bootstrap::create_iso(&bootstrap_path, cfg).map_err(ManagerError::Other)?;
 
@@ -3781,7 +4434,7 @@ impl Manager {
     }
 
     async fn garbage_collect_orphaned_fork_roots(&self) {
-        // @dive: GC only removes fork-base roots with zero metadata references, preserving live branch isolation guarantees.
+        // @dive: GC only removes fork-base roots with zero metadata references, preserving live fork isolation guarantees.
         let fork_root = self.fork_base_root();
         if !fork_root.exists() {
             return;
@@ -3947,6 +4600,29 @@ fn build_qemu_args(
         "virtio-net-pci,netdev=net0,mac={}",
         meta.network.mac
     ));
+    if tap_network.is_some() {
+        let runtime_network = map_bootstrap_network(meta);
+        let runtime_values = [
+            ("tap-mac", runtime_network.mac_address.as_str()),
+            ("tap-address-cidr", runtime_network.address_cidr.as_str()),
+            ("tap-gateway", runtime_network.gateway.as_str()),
+            ("tap-dns", runtime_network.dns.as_str()),
+            ("hostname", meta.name.as_str()),
+            (
+                "portproxy-auth-token",
+                meta.metadata
+                    .get(META_PORTPROXY_AUTH_TOKEN)
+                    .map(String::as_str)
+                    .unwrap_or(""),
+            ),
+        ];
+        for (name, value) in runtime_values {
+            args.push("-fw_cfg".to_string());
+            args.push(format!("name=opt/chevalier/{name},string={value}"));
+            args.push("-smbios".to_string());
+            args.push(format!("type=11,value=chevalier.{name}={value}"));
+        }
+    }
     for assignment in &meta.pci_devices {
         for (function_index, bdf) in assignment.bdfs.iter().enumerate() {
             args.push("-device".to_string());
@@ -4023,6 +4699,27 @@ fn build_qemu_args(
             "file={},if=virtio,index=1,id=bootstrap,media=cdrom,readonly=on",
             bootstrap_iso.display()
         ));
+    }
+    // The d2vm base image's first-boot loader intentionally finds bootstrap.iso
+    // at /dev/vdb. Keep that compatibility disk ahead of the durable attachment
+    // and pin the latter to a high PCI slot; the durable disk has a stable serial
+    // and is discovered by-id, so its /dev/vd* enumeration is deliberately irrelevant.
+    if let Some(volume) = meta.durable_volume.as_ref() {
+        let volume_path = vm_dir
+            .parent()
+            .ok_or_else(|| anyhow!("VM directory has no data-dir parent"))?
+            .join(VOLUMES_DIR_NAME)
+            .join(format!("{}.qcow2", volume.volume_id));
+        args.push("-drive".to_string());
+        args.push(format!(
+            "file={},if=none,id=openbracket-durable,cache=none,aio=threads,format=qcow2",
+            volume_path.display()
+        ));
+        args.push("-device".to_string());
+        args.push(
+            "virtio-blk-pci,drive=openbracket-durable,serial=openbracket-durable,bus=pcie.0,addr=0x1e"
+                .to_string(),
+        );
     }
 
     Ok(args)
@@ -4528,7 +5225,15 @@ fn spawn_exit_task(
             let _ = fuse::unmount_fuse(handle).await;
         }
         if let Some(handle) = inner.runtime.tap_network.take() {
-            handle.shutdown().await;
+            if tokio::time::timeout(Duration::from_secs(10), handle.shutdown())
+                .await
+                .is_err()
+            {
+                warn!(
+                    vm_id = %vm_id,
+                    "timed out cleaning up tap network after VM exit"
+                );
+            }
         }
 
         let preserve_existing_error_reason = {
@@ -4584,6 +5289,7 @@ fn configure_qemu_process_identity(
     cmd: &mut Command,
     vm_dir: &Path,
     runtime_dir: &Path,
+    additional_writable_paths: &[PathBuf],
     cfg: &Config,
 ) -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
@@ -4609,6 +5315,14 @@ fn configure_qemu_process_identity(
             runtime_dir.display()
         )
     })?;
+    for path in additional_writable_paths {
+        chown_single_path(
+            path,
+            cfg.qemu_process.run_as_uid,
+            cfg.qemu_process.run_as_gid,
+        )
+        .with_context(|| format!("chown qemu writable path {}", path.display()))?;
+    }
 
     let uid = cfg.qemu_process.run_as_uid;
     let gid = cfg.qemu_process.run_as_gid;
@@ -4643,6 +5357,7 @@ fn configure_qemu_process_identity(
     _cmd: &mut Command,
     _vm_dir: &Path,
     _runtime_dir: &Path,
+    _additional_writable_paths: &[PathBuf],
     _cfg: &Config,
 ) -> Result<()> {
     Ok(())
@@ -5289,6 +6004,38 @@ mod tests {
             .expect("operator-configured bounds should admit the dedicated VM");
     }
 
+    #[tokio::test]
+    async fn base_image_lock_serializes_same_target() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let manager = Arc::new(
+            Manager::new(Config {
+                listen_address: "127.0.0.1:0".to_string(),
+                data_dir: tmp.path().to_string_lossy().to_string(),
+                ..Config::default()
+            })
+            .await
+            .expect("create manager"),
+        );
+        let target = tmp.path().join("base-images/runtime.qcow2");
+        let first = manager.lock_base_image(&target).await;
+        let waiting_manager = Arc::clone(&manager);
+        let waiting_target = target.clone();
+        let waiting = tokio::spawn(async move {
+            let _guard = waiting_manager.lock_base_image(&waiting_target).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !waiting.is_finished(),
+            "same-target preparation must wait for the active converter"
+        );
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("queued preparation should acquire the released lock")
+            .expect("queued preparation task should succeed");
+    }
+
     fn qemu_img_available() -> bool {
         std::process::Command::new("qemu-img")
             .arg("--version")
@@ -5359,6 +6106,7 @@ mod tests {
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
             pci_devices: Vec::new(),
+            durable_volume: None,
             boot_incoming_ram_path: String::new(),
             started_at: None,
         }
@@ -5436,7 +6184,10 @@ mod tests {
             cfg,
             host_arch: test_arch.to_string(),
             resource_bounds: VmResourceBounds::default(),
+            base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
+            session_registry: RwLock::new(HashMap::new()),
+            volumes: RwLock::new(HashMap::new()),
             pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };
@@ -5472,6 +6223,10 @@ mod tests {
             "qemu-img create failed: {}",
             String::from_utf8_lossy(&create_output.stderr)
         );
+        let parent_volume = manager
+            .ensure_durable_volume("workspace:test:thread:parent", 1)
+            .await
+            .expect("create parent durable volume");
 
         let mut parent_meta = VmMetadata {
             id: parent_id.clone(),
@@ -5494,7 +6249,10 @@ mod tests {
                 proxy_port: 0,
                 rpc_port: 0,
             },
-            metadata: HashMap::new(),
+            metadata: HashMap::from([(
+                META_STORAGE_PROFILE.to_string(),
+                "durable-data".to_string(),
+            )]),
             snapshots: Vec::new(),
             shared_mounts: vec![SharedMountSpec {
                 host_path: parent_dir.to_string_lossy().to_string(),
@@ -5508,6 +6266,7 @@ mod tests {
                 vfs_scope_path: String::new(),
             }],
             pci_devices: Vec::new(),
+            durable_volume: Some(parent_volume.clone()),
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -5561,7 +6320,7 @@ mod tests {
                 .metadata
                 .get(META_STORAGE_PROFILE)
                 .map(String::as_str),
-            Some(config::StorageProfile::LocalEphemeral.as_str())
+            Some("durable-data")
         );
         assert_eq!(
             child_after
@@ -5580,6 +6339,11 @@ mod tests {
         assert_eq!(child_after.shared_mounts, parent_after.shared_mounts);
         assert_eq!(child_after.shared_mounts[0].guest_path, "/workspace");
         assert_eq!(child_after.shared_mounts[0].mount_tag, "runtimefs");
+        let child_volume = child_after
+            .durable_volume
+            .as_ref()
+            .expect("forked VM should have a child durable volume");
+        assert_ne!(child_volume.volume_id, parent_volume.volume_id);
 
         let fork_base_path = parent_after
             .metadata
@@ -5607,6 +6371,17 @@ mod tests {
             PathBuf::from(parent_backing),
             PathBuf::from(fork_base_path),
             "overlay backing should point to persisted fork base"
+        );
+
+        let parent_volume_path = manager.volume_disk_path(&parent_volume.volume_id);
+        let child_volume_path = manager.volume_disk_path(&child_volume.volume_id);
+        let parent_volume_backing = qemu_backing_file(&parent_volume_path)
+            .expect("parent durable overlay missing backing file");
+        let child_volume_backing = qemu_backing_file(&child_volume_path)
+            .expect("child durable overlay missing backing file");
+        assert_eq!(
+            parent_volume_backing, child_volume_backing,
+            "parent and child durable volumes must share an immutable CoW backing"
         );
 
         unsafe {
@@ -5646,10 +6421,14 @@ mod tests {
                 proxy_port: 0,
                 rpc_port: 0,
             },
-            metadata: HashMap::new(),
+            metadata: HashMap::from([(
+                META_SESSION_ID.to_string(),
+                "persisted-session".to_string(),
+            )]),
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
             pci_devices: Vec::new(),
+            durable_volume: None,
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -5687,7 +6466,10 @@ mod tests {
             cfg,
             host_arch: ARCH_AMD64.to_string(),
             resource_bounds: VmResourceBounds::default(),
+            base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
+            session_registry: RwLock::new(HashMap::new()),
+            volumes: RwLock::new(HashMap::new()),
             pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };
@@ -5697,9 +6479,118 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, vm_id);
         assert_eq!(listed[0].state, VmState::Stopped);
+        assert_eq!(
+            manager
+                .get_by_session_id("persisted-session")
+                .await
+                .expect("rehydrated session lookup")
+                .id,
+            vm_id
+        );
+        manager.session_registry.write().await.clear();
+        assert_eq!(
+            manager
+                .get_by_session_id("persisted-session")
+                .await
+                .expect("one lookup-time registry rebuild")
+                .id,
+            vm_id
+        );
+        assert!(matches!(
+            manager.get_by_session_id("missing-session").await,
+            Err(ManagerError::VmNotFound)
+        ));
 
         let persisted = load_metadata(&vm_dir).expect("reload persisted metadata");
         assert_eq!(persisted.state, VmState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn durable_volume_registry_survives_manager_restart_and_explicit_delete() {
+        if !qemu_img_available() {
+            eprintln!("qemu-img unavailable; skipping durable volume registry runtime test");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let data_dir = tmp.path().to_path_buf();
+        fs::create_dir_all(data_dir.join(config::BASE_IMAGES_DIR_NAME))
+            .expect("create base images");
+        let cfg = Config {
+            listen_address: "127.0.0.1:0".to_string(),
+            data_dir: data_dir.to_string_lossy().to_string(),
+            qemu_bin: "qemu-system-x86_64".to_string(),
+            qemu_arm64_bin: "qemu-system-aarch64".to_string(),
+            qemu_img_bin: "qemu-img".to_string(),
+            virtiofsd_bin: "/usr/lib/qemu/virtiofsd".to_string(),
+            docker_bin: "docker".to_string(),
+            log_level: "info".to_string(),
+            force_local_build: false,
+            max_active_vms: None,
+            max_fork_chain_depth: 32,
+            fork_compaction_depth_threshold: 8,
+            storage_profile: config::StorageProfile::LocalEphemeral,
+            shared_mount_profiles: vec!["local-path".to_string()],
+            ha_mode: false,
+            node_registry: None,
+            control_bus: None,
+            vfs_internal_service_token: None,
+            pci_policy_path: None,
+            pci: Default::default(),
+            qemu_process: Default::default(),
+            guest_network: Default::default(),
+            network_services: Default::default(),
+            security: Default::default(),
+            snapshot_staging_dir: None,
+        };
+
+        let manager = Manager::new(cfg.clone()).await.expect("create manager");
+        let created = manager
+            .ensure_durable_volume("thread:durable-test", 1)
+            .await
+            .expect("create durable volume");
+        assert_eq!(created.owner_key, "thread:durable-test");
+        assert!(manager.volume_disk_path(&created.volume_id).is_file());
+        drop(manager);
+
+        let restarted = Manager::new(cfg).await.expect("restart manager");
+        let listed = restarted.list_durable_volumes().await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0.owner_key, "thread:durable-test");
+        assert!(listed[0].1.is_empty());
+        let reattached = restarted
+            .ensure_durable_volume("thread:durable-test", 1)
+            .await
+            .expect("reattach retained volume");
+        assert_eq!(reattached.volume_id, created.volume_id);
+
+        let backing_id = "fork-base:durable-delete-test";
+        let fork_root = restarted
+            .volumes_dir()
+            .join(VOLUME_FORK_BASES_DIR_NAME)
+            .join("durable-delete-test");
+        fs::create_dir_all(&fork_root).expect("create durable fork base directory");
+        fs::write(fork_root.join("base.qcow2"), b"test").expect("create durable fork base");
+        {
+            let mut volumes = restarted.volumes.write().await;
+            let volume = volumes
+                .get_mut("thread:durable-test")
+                .expect("durable volume registry entry");
+            volume.backing_volume_id = Some(backing_id.to_string());
+            save_volume_metadata(&restarted.volumes_dir(), volume)
+                .expect("persist durable backing identity");
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            restarted.delete_durable_volume("thread:durable-test"),
+        )
+        .await
+        .expect("backed durable volume deletion must not deadlock")
+        .expect("delete unattached durable volume");
+        assert!(restarted.list_durable_volumes().await.is_empty());
+        assert!(!restarted.volume_disk_path(&created.volume_id).exists());
+        assert!(!fork_root.exists());
     }
 
     #[tokio::test]
@@ -5741,7 +6632,10 @@ mod tests {
             cfg,
             host_arch: ARCH_AMD64.to_string(),
             resource_bounds: VmResourceBounds::default(),
+            base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
+            session_registry: RwLock::new(HashMap::new()),
+            volumes: RwLock::new(HashMap::new()),
             pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };
@@ -5775,6 +6669,7 @@ mod tests {
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
             pci_devices: Vec::new(),
+            durable_volume: None,
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -5840,7 +6735,10 @@ mod tests {
             cfg,
             host_arch: ARCH_AMD64.to_string(),
             resource_bounds: VmResourceBounds::default(),
+            base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
+            session_registry: RwLock::new(HashMap::new()),
+            volumes: RwLock::new(HashMap::new()),
             pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };
@@ -5874,6 +6772,7 @@ mod tests {
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
             pci_devices: Vec::new(),
+            durable_volume: None,
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -5954,7 +6853,10 @@ mod tests {
             cfg,
             host_arch: ARCH_AMD64.to_string(),
             resource_bounds: VmResourceBounds::default(),
+            base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
+            session_registry: RwLock::new(HashMap::new()),
+            volumes: RwLock::new(HashMap::new()),
             pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };
@@ -5988,6 +6890,7 @@ mod tests {
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
             pci_devices: Vec::new(),
+            durable_volume: None,
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -6052,7 +6955,10 @@ mod tests {
             cfg,
             host_arch: ARCH_AMD64.to_string(),
             resource_bounds: VmResourceBounds::default(),
+            base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
+            session_registry: RwLock::new(HashMap::new()),
+            volumes: RwLock::new(HashMap::new()),
             pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };
@@ -6087,10 +6993,6 @@ mod tests {
                     META_SESSION_ID.to_string(),
                     "runtime-session-existing".to_string(),
                 ),
-                (
-                    META_BRANCH_ID.to_string(),
-                    "runtime-session-existing".to_string(),
-                ),
                 (META_TENANT_ID.to_string(), "tenant-existing".to_string()),
                 (
                     META_WORKSPACE_ID.to_string(),
@@ -6116,6 +7018,7 @@ mod tests {
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
             pci_devices: Vec::new(),
+            durable_volume: None,
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -6158,10 +7061,6 @@ mod tests {
         );
         assert_eq!(
             updated.metadata.get(META_SESSION_ID).map(String::as_str),
-            Some("runtime-session-existing")
-        );
-        assert_eq!(
-            updated.metadata.get(META_BRANCH_ID).map(String::as_str),
             Some("runtime-session-existing")
         );
         assert_eq!(
@@ -6271,6 +7170,7 @@ mod tests {
                 vfs_scope_path: String::new(),
             }],
             pci_devices: Vec::new(),
+            durable_volume: None,
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -6337,6 +7237,7 @@ mod tests {
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
             pci_devices: Vec::new(),
+            durable_volume: None,
             boot_incoming_ram_path: "/srv/chevalier/vms/vm-incoming/snapshots/snap-abc.ram"
                 .to_string(),
             started_at: None,
@@ -6404,6 +7305,7 @@ mod tests {
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
             pci_devices: Vec::new(),
+            durable_volume: None,
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -6461,10 +7363,14 @@ mod tests {
                 proxy_port: 3000,
                 rpc_port: 3001,
             },
-            metadata: HashMap::new(),
+            metadata: HashMap::from([(
+                META_PORTPROXY_AUTH_TOKEN.to_string(),
+                "runtime-token".to_string(),
+            )]),
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
             pci_devices: Vec::new(),
+            durable_volume: None,
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -6493,6 +7399,29 @@ mod tests {
         assert!(netdev.contains("script=no"));
         assert!(!netdev.contains("guestfwd="));
         assert!(!netdev.contains("hostfwd="));
+        let fw_cfg = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-fw_cfg")
+            .map(|pair| pair[1].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(fw_cfg.len(), 6);
+        assert!(fw_cfg.contains(&"name=opt/chevalier/tap-mac,string=02:00:00:00:00:10"));
+        assert!(
+            fw_cfg
+                .iter()
+                .any(|arg| arg.starts_with("name=opt/chevalier/tap-address-cidr,string="))
+        );
+        assert!(fw_cfg.contains(&"name=opt/chevalier/hostname,string=guest-network"));
+        assert!(fw_cfg.contains(&"name=opt/chevalier/portproxy-auth-token,string=runtime-token"));
+        let smbios = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-smbios")
+            .map(|pair| pair[1].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(smbios.len(), 6);
+        assert!(smbios.contains(&"type=11,value=chevalier.tap-mac=02:00:00:00:00:10"));
+        assert!(smbios.contains(&"type=11,value=chevalier.hostname=guest-network"));
+        assert!(smbios.contains(&"type=11,value=chevalier.portproxy-auth-token=runtime-token"));
     }
 
     #[test]
@@ -6522,6 +7451,7 @@ mod tests {
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
             pci_devices: Vec::new(),
+            durable_volume: None,
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -6535,6 +7465,8 @@ mod tests {
             &[],
         )
         .expect("build qemu args");
+        assert!(!args.iter().any(|arg| arg == "-fw_cfg"));
+        assert!(!args.iter().any(|arg| arg == "-smbios"));
 
         let netdev_idx = args
             .iter()
@@ -6657,6 +7589,7 @@ mod tests {
                 vfs_scope_path: String::new(),
             }],
             pci_devices: Vec::new(),
+            durable_volume: None,
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
@@ -6861,7 +7794,10 @@ mod tests {
             },
             host_arch: ARCH_ARM64.to_string(),
             resource_bounds: VmResourceBounds::default(),
+            base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
+            session_registry: RwLock::new(HashMap::new()),
+            volumes: RwLock::new(HashMap::new()),
             pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };

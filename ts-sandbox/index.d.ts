@@ -29,6 +29,8 @@ export declare class Sandbox {
   attachSessionPassive(sessionId: string): Promise<Session>
   /** List live sessions visible to this sandbox provider. */
   listSessions(): Promise<Array<SessionInfoJs>>
+  listDurableVolumes(): Promise<Array<DurableVolumeInfoJs>>
+  deleteDurableVolume(ownerKey: string): Promise<void>
   listHostPciDevices(): Promise<HostPciInventoryJs>
   /** Discard a provider session by id, even if this process does not hold a Session handle. */
   discardSessionById(sessionId: string): Promise<void>
@@ -90,6 +92,16 @@ export declare class ShellHandle {
   resize(cols: number, rows: number): Promise<void>
   /** The next shell event, or `null` when the shell stream ends. */
   next(): Promise<ShellEventJs | null>
+}
+
+export interface DurableVolumeInfoJs {
+  ownerKey: string
+  volumeId: string
+  sizeGb: number
+  createdAtMs: number
+  updatedAtMs: number
+  backingVolumeId?: string
+  attachedVmIds: Array<string>
 }
 
 /** A single exec event. `type` is `stdout` | `stderr` | `exit` | `timeout`. */
@@ -196,7 +208,6 @@ export interface SessionInfoJs {
   vmId: string
   name: string
   state: number
-  branchId?: string
   parentSessionId?: string
   forkId?: string
 }
@@ -211,6 +222,9 @@ export interface SessionOpts {
   sharedMounts?: Array<SharedMountOpts>
   egressAllowlist?: Array<string>
   pciDeviceIds?: Array<string>
+  storageProfile?: string
+  volumeOwnerKey?: string
+  volumeSizeGb?: number
 }
 
 export interface SessionSnapshotJs {

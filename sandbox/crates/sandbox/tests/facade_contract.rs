@@ -22,13 +22,14 @@ use chevalier_sandbox::proto::google::protobuf::Empty;
 use chevalier_sandbox::proto::vmd::v1::vmd_service_server::{VmdService, VmdServiceServer};
 use chevalier_sandbox::proto::vmd::v1::{
     AttachPciDeviceRequest, CreateSnapshotRequest, CreateVmRequest, CreateVmStreamResponse,
-    DeleteSnapshotRequest, DeleteVmRequest, DetachPciDeviceRequest, ForkVmRequest, ForkVmResponse,
-    GetSnapshotRequest, GetVmRequest, HealthRequest, HealthResponse, InfoRequest, InfoResponse,
-    ListHostPciDevicesRequest, ListHostPciDevicesResponse, ListSnapshotsRequest,
-    ListSnapshotsResponse, ListVMsRequest, ListVMsResponse, NetworkSpec, PciDeviceActionResponse,
-    PortProxyPorts, PreDownloadVmImageRequest, PreDownloadVmImageResponse, ResourceSpec,
-    RestoreSnapshotRequest, Snapshot, UpdateVmRequest, Vm, VmActionRequest, VmSource, VmSourceType,
-    VmState, create_vm_stream_response,
+    DeleteDurableVolumeRequest, DeleteSnapshotRequest, DeleteVmRequest, DetachPciDeviceRequest,
+    ForkVmRequest, ForkVmResponse, GetSnapshotRequest, GetVmBySessionRequest, GetVmRequest,
+    HealthRequest, HealthResponse, InfoRequest, InfoResponse, ListDurableVolumesRequest,
+    ListDurableVolumesResponse, ListHostPciDevicesRequest, ListHostPciDevicesResponse,
+    ListSnapshotsRequest, ListSnapshotsResponse, ListVMsRequest, ListVMsResponse, NetworkSpec,
+    PciDeviceActionResponse, PortProxyPorts, PreDownloadVmImageRequest, PreDownloadVmImageResponse,
+    ResourceSpec, RestoreSnapshotRequest, Snapshot, UpdateVmRequest, Vm, VmActionRequest, VmSource,
+    VmSourceType, VmState, create_vm_stream_response,
 };
 use chevalier_sandbox::{
     ExecEvent, ExecInput, ExecOptions, ForkOptions, Sandbox, SandboxConfig, SandboxError,
@@ -69,16 +70,8 @@ impl MockVmd {
         id: String,
         name: String,
         state: i32,
-        mut metadata: HashMap<String, String>,
+        metadata: HashMap<String, String>,
     ) -> Vm {
-        let branch_id = metadata
-            .get("chevalier.session_id")
-            .cloned()
-            .filter(|_| !metadata.contains_key("chevalier.branch_id"));
-        if let Some(session_id) = branch_id {
-            metadata.insert("chevalier.branch_id".to_string(), session_id);
-        }
-
         Vm {
             id,
             name,
@@ -107,6 +100,7 @@ impl MockVmd {
             started_at: None,
             shared_mounts: Vec::new(),
             pci_devices: Vec::new(),
+            durable_volume: None,
         }
     }
 
@@ -163,6 +157,25 @@ impl VmdService for MockVmd {
             .get(&vm_id)
             .cloned()
             .ok_or_else(|| Status::not_found("vm not found"))?;
+        Ok(Response::new(vm))
+    }
+
+    async fn get_vm_by_session(
+        &self,
+        request: Request<GetVmBySessionRequest>,
+    ) -> Result<Response<Vm>, Status> {
+        let session_id = request.into_inner().session_id;
+        let guard = self.state.lock().await;
+        let vm = guard
+            .vms
+            .values()
+            .find(|vm| {
+                vm.metadata
+                    .get("chevalier.session_id")
+                    .is_some_and(|value| value == &session_id)
+            })
+            .cloned()
+            .ok_or_else(|| Status::not_found("session not found"))?;
         Ok(Response::new(vm))
     }
 
@@ -264,6 +277,22 @@ impl VmdService for MockVmd {
             child_vm: Some(child_vm),
             fork_id,
         }))
+    }
+
+    async fn list_durable_volumes(
+        &self,
+        _request: Request<ListDurableVolumesRequest>,
+    ) -> Result<Response<ListDurableVolumesResponse>, Status> {
+        Ok(Response::new(ListDurableVolumesResponse {
+            volumes: Vec::new(),
+        }))
+    }
+
+    async fn delete_durable_volume(
+        &self,
+        _request: Request<DeleteDurableVolumeRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        Err(Status::not_found("durable volume not found"))
     }
 
     async fn start_vm(&self, request: Request<VmActionRequest>) -> Result<Response<Vm>, Status> {
@@ -793,7 +822,7 @@ async fn session_reuse_and_fork_lineage_contract() {
     let fork_result = reused
         .fork(ForkOptions::default())
         .await
-        .expect("fork should create child branch");
+        .expect("fork should create child session");
 
     assert_eq!(fork_result.parent_session_id, "session-parent");
     assert_ne!(fork_result.child_session_id, "session-parent");
@@ -823,7 +852,7 @@ async fn session_reuse_and_fork_lineage_contract() {
         .child
         .discard()
         .await
-        .expect("child branch should discard independently");
+        .expect("child session should discard independently");
 
     let guard = harness.vmd_state.lock().await;
     assert!(
@@ -853,6 +882,9 @@ async fn session_create_forwards_shared_mounts_contract() {
         .session(SessionOptions {
             session_id: Some("session-mounts".to_string()),
             auto_start: false,
+            storage_profile: "durable-data".to_string(),
+            volume_owner_key: Some("workspace:test:thread:session-mounts".to_string()),
+            volume_size_gb: Some(64),
             shared_mounts: vec![SharedMount {
                 host_path: "/tmp/runtimefs".to_string(),
                 guest_path: "/workspace".to_string(),
@@ -888,6 +920,9 @@ async fn session_create_forwards_shared_mounts_contract() {
         chevalier_sandbox::proto::vmd::v1::SharedMountContinuity::RestoreCrossNode as i32
     );
     assert_eq!(req.shared_mounts[0].backend_profile, "shared-posix");
+    assert_eq!(req.storage_profile, "durable-data");
+    assert_eq!(req.volume_owner_key, "workspace:test:thread:session-mounts");
+    assert_eq!(req.volume_size_gb, 64);
 }
 
 #[tokio::test(flavor = "multi_thread")]

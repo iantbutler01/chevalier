@@ -31,14 +31,16 @@ use crate::partition::{self, PartitionGate, PartitionPolicyConfig};
 use crate::pci::{PCI_CAPABILITY_HEADER, PciInventoryDevice, PciInventoryState};
 use crate::proto::v1::{
     AttachPciDeviceRequest, CreateSnapshotRequest, CreateVmPhase, CreateVmProgress,
-    CreateVmRequest, CreateVmStreamResponse, DeleteSnapshotRequest, DeleteVmRequest,
-    DetachPciDeviceRequest, ForkVmRequest, ForkVmResponse, GetSnapshotRequest, GetVmRequest,
-    HealthRequest, HealthResponse, HostPciDevice, HostPciDeviceState, HostPciFunction, InfoRequest,
-    InfoResponse, ListHostPciDevicesRequest, ListHostPciDevicesResponse, ListSnapshotsRequest,
-    ListSnapshotsResponse, ListVMsRequest, ListVMsResponse, PciDeviceActionResponse,
-    PreDownloadVmImagePhase, PreDownloadVmImageRequest, PreDownloadVmImageResponse, ResourceSpec,
-    RestoreSnapshotRequest, Snapshot, UpdateVmRequest, Vm, VmActionRequest, VmSource,
-    VmSourceType as ProtoVmSourceType, VmState as ProtoVmState, create_vm_stream_response,
+    CreateVmRequest, CreateVmStreamResponse, DeleteDurableVolumeRequest, DeleteSnapshotRequest,
+    DeleteVmRequest, DetachPciDeviceRequest, DurableVolume, DurableVolumeAttachment, ForkVmRequest,
+    ForkVmResponse, GetSnapshotRequest, GetVmBySessionRequest, GetVmRequest, HealthRequest,
+    HealthResponse, HostPciDevice, HostPciDeviceState, HostPciFunction, InfoRequest, InfoResponse,
+    ListDurableVolumesRequest, ListDurableVolumesResponse, ListHostPciDevicesRequest,
+    ListHostPciDevicesResponse, ListSnapshotsRequest, ListSnapshotsResponse, ListVMsRequest,
+    ListVMsResponse, PciDeviceActionResponse, PreDownloadVmImagePhase, PreDownloadVmImageRequest,
+    PreDownloadVmImageResponse, ResourceSpec, RestoreSnapshotRequest, Snapshot, UpdateVmRequest,
+    Vm, VmActionRequest, VmSource, VmSourceType as ProtoVmSourceType, VmState as ProtoVmState,
+    create_vm_stream_response,
     vmd_service_server::{VmdService, VmdServiceServer},
 };
 use crate::state::manager::{CreateVmProgressCallback, CreateVmProgressEvent, CreateVmStage};
@@ -515,6 +517,25 @@ impl VmdService for GrpcService {
         Ok(Response::new(build_vm(&meta, Some(&runtime), true)))
     }
 
+    async fn get_vm_by_session(&self, request: Request<GetVmBySessionRequest>) -> GrpcResult<Vm> {
+        self.authorize(&request, AccessLevel::Read).await?;
+        let session_id = request.into_inner().session_id;
+        if session_id.trim().is_empty() {
+            return Err(Status::invalid_argument("session_id is required"));
+        }
+        let meta = self
+            .manager
+            .get_by_session_id(&session_id)
+            .await
+            .map_err(status_from_error)?;
+        let (detail, runtime) = self
+            .manager
+            .get_with_runtime(&meta.id)
+            .await
+            .map_err(status_from_error)?;
+        Ok(Response::new(build_vm(&detail, Some(&runtime), true)))
+    }
+
     async fn create_vm(
         &self,
         request: Request<CreateVmRequest>,
@@ -607,6 +628,13 @@ impl VmdService for GrpcService {
                 })
                 .collect(),
             pci_device_ids: req.pci_device_ids,
+            storage_profile: req.storage_profile,
+            volume_owner_key: if req.volume_owner_key.trim().is_empty() {
+                None
+            } else {
+                Some(req.volume_owner_key)
+            },
+            volume_size_gb: (req.volume_size_gb > 0).then_some(req.volume_size_gb),
         };
 
         let manager = Arc::clone(&self.manager);
@@ -733,6 +761,45 @@ impl VmdService for GrpcService {
             child_vm: Some(build_vm(&child_detail, Some(&child_runtime), true)),
             fork_id,
         }))
+    }
+
+    async fn list_durable_volumes(
+        &self,
+        request: Request<ListDurableVolumesRequest>,
+    ) -> GrpcResult<ListDurableVolumesResponse> {
+        self.authorize(&request, AccessLevel::Read).await?;
+        let volumes = self
+            .manager
+            .list_durable_volumes()
+            .await
+            .into_iter()
+            .map(|(volume, attached_vm_ids)| DurableVolume {
+                owner_key: volume.owner_key,
+                volume_id: volume.volume_id,
+                size_gb: volume.size_gb,
+                created_at: Some(to_timestamp(volume.created_at)),
+                updated_at: Some(to_timestamp(volume.updated_at)),
+                backing_volume_id: volume.backing_volume_id.unwrap_or_default(),
+                attached_vm_ids,
+            })
+            .collect();
+        Ok(Response::new(ListDurableVolumesResponse { volumes }))
+    }
+
+    async fn delete_durable_volume(
+        &self,
+        request: Request<DeleteDurableVolumeRequest>,
+    ) -> GrpcResult<()> {
+        self.authorize(&request, AccessLevel::Write).await?;
+        let owner_key = request.into_inner().owner_key;
+        if owner_key.trim().is_empty() {
+            return Err(Status::invalid_argument("owner_key is required"));
+        }
+        self.manager
+            .delete_durable_volume(&owner_key)
+            .await
+            .map_err(status_from_error)?;
+        Ok(Response::new(()))
     }
 
     async fn start_vm(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
@@ -888,6 +955,7 @@ impl VmdService for GrpcService {
         let target = image::default_base_image_path(&self.cfg, &reference, &arch);
         let force = req.force;
         let docker_bin = self.cfg.docker_bin.clone();
+        let manager = Arc::clone(&self.manager);
         let (tx, rx) = mpsc::unbounded_channel();
 
         tokio::spawn(async move {
@@ -903,6 +971,7 @@ impl VmdService for GrpcService {
                 return;
             }
 
+            let _base_image_guard = manager.lock_base_image(&target).await;
             match fs::metadata(&target).await {
                 Ok(metadata) if metadata.len() > 0 && !force => {
                     let size = metadata.len();
@@ -1450,6 +1519,14 @@ fn build_vm(
                 bdfs: assignment.bdfs.clone(),
             })
             .collect(),
+        durable_volume: meta
+            .durable_volume
+            .as_ref()
+            .map(|volume| DurableVolumeAttachment {
+                owner_key: volume.owner_key.clone(),
+                volume_id: volume.volume_id.clone(),
+                size_gb: volume.size_gb,
+            }),
     };
 
     if let Some(runtime) = runtime {
@@ -1516,6 +1593,8 @@ fn status_from_error(err: ManagerError) -> Status {
     match err {
         ManagerError::VmNotFound => Status::not_found(err.to_string()),
         ManagerError::SnapshotNotFound => Status::not_found(err.to_string()),
+        ManagerError::VolumeNotFound => Status::not_found(err.to_string()),
+        ManagerError::VolumeInUse(_) => Status::failed_precondition(err.to_string()),
         ManagerError::InvalidState => Status::failed_precondition(err.to_string()),
         ManagerError::Cancelled => Status::cancelled(err.to_string()),
         ManagerError::PciConflict(_) => Status::already_exists(err.to_string()),

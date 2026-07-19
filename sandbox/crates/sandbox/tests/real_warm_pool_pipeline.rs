@@ -294,6 +294,9 @@ async fn warm_pool_hit_path_avoids_image_download_and_conversion_on_request_path
             architecture: arch.clone(),
             shared_mounts: Vec::new(),
             pci_device_ids: Vec::new(),
+            storage_profile: "local-ephemeral".to_string(),
+            volume_owner_key: String::new(),
+            volume_size_gb: 0,
         }))
         .await
         .expect("start direct create_vm stream")

@@ -190,6 +190,13 @@ pub struct VmMetadata {
     pub shared_mounts: Vec<SharedMountSpec>,
     #[serde(default)]
     pub pci_devices: Vec<PciDeviceAssignmentSpec>,
+    /// Optional machine-state disk that is owned independently from this VM.
+    ///
+    /// The volume lives under the daemon data directory and is retained when
+    /// the VM is deleted. Persisting only the stable identity/size here keeps
+    /// VM metadata portable while allowing the manager to derive the host path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_volume: Option<DurableVolumeAttachment>,
     /// Absolute path of an external RAM file for the next `start_vm` to consume via
     /// `-incoming file:<path>`. Set transiently by `restore_snapshot` (and by fork Path
     /// A for both parent and child) right before the launch, cleared after the launch
@@ -198,6 +205,26 @@ pub struct VmMetadata {
     pub boot_incoming_ram_path: String,
     #[serde(default, with = "iso8601::option")]
     pub started_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DurableVolumeAttachment {
+    pub owner_key: String,
+    pub volume_id: String,
+    pub size_gb: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DurableVolumeMetadata {
+    pub owner_key: String,
+    pub volume_id: String,
+    pub size_gb: i32,
+    #[serde(with = "iso8601")]
+    pub created_at: DateTime<Utc>,
+    #[serde(with = "iso8601")]
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backing_volume_id: Option<String>,
 }
 
 impl VmMetadata {
@@ -255,6 +282,9 @@ pub struct CreateVmParams {
     pub architecture: String,
     pub shared_mounts: Vec<SharedMountSpec>,
     pub pci_device_ids: Vec<String>,
+    pub storage_profile: String,
+    pub volume_owner_key: Option<String>,
+    pub volume_size_gb: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default)]

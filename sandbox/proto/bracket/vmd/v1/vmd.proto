@@ -146,6 +146,7 @@ message VM {
   google.protobuf.Timestamp started_at = 12;
   repeated SharedMount shared_mounts = 13;
   repeated PciDeviceAssignment pci_devices = 14;
+  DurableVolumeAttachment durable_volume = 15;
 }
 
 message ListVMsRequest {
@@ -160,6 +161,36 @@ message GetVMRequest {
   string vm_id = 1;
 }
 
+message GetVMBySessionRequest {
+  string session_id = 1;
+}
+
+message DurableVolumeAttachment {
+  string owner_key = 1;
+  string volume_id = 2;
+  int32 size_gb = 3;
+}
+
+message DurableVolume {
+  string owner_key = 1;
+  string volume_id = 2;
+  int32 size_gb = 3;
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp updated_at = 5;
+  string backing_volume_id = 6;
+  repeated string attached_vm_ids = 7;
+}
+
+message ListDurableVolumesRequest {}
+
+message ListDurableVolumesResponse {
+  repeated DurableVolume volumes = 1;
+}
+
+message DeleteDurableVolumeRequest {
+  string owner_key = 1;
+}
+
 message CreateVMRequest {
   string name = 1;
   VMSource source = 2;
@@ -169,6 +200,9 @@ message CreateVMRequest {
   string architecture = 6;
   repeated SharedMount shared_mounts = 7;
   repeated string pci_device_ids = 8;
+  string storage_profile = 9;
+  string volume_owner_key = 10;
+  int32 volume_size_gb = 11;
 }
 
 message ListHostPciDevicesRequest {}
@@ -304,10 +338,14 @@ service VMDService {
 
   rpc ListVMs(ListVMsRequest) returns (ListVMsResponse);
   rpc GetVM(GetVMRequest) returns (VM);
+  rpc GetVMBySession(GetVMBySessionRequest) returns (VM);
   rpc CreateVM(CreateVMRequest) returns (stream CreateVmStreamResponse);
   rpc UpdateVM(UpdateVMRequest) returns (VM);
   rpc DeleteVM(DeleteVMRequest) returns (google.protobuf.Empty);
   rpc ForkVM(ForkVMRequest) returns (ForkVMResponse);
+
+  rpc ListDurableVolumes(ListDurableVolumesRequest) returns (ListDurableVolumesResponse);
+  rpc DeleteDurableVolume(DeleteDurableVolumeRequest) returns (google.protobuf.Empty);
 
   rpc StartVM(VMActionRequest) returns (VM);
   rpc StopVM(VMActionRequest) returns (VM);

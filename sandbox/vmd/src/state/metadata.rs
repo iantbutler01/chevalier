@@ -10,9 +10,10 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use super::types::VmMetadata;
+use super::types::{DurableVolumeMetadata, VmMetadata};
 
 const METADATA_FILENAME: &str = "vm.json";
+const VOLUME_METADATA_SUFFIX: &str = ".volume.json";
 
 fn metadata_path(dir: &Path) -> PathBuf {
     dir.join(METADATA_FILENAME)
@@ -63,6 +64,40 @@ pub fn save_metadata(dir: &Path, meta: &mut VmMetadata) -> Result<()> {
     let dst = metadata_path(dir);
     fs::rename(path, &dst).with_context(|| format!("rename metadata to {}", dst.display()))?;
     Ok(())
+}
+
+pub fn load_volume_metadata(path: &Path) -> Result<DurableVolumeMetadata> {
+    let data =
+        fs::read(path).with_context(|| format!("read volume metadata {}", path.display()))?;
+    serde_json::from_slice(&data)
+        .with_context(|| format!("decode volume metadata {}", path.display()))
+}
+
+pub fn save_volume_metadata(dir: &Path, meta: &mut DurableVolumeMetadata) -> Result<()> {
+    meta.updated_at = Utc::now();
+    fs::create_dir_all(dir)
+        .with_context(|| format!("ensure volume metadata dir {}", dir.display()))?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix("volume-")
+        .suffix(".json")
+        .tempfile_in(dir)
+        .context("create temp volume metadata file")?;
+    {
+        let file = tmp.as_file_mut();
+        let mut value = serde_json::to_value(&*meta)?;
+        normalize_timestamps(&mut value);
+        let data = serde_json::to_vec_pretty(&value)?;
+        file.write_all(&data)?;
+        file.sync_all()?;
+    }
+    let dst = volume_metadata_path(dir, &meta.volume_id);
+    fs::rename(tmp.path(), &dst)
+        .with_context(|| format!("rename volume metadata to {}", dst.display()))?;
+    Ok(())
+}
+
+pub fn volume_metadata_path(dir: &Path, volume_id: &str) -> PathBuf {
+    dir.join(format!("{volume_id}{VOLUME_METADATA_SUFFIX}"))
 }
 
 fn normalize_timestamps(value: &mut Value) {

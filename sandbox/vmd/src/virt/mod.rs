@@ -85,6 +85,14 @@ fn configured_d2vm_docker_api_version() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn configured_d2vm_host_workdir() -> Option<PathBuf> {
+    std::env::var("CHEVALIER_SANDBOX_D2VM_HOST_WORKDIR")
+        .or_else(|_| std::env::var("BRACKET_SANDBOX_D2VM_HOST_WORKDIR"))
+        .ok()
+        .map(|raw| PathBuf::from(raw.trim()))
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
 fn parse_env_bool(raw: &str) -> bool {
     matches!(
         raw.trim().to_ascii_lowercase().as_str(),
@@ -118,6 +126,16 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
     let host_dir = host_dir
         .canonicalize()
         .with_context(|| format!("canonicalize {}", host_dir.display()))?;
+    // When vmd itself runs in a container with the host Docker socket, `host_dir`
+    // is a path in vmd's mount namespace. The sibling converter container needs
+    // the corresponding Docker-host path so both containers see the same bind.
+    let docker_host_dir = configured_d2vm_host_workdir().unwrap_or_else(|| host_dir.clone());
+    if !docker_host_dir.is_absolute() {
+        bail!(
+            "configured d2vm host workdir must be absolute: {}",
+            docker_host_dir.display()
+        );
+    }
     debug!(
         image = %opts.image,
         output = %output_name,
@@ -131,6 +149,7 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
         converter_bin = ?d2vm_bin,
         converter_platform = ?converter_platform,
         workdir = %host_dir.display(),
+        docker_host_workdir = %docker_host_dir.display(),
         "running d2vm conversion"
     );
 
@@ -173,7 +192,11 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
             .arg("-v")
             .arg("/var/run/docker.sock:/var/run/docker.sock")
             .arg("-v")
-            .arg(format!("{}:{}", host_dir.display(), D2VM_CONTAINER_DIR))
+            .arg(format!(
+                "{}:{}",
+                docker_host_dir.display(),
+                D2VM_CONTAINER_DIR
+            ))
             .arg("-w")
             .arg(D2VM_CONTAINER_DIR)
             // Force converter image to host architecture so qemu-img itself never runs under
@@ -246,6 +269,29 @@ pub async fn create_overlay(
     if !output.status.success() {
         bail!(
             "qemu-img overlay create failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+pub async fn create_qcow2(qemu_img_bin: &str, path: &Path, size_gb: i32) -> Result<()> {
+    if size_gb <= 0 {
+        bail!("invalid qcow2 size: {size_gb}GB");
+    }
+    let size_arg = format!("{size_gb}G");
+    let output = Command::new(qemu_img_bin)
+        .arg("create")
+        .arg("-f")
+        .arg("qcow2")
+        .arg(path)
+        .arg(size_arg)
+        .output()
+        .await
+        .with_context(|| "spawn qemu-img create")?;
+    if !output.status.success() {
+        bail!(
+            "qemu-img create failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
@@ -1125,8 +1171,13 @@ pub async fn spawn_virtiofsd(
         );
     }
 
-    // Pre-remove any stale socket from a prior crashed daemon so virtiofsd can bind.
+    // Pre-remove both artifacts from a prior crashed daemon. Rust virtiofsd creates
+    // `<socket>.pid` alongside the socket and refuses to start while that pid file
+    // remains, even when the recorded process disappeared with a vmd/container
+    // restart.
     let _ = std::fs::remove_file(&spawn.socket_path);
+    let pid_path = PathBuf::from(format!("{}.pid", spawn.socket_path.to_string_lossy()));
+    let _ = std::fs::remove_file(&pid_path);
 
     let mut cmd = Command::new(virtiofsd_bin);
     cmd.arg(format!(
@@ -1263,6 +1314,8 @@ pub fn terminate_virtiofsd(handle: &VirtiofsdHandle) {
     }
     // Best-effort unlink of the socket file (virtiofsd should have cleaned it up).
     let _ = std::fs::remove_file(&handle.socket_path);
+    let pid_path = PathBuf::from(format!("{}.pid", handle.socket_path.to_string_lossy()));
+    let _ = std::fs::remove_file(pid_path);
 }
 
 impl MonitorHandle {
@@ -1755,6 +1808,8 @@ exit 2
             std::env::remove_var("BRACKET_SANDBOX_D2VM_INCLUDE_BOOTSTRAP");
             std::env::remove_var("CHEVALIER_SANDBOX_D2VM_DOCKER_API_VERSION");
             std::env::remove_var("BRACKET_SANDBOX_D2VM_DOCKER_API_VERSION");
+            std::env::remove_var("CHEVALIER_SANDBOX_D2VM_HOST_WORKDIR");
+            std::env::remove_var("BRACKET_SANDBOX_D2VM_HOST_WORKDIR");
             std::env::remove_var("DOCKER_API_VERSION");
         }
     }
@@ -1822,6 +1877,28 @@ exit 2
 
         let log = fs::read_to_string(log_path).expect("read fake docker log");
         assert!(log.contains("-e DOCKER_API_VERSION=1.42"));
+        clear_d2vm_env();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_d2vm_uses_docker_host_workdir_for_sibling_converter() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        clear_d2vm_env();
+        unsafe {
+            std::env::set_var(
+                "CHEVALIER_SANDBOX_D2VM_HOST_WORKDIR",
+                "/host-visible/chevalier/base-images",
+            );
+        }
+        let (tmp, docker_bin, log_path) = create_fake_d2vm_docker();
+
+        run_d2vm(&docker_bin, tmp.path(), d2vm_options())
+            .await
+            .expect("fake docker run should succeed");
+
+        let log = fs::read_to_string(log_path).expect("read fake docker log");
+        assert!(log.contains("-v /host-visible/chevalier/base-images:/workspace"));
         clear_d2vm_env();
     }
 

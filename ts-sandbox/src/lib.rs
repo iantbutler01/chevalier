@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chevalier_sandbox::{
-    EventStream, ExecEvent, ExecInput, ExecOptions, ForkOptions,
-    ForwardHandle as EngineForwardHandle, HostPciDevice as EngineHostPciDevice,
+    DurableVolumeInfo as EngineDurableVolumeInfo, EventStream, ExecEvent, ExecInput, ExecOptions,
+    ForkOptions, ForwardHandle as EngineForwardHandle, HostPciDevice as EngineHostPciDevice,
     HostPciDeviceState as EngineHostPciDeviceState, HostPciFunction as EngineHostPciFunction,
     HostPciInventory as EngineHostPciInventory, OpenComputerBackendConfig, OpenComputerMountConfig,
     PciDeviceAction as EnginePciDeviceAction, ResourceLimits, Sandbox as EngineSandbox,
@@ -314,6 +314,9 @@ pub struct SessionOpts {
     pub shared_mounts: Option<Vec<SharedMountOpts>>,
     pub egress_allowlist: Option<Vec<String>>,
     pub pci_device_ids: Option<Vec<String>>,
+    pub storage_profile: Option<String>,
+    pub volume_owner_key: Option<String>,
+    pub volume_size_gb: Option<u32>,
 }
 
 impl From<SessionOpts> for SessionOptions {
@@ -333,6 +336,14 @@ impl From<SessionOpts> for SessionOptions {
                 .collect(),
             egress_allowlist: o.egress_allowlist,
             pci_device_ids: o.pci_device_ids.unwrap_or_default(),
+            storage_profile: o
+                .storage_profile
+                .unwrap_or_else(|| "local-ephemeral".to_string()),
+            volume_owner_key: o.volume_owner_key,
+            volume_size_gb: o
+                .volume_size_gb
+                .and_then(|value| i32::try_from(value).ok())
+                .filter(|value| *value > 0),
             ..Default::default()
         }
     }
@@ -412,7 +423,6 @@ pub struct SessionInfoJs {
     pub vm_id: String,
     pub name: String,
     pub state: i32,
-    pub branch_id: Option<String>,
     pub parent_session_id: Option<String>,
     pub fork_id: Option<String>,
 }
@@ -424,9 +434,33 @@ impl From<EngineSessionInfo> for SessionInfoJs {
             vm_id: info.vm_id,
             name: info.name,
             state: info.state,
-            branch_id: info.branch_id,
             parent_session_id: info.parent_session_id,
             fork_id: info.fork_id,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct DurableVolumeInfoJs {
+    pub owner_key: String,
+    pub volume_id: String,
+    pub size_gb: i32,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub backing_volume_id: Option<String>,
+    pub attached_vm_ids: Vec<String>,
+}
+
+impl From<EngineDurableVolumeInfo> for DurableVolumeInfoJs {
+    fn from(info: EngineDurableVolumeInfo) -> Self {
+        Self {
+            owner_key: info.owner_key,
+            volume_id: info.volume_id,
+            size_gb: info.size_gb,
+            created_at_ms: info.created_at_ms,
+            updated_at_ms: info.updated_at_ms,
+            backing_volume_id: info.backing_volume_id,
+            attached_vm_ids: info.attached_vm_ids,
         }
     }
 }
@@ -1000,6 +1034,23 @@ impl Sandbox {
     pub async fn list_sessions(&self) -> napi::Result<Vec<SessionInfoJs>> {
         let sessions = self.inner.list_sessions().await.map_err(sb_err)?;
         Ok(sessions.into_iter().map(Into::into).collect())
+    }
+
+    #[napi]
+    pub async fn list_durable_volumes(&self) -> napi::Result<Vec<DurableVolumeInfoJs>> {
+        self.inner
+            .list_durable_volumes()
+            .await
+            .map(|volumes| volumes.into_iter().map(Into::into).collect())
+            .map_err(sb_err)
+    }
+
+    #[napi]
+    pub async fn delete_durable_volume(&self, owner_key: String) -> napi::Result<()> {
+        self.inner
+            .delete_durable_volume(&owner_key)
+            .await
+            .map_err(sb_err)
     }
 
     #[napi]

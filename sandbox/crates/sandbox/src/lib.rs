@@ -12,7 +12,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::Stream;
+use futures::{Stream, StreamExt};
 #[cfg(feature = "distributed-control")]
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
@@ -65,16 +65,16 @@ use proto::bracket::portproxy::v1::{
 };
 use proto::vmd::v1::vmd_service_client::VmdServiceClient;
 use proto::vmd::v1::{
-    AttachPciDeviceRequest, CreateSnapshotRequest, CreateVmRequest, DeleteSnapshotRequest,
-    DetachPciDeviceRequest, ForkVmRequest, GetVmRequest, ListHostPciDevicesRequest,
-    ListSnapshotsRequest, ListVMsRequest, Metadata, PreDownloadVmImageRequest, ResourceSpec,
-    RestoreSnapshotRequest, Vm, VmActionRequest, VmSource, VmSourceType,
+    AttachPciDeviceRequest, CreateSnapshotRequest, CreateVmRequest, DeleteDurableVolumeRequest,
+    DeleteSnapshotRequest, DetachPciDeviceRequest, ForkVmRequest, GetVmBySessionRequest,
+    GetVmRequest, ListDurableVolumesRequest, ListHostPciDevicesRequest, ListSnapshotsRequest,
+    ListVMsRequest, Metadata, PreDownloadVmImageRequest, ResourceSpec, RestoreSnapshotRequest, Vm,
+    VmActionRequest, VmSource, VmSourceType,
 };
 
 const PCI_CAPABILITY_HEADER: &str = "x-chevalier-pci-token";
 
 const META_SESSION_ID: &str = "chevalier.session_id";
-const META_BRANCH_ID: &str = "chevalier.branch_id";
 const META_PARENT_SESSION_ID: &str = "chevalier.parent_session_id";
 const META_PARENT_VM_ID: &str = "chevalier.parent_vm_id";
 const META_FORK_ID: &str = "chevalier.fork_id";
@@ -440,6 +440,9 @@ pub struct SessionOptions {
     pub shared_mounts: Vec<SharedMount>,
     pub egress_allowlist: Option<Vec<String>>,
     pub pci_device_ids: Vec<String>,
+    pub storage_profile: String,
+    pub volume_owner_key: Option<String>,
+    pub volume_size_gb: Option<i32>,
 }
 
 impl Default for SessionOptions {
@@ -455,6 +458,9 @@ impl Default for SessionOptions {
             shared_mounts: Vec::new(),
             egress_allowlist: None,
             pci_device_ids: Vec::new(),
+            storage_profile: "local-ephemeral".to_string(),
+            volume_owner_key: None,
+            volume_size_gb: None,
         }
     }
 }
@@ -826,9 +832,19 @@ pub struct SessionInfo {
     pub vm_id: String,
     pub name: String,
     pub state: i32,
-    pub branch_id: Option<String>,
     pub parent_session_id: Option<String>,
     pub fork_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DurableVolumeInfo {
+    pub owner_key: String,
+    pub volume_id: String,
+    pub size_gb: i32,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub backing_volume_id: Option<String>,
+    pub attached_vm_ids: Vec<String>,
 }
 
 pub struct ForkResult {
@@ -977,6 +993,38 @@ impl RebindRestorePolicy {
 }
 
 impl Session {
+    async fn sync_guest_filesystems(&self) -> Result<()> {
+        let mut handle = self
+            .exec(
+                "sync",
+                ExecOptions {
+                    timeout_secs: Some(30),
+                    close_stdin_on_start: true,
+                    ..ExecOptions::default()
+                },
+            )
+            .await?;
+        while let Some(event) = handle.events.next().await {
+            match event? {
+                ExecEvent::Exit(0) => return Ok(()),
+                ExecEvent::Exit(code) => {
+                    return Err(SandboxError::InvalidResponse(format!(
+                        "guest filesystem sync exited with status {code}"
+                    )));
+                }
+                ExecEvent::Timeout => {
+                    return Err(SandboxError::DaemonUnavailable(
+                        "guest filesystem sync timed out before snapshot".to_string(),
+                    ));
+                }
+                ExecEvent::Stdout(_) | ExecEvent::Stderr(_) => {}
+            }
+        }
+        Err(SandboxError::InvalidResponse(
+            "guest filesystem sync ended without an exit status".to_string(),
+        ))
+    }
+
     pub(crate) fn new_with_backend(
         sandbox: Sandbox,
         session_id: String,
@@ -2416,6 +2464,12 @@ impl Session {
             });
         }
 
+        // @dive: QEMU has no general QMP block flush command. Flush guest page
+        //        caches through the guest RPC before pausing/snapshotting so every
+        //        writable disk, including a separately attached durable volume,
+        //        reaches its cache=none backing file before the VM state is pinned.
+        self.sync_guest_filesystems().await?;
+
         let node_endpoint = self.resolve_session_endpoint().await?;
         let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
         let snapshot = client
@@ -2548,6 +2602,8 @@ impl Session {
             return control.fork(self.sandbox.clone(), self, opts).await;
         }
 
+        self.sync_guest_filesystems().await?;
+
         let auto_start_child = opts.auto_start_child;
         let node_endpoint = self.resolve_session_endpoint().await?;
         let child_session_id = Uuid::new_v4().to_string();
@@ -2556,7 +2612,6 @@ impl Session {
         child_metadata.insert(META_SESSION_ID.to_string(), child_session_id.clone());
         child_metadata.insert(META_PARENT_SESSION_ID.to_string(), self.session_id.clone());
         child_metadata.insert(META_PARENT_VM_ID.to_string(), self.vm_id.clone());
-        child_metadata.insert(META_BRANCH_ID.to_string(), child_session_id.clone());
 
         #[cfg(feature = "distributed-control")]
         self.sandbox
@@ -2875,7 +2930,6 @@ impl Sandbox {
         }
 
         metadata.insert(META_SESSION_ID.to_string(), session_id.clone());
-        metadata.insert(META_BRANCH_ID.to_string(), session_id.clone());
 
         let resources = opts
             .resources
@@ -2926,6 +2980,9 @@ impl Sandbox {
                 })
                 .collect(),
             pci_device_ids: opts.pci_device_ids,
+            storage_profile: opts.storage_profile,
+            volume_owner_key: opts.volume_owner_key.unwrap_or_default(),
+            volume_size_gb: opts.volume_size_gb.unwrap_or_default(),
         };
 
         let node_endpoint = self
@@ -3262,7 +3319,6 @@ impl Sandbox {
                     vm_id: vm.id,
                     name: vm.name,
                     state: vm.state,
-                    branch_id: vm.metadata.get(META_BRANCH_ID).cloned(),
                     parent_session_id: vm.metadata.get(META_PARENT_SESSION_ID).cloned(),
                     fork_id: vm.metadata.get(META_FORK_ID).cloned(),
                 });
@@ -3270,6 +3326,110 @@ impl Sandbox {
         }
 
         Ok(sessions)
+    }
+
+    pub async fn list_durable_volumes(&self) -> Result<Vec<DurableVolumeInfo>> {
+        if matches!(&self.inner.control_backend, ControlBackend::OpenComputer(_)) {
+            return Ok(Vec::new());
+        }
+        let mut volumes = HashMap::new();
+        let mut contacted = false;
+        let mut last_connect_error = None;
+        for endpoint in self.candidate_endpoints().await? {
+            let mut client = match self.vmd_client_for_endpoint(&endpoint).await {
+                Ok(client) => client,
+                Err(error) => {
+                    last_connect_error = Some(error);
+                    continue;
+                }
+            };
+            contacted = true;
+            let response = match client
+                .list_durable_volumes(self.request_with_auth(ListDurableVolumesRequest {}))
+                .await
+            {
+                Ok(response) => response.into_inner(),
+                Err(status) if status.code() == tonic::Code::Unimplemented => continue,
+                Err(status) => return Err(SandboxError::Grpc(status)),
+            };
+            for volume in response.volumes {
+                let timestamp_ms = |value: Option<proto::google::protobuf::Timestamp>| {
+                    value
+                        .map(|timestamp| {
+                            timestamp.seconds.saturating_mul(1_000)
+                                + i64::from(timestamp.nanos).saturating_div(1_000_000)
+                        })
+                        .unwrap_or_default()
+                };
+                volumes
+                    .entry(volume.owner_key.clone())
+                    .or_insert(DurableVolumeInfo {
+                        owner_key: volume.owner_key,
+                        volume_id: volume.volume_id,
+                        size_gb: volume.size_gb,
+                        created_at_ms: timestamp_ms(volume.created_at),
+                        updated_at_ms: timestamp_ms(volume.updated_at),
+                        backing_volume_id: (!volume.backing_volume_id.is_empty())
+                            .then_some(volume.backing_volume_id),
+                        attached_vm_ids: volume.attached_vm_ids,
+                    });
+            }
+        }
+        if !contacted {
+            return Err(last_connect_error.unwrap_or_else(|| {
+                SandboxError::DaemonUnavailable(
+                    "no sandbox endpoint available for durable volume inventory".to_string(),
+                )
+            }));
+        }
+        let mut volumes = volumes.into_values().collect::<Vec<_>>();
+        volumes.sort_by(|left, right| left.owner_key.cmp(&right.owner_key));
+        Ok(volumes)
+    }
+
+    pub async fn delete_durable_volume(&self, owner_key: &str) -> Result<()> {
+        if matches!(&self.inner.control_backend, ControlBackend::OpenComputer(_)) {
+            return Err(SandboxError::Unsupported(
+                "durable data volumes are only available for vmd-backed sandboxes".to_string(),
+            ));
+        }
+        let mut found = false;
+        let mut contacted = false;
+        let mut last_connect_error = None;
+        for endpoint in self.candidate_endpoints().await? {
+            let mut client = match self.vmd_client_for_endpoint(&endpoint).await {
+                Ok(client) => client,
+                Err(error) => {
+                    last_connect_error = Some(error);
+                    continue;
+                }
+            };
+            contacted = true;
+            match client
+                .delete_durable_volume(self.request_with_auth(DeleteDurableVolumeRequest {
+                    owner_key: owner_key.to_string(),
+                }))
+                .await
+            {
+                Ok(_) => found = true,
+                Err(status) if status.code() == tonic::Code::NotFound => {}
+                Err(status) => return Err(SandboxError::Grpc(status)),
+            }
+        }
+        if !contacted {
+            return Err(last_connect_error.unwrap_or_else(|| {
+                SandboxError::DaemonUnavailable(
+                    "no sandbox endpoint available for durable volume deletion".to_string(),
+                )
+            }));
+        }
+        if found {
+            Ok(())
+        } else {
+            Err(SandboxError::InvalidResponse(format!(
+                "durable volume not found: {owner_key}"
+            )))
+        }
     }
 
     async fn build_control_backend(config: &SandboxConfig) -> Result<ControlBackend> {
@@ -4346,6 +4506,9 @@ impl Sandbox {
     }
 
     async fn find_vm_by_session_id(&self, session_id: &str) -> Result<Option<(Vm, String)>> {
+        let mut successful_lookup = false;
+        let mut last_error = None;
+        let mut attempted = HashSet::new();
         #[cfg(feature = "distributed-control")]
         match &self.inner.control_backend {
             ControlBackend::Distributed(control) => {
@@ -4356,11 +4519,14 @@ impl Sandbox {
                     .filter(|endpoint| !endpoint.trim().is_empty())
                 {
                     let endpoint = normalize_endpoint(&endpoint)?;
-                    if let Some(vm) = self
+                    attempted.insert(endpoint.clone());
+                    match self
                         .find_vm_by_session_id_on_endpoint(session_id, &endpoint)
-                        .await?
+                        .await
                     {
-                        return Ok(Some((vm, endpoint)));
+                        Ok(Some(vm)) => return Ok(Some((vm, endpoint))),
+                        Ok(None) => successful_lookup = true,
+                        Err(error) => last_error = Some(error),
                     }
                 }
             }
@@ -4368,15 +4534,28 @@ impl Sandbox {
         }
 
         for endpoint in self.candidate_endpoints().await? {
-            if let Some(vm) = self
+            if !attempted.insert(endpoint.clone()) {
+                continue;
+            }
+            match self
                 .find_vm_by_session_id_on_endpoint(session_id, &endpoint)
-                .await?
+                .await
             {
-                return Ok(Some((vm, endpoint)));
+                Ok(Some(vm)) => return Ok(Some((vm, endpoint))),
+                Ok(None) => successful_lookup = true,
+                Err(error) => last_error = Some(error),
             }
         }
 
-        Ok(None)
+        if successful_lookup {
+            Ok(None)
+        } else if let Some(error) = last_error {
+            Err(error)
+        } else {
+            Err(SandboxError::DaemonUnavailable(
+                "no sandbox endpoint available for session registry lookup".to_string(),
+            ))
+        }
     }
 
     async fn find_vm_by_session_id_on_endpoint(
@@ -4384,25 +4563,37 @@ impl Sandbox {
         session_id: &str,
         endpoint: &str,
     ) -> Result<Option<Vm>> {
-        let mut client = match self.vmd_client_for_endpoint(endpoint).await {
-            Ok(client) => client,
-            Err(_) => return Ok(None),
-        };
-        let request = self.request_with_auth(ListVMsRequest {
-            include_snapshots: false,
+        let mut client = self.vmd_client_for_endpoint(endpoint).await?;
+        let request = self.request_with_auth(GetVmBySessionRequest {
+            session_id: session_id.to_string(),
         });
-        let response =
-            match tokio::time::timeout(self.inner.cfg.connect_timeout, client.list_v_ms(request))
-                .await
-            {
-                Ok(Ok(response)) => response.into_inner(),
-                Ok(Err(_)) | Err(_) => return Ok(None),
-            };
-
-        Ok(response
-            .vms
-            .into_iter()
-            .find(|vm| vm.metadata.get(META_SESSION_ID).map(String::as_str) == Some(session_id)))
+        match tokio::time::timeout(
+            self.inner.cfg.connect_timeout,
+            client.get_vm_by_session(request),
+        )
+        .await
+        {
+            Ok(Ok(response)) => Ok(Some(response.into_inner())),
+            Ok(Err(status)) if status.code() == tonic::Code::NotFound => Ok(None),
+            Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+                // Rolling-upgrade compatibility for a daemon that predates the
+                // explicit persisted session registry.
+                let response = client
+                    .list_v_ms(self.request_with_auth(ListVMsRequest {
+                        include_snapshots: false,
+                    }))
+                    .await
+                    .map_err(SandboxError::Grpc)?
+                    .into_inner();
+                Ok(response.vms.into_iter().find(|vm| {
+                    vm.metadata.get(META_SESSION_ID).map(String::as_str) == Some(session_id)
+                }))
+            }
+            Ok(Err(status)) => Err(SandboxError::Grpc(status)),
+            Err(_) => Err(SandboxError::DaemonUnavailable(format!(
+                "session registry lookup timed out at {endpoint}"
+            ))),
+        }
     }
 
     async fn ensure_vm_running(&self, vm_id: &str, endpoint: &str) -> Result<Vm> {
@@ -5106,6 +5297,10 @@ fn parse_bool_like(raw: &str) -> Option<bool> {
 
 fn is_rebind_candidate_error(err: &SandboxError) -> bool {
     match err {
+        // tonic can surface the same dead-channel/connect failure either as a
+        // Status or as a transport::Error depending on whether the HTTP/2
+        // channel was established. Both authorize endpoint rebind/retry.
+        SandboxError::Transport(_) => true,
         SandboxError::Grpc(status) => {
             let message = status.message().to_ascii_lowercase();
             status.code() == tonic::Code::Unavailable

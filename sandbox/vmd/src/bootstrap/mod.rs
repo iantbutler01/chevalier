@@ -26,6 +26,7 @@ pub struct Config {
     pub network: Option<NetworkConfig>,
     pub http_proxy_url: Option<String>,
     pub portproxy_auth_token: Option<String>,
+    pub durable_volume: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -60,6 +61,7 @@ pub fn create_iso<P: AsRef<Path>>(path: P, cfg: Config) -> Result<()> {
         cfg.network.as_ref(),
         cfg.http_proxy_url.as_deref(),
         cfg.portproxy_auth_token.as_deref(),
+        cfg.durable_volume,
     );
     let shared_mounts = build_shared_mounts_file(&cfg.shared_mounts);
     let entries = vec![
@@ -83,11 +85,13 @@ fn build_init_script(
     network: Option<&NetworkConfig>,
     http_proxy_url: Option<&str>,
     portproxy_auth_token: Option<&str>,
+    durable_volume: bool,
 ) -> String {
     let host_value = shell_escape(hostname);
     let network_setup = build_network_setup_script(network);
     let proxy_setup = build_proxy_setup_script(http_proxy_url);
     let portproxy_auth_setup = build_portproxy_auth_setup_script(portproxy_auth_token);
+    let durable_volume_setup = build_durable_volume_setup_script(durable_volume);
     format!(
         r#"#!/bin/bash
 set -euxo pipefail
@@ -135,6 +139,8 @@ if [ -n "$HOSTNAME" ]; then
 fi
 
 {network_setup}
+
+{durable_volume_setup}
 
 log "searching bootstrap payload files"
 SRC=""
@@ -446,7 +452,100 @@ log "bootstrap init complete"
         host_value = host_value,
         network_setup = network_setup,
         proxy_setup = proxy_setup,
+        durable_volume_setup = durable_volume_setup,
     )
+}
+
+fn build_durable_volume_setup_script(enabled: bool) -> String {
+    if !enabled {
+        return r#"log "durable machine-state volume disabled""#.to_string();
+    }
+    r#"log "configuring durable machine-state volume"
+mkdir -p /usr/local/sbin /etc/systemd/system
+cat <<'EOF' >/usr/local/sbin/chevalier-mount-durable.sh
+#!/bin/bash
+set -euo pipefail
+
+DEVICE=/dev/disk/by-id/virtio-openbracket-durable
+MOUNT=/var/lib/openbracket/durable
+
+log() {
+  printf 'chevalier-durable-volume: %s %s\n' "$(date -Iseconds)" "$*" | systemd-cat -t chevalier-durable-volume || true
+}
+
+for ATTEMPT in $(seq 1 60); do
+  [ -b "$DEVICE" ] && break
+  sleep 1
+done
+if [ ! -b "$DEVICE" ]; then
+  log "durable block device not found: $DEVICE"
+  exit 1
+fi
+
+TYPE=$(blkid -s TYPE -o value "$DEVICE" 2>/dev/null || true)
+if [ -z "$TYPE" ]; then
+  log "formatting first-use durable volume"
+  mkfs.ext4 -F -L openbracket-durable "$DEVICE"
+elif [ "$TYPE" != "ext4" ]; then
+  log "unsupported durable volume filesystem: $TYPE"
+  exit 1
+fi
+
+mkdir -p "$MOUNT"
+if ! mountpoint -q "$MOUNT"; then
+  mount -t ext4 -o noatime "$DEVICE" "$MOUNT"
+fi
+
+bind_state() {
+  TARGET="$1"
+  NAME="$2"
+  SOURCE="$MOUNT/$NAME"
+  mkdir -p "$SOURCE"
+  if [ ! -e "$SOURCE/.openbracket-initialized" ]; then
+    if [ -d "$TARGET" ]; then
+      cp -a "$TARGET/." "$SOURCE/"
+    fi
+    touch "$SOURCE/.openbracket-initialized"
+  fi
+  mkdir -p "$TARGET"
+  if ! mountpoint -q "$TARGET"; then
+    mount --bind "$SOURCE" "$TARGET"
+  fi
+}
+
+# Preserve the sandbox image contract's machine-state paths while keeping the
+# base root disk available as the immutable boot/recovery surface.
+bind_state /var/lib/docker var-lib-docker
+bind_state /var/cache/openbracket var-cache-openbracket
+bind_state /root root
+bind_state /usr/local usr-local
+log "durable machine-state paths mounted"
+EOF
+chmod 0755 /usr/local/sbin/chevalier-mount-durable.sh
+
+cat <<'EOF' >/etc/systemd/system/chevalier-durable-volume.service
+[Unit]
+Description=Mount Chevalier durable machine-state volume
+After=systemd-udev-settle.service
+Before=containerd.service docker.service chevalier-shared-mounts.service portproxy.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/chevalier-mount-durable.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=local-fs.target
+EOF
+
+systemctl stop docker.service containerd.service 2>/dev/null || true
+systemctl daemon-reload
+systemctl enable chevalier-durable-volume.service
+systemctl start chevalier-durable-volume.service
+# Persisted workloads can make Docker's first reconciliation slow. Let systemd
+# finish that work without delaying installation/startup of the guest RPC plane.
+systemctl start --no-block containerd.service docker.service 2>/dev/null || true"#
+        .to_string()
 }
 
 fn build_network_setup_script(network: Option<&NetworkConfig>) -> String {
@@ -589,6 +688,7 @@ network:
       dhcp4: false
       dhcp6: false
       accept-ra: false
+      optional: true
       link-local: []
       addresses:
         - "$TAP_ADDRESS_CIDR"
@@ -1106,6 +1206,7 @@ mod tests {
             network: None,
             http_proxy_url: None,
             portproxy_auth_token: Some("test-token".to_string()),
+            durable_volume: false,
         };
         create_iso(&iso_path, cfg)?;
 
@@ -1160,7 +1261,7 @@ mod tests {
 
     #[test]
     fn init_script_precreates_guest_paths_before_mount_phase() {
-        let script = build_init_script("vm-test", None, None, None);
+        let script = build_init_script("vm-test", None, None, None, false);
         let precreate = script
             .find("mkdir -p \"$GUEST\"")
             .expect("precreate loop present");
@@ -1176,7 +1277,7 @@ mod tests {
 
     #[test]
     fn init_script_uses_guest_safe_virtiofs_options() {
-        let script = build_init_script("vm-test", None, None, None);
+        let script = build_init_script("vm-test", None, None, None, false);
         assert!(script.contains("VFS_OPTS=\"\""));
         assert!(script.contains("VFS_OPTS=\"ro\""));
         assert!(script.contains("if [ -n \"$VFS_OPTS\" ]; then"));
@@ -1198,7 +1299,8 @@ mod tests {
 
     #[test]
     fn init_script_configures_managed_proxy_files_when_proxy_url_present() {
-        let script = build_init_script("vm-test", None, Some("http://10.0.2.100:3128"), None);
+        let script =
+            build_init_script("vm-test", None, Some("http://10.0.2.100:3128"), None, false);
         assert!(script.contains("log \"configuring managed guest proxy environment\""));
         assert!(script.contains("HTTP_PROXY_URL='http://10.0.2.100:3128'"));
         assert!(script.contains("cat <<EOF >/etc/chevalier/proxy.env"));
@@ -1208,7 +1310,7 @@ mod tests {
 
     #[test]
     fn init_script_removes_managed_proxy_files_when_proxy_url_absent() {
-        let script = build_init_script("vm-test", None, None, None);
+        let script = build_init_script("vm-test", None, None, None, false);
         assert!(script.contains("managed guest proxy disabled; removing managed proxy files"));
         assert!(script.contains("rm -f /etc/chevalier/proxy.env"));
         assert!(script.contains("rm -f /etc/profile.d/chevalier-proxy.sh"));
@@ -1224,7 +1326,7 @@ mod tests {
             gateway: "198.18.0.1".to_string(),
             dns: "198.18.0.1".to_string(),
         };
-        let script = build_init_script("vm-test", Some(&network), None, None);
+        let script = build_init_script("vm-test", Some(&network), None, None, false);
         assert!(script.contains("log \"configuring managed tap network\""));
         assert!(script.contains("TAP_ADDRESS_CIDR='198.18.0.2/30'"));
         assert!(script.contains("ip route replace default via \"$TAP_GATEWAY\""));
@@ -1232,6 +1334,7 @@ mod tests {
         assert!(script.contains("disabling inherited netplan config"));
         assert!(script.contains("chmod 0600 /etc/netplan/90-chevalier-tap.yaml"));
         assert!(script.contains("accept-ra: false"));
+        assert!(script.contains("optional: true"));
         assert!(script.contains("link-local: []"));
         assert!(script.contains("ExecStartPre=/usr/local/sbin/chevalier-apply-tap-network.sh"));
         assert!(script.contains("cat <<'EOF' >/usr/local/sbin/chevalier-apply-tap-network.sh"));
@@ -1241,7 +1344,7 @@ mod tests {
 
     #[test]
     fn init_script_installs_noop_tap_repair_when_network_absent() {
-        let script = build_init_script("vm-test", None, None, None);
+        let script = build_init_script("vm-test", None, None, None, false);
         assert!(script.contains("log \"managed tap network disabled\""));
         assert!(script.contains("ExecStartPre=/usr/local/sbin/chevalier-apply-tap-network.sh"));
         assert!(script.contains("cat <<'EOF' >/usr/local/sbin/chevalier-apply-tap-network.sh"));
@@ -1250,14 +1353,14 @@ mod tests {
 
     #[test]
     fn init_script_does_not_block_portproxy_on_network_online() {
-        let script = build_init_script("vm-test", None, None, None);
+        let script = build_init_script("vm-test", None, None, None, false);
         assert!(script.contains("After=network.target"));
         assert!(!script.contains("network-online.target"));
     }
 
     #[test]
     fn init_script_configures_portproxy_auth_env_file_when_token_present() {
-        let script = build_init_script("vm-test", None, None, Some("guest-token"));
+        let script = build_init_script("vm-test", None, None, Some("guest-token"), false);
         assert!(script.contains("log \"configuring managed portproxy auth\""));
         assert!(script.contains("CHEVALIER_PORTPROXY_AUTH_TOKEN=%s"));
         assert!(script.contains("'guest-token' >/etc/chevalier/portproxy.env"));
@@ -1267,10 +1370,25 @@ mod tests {
 
     #[test]
     fn init_script_removes_portproxy_auth_env_file_when_token_absent() {
-        let script = build_init_script("vm-test", None, None, None);
+        let script = build_init_script("vm-test", None, None, None, false);
         assert!(script.contains("managed portproxy auth disabled; removing managed auth file"));
         assert!(script.contains("rm -f /etc/chevalier/portproxy.env"));
         assert!(script.contains("EnvironmentFile=-/etc/chevalier/portproxy.env"));
+    }
+
+    #[test]
+    fn init_script_mounts_durable_machine_state_before_runtime_services() {
+        let script = build_init_script("vm-test", None, None, None, true);
+        assert!(script.contains("DEVICE=/dev/disk/by-id/virtio-openbracket-durable"));
+        assert!(script.contains("mkfs.ext4 -F -L openbracket-durable"));
+        assert!(script.contains("bind_state /var/lib/docker var-lib-docker"));
+        assert!(script.contains("bind_state /var/cache/openbracket var-cache-openbracket"));
+        assert!(script.contains("bind_state /root root"));
+        assert!(script.contains("bind_state /usr/local usr-local"));
+        assert!(script.contains(
+            "Before=containerd.service docker.service chevalier-shared-mounts.service portproxy.service"
+        ));
+        assert!(script.contains("systemctl start --no-block containerd.service docker.service"));
     }
 
     fn read_root_entries(path: &Path) -> Result<Vec<String>> {

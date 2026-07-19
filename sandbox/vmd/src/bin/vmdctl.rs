@@ -524,6 +524,9 @@ async fn create_vm(
         architecture: arch.unwrap_or_default(),
         shared_mounts: Vec::new(),
         pci_device_ids: Vec::new(),
+        storage_profile: "local-ephemeral".to_string(),
+        volume_owner_key: String::new(),
+        volume_size_gb: 0,
     };
 
     let mut stream = client
