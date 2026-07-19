@@ -397,13 +397,15 @@ fn create_inference_client_with_config(
             "openrouter-responses" => std::env::var("OPENROUTER_API_KEY")
                 .or_else(|_| std::env::var("OPENROUTER_KEY"))
                 .map_err(|_| Error::NonRetryable("OPENROUTER_API_KEY not set".to_string()))?,
-            "google-gemini" | "google-genai" | "gemini" => std::env::var("GOOGLE_GEMINI_API_KEY")
-                .or_else(|_| std::env::var("GEMINI_API_KEY"))
-                .map_err(|_| {
-                    Error::NonRetryable(
-                        "GOOGLE_GEMINI_API_KEY or GEMINI_API_KEY not set".to_string(),
-                    )
-                })?,
+            "google" | "google-gemini" | "google-genai" | "gemini" => {
+                std::env::var("GOOGLE_GEMINI_API_KEY")
+                    .or_else(|_| std::env::var("GEMINI_API_KEY"))
+                    .map_err(|_| {
+                        Error::NonRetryable(
+                            "GOOGLE_GEMINI_API_KEY or GEMINI_API_KEY not set".to_string(),
+                        )
+                    })?
+            }
             "custom-openai" => {
                 std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "not-needed".to_string())
             }
@@ -488,7 +490,7 @@ fn create_inference_client_with_config(
             }
             Box::new(client)
         }
-        "google-gemini" | "google-genai" | "gemini" => {
+        "google" | "google-gemini" | "google-genai" | "gemini" => {
             let mut client = GoogleGenAIClient::new(key, model_name);
             if let Some(r) = reasoning
                 && let Ok(budget) = r.parse::<u32>()
@@ -885,6 +887,12 @@ mod tests {
     fn test_create_inference_client_openai_responses() {
         set_test_env_var("OPENAI_API_KEY", "test-key");
         let result = create_inference_client("openai:resp:gpt-4o", None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_inference_client_accepts_google_catalog_alias() {
+        let result = create_inference_client("google:gemini-2.5-flash", Some("test-key"));
         assert!(result.is_ok());
     }
 
