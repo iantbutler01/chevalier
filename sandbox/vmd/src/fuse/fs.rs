@@ -513,6 +513,45 @@ impl RemoteFuseFs {
             .map(|state| state.buffer.clone()))
     }
 
+    /// Apply a pathname-based metadata mutation to a file that exists only in
+    /// this mount's created-handle state. Linux may omit `fh` on chmod/truncate
+    /// immediately after create; routing that operation to the gateway would
+    /// observe ENOENT because the first write has not been flushed yet.
+    fn mutate_created_handle_for_path(
+        &self,
+        path: &str,
+        size: Option<u64>,
+        executable: Option<bool>,
+    ) -> FuseResult<Option<RemoteMetadata>> {
+        let mut handles = self.lock_handles()?;
+        let Some(state) = handles
+            .files
+            .values_mut()
+            .find(|state| state.path == path && state.created)
+        else {
+            return Ok(None);
+        };
+        if let Some(size) = size {
+            state.buffer.resize(size as usize, 0);
+        }
+        if let Some(executable) = executable {
+            state.executable = executable;
+        }
+        if size.is_some() || executable.is_some() {
+            state.dirty = true;
+            state.loaded = true;
+            state.revision = state.revision.saturating_add(1);
+        }
+        Ok(Some(RemoteMetadata {
+            kind: "file".to_string(),
+            size_bytes: state.buffer.len() as u64,
+            link_target: None,
+            content_hash: Some(content_hash_for_bytes(&state.buffer)),
+            executable: state.executable,
+            updated_at: None,
+        }))
+    }
+
     fn read_bytes(&self, path: &str, offset: u64, size: u32) -> FuseResult<Vec<u8>> {
         // A created-but-unflushed file has no gateway content yet; serve the
         // creator's buffer (checked first so an oversized created buffer never
@@ -1348,6 +1387,46 @@ mod tests {
             "path readers must be served a created file's uncommitted bytes"
         );
     }
+
+    #[test]
+    fn pathname_mutations_update_an_uncommitted_created_file_without_gateway_io() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let client =
+            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
+        let fs = RemoteFuseFs::new(client, false, "test-scope", runtime.handle().clone());
+        let path = "git-meta/config.lock";
+        let bytes = b"created contents".to_vec();
+        let writer = fs
+            .next_handle(path, bytes.clone(), true, None, false, true)
+            .unwrap();
+        {
+            let mut handles = fs.lock_handles().unwrap();
+            let state = handles.files.get_mut(&writer).unwrap();
+            state.dirty = true;
+            state.revision += 1;
+        }
+
+        // The endpoint is deliberately unroutable. A gateway stat/write would
+        // fail this test; created-inode chmod/truncate must stay handle-local.
+        let metadata = fs
+            .mutate_created_handle_for_path(path, Some(7), Some(true))
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.size_bytes, 7);
+        assert!(metadata.executable);
+        assert_eq!(
+            metadata.content_hash,
+            Some(content_hash_for_bytes(&bytes[..7]))
+        );
+        assert_eq!(fs.read_bytes(path, 0, 64).unwrap(), bytes[..7]);
+
+        let handles = fs.lock_handles().unwrap();
+        let state = handles.files.get(&writer).unwrap();
+        assert_eq!(state.buffer, bytes[..7]);
+        assert!(state.executable);
+        assert!(state.dirty);
+        assert!(state.loaded);
+    }
 }
 
 /// FUSE operation bodies. Dispatched concurrently by `SpawnedFuseFs`
@@ -1487,6 +1566,13 @@ impl RemoteFuseFs {
             }
 
             let path = self.path_for_ino(ino)?;
+            if let Some(metadata) = self.mutate_created_handle_for_path(
+                &path,
+                size,
+                mode.map(|value| value & 0o111 != 0),
+            )? {
+                return Ok(self.attr_for_path(&path, &metadata, false));
+            }
             if let Some(size) = size {
                 let attr = self.resize_path_immediate(&path, size)?;
                 if mode.is_none() {
