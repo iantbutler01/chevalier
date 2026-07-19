@@ -220,6 +220,7 @@ pub struct Manager {
     session_registry: RwLock<HashMap<String, String>>,
     snapshots: RwLock<HashMap<String, SnapshotRecord>>,
     volumes: RwLock<HashMap<String, DurableVolumeMetadata>>,
+    volume_operation_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pci_leases: Mutex<HashMap<String, String>>,
 }
 
@@ -252,6 +253,7 @@ impl Manager {
             session_registry: RwLock::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
+            volume_operation_locks: Mutex::new(HashMap::new()),
             pci_leases: Mutex::new(HashMap::new()),
         };
 
@@ -278,6 +280,30 @@ impl Manager {
             )
         };
         lock.lock_owned().await
+    }
+
+    async fn lock_volume_operations(&self, owner_keys: &[&str]) -> Vec<OwnedMutexGuard<()>> {
+        let mut sorted_owner_keys = owner_keys.to_vec();
+        sorted_owner_keys.sort_unstable();
+        sorted_owner_keys.dedup();
+        let locks = {
+            let mut operation_locks = self.volume_operation_locks.lock().await;
+            sorted_owner_keys
+                .into_iter()
+                .map(|owner_key| {
+                    Arc::clone(
+                        operation_locks
+                            .entry(owner_key.to_string())
+                            .or_insert_with(|| Arc::new(Mutex::new(()))),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in locks {
+            guards.push(lock.lock_owned().await);
+        }
+        guards
     }
 
     async fn metadata_with_runtime_network_snapshot(&self, mut metadata: VmMetadata) -> VmMetadata {
@@ -491,8 +517,8 @@ impl Manager {
                 self.resource_bounds.max_disk_gb
             )));
         }
-        let mut volumes = self.volumes.write().await;
-        if let Some(existing) = volumes.get(owner_key) {
+        let _operation_guards = self.lock_volume_operations(&[owner_key]).await;
+        if let Some(existing) = self.volumes.read().await.get(owner_key).cloned() {
             let attached = self.attached_vm_ids_for_volume(owner_key).await;
             if !attached.is_empty() {
                 return Err(ManagerError::VolumeInUse(attached.join(",")));
@@ -530,7 +556,10 @@ impl Manager {
             let _ = fs::remove_file(&disk_path);
             return Err(ManagerError::Other(error));
         }
-        volumes.insert(owner_key.to_string(), meta);
+        self.volumes
+            .write()
+            .await
+            .insert(owner_key.to_string(), meta);
         info!(
             owner_key = %owner_key,
             volume_id = %volume_id,
@@ -563,18 +592,21 @@ impl Manager {
 
     pub async fn delete_durable_volume(&self, owner_key: &str) -> ManagerResult<()> {
         Self::validate_volume_owner_key(owner_key)?;
+        let _operation_guards = self.lock_volume_operations(&[owner_key]).await;
         let attached = self.attached_vm_ids_for_volume(owner_key).await;
         if !attached.is_empty() {
             return Err(ManagerError::VolumeInUse(attached.join(",")));
         }
-        let mut volumes = self.volumes.write().await;
-        let meta = volumes
-            .remove(owner_key)
+        let meta = self
+            .volumes
+            .read()
+            .await
+            .get(owner_key)
+            .cloned()
             .ok_or(ManagerError::VolumeNotFound)?;
         let disk_path = self.volume_disk_path(&meta.volume_id);
         if let Err(error) = fs::remove_file(&disk_path) {
             if error.kind() != std::io::ErrorKind::NotFound {
-                volumes.insert(owner_key.to_string(), meta);
                 return Err(ManagerError::Io(error));
             }
         }
@@ -589,8 +621,8 @@ impl Manager {
                 );
             }
         }
+        self.volumes.write().await.remove(owner_key);
         info!(owner_key = %owner_key, volume_id = %meta.volume_id, "deleted durable data volume");
-        drop(volumes);
         if let Some(backing_id) = meta.backing_volume_id.as_deref() {
             self.cleanup_volume_fork_base_if_unreferenced(backing_id)
                 .await;
@@ -605,17 +637,25 @@ impl Manager {
         fork_id: &str,
     ) -> ManagerResult<()> {
         Self::validate_volume_owner_key(&child.owner_key)?;
-        let mut volumes = self.volumes.write().await;
-        if volumes.contains_key(&child.owner_key) {
+        let _operation_guards = self
+            .lock_volume_operations(&[&parent.owner_key, &child.owner_key])
+            .await;
+        let (mut parent_meta, child_exists) = {
+            let volumes = self.volumes.read().await;
+            (
+                volumes
+                    .get(&parent.owner_key)
+                    .cloned()
+                    .ok_or(ManagerError::VolumeNotFound)?,
+                volumes.contains_key(&child.owner_key),
+            )
+        };
+        if child_exists {
             return Err(ManagerError::Other(anyhow!(
                 "durable child volume owner already exists: {}",
                 child.owner_key
             )));
         }
-        let mut parent_meta = volumes
-            .get(&parent.owner_key)
-            .cloned()
-            .ok_or(ManagerError::VolumeNotFound)?;
         let parent_path = self.volume_disk_path(&parent.volume_id);
         let fork_root = self
             .volumes_dir()
@@ -671,8 +711,11 @@ impl Manager {
             let _ = fs::remove_dir_all(&fork_root);
             return Err(ManagerError::Other(error));
         }
-        volumes.insert(parent.owner_key.clone(), parent_meta);
-        volumes.insert(child.owner_key.clone(), child_meta);
+        {
+            let mut volumes = self.volumes.write().await;
+            volumes.insert(parent.owner_key.clone(), parent_meta);
+            volumes.insert(child.owner_key.clone(), child_meta);
+        }
         info!(
             parent_owner_key = %parent.owner_key,
             child_owner_key = %child.owner_key,
@@ -688,7 +731,9 @@ impl Manager {
         child: &DurableVolumeAttachment,
         fork_id: &str,
     ) {
-        let mut volumes = self.volumes.write().await;
+        let _operation_guards = self
+            .lock_volume_operations(&[&parent.owner_key, &child.owner_key])
+            .await;
         let parent_path = self.volume_disk_path(&parent.volume_id);
         let child_path = self.volume_disk_path(&child.volume_id);
         let fork_root = self
@@ -700,10 +745,16 @@ impl Manager {
         let _ = fs::remove_file(&child_path);
         let _ = fs::rename(&base_path, &parent_path);
         let _ = fs::remove_dir_all(&fork_root);
-        volumes.remove(&child.owner_key);
-        if let Some(parent_meta) = volumes.get_mut(&parent.owner_key) {
-            parent_meta.backing_volume_id = None;
-            let _ = save_volume_metadata(&self.volumes_dir(), parent_meta);
+        let parent_meta = {
+            let mut volumes = self.volumes.write().await;
+            volumes.remove(&child.owner_key);
+            volumes.get_mut(&parent.owner_key).map(|parent_meta| {
+                parent_meta.backing_volume_id = None;
+                parent_meta.clone()
+            })
+        };
+        if let Some(mut parent_meta) = parent_meta {
+            let _ = save_volume_metadata(&self.volumes_dir(), &mut parent_meta);
         }
         let _ = fs::remove_file(volume_metadata_path(&self.volumes_dir(), &child.volume_id));
     }
@@ -6043,6 +6094,174 @@ mod tests {
             .is_ok()
     }
 
+    #[cfg(unix)]
+    fn blocking_qemu_img(root: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let script = root.join("blocking-qemu-img");
+        let entered = root.join("qemu-img-entered");
+        let release = root.join("qemu-img-release");
+        let calls = root.join("qemu-img-calls");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf 'call\\n' >> '{}'\ntouch '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\n",
+                calls.display(),
+                entered.display(),
+                release.display(),
+            ),
+        )
+        .expect("write blocking qemu-img");
+        let mut permissions = fs::metadata(&script)
+            .expect("read blocking qemu-img metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("make blocking qemu-img executable");
+        (script, entered, release, calls)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_volume_creation_does_not_block_inventory_and_serializes_same_owner() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let (qemu_img_bin, entered, release, calls) = blocking_qemu_img(tmp.path());
+        let manager = Arc::new(
+            Manager::new(Config {
+                listen_address: "127.0.0.1:0".to_string(),
+                data_dir: tmp.path().join("vmd").to_string_lossy().to_string(),
+                qemu_img_bin: qemu_img_bin.to_string_lossy().to_string(),
+                ..Config::default()
+            })
+            .await
+            .expect("create manager"),
+        );
+        let owner_key = "workspace:test:thread:contended";
+
+        let first_manager = Arc::clone(&manager);
+        let first =
+            tokio::spawn(async move { first_manager.ensure_durable_volume(owner_key, 1).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !entered.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first qemu-img invocation should start");
+
+        let second_manager = Arc::clone(&manager);
+        let second =
+            tokio::spawn(async move { second_manager.ensure_durable_volume(owner_key, 1).await });
+        let listed =
+            tokio::time::timeout(Duration::from_millis(200), manager.list_durable_volumes())
+                .await
+                .expect("inventory must not wait for qemu-img");
+        assert!(listed.is_empty(), "uncommitted volume must stay invisible");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            fs::read_to_string(&calls)
+                .expect("read qemu-img calls")
+                .lines()
+                .count(),
+            1,
+            "same-owner creation must wait on the per-volume reservation"
+        );
+
+        fs::write(&release, b"release").expect("release qemu-img");
+        let first_volume = first
+            .await
+            .expect("join first creation")
+            .expect("first creation succeeds");
+        let second_volume = second
+            .await
+            .expect("join second creation")
+            .expect("second creation reuses committed volume");
+        assert_eq!(first_volume.volume_id, second_volume.volume_id);
+        assert_eq!(manager.list_durable_volumes().await.len(), 1);
+        assert_eq!(
+            fs::read_to_string(calls)
+                .expect("read final qemu-img calls")
+                .lines()
+                .count(),
+            1,
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_volume_fork_does_not_block_inventory() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let (qemu_img_bin, entered, release, calls) = blocking_qemu_img(tmp.path());
+        let manager = Arc::new(
+            Manager::new(Config {
+                listen_address: "127.0.0.1:0".to_string(),
+                data_dir: tmp.path().join("vmd").to_string_lossy().to_string(),
+                qemu_img_bin: qemu_img_bin.to_string_lossy().to_string(),
+                ..Config::default()
+            })
+            .await
+            .expect("create manager"),
+        );
+        let parent = DurableVolumeAttachment {
+            owner_key: "workspace:test:thread:fork-parent".to_string(),
+            volume_id: "fork-parent".to_string(),
+            size_gb: 1,
+        };
+        let child = DurableVolumeAttachment {
+            owner_key: "workspace:test:thread:fork-child".to_string(),
+            volume_id: "fork-child".to_string(),
+            size_gb: 1,
+        };
+        fs::create_dir_all(manager.volumes_dir()).expect("create volumes directory");
+        fs::write(manager.volume_disk_path(&parent.volume_id), b"parent")
+            .expect("create parent volume disk");
+        manager.volumes.write().await.insert(
+            parent.owner_key.clone(),
+            DurableVolumeMetadata {
+                owner_key: parent.owner_key.clone(),
+                volume_id: parent.volume_id.clone(),
+                size_gb: parent.size_gb,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                backing_volume_id: None,
+            },
+        );
+
+        let fork_manager = Arc::clone(&manager);
+        let fork_parent = parent.clone();
+        let fork_child = child.clone();
+        let fork = tokio::spawn(async move {
+            fork_manager
+                .fork_durable_volume(&fork_parent, &fork_child, "contention-test")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !entered.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fork qemu-img invocation should start");
+
+        let listed =
+            tokio::time::timeout(Duration::from_millis(200), manager.list_durable_volumes())
+                .await
+                .expect("inventory must not wait for fork qemu-img");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0.owner_key, parent.owner_key);
+
+        fs::write(&release, b"release").expect("release fork qemu-img");
+        fork.await
+            .expect("join durable volume fork")
+            .expect("durable volume fork succeeds");
+        let listed = manager.list_durable_volumes().await;
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            fs::read_to_string(calls)
+                .expect("read fork qemu-img calls")
+                .lines()
+                .count(),
+            2,
+        );
+    }
+
     fn qemu_backing_file(path: &Path) -> Option<String> {
         let output = std::process::Command::new("qemu-img")
             .arg("info")
@@ -6188,6 +6407,7 @@ mod tests {
             vms: RwLock::new(HashMap::new()),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
+            volume_operation_locks: Mutex::new(HashMap::new()),
             pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };
@@ -6470,6 +6690,7 @@ mod tests {
             vms: RwLock::new(HashMap::new()),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
+            volume_operation_locks: Mutex::new(HashMap::new()),
             pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };
@@ -6636,6 +6857,7 @@ mod tests {
             vms: RwLock::new(HashMap::new()),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
+            volume_operation_locks: Mutex::new(HashMap::new()),
             pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };
@@ -6739,6 +6961,7 @@ mod tests {
             vms: RwLock::new(HashMap::new()),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
+            volume_operation_locks: Mutex::new(HashMap::new()),
             pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };
@@ -6857,6 +7080,7 @@ mod tests {
             vms: RwLock::new(HashMap::new()),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
+            volume_operation_locks: Mutex::new(HashMap::new()),
             pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };
@@ -6959,6 +7183,7 @@ mod tests {
             vms: RwLock::new(HashMap::new()),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
+            volume_operation_locks: Mutex::new(HashMap::new()),
             pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };
@@ -7798,6 +8023,7 @@ mod tests {
             vms: RwLock::new(HashMap::new()),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
+            volume_operation_locks: Mutex::new(HashMap::new()),
             pci_leases: Mutex::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
         };

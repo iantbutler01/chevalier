@@ -73,6 +73,7 @@ use proto::vmd::v1::{
 };
 
 const PCI_CAPABILITY_HEADER: &str = "x-chevalier-pci-token";
+const DURABLE_VOLUME_LIST_TIMEOUT: Duration = Duration::from_secs(2);
 
 const META_SESSION_ID: &str = "chevalier.session_id";
 const META_PARENT_SESSION_ID: &str = "chevalier.parent_session_id";
@@ -3344,12 +3345,21 @@ impl Sandbox {
                 }
             };
             contacted = true;
-            let response = match client
-                .list_durable_volumes(self.request_with_auth(ListDurableVolumesRequest {}))
-                .await
-            {
+            let mut request = self.request_with_auth(ListDurableVolumesRequest {});
+            request.set_timeout(DURABLE_VOLUME_LIST_TIMEOUT);
+            let response = match client.list_durable_volumes(request).await {
                 Ok(response) => response.into_inner(),
                 Err(status) if status.code() == tonic::Code::Unimplemented => continue,
+                Err(status)
+                    if matches!(
+                        status.code(),
+                        tonic::Code::Cancelled | tonic::Code::DeadlineExceeded
+                    ) =>
+                {
+                    return Err(SandboxError::Grpc(tonic::Status::deadline_exceeded(
+                        "durable volume inventory timed out",
+                    )));
+                }
                 Err(status) => return Err(SandboxError::Grpc(status)),
             };
             for volume in response.volumes {

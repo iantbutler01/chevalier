@@ -4,7 +4,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chevalier_sandbox::proto::bracket::portproxy::v1::port_proxy_server::{
     PortProxy, PortProxyServer,
@@ -55,6 +55,7 @@ struct MockVmdState {
     restored_snapshot_ids: Vec<String>,
     predownload_requests: Vec<(String, String)>,
     create_requests: Vec<CreateVmRequest>,
+    list_durable_volumes_delay: Option<Duration>,
 }
 
 #[derive(Clone)]
@@ -283,6 +284,10 @@ impl VmdService for MockVmd {
         &self,
         _request: Request<ListDurableVolumesRequest>,
     ) -> Result<Response<ListDurableVolumesResponse>, Status> {
+        let delay = self.state.lock().await.list_durable_volumes_delay;
+        if let Some(delay) = delay {
+            sleep(delay).await;
+        }
         Ok(Response::new(ListDurableVolumesResponse {
             volumes: Vec::new(),
         }))
@@ -782,6 +787,35 @@ async fn disabled_pci_inventory_is_backward_compatible_without_a_capability_toke
         .expect("disabled inventory should not require a PCI token");
     assert!(!inventory.enabled);
     assert!(inventory.devices.is_empty());
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_volume_inventory_has_a_short_rpc_deadline() {
+    let harness = TestHarness::start().await;
+    harness.vmd_state.lock().await.list_durable_volumes_delay = Some(Duration::from_secs(30));
+    let mut config = sandbox_config();
+    config.connect_timeout = Duration::from_secs(30);
+    let sandbox = Sandbox::connect(harness.vmd_endpoint.clone(), config)
+        .await
+        .expect("connect sandbox facade to mock vmd");
+
+    let started = Instant::now();
+    let error = timeout(Duration::from_secs(4), sandbox.list_durable_volumes())
+        .await
+        .expect("durable inventory must honor its own deadline")
+        .expect_err("delayed durable inventory should time out");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "durable inventory exceeded its short deadline"
+    );
+    match error {
+        SandboxError::Grpc(status) => {
+            assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        }
+        other => panic!("expected gRPC deadline error, got {other:?}"),
+    }
 
     harness.shutdown().await;
 }
