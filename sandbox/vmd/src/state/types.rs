@@ -257,6 +257,12 @@ impl Vm {
         self.inner.lock().await
     }
 
+    pub fn try_lock(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, VmInner>, tokio::sync::TryLockError> {
+        self.inner.try_lock()
+    }
+
     pub async fn lock_owned(&self) -> tokio::sync::OwnedMutexGuard<VmInner> {
         self.inner.clone().lock_owned().await
     }

@@ -3347,10 +3347,15 @@ impl Sandbox {
             contacted = true;
             let mut request = self.request_with_auth(ListDurableVolumesRequest {});
             request.set_timeout(DURABLE_VOLUME_LIST_TIMEOUT);
-            let response = match client.list_durable_volumes(request).await {
-                Ok(response) => response.into_inner(),
-                Err(status) if status.code() == tonic::Code::Unimplemented => continue,
-                Err(status)
+            let response = match tokio::time::timeout(
+                DURABLE_VOLUME_LIST_TIMEOUT,
+                client.list_durable_volumes(request),
+            )
+            .await
+            {
+                Ok(Ok(response)) => response.into_inner(),
+                Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => continue,
+                Ok(Err(status))
                     if matches!(
                         status.code(),
                         tonic::Code::Cancelled | tonic::Code::DeadlineExceeded
@@ -3360,7 +3365,12 @@ impl Sandbox {
                         "durable volume inventory timed out",
                     )));
                 }
-                Err(status) => return Err(SandboxError::Grpc(status)),
+                Ok(Err(status)) => return Err(SandboxError::Grpc(status)),
+                Err(_) => {
+                    return Err(SandboxError::Grpc(tonic::Status::deadline_exceeded(
+                        "durable volume inventory timed out",
+                    )));
+                }
             };
             for volume in response.volumes {
                 let timestamp_ms = |value: Option<proto::google::protobuf::Timestamp>| {

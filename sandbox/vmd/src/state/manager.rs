@@ -505,6 +505,29 @@ impl Manager {
         attached
     }
 
+    async fn visible_attached_vm_ids_for_volume(&self, owner_key: &str) -> Vec<String> {
+        let guard = self.vms.read().await;
+        let mut attached = Vec::new();
+        for vm in guard.values() {
+            // Inventory is observational and must remain available while a VM
+            // operation owns its runtime lock. Mutation paths use the blocking
+            // helper above so a busy VM can never make deletion look safe.
+            let Ok(inner) = vm.try_lock() else {
+                continue;
+            };
+            if inner
+                .metadata
+                .durable_volume
+                .as_ref()
+                .is_some_and(|volume| volume.owner_key == owner_key)
+            {
+                attached.push(inner.metadata.id.clone());
+            }
+        }
+        attached.sort();
+        attached
+    }
+
     async fn ensure_durable_volume(
         &self,
         owner_key: &str,
@@ -583,7 +606,9 @@ impl Manager {
             .collect::<Vec<_>>();
         let mut out = Vec::with_capacity(volumes.len());
         for volume in volumes {
-            let attached = self.attached_vm_ids_for_volume(&volume.owner_key).await;
+            let attached = self
+                .visible_attached_vm_ids_for_volume(&volume.owner_key)
+                .await;
             out.push((volume, attached));
         }
         out.sort_by(|left, right| left.0.owner_key.cmp(&right.0.owner_key));
@@ -6182,6 +6207,84 @@ mod tests {
                 .count(),
             1,
         );
+    }
+
+    #[tokio::test]
+    async fn durable_volume_inventory_does_not_wait_for_busy_vm_runtime() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let manager = Manager::new(Config {
+            listen_address: "127.0.0.1:0".to_string(),
+            data_dir: tmp.path().join("vmd").to_string_lossy().to_string(),
+            ..Config::default()
+        })
+        .await
+        .expect("create manager");
+        let attachment = DurableVolumeAttachment {
+            owner_key: "workspace:test:thread:busy-runtime".to_string(),
+            volume_id: "busy-runtime".to_string(),
+            size_gb: 1,
+        };
+        manager.volumes.write().await.insert(
+            attachment.owner_key.clone(),
+            DurableVolumeMetadata {
+                owner_key: attachment.owner_key.clone(),
+                volume_id: attachment.volume_id.clone(),
+                size_gb: attachment.size_gb,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                backing_volume_id: None,
+            },
+        );
+        let vm_id = "busy-volume-vm".to_string();
+        let vm_dir = tmp.path().join("vmd").join(&vm_id);
+        fs::create_dir_all(&vm_dir).expect("create vm dir");
+        let metadata = VmMetadata {
+            id: vm_id.clone(),
+            name: "busy-volume".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            state: VmState::Running,
+            architecture: ARCH_AMD64.to_string(),
+            source: VmSource {
+                source_type: VmSourceType::Docker,
+                reference: "mock/image:latest".to_string(),
+            },
+            resources: crate::state::ResourceSpec {
+                vcpu: 1,
+                memory_mb: 512,
+                disk_gb: 10,
+            },
+            network: NetworkSpec {
+                mac: "02:00:00:00:00:04".to_string(),
+                proxy_port: 0,
+                rpc_port: 0,
+            },
+            metadata: HashMap::new(),
+            snapshots: Vec::new(),
+            shared_mounts: Vec::new(),
+            pci_devices: Vec::new(),
+            durable_volume: Some(attachment),
+            boot_incoming_ram_path: String::new(),
+            started_at: None,
+        };
+        let vm = Arc::new(Vm::new(metadata, VmRuntime::new(&vm_dir), vm_dir));
+        manager
+            .vms
+            .write()
+            .await
+            .insert(vm_id.clone(), Arc::clone(&vm));
+
+        let busy_guard = vm.lock().await;
+        let listed =
+            tokio::time::timeout(Duration::from_millis(200), manager.list_durable_volumes())
+                .await
+                .expect("inventory must not wait for a busy VM runtime");
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].1.is_empty());
+        drop(busy_guard);
+
+        let listed = manager.list_durable_volumes().await;
+        assert_eq!(listed[0].1, vec![vm_id]);
     }
 
     #[cfg(unix)]
