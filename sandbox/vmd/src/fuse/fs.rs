@@ -754,7 +754,11 @@ impl RemoteFuseFs {
 
     fn flush_handle_immediate(&self, fh: u64) -> FuseResult<()> {
         self.flush_handle(fh)?;
-        self.flush_writes()
+        self.flush_writes()?;
+        // A file can be renamed between its data flush and the final
+        // close/fsync. Do not report a barrier until both ordered journals are
+        // remotely acknowledged.
+        self.flush_namespace()
     }
 
     fn flush_handles_for_path(&self, path: &str) -> FuseResult<()> {
@@ -1024,6 +1028,14 @@ impl RemoteFuseFs {
         }
         let namespace = self.namespace.as_ref().ok_or(Errno::EIO)?;
         namespace.enqueue(mutation).map_err(|_| Errno::EIO)
+    }
+
+    fn commit_namespace(&self, mutation: VfsNamespaceMutation) -> FuseResult<()> {
+        self.enqueue_namespace(mutation)?;
+        // Namespace syscalls are publication points. The journal still
+        // coalesces concurrently enqueued operations into one ordered batch,
+        // but success cannot precede remote visibility.
+        self.flush_namespace()
     }
 
     fn flush_namespace(&self) -> FuseResult<()> {
@@ -1827,7 +1839,7 @@ impl RemoteFuseFs {
         _lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
-        match self.flush_handle(fh.0) {
+        match self.flush_handle_immediate(fh.0) {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(err),
         }
@@ -1855,7 +1867,7 @@ impl RemoteFuseFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let flush_result = self.flush_handle(fh.0);
+        let flush_result = self.flush_handle_immediate(fh.0);
         let _ = self
             .lock_handles()
             .map(|mut handles| handles.files.remove(&fh.0));
@@ -1876,7 +1888,7 @@ impl RemoteFuseFs {
         let result: FuseResult<FileAttr> = (|| {
             let parent_path = self.path_for_ino(parent)?;
             let path = Self::child_path(parent_path.as_str(), name)?;
-            self.enqueue_namespace(VfsNamespaceMutation::CreateDirectory { path: path.clone() })?;
+            self.commit_namespace(VfsNamespaceMutation::CreateDirectory { path: path.clone() })?;
             self.cache.invalidate(&path);
             let metadata = RemoteMetadata {
                 kind: "directory".to_string(),
@@ -1908,7 +1920,7 @@ impl RemoteFuseFs {
             let target = target.to_str().ok_or(Errno::EINVAL)?.to_string();
             let parent_path = self.path_for_ino(parent)?;
             let path = Self::child_path(parent_path.as_str(), link_name)?;
-            self.enqueue_namespace(VfsNamespaceMutation::CreateSymlink {
+            self.commit_namespace(VfsNamespaceMutation::CreateSymlink {
                 path: path.clone(),
                 target: target.clone(),
             })?;
@@ -1933,7 +1945,7 @@ impl RemoteFuseFs {
         let result: FuseResult<()> = (|| {
             let parent_path = self.path_for_ino(parent)?;
             let path = Self::child_path(parent_path.as_str(), name)?;
-            self.enqueue_namespace(VfsNamespaceMutation::DeleteFile {
+            self.commit_namespace(VfsNamespaceMutation::DeleteFile {
                 path: path.clone(),
                 precondition: None,
             })?;
@@ -1951,7 +1963,7 @@ impl RemoteFuseFs {
         let result: FuseResult<()> = (|| {
             let parent_path = self.path_for_ino(parent)?;
             let path = Self::child_path(parent_path.as_str(), name)?;
-            self.enqueue_namespace(VfsNamespaceMutation::RemoveDirectory { path: path.clone() })?;
+            self.commit_namespace(VfsNamespaceMutation::RemoveDirectory { path: path.clone() })?;
             self.cache.invalidate(&path);
             self.detach_inode_path(&path);
             Ok(())
@@ -1977,7 +1989,7 @@ impl RemoteFuseFs {
             let from = Self::child_path(parent_path.as_str(), name)?;
             let to = Self::child_path(newparent_path.as_str(), newname)?;
             self.flush_handles_for_subtree(&from)?;
-            self.enqueue_namespace(VfsNamespaceMutation::Rename {
+            self.commit_namespace(VfsNamespaceMutation::Rename {
                 from: from.clone(),
                 to: to.clone(),
             })?;
