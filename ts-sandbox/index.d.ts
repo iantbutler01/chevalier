@@ -46,6 +46,8 @@ export declare class Session {
   shell(options?: ShellOpts | undefined | null): Promise<ShellHandle>
   /** Read a file from the guest. */
   readFile(path: string): Promise<Buffer>
+  /** List a directory through the guest's mounted filesystem. */
+  listDir(path: string): Promise<Array<SessionDirectoryEntryJs>>
   /** Write a file to the guest. */
   writeFile(path: string, data: Buffer): Promise<void>
   /** Fork this session (CoW); returns the child session. */
@@ -201,6 +203,13 @@ export interface SandboxConnectOptions {
 
 export interface SessionCheckpointJs {
   id: string
+}
+
+/** One entry returned by `Session.listDir`. */
+export interface SessionDirectoryEntryJs {
+  name: string
+  isDir: boolean
+  isSymlink: boolean
 }
 
 export interface SessionInfoJs {

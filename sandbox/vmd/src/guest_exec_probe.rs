@@ -196,17 +196,6 @@ pub async fn run_guest_shell_exec(
         })
         .await
         .map_err(|_| anyhow!("enqueue shell exec start request"))?;
-    if let Some(stdin) = stdin {
-        for chunk in stdin.chunks(64 * 1024) {
-            req_tx
-                .send(ExecRequest {
-                    request: Some(exec_request::Request::StdinData(chunk.to_vec())),
-                })
-                .await
-                .map_err(|_| anyhow!("enqueue shell exec stdin request"))?;
-        }
-    }
-    drop(req_tx);
 
     let response = client
         .exec(request_with_portproxy_auth(
@@ -216,26 +205,44 @@ pub async fn run_guest_shell_exec(
         .await
         .context("invoke shell exec")?;
     let mut stream = response.into_inner();
-    let mut output = GuestShellExecOutput::default();
 
-    while let Some(frame) = stream.message().await.context("read shell exec frame")? {
-        match frame {
-            ExecResponse {
-                response: Some(exec_response::Response::StdoutData(bytes)),
-            } => output.stdout.extend(bytes),
-            ExecResponse {
-                response: Some(exec_response::Response::StderrData(bytes)),
-            } => output.stderr.extend(bytes),
-            ExecResponse {
-                response: Some(exec_response::Response::ExitCode(code)),
-            } => {
-                output.exit_code = Some(code);
-                return Ok(output);
+    let send_stdin = async move {
+        if let Some(stdin) = stdin {
+            for chunk in stdin.chunks(64 * 1024) {
+                req_tx
+                    .send(ExecRequest {
+                        request: Some(exec_request::Request::StdinData(chunk.to_vec())),
+                    })
+                    .await
+                    .map_err(|_| anyhow!("enqueue shell exec stdin request"))?;
             }
-            ExecResponse { response: None } => {}
         }
-    }
+        drop(req_tx);
+        Ok::<(), anyhow::Error>(())
+    };
+    let read_output = async move {
+        let mut output = GuestShellExecOutput::default();
+        while let Some(frame) = stream.message().await.context("read shell exec frame")? {
+            match frame {
+                ExecResponse {
+                    response: Some(exec_response::Response::StdoutData(bytes)),
+                } => output.stdout.extend(bytes),
+                ExecResponse {
+                    response: Some(exec_response::Response::StderrData(bytes)),
+                } => output.stderr.extend(bytes),
+                ExecResponse {
+                    response: Some(exec_response::Response::ExitCode(code)),
+                } => {
+                    output.exit_code = Some(code);
+                    return Ok(output);
+                }
+                ExecResponse { response: None } => {}
+            }
+        }
+        Ok::<GuestShellExecOutput, anyhow::Error>(output)
+    };
 
+    let ((), output) = tokio::try_join!(send_stdin, read_output)?;
     Ok(output)
 }
 
@@ -364,7 +371,126 @@ fn shell_single_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::time::Duration;
+
+    use futures::{Stream, stream};
+    use tokio::net::TcpListener;
+    use tonic::transport::Server;
+    use tonic::{Response, Streaming};
+
     use super::*;
+    use crate::proto::bracket::portproxy::v1::shell_exec_server::{ShellExec, ShellExecServer};
+    use crate::proto::bracket::portproxy::v1::{InteractiveShellRequest, InteractiveShellResponse};
+
+    type ExecResponseStream =
+        Pin<Box<dyn Stream<Item = Result<ExecResponse, Status>> + Send + 'static>>;
+    type InteractiveResponseStream =
+        Pin<Box<dyn Stream<Item = Result<InteractiveShellResponse, Status>> + Send + 'static>>;
+
+    #[derive(Clone, Default)]
+    struct CountingShellExec;
+
+    #[tonic::async_trait]
+    impl ShellExec for CountingShellExec {
+        type ExecStream = ExecResponseStream;
+        type InteractiveShellStream = InteractiveResponseStream;
+
+        async fn exec(
+            &self,
+            request: Request<Streaming<ExecRequest>>,
+        ) -> Result<Response<Self::ExecStream>, Status> {
+            let mut requests = request.into_inner();
+            let first = requests
+                .message()
+                .await?
+                .ok_or_else(|| Status::invalid_argument("missing start frame"))?;
+            if !matches!(
+                first.request,
+                Some(exec_request::Request::Start(ExecStart { .. }))
+            ) {
+                return Err(Status::invalid_argument("first frame was not start"));
+            }
+
+            let (response_tx, response_rx) = mpsc::channel(2);
+            tokio::spawn(async move {
+                let mut stdin_bytes = 0usize;
+                loop {
+                    match requests.message().await {
+                        Ok(Some(ExecRequest {
+                            request: Some(exec_request::Request::StdinData(bytes)),
+                        })) => stdin_bytes += bytes.len(),
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(status) => {
+                            let _ = response_tx.send(Err(status)).await;
+                            return;
+                        }
+                    }
+                }
+                let _ = response_tx
+                    .send(Ok(ExecResponse {
+                        response: Some(exec_response::Response::StdoutData(
+                            stdin_bytes.to_string().into_bytes(),
+                        )),
+                    }))
+                    .await;
+                let _ = response_tx
+                    .send(Ok(ExecResponse {
+                        response: Some(exec_response::Response::ExitCode(0)),
+                    }))
+                    .await;
+            });
+
+            Ok(Response::new(Box::pin(ReceiverStream::new(response_rx))))
+        }
+
+        async fn interactive_shell(
+            &self,
+            _request: Request<Streaming<InteractiveShellRequest>>,
+        ) -> Result<Response<Self::InteractiveShellStream>, Status> {
+            Err(Status::unimplemented(
+                "interactive shell is not used by this test",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn guest_shell_exec_streams_stdin_larger_than_request_channel_capacity() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener.local_addr().expect("test listener has address");
+        let incoming = stream::unfold(listener, |listener| async {
+            Some((listener.accept().await.map(|(socket, _)| socket), listener))
+        });
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(ShellExecServer::new(CountingShellExec))
+                .serve_with_incoming(incoming)
+                .await
+                .expect("test shell exec server should run");
+        });
+
+        let stdin = vec![0x5a; 8 * 64 * 1024 + 1];
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_guest_shell_exec(
+                format!("http://{address}").as_str(),
+                None,
+                "cat >/dev/null",
+                Some(stdin.as_slice()),
+                5,
+            ),
+        )
+        .await
+        .expect("large stdin exec should not deadlock")
+        .expect("large stdin exec should succeed");
+        server.abort();
+
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.stdout_lossy(), stdin.len().to_string());
+    }
 
     #[test]
     fn portproxy_auth_header_uses_vm_metadata_token() {

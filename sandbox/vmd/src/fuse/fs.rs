@@ -752,9 +752,32 @@ impl RemoteFuseFs {
     }
 
     fn authoritative_file_route(&self, path: &str, file_id: &str) -> FuseResult<StableFileRoute> {
+        self.authoritative_file_route_with_metadata(path, file_id, false)
+    }
+
+    fn authoritative_file_route_attributes(
+        &self,
+        path: &str,
+        file_id: &str,
+    ) -> FuseResult<StableFileRoute> {
+        self.authoritative_file_route_with_metadata(path, file_id, true)
+    }
+
+    fn authoritative_file_route_with_metadata(
+        &self,
+        path: &str,
+        file_id: &str,
+        attributes_only: bool,
+    ) -> FuseResult<StableFileRoute> {
         let current = self
             .tokio
-            .block_on(self.client.stat(path))
+            .block_on(async {
+                if attributes_only {
+                    self.client.stat_attributes(path).await
+                } else {
+                    self.client.stat(path).await
+                }
+            })
             .map_err(|error| {
                 tracing::warn!(path, file_id, error = %error, "vfs identity stat failed");
                 Errno::EIO
@@ -786,7 +809,13 @@ impl RemoteFuseFs {
         };
         let metadata = self
             .tokio
-            .block_on(self.client.stat(&alias))
+            .block_on(async {
+                if attributes_only {
+                    self.client.stat_attributes(&alias).await
+                } else {
+                    self.client.stat(&alias).await
+                }
+            })
             .map_err(|error| {
                 tracing::warn!(
                     path = alias,
@@ -819,13 +848,31 @@ impl RemoteFuseFs {
     }
 
     fn resolve_inode_file_route(&self, ino: INodeNo) -> FuseResult<LinkedFileRoute> {
-        self.flush_namespace()?;
-        self.flush_writes()?;
+        self.resolve_inode_file_route_with_metadata(ino, false)
+    }
+
+    fn resolve_inode_file_route_attributes(&self, ino: INodeNo) -> FuseResult<LinkedFileRoute> {
+        self.resolve_inode_file_route_with_metadata(ino, true)
+    }
+
+    fn resolve_inode_file_route_with_metadata(
+        &self,
+        ino: INodeNo,
+        attributes_only: bool,
+    ) -> FuseResult<LinkedFileRoute> {
         let (path, identity) = self.inode_route(ino)?;
+        self.flush_namespace_for_path(&path, false)?;
+        self.flush_writes()?;
         let Some(identity) = identity else {
             let metadata = self
                 .tokio
-                .block_on(self.client.stat(&path))
+                .block_on(async {
+                    if attributes_only {
+                        self.client.stat_attributes(&path).await
+                    } else {
+                        self.client.stat(&path).await
+                    }
+                })
                 .map_err(|_| Errno::EIO)?
                 .ok_or(Errno::ENOENT)?;
             let resolved_ino = self
@@ -836,7 +883,12 @@ impl RemoteFuseFs {
             }
             return Ok(LinkedFileRoute { path, metadata });
         };
-        match self.authoritative_file_route(&path, &identity)? {
+        let route = if attributes_only {
+            self.authoritative_file_route_attributes(&path, &identity)?
+        } else {
+            self.authoritative_file_route(&path, &identity)?
+        };
+        match route {
             StableFileRoute::Linked(route) => {
                 if !self
                     .lock_inodes()?
@@ -992,7 +1044,7 @@ impl RemoteFuseFs {
     }
 
     fn dir_entries(&self, path: &str) -> FuseResult<Vec<RemoteDirEntry>> {
-        self.flush_namespace()?;
+        self.flush_namespace_for_path(path, true)?;
         if let Some(entries) = self.cache.get_dir(path) {
             return Ok(entries);
         }
@@ -1014,7 +1066,7 @@ impl RemoteFuseFs {
     }
 
     fn stat_path(&self, path: &str) -> FuseResult<Option<RemoteMetadata>> {
-        self.flush_namespace()?;
+        self.flush_namespace_for_path(path, true)?;
         if let Some(metadata) = self.open_handle_metadata(path)? {
             return Ok(Some(metadata));
         }
@@ -1044,7 +1096,7 @@ impl RemoteFuseFs {
     }
 
     fn stat_path_attributes(&self, path: &str) -> FuseResult<Option<RemoteMetadata>> {
-        self.flush_namespace()?;
+        self.flush_namespace_for_path(path, true)?;
         if let Some(metadata) = self.open_handle_metadata(path)? {
             return Ok(Some(metadata));
         }
@@ -1796,7 +1848,15 @@ impl RemoteFuseFs {
     }
 
     fn flush_handle_immediate_locked(&self, fh: u64) -> FuseResult<()> {
+        let had_dirty_data = self
+            .lock_handles()?
+            .files
+            .get(&fh)
+            .is_some_and(|state| state.dirty);
         self.flush_handle_locked(fh)?;
+        if !had_dirty_data {
+            return Ok(());
+        }
         // A file can be renamed between its data flush and the final
         // close/fsync. Do not report a barrier until both ordered journals are
         // remotely acknowledged.
@@ -2148,6 +2208,37 @@ impl RemoteFuseFs {
         self.flush_namespace_locked()
     }
 
+    /// Read-side barrier for one namespace location. Namespace mutations remain
+    /// durably journaled and mutation syscalls still synchronously publish, but
+    /// a deep, unrelated rename/create must not globally stop every lookup on
+    /// the mount while its HTTP publication is in flight.
+    fn flush_namespace_for_path(
+        &self,
+        path: &str,
+        include_direct_children: bool,
+    ) -> FuseResult<()> {
+        let Some(namespace) = self.namespace.as_ref() else {
+            return Ok(());
+        };
+        if !namespace
+            .has_pending_for_path(path, include_direct_children)
+            .map_err(|_| Errno::EIO)?
+        {
+            return Ok(());
+        }
+        let _publication = self
+            .namespace_publication_gate
+            .lock()
+            .map_err(|_| Errno::EIO)?;
+        if namespace
+            .has_pending_for_path(path, include_direct_children)
+            .map_err(|_| Errno::EIO)?
+        {
+            self.flush_namespace_locked()?;
+        }
+        Ok(())
+    }
+
     fn flush_namespace_locked(&self) -> FuseResult<()> {
         match self.namespace.as_ref() {
             Some(namespace) => namespace.flush().map_err(|error| {
@@ -2265,7 +2356,7 @@ impl RemoteFuseFs {
         if state.loaded && (state.dirty || state.unlinked || state.file_id.is_none()) {
             return Ok(());
         }
-        self.flush_namespace()?;
+        self.flush_namespace_for_path(&state.path, false)?;
         // A created-but-unflushed file exists only in its creator's buffer;
         // seed this handle from it instead of 404ing at the gateway.
         let (route, bytes) = if state.file_id.is_none() {
@@ -3652,7 +3743,7 @@ impl RemoteFuseFs {
                 let metadata = self.metadata_for_handle_state(&state, authoritative);
                 return Ok(self.attr_for_metadata(ino, &metadata, true));
             }
-            let route = self.resolve_inode_file_route(ino)?;
+            let route = self.resolve_inode_file_route_attributes(ino)?;
             Ok(self.attr_for_metadata(ino, &route.metadata, false))
         })();
         match result {

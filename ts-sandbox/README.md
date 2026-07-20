@@ -56,6 +56,7 @@ for (;;) {
 
 await sess.writeFile("/tmp/note.txt", Buffer.from("data"));
 const bytes = await sess.readFile("/tmp/note.txt");
+const entries = await sess.listDir("/tmp");
 const child = await sess.fork({ childName: "branch" });
 const again = await sb.attachSession(sess.sessionId);
 ```
@@ -69,6 +70,7 @@ Exposed today:
 - `attachSession`
 - bidirectional `exec`
 - `readFile`
+- `listDir`
 - `writeFile`
 - `fork`
 - OpenComputer config: API URL/key, template, resources, burst, secret store, egress allowlist, mounts, shared mounts
@@ -77,7 +79,6 @@ Not exposed in this TS package yet:
 
 - interactive shell handle
 - port forwarding
-- directory listing
 - snapshot/restore helpers
 
 Use the Rust crate directly if you need a lower-level surface before the binding catches up.

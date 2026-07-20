@@ -398,6 +398,14 @@ pub struct Session {
     inner: EngineSession,
 }
 
+/// One entry returned by `Session.listDir`.
+#[napi(object)]
+pub struct SessionDirectoryEntryJs {
+    pub name: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+}
+
 #[napi(object)]
 pub struct SessionCheckpointJs {
     pub id: String,
@@ -612,6 +620,20 @@ impl Session {
     pub async fn read_file(&self, path: String) -> napi::Result<Buffer> {
         let b = self.inner.read_file(&path).await.map_err(sb_err)?;
         Ok(Buffer::from(b))
+    }
+
+    /// List a directory through the guest's mounted filesystem.
+    #[napi]
+    pub async fn list_dir(&self, path: String) -> napi::Result<Vec<SessionDirectoryEntryJs>> {
+        let entries = self.inner.list_dir(&path).await.map_err(sb_err)?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| SessionDirectoryEntryJs {
+                name: entry.name,
+                is_dir: entry.is_dir,
+                is_symlink: entry.is_symlink,
+            })
+            .collect())
     }
 
     /// Write a file to the guest.

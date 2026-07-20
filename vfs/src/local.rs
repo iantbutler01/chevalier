@@ -1211,6 +1211,11 @@ impl OptimizedVfsStorage for LocalVfsStorage {
             } else {
                 None
             };
+            let durability_directories = abs_path
+                .parent()
+                .map(|parent| file_publication_durability_directories(&storage.root, parent))
+                .transpose()?
+                .unwrap_or_default();
             if let Some(parent) = abs_path.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
@@ -1278,10 +1283,9 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                     storage.sync_file(&sync_target, &abs_path)?;
                 }
                 if let Some(parent) = abs_path.parent() {
-                    let mut touched_directories = HashSet::new();
-                    collect_directory_chain(&storage.root, parent, &mut touched_directories)?;
-                    sync_directories_deepest_first(&storage, touched_directories)?;
+                    debug_assert!(durability_directories.contains(parent));
                 }
+                sync_directories_deepest_first(&storage, durability_directories)?;
                 Ok((content_hash, published_absent_write))
             })();
 
@@ -2056,7 +2060,7 @@ fn complete_exact_write_replays(
                 .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
             synced_metadata.push(metadata);
             if let Some(parent) = replay.destination.parent() {
-                collect_directory_chain(&storage.root, parent, &mut touched_directories)?;
+                touched_directories.insert(parent.to_path_buf());
             }
         }
     }
@@ -2138,6 +2142,11 @@ fn install_writes_with_options(
             None
         };
         let content_hash = hex_hash(&write.bytes);
+        let durability_directories = abs_path
+            .parent()
+            .map(|parent| file_publication_durability_directories(&storage.root, parent))
+            .transpose()?
+            .unwrap_or_default();
         if let Some(parent) = abs_path.parent() {
             fs::create_dir_all(parent).map_err(|err| VfsStorageError::Internal(err.to_string()))?;
         }
@@ -2163,6 +2172,7 @@ fn install_writes_with_options(
             options,
             precondition: write.precondition,
             previous_mode,
+            durability_directories,
         });
     }
 
@@ -2246,9 +2256,7 @@ fn install_writes_with_options(
                 sync_targets.clear();
             }
         }
-        if let Some(parent) = staged.destination.parent() {
-            collect_directory_chain(&storage.root, parent, &mut touched_directories)?;
-        }
+        touched_directories.extend(staged.durability_directories);
         installed.push((
             staged.path,
             staged.destination,
@@ -2289,6 +2297,7 @@ struct StagedWrite {
     options: Option<VfsStorageWriteOptions>,
     precondition: Option<VfsStorageWritePrecondition>,
     previous_mode: Option<u32>,
+    durability_directories: HashSet<PathBuf>,
 }
 
 fn install_staged_file_preserving_identity(
@@ -2507,6 +2516,45 @@ fn collect_directory_chain(
         touched.insert(current.clone());
     }
     Ok(())
+}
+
+/// Return the directory barriers required to publish a file into `directory`.
+///
+/// An existing parent only needs its own barrier for the new/renamed directory
+/// entry. If `create_dir_all` must create missing parents, each newly created
+/// directory and its nearest existing parent also need barriers. Re-syncing the
+/// complete already-existing path to the VFS root for every file publication
+/// adds no durability and turns write bursts into filesystem-wide journal stalls.
+fn file_publication_durability_directories(
+    root: &Path,
+    directory: &Path,
+) -> VfsStorageResult<HashSet<PathBuf>> {
+    directory.strip_prefix(root).map_err(|error| {
+        VfsStorageError::Internal(format!(
+            "local VFS durability path {} escaped root {}: {error}",
+            directory.display(),
+            root.display()
+        ))
+    })?;
+    let mut touched = HashSet::new();
+    let mut current = directory.to_path_buf();
+    loop {
+        touched.insert(current.clone());
+        if current == root || current.exists() {
+            break;
+        }
+        current = current
+            .parent()
+            .ok_or_else(|| {
+                VfsStorageError::Internal(format!(
+                    "local VFS durability path {} has no parent beneath {}",
+                    current.display(),
+                    root.display()
+                ))
+            })?
+            .to_path_buf();
+    }
+    Ok(touched)
 }
 
 fn remap_touched_directories_after_rename(
@@ -3523,7 +3571,6 @@ mod tests {
             &[
                 DurabilitySyncEvent::File(destination.clone()),
                 DurabilitySyncEvent::Directory(dir.path().join("nested")),
-                DurabilitySyncEvent::Directory(dir.path().to_path_buf()),
             ],
         );
 
@@ -3627,7 +3674,6 @@ mod tests {
             &[
                 DurabilitySyncEvent::File(destination.clone()),
                 DurabilitySyncEvent::Directory(dir.path().join("nested")),
-                DurabilitySyncEvent::Directory(dir.path().to_path_buf()),
             ],
         );
 

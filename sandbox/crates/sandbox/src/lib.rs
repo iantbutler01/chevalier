@@ -74,6 +74,7 @@ use proto::vmd::v1::{
 
 const PCI_CAPABILITY_HEADER: &str = "x-chevalier-pci-token";
 const DURABLE_VOLUME_LIST_TIMEOUT: Duration = Duration::from_secs(2);
+const PORTPROXY_FILE_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 const META_SESSION_ID: &str = "chevalier.session_id";
 const META_PARENT_SESSION_ID: &str = "chevalier.parent_session_id";
@@ -2130,11 +2131,12 @@ impl Session {
             .await?;
         let response = access
             .client
-            .read_file(request_with_optional_auth(
+            .read_file(request_with_optional_auth_timeout(
                 ReadFileRequest {
                     path: path.to_string(),
                 },
                 access.auth_header.as_ref(),
+                PORTPROXY_FILE_RPC_TIMEOUT,
             ))
             .await?
             .into_inner();
@@ -2153,13 +2155,14 @@ impl Session {
             .await?;
         access
             .client
-            .write_file(request_with_optional_auth(
+            .write_file(request_with_optional_auth_timeout(
                 WriteFileRequest {
                     path: path.to_string(),
                     data,
                     create_parents: true,
                 },
                 access.auth_header.as_ref(),
+                PORTPROXY_FILE_RPC_TIMEOUT,
             ))
             .await?;
         Ok(())
@@ -2180,11 +2183,12 @@ impl Session {
             .await?;
         let response = access
             .client
-            .list_directory(request_with_optional_auth(
+            .list_directory(request_with_optional_auth_timeout(
                 ListDirectoryRequest {
                     path: path.to_string(),
                 },
                 access.auth_header.as_ref(),
+                PORTPROXY_FILE_RPC_TIMEOUT,
             ))
             .await?
             .into_inner();
@@ -2203,11 +2207,12 @@ impl Session {
             .await?;
         access
             .client
-            .delete_path(request_with_optional_auth(
+            .delete_path(request_with_optional_auth_timeout(
                 DeletePathRequest {
                     path: path.to_string(),
                 },
                 access.auth_header.as_ref(),
+                PORTPROXY_FILE_RPC_TIMEOUT,
             ))
             .await?;
         Ok(())
@@ -4971,6 +4976,16 @@ fn request_with_optional_auth<T>(
             .metadata_mut()
             .insert("authorization", value.clone());
     }
+    request
+}
+
+fn request_with_optional_auth_timeout<T>(
+    message: T,
+    auth_header: Option<&MetadataValue<Ascii>>,
+    timeout: Duration,
+) -> Request<T> {
+    let mut request = request_with_optional_auth(message, auth_header);
+    request.set_timeout(timeout);
     request
 }
 

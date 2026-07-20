@@ -150,6 +150,48 @@ impl NamespaceJournal {
         }
         Ok(())
     }
+
+    /// Whether an in-flight namespace mutation can change the lookup result for
+    /// `path`. A mutation of an ancestor can retarget or remove the path. When
+    /// `include_direct_children` is true, creation/removal/rename of an
+    /// immediate child also affects the directory listing and link metadata.
+    pub fn has_pending_for_path(&self, path: &str, include_direct_children: bool) -> Result<bool> {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| anyhow!("vfs namespace journal lock poisoned"))?;
+        Ok(state.pending.iter().any(|mutation| {
+            mutation.paths().into_iter().any(|mutation_path| {
+                !mutation_path.is_empty()
+                    && namespace_mutation_affects_path(mutation_path, path, include_direct_children)
+            })
+        }))
+    }
+}
+
+fn namespace_mutation_affects_path(
+    mutation_path: &str,
+    observed_path: &str,
+    include_direct_children: bool,
+) -> bool {
+    let mutation_path = mutation_path.trim_matches('/');
+    let observed_path = observed_path.trim_matches('/');
+    if mutation_path == observed_path {
+        return true;
+    }
+    if observed_path
+        .strip_prefix(mutation_path)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+    {
+        return true;
+    }
+    include_direct_children
+        && mutation_path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or_default()
+            == observed_path
 }
 
 impl Drop for NamespaceJournal {
@@ -1048,6 +1090,31 @@ mod tests {
         )
         .expect_err("oversized terminated record is corrupt");
         assert!(error.to_string().contains("exceeds the"));
+    }
+
+    #[test]
+    fn namespace_read_barriers_are_scoped_to_affected_paths() {
+        assert!(namespace_mutation_affects_path(
+            "repo/src",
+            "repo/src/lib.rs",
+            false
+        ));
+        assert!(namespace_mutation_affects_path(
+            "repo/src/new.rs",
+            "repo/src",
+            true
+        ));
+        assert!(!namespace_mutation_affects_path(
+            "repo/target/tmp",
+            "repo/src",
+            true
+        ));
+        assert!(!namespace_mutation_affects_path(
+            "other-repo/generated",
+            "repo",
+            true
+        ));
+        assert!(namespace_mutation_affects_path("repo", "repo", false));
     }
 
     #[test]

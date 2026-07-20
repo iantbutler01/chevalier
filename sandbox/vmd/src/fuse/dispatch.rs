@@ -17,7 +17,7 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use fuser::{
     BsdFileFlags, FileHandle, Filesystem, INodeNo, InterruptResult, KernelConfig, LockNamespace,
@@ -170,16 +170,45 @@ impl SpawnedFuseFs {
     ) {
         let inner = Arc::clone(&self.inner);
         let tokio = inner.tokio_handle();
-        tokio.spawn_blocking(move || {
-            // Blocking-pool threads may block on the runtime; a closed
-            // semaphore can only happen at teardown, where dropping the op
-            // (and its reply) makes the kernel fail the request cleanly.
-            let Ok(_permit) = inner.tokio_handle().block_on(ops.acquire_owned()) else {
-                return;
-            };
-            op(&inner);
-        });
+        spawn_bounded_blocking(&tokio, ops, move || op(&inner));
     }
+}
+
+fn spawn_bounded_blocking(
+    tokio: &tokio::runtime::Handle,
+    ops: Arc<Semaphore>,
+    op: impl FnOnce() + Send + 'static,
+) {
+    let queued_at = Instant::now();
+    tokio.spawn(async move {
+        // Admission must happen before entering the blocking pool. Waiting for
+        // this permit from inside spawn_blocking lets a FUSE request burst fill
+        // every blocking thread with semaphore waiters, leaving no thread able
+        // to run an admitted operation and release its permit.
+        let Ok(permit) = ops.acquire_owned().await else {
+            return;
+        };
+        let queue_wait = queued_at.elapsed();
+        if queue_wait >= Duration::from_secs(1) {
+            tracing::warn!(
+                queue_wait_ms = queue_wait.as_millis(),
+                "vfs fuse operation waited for dispatch admission"
+            );
+        }
+        let _ = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let started_at = Instant::now();
+            op();
+            let operation_time = started_at.elapsed();
+            if operation_time >= Duration::from_secs(1) {
+                tracing::warn!(
+                    operation_time_ms = operation_time.as_millis(),
+                    "vfs fuse operation occupied a dispatch worker"
+                );
+            }
+        })
+        .await;
+    });
 }
 
 impl Filesystem for SpawnedFuseFs {
@@ -510,11 +539,46 @@ impl Filesystem for SpawnedFuseFs {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
 
     use fuser::{INodeNo, LockNamespace, LockOwner, RequestId};
+    use tokio::sync::Semaphore;
 
-    use super::LockWaitRegistry;
+    use super::{LockWaitRegistry, spawn_bounded_blocking};
+
+    #[test]
+    fn semaphore_waiters_do_not_consume_blocking_pool_threads() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let semaphore = Arc::new(Semaphore::new(1));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        spawn_bounded_blocking(&runtime.handle(), Arc::clone(&semaphore), move || {
+            started_tx.send(()).expect("report admitted operation");
+            release_rx.recv().expect("release admitted operation");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first operation starts");
+
+        for _ in 0..8 {
+            spawn_bounded_blocking(&runtime.handle(), Arc::clone(&semaphore), || {});
+        }
+
+        let (probe_tx, probe_rx) = mpsc::channel();
+        runtime.spawn_blocking(move || probe_tx.send(()).expect("report unrelated blocking work"));
+        probe_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("semaphore waiters must not starve unrelated blocking work");
+
+        release_tx.send(()).expect("release first operation");
+    }
 
     #[test]
     fn lock_wait_registry_cancels_only_the_exact_live_request() {
