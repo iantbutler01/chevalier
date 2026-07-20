@@ -20,7 +20,10 @@ pub const RANGE_FINGERPRINT_HEADER: &str = "x-chevalier-vfs-range-fingerprint";
 /// Transient-failure budget sized to ride out a gateway restart, not mask a
 /// broken one: only transport failures and 5xx/429/408 consume it — hard 4xx
 /// rejections fail on the first attempt.
-const READ_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
+const METADATA_READ_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
+// File bodies have a longer per-attempt timeout than metadata. Their total
+// budget must exceed one attempt or a congested first request can never retry.
+const FILE_READ_RETRY_TIMEOUT: Duration = Duration::from_secs(45);
 const METADATA_READ_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const FILE_READ_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
 const ADVISORY_LOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -125,6 +128,7 @@ impl RemoteVfsClient {
                     ("max_hash_bytes", "0".to_string()),
                 ])
                 .timeout(METADATA_READ_ATTEMPT_TIMEOUT),
+            METADATA_READ_RETRY_TIMEOUT,
             |status, body| {
                 if status == StatusCode::NOT_FOUND {
                     return Ok(None);
@@ -159,6 +163,7 @@ impl RemoteVfsClient {
                 .get(self.url("/stat"))
                 .query(&query)
                 .timeout(METADATA_READ_ATTEMPT_TIMEOUT),
+            METADATA_READ_RETRY_TIMEOUT,
             |status, body| {
                 if status == StatusCode::NOT_FOUND {
                     return Ok(None);
@@ -177,6 +182,7 @@ impl RemoteVfsClient {
                 .get(self.url("/file/raw"))
                 .query(&[("path", self.path_arg(path))])
                 .timeout(FILE_READ_ATTEMPT_TIMEOUT),
+            FILE_READ_RETRY_TIMEOUT,
             |status, body| {
                 if status == StatusCode::NOT_FOUND {
                     return Ok(None);
@@ -209,7 +215,7 @@ impl RemoteVfsClient {
         if let Some(fingerprint) = fingerprint {
             request = request.header(RANGE_FINGERPRINT_HEADER, fingerprint);
         }
-        self.read_decoded(request, |status, body| {
+        self.read_decoded(request, FILE_READ_RETRY_TIMEOUT, |status, body| {
             if status == StatusCode::NOT_FOUND {
                 return Ok(RangeRead::NotFound);
             }
@@ -786,9 +792,10 @@ impl RemoteVfsClient {
     async fn read_decoded<T>(
         &self,
         builder: reqwest::RequestBuilder,
+        retry_timeout: Duration,
         mut decode: impl FnMut(StatusCode, &[u8]) -> Result<T>,
     ) -> Result<T> {
-        let deadline = Instant::now() + READ_RETRY_TIMEOUT;
+        let deadline = Instant::now() + retry_timeout;
         let mut retry_delay = READ_RETRY_DELAY_MIN;
         loop {
             let request = builder
@@ -1009,6 +1016,12 @@ fn common_parent<'a>(paths: impl Iterator<Item = &'a str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_retry_budgets_exceed_their_attempt_timeouts() {
+        assert!(METADATA_READ_RETRY_TIMEOUT > METADATA_READ_ATTEMPT_TIMEOUT);
+        assert!(FILE_READ_RETRY_TIMEOUT > FILE_READ_ATTEMPT_TIMEOUT);
+    }
 
     #[test]
     fn exact_mode_header_is_optional_and_masked() {
