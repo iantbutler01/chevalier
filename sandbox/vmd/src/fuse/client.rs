@@ -20,7 +20,7 @@ pub const RANGE_FINGERPRINT_HEADER: &str = "x-chevalier-vfs-range-fingerprint";
 /// Transient-failure budget sized to ride out a gateway restart, not mask a
 /// broken one: only transport failures and 5xx/429/408 consume it — hard 4xx
 /// rejections fail on the first attempt.
-const METADATA_READ_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
+const METADATA_READ_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 // File bodies have a longer per-attempt timeout than metadata. Their total
 // budget must exceed one attempt or a congested first request can never retry.
 const FILE_READ_RETRY_TIMEOUT: Duration = Duration::from_secs(45);

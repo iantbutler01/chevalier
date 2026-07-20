@@ -592,6 +592,7 @@ pub struct RemoteFuseFs {
     inodes: Mutex<InodeTable>,
     handles: Mutex<HandleTable>,
     namespace: Option<NamespaceJournal>,
+    namespace_publication_gate: Mutex<()>,
     writes: Option<WriteJournal>,
     read_only: bool,
     scope_path: String,
@@ -611,6 +612,7 @@ impl RemoteFuseFs {
             inodes: Mutex::new(InodeTable::new()),
             handles: Mutex::new(HandleTable::default()),
             namespace: None,
+            namespace_publication_gate: Mutex::new(()),
             writes: None,
             read_only,
             scope_path: scope_path.trim_matches('/').to_string(),
@@ -664,6 +666,7 @@ impl RemoteFuseFs {
             inodes: Mutex::new(InodeTable::new()),
             handles: Mutex::new(HandleTable::default()),
             namespace,
+            namespace_publication_gate: Mutex::new(()),
             writes,
             read_only,
             scope_path: scope_path.trim_matches('/').to_string(),
@@ -2122,14 +2125,26 @@ impl RemoteFuseFs {
     }
 
     fn commit_namespace(&self, mutation: VfsNamespaceMutation) -> FuseResult<()> {
+        let _publication = self
+            .namespace_publication_gate
+            .lock()
+            .map_err(|_| Errno::EIO)?;
         self.enqueue_namespace(mutation)?;
-        // Namespace syscalls are publication points. The journal still
-        // coalesces concurrently enqueued operations into one ordered batch,
-        // but success cannot precede remote visibility.
-        self.flush_namespace()
+        // Namespace syscalls are publication points. Serialize enqueue+flush
+        // so a terminal journal result is returned to the mutation that
+        // caused it instead of being consumed by an unrelated waiter.
+        self.flush_namespace_locked()
     }
 
     fn flush_namespace(&self) -> FuseResult<()> {
+        let _publication = self
+            .namespace_publication_gate
+            .lock()
+            .map_err(|_| Errno::EIO)?;
+        self.flush_namespace_locked()
+    }
+
+    fn flush_namespace_locked(&self) -> FuseResult<()> {
         match self.namespace.as_ref() {
             Some(namespace) => namespace.flush().map_err(|error| {
                 tracing::warn!(error = %error, "vfs namespace barrier failed");
