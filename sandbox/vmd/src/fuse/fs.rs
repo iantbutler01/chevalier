@@ -1116,13 +1116,15 @@ impl RemoteFuseFs {
         mode: Option<u32>,
     ) -> FuseResult<Option<RemoteMetadata>> {
         let mut handles = self.lock_handles()?;
-        let Some(state) = handles
+        let Some(fh) = handles
             .files
-            .values_mut()
-            .find(|state| state.path == path && state.created)
+            .iter()
+            .find(|(_, state)| state.path == path && state.created)
+            .map(|(fh, _)| *fh)
         else {
             return Ok(None);
         };
+        let state = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
         if let Some(size) = size {
             state.buffer.resize(size as usize, 0);
         }
@@ -1134,7 +1136,7 @@ impl RemoteFuseFs {
             state.loaded = true;
             state.revision = state.revision.saturating_add(1);
         }
-        Ok(Some(RemoteMetadata {
+        let metadata = RemoteMetadata {
             kind: "file".to_string(),
             size_bytes: state.buffer.len() as u64,
             file_id: state.file_id.clone(),
@@ -1144,7 +1146,9 @@ impl RemoteFuseFs {
             executable: mode_is_executable(state.mode),
             mode: Some(state.mode),
             updated_at: None,
-        }))
+        };
+        Self::mirror_handle_state_locked(&mut handles, fh)?;
+        Ok(Some(metadata))
     }
 
     fn read_bytes(&self, path: &str, offset: u64, size: u32) -> FuseResult<Vec<u8>> {
@@ -1262,11 +1266,51 @@ impl RemoteFuseFs {
         if handles.files.len() >= MAX_OPEN_HANDLES {
             return Err(Errno::EMFILE);
         }
+        let sibling = handles
+            .files
+            .values()
+            .find(|state| Self::same_open_file(state, path, file_id.as_deref()))
+            .cloned();
+        let coherent_sibling = sibling
+            .as_ref()
+            .filter(|state| state.loaded && (state.dirty || state.created));
         // An O_EXCL create can already have an empty gateway placeholder while
         // its creator still owns handle-local bytes and pathname mutations.
         // Presence of an authoritative content hash distinguishes that case
         // from the older fully-local create whose first publication is absent.
         let has_remote_baseline = !created || base_content_hash.is_some();
+        let initial = coherent_sibling
+            .map(|state| state.buffer.clone())
+            .unwrap_or(initial);
+        let mode = coherent_sibling
+            .map(|state| state.mode)
+            .unwrap_or_else(|| normalize_mode(mode));
+        let base_mode = coherent_sibling
+            .map(|state| state.base_mode)
+            .unwrap_or_else(|| has_remote_baseline.then_some(mode));
+        let created = coherent_sibling
+            .map(|state| state.created)
+            .unwrap_or(created);
+        let dirty = coherent_sibling.is_some_and(|state| state.dirty);
+        let loaded = coherent_sibling.is_some() || loaded;
+        let base_content_hash = coherent_sibling
+            .map(|state| state.base_content_hash.clone())
+            .unwrap_or_else(|| {
+                if created && base_content_hash.is_none() {
+                    Some("absent".to_string())
+                } else {
+                    base_content_hash
+                }
+            });
+        let publication_acknowledged =
+            coherent_sibling.is_some_and(|state| state.publication_acknowledged);
+        let pending_publication =
+            coherent_sibling.and_then(|state| state.pending_publication.clone());
+        let publication_gate = sibling
+            .as_ref()
+            .map(|state| Arc::clone(&state.publication_gate))
+            .unwrap_or_else(|| Arc::new(Mutex::new(())));
+        let revision = coherent_sibling.map(|state| state.revision).unwrap_or(0);
         let fh = handles.next;
         handles.next += 1;
         handles.files.insert(
@@ -1277,23 +1321,58 @@ impl RemoteFuseFs {
                 link_count,
                 unlinked: false,
                 buffer: initial,
-                mode: normalize_mode(mode),
-                base_mode: has_remote_baseline.then_some(normalize_mode(mode)),
+                mode,
+                base_mode,
                 created,
-                dirty: false,
+                dirty,
                 loaded,
-                base_content_hash: if created && base_content_hash.is_none() {
-                    Some("absent".to_string())
-                } else {
-                    base_content_hash
-                },
-                publication_acknowledged: false,
-                pending_publication: None,
-                publication_gate: Arc::new(Mutex::new(())),
-                revision: 0,
+                base_content_hash,
+                publication_acknowledged,
+                pending_publication,
+                publication_gate,
+                revision,
             },
         );
         Ok(fh)
+    }
+
+    fn same_open_file(state: &FileState, path: &str, file_id: Option<&str>) -> bool {
+        match (state.file_id.as_deref(), file_id) {
+            (Some(left), Some(right)) => left == right,
+            _ => !state.unlinked && state.path == path,
+        }
+    }
+
+    /// All open handles for one inode share a publication gate. Mirroring the
+    /// mutable inode state after each ordered mutation gives pathname
+    /// truncate/chmod and descriptor writes the same coherent view without
+    /// weakening gateway CAS across independent mounts.
+    fn mirror_handle_state_locked(handles: &mut HandleTable, source_fh: u64) -> FuseResult<()> {
+        let source = handles
+            .files
+            .get(&source_fh)
+            .cloned()
+            .ok_or(Errno::ENOENT)?;
+        for (fh, state) in &mut handles.files {
+            if *fh == source_fh
+                || !Self::same_open_file(state, &source.path, source.file_id.as_deref())
+            {
+                continue;
+            }
+            state.file_id = source.file_id.clone();
+            state.link_count = source.link_count;
+            state.buffer = source.buffer.clone();
+            state.mode = source.mode;
+            state.base_mode = source.base_mode;
+            state.publication_acknowledged = source.publication_acknowledged;
+            state.pending_publication = source.pending_publication.clone();
+            state.created = source.created;
+            state.dirty = source.dirty;
+            state.loaded = source.loaded;
+            state.base_content_hash = source.base_content_hash.clone();
+            state.revision = source.revision;
+        }
+        Ok(())
     }
 
     fn stat_published_file(
@@ -1392,12 +1471,14 @@ impl RemoteFuseFs {
             handle.created = false;
             handle.publication_acknowledged = false;
             handle.pending_publication = None;
-            if handle.revision == pending.revision {
+            let cache_bytes = if handle.revision == pending.revision {
                 handle.dirty = false;
                 Some(handle.buffer.clone())
             } else {
                 None
-            }
+            };
+            Self::mirror_handle_state_locked(&mut handles, fh)?;
+            cache_bytes
         };
         self.invalidate_inode_aliases(&pending.path);
         if pending.path != route.path {
@@ -1625,7 +1706,9 @@ impl RemoteFuseFs {
                 updated_at: authoritative_metadata.updated_at,
             }),
         );
-        if let Some(handle) = self.lock_handles()?.files.get_mut(&fh) {
+        {
+            let mut handles = self.lock_handles()?;
+            let handle = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
             handle.path = authoritative_route.path.clone();
             handle.loaded = true;
             handle.base_content_hash = Some(next_content_hash);
@@ -1637,6 +1720,7 @@ impl RemoteFuseFs {
             if handle.revision == state.revision {
                 handle.dirty = false;
             }
+            Self::mirror_handle_state_locked(&mut handles, fh)?;
         }
         if let Some(file_id) = published_file_id {
             self.lock_inodes()?
@@ -1784,6 +1868,7 @@ impl RemoteFuseFs {
                     mode: Some(state.mode),
                     updated_at: None,
                 };
+                Self::mirror_handle_state_locked(&mut handles, fh)?;
                 return Ok(self.attr_for_path(path, &metadata, false));
             }
         }
@@ -2693,6 +2778,75 @@ mod tests {
     }
 
     #[test]
+    fn same_inode_handles_share_dirty_state_and_publication_gate() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let client =
+            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
+        let fs = RemoteFuseFs::new(client, false, "test-scope", runtime.handle().clone());
+        let first = fs
+            .next_handle(
+                "value",
+                Vec::new(),
+                true,
+                Some("empty-hash".to_string()),
+                0o644,
+                true,
+                Some("inode-value".to_string()),
+                1,
+            )
+            .unwrap();
+        {
+            let mut handles = fs.lock_handles().unwrap();
+            let state = handles.files.get_mut(&first).unwrap();
+            state.buffer = b"dirty".to_vec();
+            state.mode = 0o755;
+            state.dirty = true;
+            state.revision = 1;
+        }
+        let second = fs
+            .next_handle(
+                "value",
+                Vec::new(),
+                false,
+                Some("empty-hash".to_string()),
+                0o644,
+                false,
+                Some("inode-value".to_string()),
+                1,
+            )
+            .unwrap();
+        {
+            let mut handles = fs.lock_handles().unwrap();
+            let first_state = handles.files.get(&first).unwrap().clone();
+            let second_state = handles.files.get(&second).unwrap();
+            assert_eq!(second_state.buffer, b"dirty");
+            assert_eq!(second_state.mode, 0o755);
+            assert!(second_state.created);
+            assert!(second_state.dirty);
+            assert!(Arc::ptr_eq(
+                &first_state.publication_gate,
+                &second_state.publication_gate
+            ));
+
+            let second_state = handles.files.get_mut(&second).unwrap();
+            second_state.buffer.truncate(3);
+            second_state.dirty = false;
+            second_state.base_content_hash = Some("published-hash".to_string());
+            second_state.base_mode = Some(0o755);
+            second_state.created = false;
+            RemoteFuseFs::mirror_handle_state_locked(&mut handles, second).unwrap();
+            let first_state = handles.files.get(&first).unwrap();
+            assert_eq!(first_state.buffer, b"dir");
+            assert!(!first_state.dirty);
+            assert!(!first_state.created);
+            assert_eq!(
+                first_state.base_content_hash.as_deref(),
+                Some("published-hash")
+            );
+        }
+    }
+
+    #[test]
     fn rename_serializes_with_inflight_and_duplicate_handle_publication() {
         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
         let client =
@@ -3401,6 +3555,7 @@ impl RemoteFuseFs {
                         state.dirty = true;
                         state.loaded = true;
                         state.revision = state.revision.saturating_add(1);
+                        Self::mirror_handle_state_locked(&mut handles, fh.0)?;
                     }
                     // fchmod(2) is a publication point. Publish the handle
                     // through its stable identity instead of applying chmod
@@ -3623,8 +3778,13 @@ impl RemoteFuseFs {
             if dirty {
                 let mut handles = self.lock_handles()?;
                 let state = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
+                if truncate {
+                    state.buffer.clear();
+                    state.loaded = true;
+                }
                 state.dirty = true;
                 state.revision = state.revision.saturating_add(1);
+                Self::mirror_handle_state_locked(&mut handles, fh)?;
             }
             Ok(fh)
         })();
@@ -3696,6 +3856,7 @@ impl RemoteFuseFs {
             state.dirty = true;
             state.loaded = true;
             state.revision = state.revision.saturating_add(1);
+            Self::mirror_handle_state_locked(&mut handles, fh.0)?;
             Ok(data.len() as u32)
         })();
         match result {
@@ -4358,8 +4519,11 @@ impl RemoteFuseFs {
                 && let Ok(mut handles) = self.lock_handles()
                 && let Some(state) = handles.files.get_mut(&fh)
             {
+                state.buffer.clear();
+                state.loaded = true;
                 state.dirty = true;
                 state.revision = state.revision.saturating_add(1);
+                let _ = Self::mirror_handle_state_locked(&mut handles, fh);
             }
             Ok((attr, fh))
         })();
