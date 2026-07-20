@@ -15,13 +15,14 @@ use chevalier_sandbox::vfs::{
 use fuser::{
     BsdFileFlags, Errno, FileAttr, FileHandle, FileType, FopenFlags, Generation, INodeNo,
     InitFlags, KernelConfig, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, TimeOrNow,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyWrite, TimeOrNow,
 };
 use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
+use uuid::Uuid;
 
 use super::cache::RemoteFuseCache;
-use super::client::{RangeRead, RemoteVfsClient};
+use super::client::{RangeRead, RemoteVfsClient, request_status};
 use super::namespace::NamespaceJournal;
 use super::write::WriteJournal;
 
@@ -33,8 +34,12 @@ const MAX_OPEN_HANDLES: usize = 8_192;
 const SETATTR_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
 const SETATTR_RETRY_DELAY_MIN: Duration = Duration::from_millis(50);
 const SETATTR_RETRY_DELAY_MAX: Duration = Duration::from_millis(500);
+const ADVISORY_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
+const ADVISORY_LOCK_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const ADVISORY_LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 type FuseResult<T> = std::result::Result<T, Errno>;
+type ActiveAdvisoryLocks = HashMap<String, HashMap<u64, String>>;
 
 #[derive(Default)]
 struct InodeTable {
@@ -200,6 +205,8 @@ pub struct RemoteFuseFs {
     writes: Option<WriteJournal>,
     read_only: bool,
     scope_path: String,
+    mount_id: String,
+    active_lock_owners: std::sync::Arc<Mutex<ActiveAdvisoryLocks>>,
     tokio: Handle,
     uid: u32,
     gid: u32,
@@ -207,6 +214,7 @@ pub struct RemoteFuseFs {
 
 impl RemoteFuseFs {
     pub fn new(client: RemoteVfsClient, read_only: bool, scope_path: &str, tokio: Handle) -> Self {
+        let (mount_id, active_lock_owners) = Self::start_lock_heartbeat(&client, &tokio);
         Self {
             client,
             cache: std::sync::Arc::new(RemoteFuseCache::default()),
@@ -216,6 +224,8 @@ impl RemoteFuseFs {
             writes: None,
             read_only,
             scope_path: scope_path.trim_matches('/').to_string(),
+            mount_id,
+            active_lock_owners,
             tokio,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
@@ -255,6 +265,7 @@ impl RemoteFuseFs {
                 Some(Box::new(move |path: &str| dead_letter_cache.invalidate(path))),
             )?)
         };
+        let (mount_id, active_lock_owners) = Self::start_lock_heartbeat(&client, &tokio);
         Ok(Self {
             client,
             cache,
@@ -264,10 +275,51 @@ impl RemoteFuseFs {
             writes,
             read_only,
             scope_path: scope_path.trim_matches('/').to_string(),
+            mount_id,
+            active_lock_owners,
             tokio,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
         })
+    }
+
+    fn start_lock_heartbeat(
+        client: &RemoteVfsClient,
+        tokio: &Handle,
+    ) -> (String, std::sync::Arc<Mutex<ActiveAdvisoryLocks>>) {
+        let mount_id = Uuid::new_v4().to_string();
+        let active = std::sync::Arc::new(Mutex::new(HashMap::new()));
+        let weak = std::sync::Arc::downgrade(&active);
+        let heartbeat_client = client.clone();
+        let heartbeat_mount_id = mount_id.clone();
+        tokio.spawn(async move {
+            let mut interval = tokio::time::interval(ADVISORY_LOCK_HEARTBEAT_INTERVAL);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let Some(active) = weak.upgrade() else {
+                    break;
+                };
+                let has_locks = active
+                    .lock()
+                    .map(|owners| !owners.is_empty())
+                    .unwrap_or(false);
+                if !has_locks {
+                    continue;
+                }
+                if let Err(error) = heartbeat_client
+                    .renew_advisory_locks(&heartbeat_mount_id)
+                    .await
+                {
+                    tracing::warn!(
+                        mount_id = heartbeat_mount_id,
+                        error = %error,
+                        "failed to renew distributed VFS advisory locks"
+                    );
+                }
+            }
+        });
+        (mount_id, active)
     }
 
     pub(super) fn tokio_handle(&self) -> Handle {
@@ -368,11 +420,7 @@ impl RemoteFuseFs {
             crtime: mtime,
             kind,
             perm,
-            nlink: if matches!(kind, FileType::Directory) {
-                2
-            } else {
-                1
-            },
+            nlink: metadata.link_count.max(1).min(u32::MAX as u64) as u32,
             uid: self.uid,
             gid: self.gid,
             rdev: 0,
@@ -494,6 +542,8 @@ impl RemoteFuseFs {
         Ok(Some(RemoteMetadata {
             kind: "file".to_string(),
             size_bytes: state.buffer.len() as u64,
+            file_id: None,
+            link_count: 1,
             link_target: None,
             content_hash: Some(content_hash_for_bytes(&state.buffer)),
             executable: state.executable,
@@ -545,6 +595,8 @@ impl RemoteFuseFs {
         Ok(Some(RemoteMetadata {
             kind: "file".to_string(),
             size_bytes: state.buffer.len() as u64,
+            file_id: None,
+            link_count: 1,
             link_target: None,
             content_hash: Some(content_hash_for_bytes(&state.buffer)),
             executable: state.executable,
@@ -736,6 +788,8 @@ impl RemoteFuseFs {
             Some(RemoteMetadata {
                 kind: "file".to_string(),
                 size_bytes: state.buffer.len() as u64,
+                file_id: None,
+                link_count: 1,
                 link_target: None,
                 content_hash: Some(next_content_hash.clone()),
                 executable: state.executable,
@@ -824,6 +878,8 @@ impl RemoteFuseFs {
                 let metadata = RemoteMetadata {
                     kind: "file".to_string(),
                     size_bytes: size,
+                    file_id: None,
+                    link_count: 1,
                     link_target: None,
                     content_hash: Some(content_hash_for_bytes(&state.buffer)),
                     executable: state.executable,
@@ -871,6 +927,8 @@ impl RemoteFuseFs {
         let metadata = RemoteMetadata {
             kind: "file".to_string(),
             size_bytes: size,
+            file_id: prior.file_id,
+            link_count: prior.link_count,
             link_target: None,
             content_hash: Some(next_hash.clone()),
             executable: prior.executable,
@@ -1103,6 +1161,127 @@ impl RemoteFuseFs {
     fn lock_handles(&self) -> FuseResult<MutexGuard<'_, HandleTable>> {
         self.handles.lock().map_err(|_| Errno::EIO)
     }
+
+    fn advisory_lock_owner_key(&self, lock_owner: fuser::LockOwner) -> String {
+        lock_owner.0.to_string()
+    }
+
+    fn advisory_lock_kind(typ: i32) -> FuseResult<&'static str> {
+        match typ {
+            value if value == i32::from(libc::F_RDLCK) => Ok("read"),
+            value if value == i32::from(libc::F_WRLCK) => Ok("write"),
+            value if value == i32::from(libc::F_UNLCK) => Ok("unlock"),
+            _ => Err(Errno::EINVAL),
+        }
+    }
+
+    fn advisory_lock_error(error: &anyhow::Error) -> Errno {
+        match request_status(error) {
+            Some(reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::NOT_IMPLEMENTED) => {
+                Errno::EOPNOTSUPP
+            }
+            Some(reqwest::StatusCode::BAD_REQUEST) => Errno::EINVAL,
+            _ => Errno::EIO,
+        }
+    }
+
+    fn release_advisory_lock_owner(
+        &self,
+        ino: INodeNo,
+        lock_owner: fuser::LockOwner,
+    ) -> FuseResult<()> {
+        let owner = self.advisory_lock_owner_key(lock_owner);
+        let file_id = self
+            .active_lock_owners
+            .lock()
+            .map(|owners| {
+                owners
+                    .get(&owner)
+                    .and_then(|files| files.get(&ino.0))
+                    .cloned()
+            })
+            .map_err(|_| Errno::EIO)?;
+        let Some(file_id) = file_id else {
+            return Ok(());
+        };
+        self.tokio
+            .block_on(
+                self.client
+                    .release_advisory_lock_owner(&self.mount_id, &owner, &file_id),
+            )
+            .map_err(|error| Self::advisory_lock_error(&error))?;
+        let mut active = self.active_lock_owners.lock().map_err(|_| Errno::EIO)?;
+        if let Some(files) = active.get_mut(&owner) {
+            files.remove(&ino.0);
+            if files.is_empty() {
+                active.remove(&owner);
+            }
+        }
+        Ok(())
+    }
+
+    fn set_advisory_lock(
+        &self,
+        ino: INodeNo,
+        lock_owner: fuser::LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        sleep: bool,
+    ) -> FuseResult<()> {
+        let path = self.path_for_ino(ino)?;
+        let owner = self.advisory_lock_owner_key(lock_owner);
+        let kind = Self::advisory_lock_kind(typ)?;
+        let deadline = Instant::now() + ADVISORY_LOCK_BLOCK_TIMEOUT;
+        loop {
+            let response = self
+                .tokio
+                .block_on(self.client.advisory_lock(
+                    "set",
+                    &path,
+                    &self.mount_id,
+                    &owner,
+                    start,
+                    end,
+                    kind,
+                    pid,
+                ))
+                .map_err(|error| Self::advisory_lock_error(&error))?;
+            if response.acquired {
+                if kind != "unlock" {
+                    let file_id = response.file_id.ok_or(Errno::EIO)?;
+                    self.active_lock_owners
+                        .lock()
+                        .map_err(|_| Errno::EIO)?
+                        .entry(owner)
+                        .or_default()
+                        .insert(ino.0, file_id);
+                }
+                return Ok(());
+            }
+            if !sleep || Instant::now() >= deadline {
+                return Err(Errno::EAGAIN);
+            }
+            std::thread::sleep(ADVISORY_LOCK_RETRY_DELAY);
+        }
+    }
+}
+
+impl Drop for RemoteFuseFs {
+    fn drop(&mut self) {
+        let client = self.client.clone();
+        let mount_id = self.mount_id.clone();
+        self.tokio.spawn(async move {
+            if let Err(error) = client.release_advisory_lock_mount(&mount_id).await {
+                tracing::debug!(
+                    mount_id,
+                    error = %error,
+                    "best-effort distributed VFS lock release failed during unmount"
+                );
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1146,10 +1325,11 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 impl RemoteFuseFs {
     fn requested_init_capabilities_for(read_only: bool) -> InitFlags {
+        let locks = InitFlags::FUSE_POSIX_LOCKS | InitFlags::FUSE_FLOCK_LOCKS;
         if read_only {
-            InitFlags::FUSE_AUTO_INVAL_DATA
+            InitFlags::FUSE_AUTO_INVAL_DATA | locks
         } else {
-            InitFlags::FUSE_WRITEBACK_CACHE | InitFlags::FUSE_AUTO_INVAL_DATA
+            InitFlags::FUSE_WRITEBACK_CACHE | InitFlags::FUSE_AUTO_INVAL_DATA | locks
         }
     }
 }
@@ -1187,11 +1367,16 @@ mod tests {
     fn mounts_request_automatic_data_invalidation() {
         assert_eq!(
             RemoteFuseFs::requested_init_capabilities_for(false),
-            InitFlags::FUSE_WRITEBACK_CACHE | InitFlags::FUSE_AUTO_INVAL_DATA
+            InitFlags::FUSE_WRITEBACK_CACHE
+                | InitFlags::FUSE_AUTO_INVAL_DATA
+                | InitFlags::FUSE_POSIX_LOCKS
+                | InitFlags::FUSE_FLOCK_LOCKS
         );
         assert_eq!(
             RemoteFuseFs::requested_init_capabilities_for(true),
             InitFlags::FUSE_AUTO_INVAL_DATA
+                | InitFlags::FUSE_POSIX_LOCKS
+                | InitFlags::FUSE_FLOCK_LOCKS
         );
     }
 
@@ -1273,6 +1458,8 @@ mod tests {
         let committed_metadata = RemoteMetadata {
             kind: "file".to_string(),
             size_bytes: committed.len() as u64,
+            file_id: None,
+            link_count: 1,
             link_target: None,
             content_hash: Some(content_hash_for_bytes(&committed)),
             executable: false,
@@ -1326,6 +1513,8 @@ mod tests {
         let metadata = RemoteMetadata {
             kind: "file".to_string(),
             size_bytes: 123,
+            file_id: None,
+            link_count: 1,
             link_target: None,
             content_hash: None,
             executable: false,
@@ -1564,6 +1753,8 @@ impl RemoteFuseFs {
                             &RemoteMetadata {
                                 kind: "file".to_string(),
                                 size_bytes: state.buffer.len() as u64,
+                                file_id: None,
+                                link_count: 1,
                                 link_target: None,
                                 content_hash: state.base_content_hash,
                                 executable: state.executable,
@@ -1663,6 +1854,8 @@ impl RemoteFuseFs {
         let directory_metadata = || RemoteMetadata {
             kind: "directory".to_string(),
             size_bytes: 0,
+            file_id: None,
+            link_count: 2,
             link_target: None,
             content_hash: None,
             executable: false,
@@ -1685,6 +1878,8 @@ impl RemoteFuseFs {
                 let metadata = RemoteMetadata {
                     kind: entry.kind,
                     size_bytes: entry.size_bytes,
+                    file_id: entry.file_id,
+                    link_count: entry.link_count,
                     link_target: entry.link_target,
                     content_hash: entry.content_hash,
                     executable: entry.executable,
@@ -1834,24 +2029,21 @@ impl RemoteFuseFs {
 
     pub(super) fn flush(
         &self,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
-        _lock_owner: fuser::LockOwner,
+        lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
-        match self.flush_handle_immediate(fh.0) {
+        match self
+            .flush_handle_immediate(fh.0)
+            .and_then(|()| self.release_advisory_lock_owner(ino, lock_owner))
+        {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(err),
         }
     }
 
-    pub(super) fn fsync(
-        &self,
-        _ino: INodeNo,
-        fh: FileHandle,
-        _datasync: bool,
-        reply: ReplyEmpty,
-    ) {
+    pub(super) fn fsync(&self, _ino: INodeNo, fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
         match self.flush_handle_immediate(fh.0) {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(err),
@@ -1860,20 +2052,104 @@ impl RemoteFuseFs {
 
     pub(super) fn release(
         &self,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         _flags: OpenFlags,
-        _lock_owner: Option<fuser::LockOwner>,
+        lock_owner: Option<fuser::LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let flush_result = self.flush_handle_immediate(fh.0);
+        let flush_result = self
+            .flush_handle_immediate(fh.0)
+            .and_then(|()| match lock_owner {
+                Some(lock_owner) => self.release_advisory_lock_owner(ino, lock_owner),
+                None => Ok(()),
+            });
         let _ = self
             .lock_handles()
             .map(|mut handles| handles.files.remove(&fh.0));
         match flush_result {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(err),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn getlk(
+        &self,
+        ino: INodeNo,
+        _fh: FileHandle,
+        lock_owner: fuser::LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        reply: ReplyLock,
+    ) {
+        let result = (|| {
+            let path = self.path_for_ino(ino)?;
+            let owner = self.advisory_lock_owner_key(lock_owner);
+            let kind = Self::advisory_lock_kind(typ)?;
+            if kind == "unlock" {
+                return Err(Errno::EINVAL);
+            }
+            self.tokio
+                .block_on(self.client.advisory_lock(
+                    "get",
+                    &path,
+                    &self.mount_id,
+                    &owner,
+                    start,
+                    end,
+                    kind,
+                    pid,
+                ))
+                .map_err(|error| Self::advisory_lock_error(&error))
+        })();
+        match result {
+            Ok(response) if response.acquired => {
+                reply.locked(0, 0, i32::from(libc::F_UNLCK), 0);
+            }
+            Ok(response) => {
+                let Some(conflict) = response.conflict else {
+                    reply.error(Errno::EIO);
+                    return;
+                };
+                let Ok(conflict_start) = conflict.start.parse::<u64>() else {
+                    reply.error(Errno::EIO);
+                    return;
+                };
+                let Ok(conflict_end) = conflict.end.parse::<u64>() else {
+                    reply.error(Errno::EIO);
+                    return;
+                };
+                let conflict_type = if conflict.kind == "read" {
+                    i32::from(libc::F_RDLCK)
+                } else {
+                    i32::from(libc::F_WRLCK)
+                };
+                reply.locked(conflict_start, conflict_end, conflict_type, conflict.pid);
+            }
+            Err(error) => reply.error(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn setlk(
+        &self,
+        ino: INodeNo,
+        _fh: FileHandle,
+        lock_owner: fuser::LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        sleep: bool,
+        reply: ReplyEmpty,
+    ) {
+        match self.set_advisory_lock(ino, lock_owner, start, end, typ, pid, sleep) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
         }
     }
 
@@ -1893,6 +2169,8 @@ impl RemoteFuseFs {
             let metadata = RemoteMetadata {
                 kind: "directory".to_string(),
                 size_bytes: 0,
+                file_id: None,
+                link_count: 2,
                 link_target: None,
                 content_hash: None,
                 executable: false,
@@ -1928,6 +2206,8 @@ impl RemoteFuseFs {
             let metadata = RemoteMetadata {
                 kind: "symlink".to_string(),
                 size_bytes: target.len() as u64,
+                file_id: None,
+                link_count: 1,
                 link_target: Some(target),
                 content_hash: None,
                 executable: false,
@@ -2045,6 +2325,8 @@ impl RemoteFuseFs {
             let metadata = self.stat_path(&destination)?.unwrap_or(RemoteMetadata {
                 kind: "file".to_string(),
                 size_bytes: bytes.len() as u64,
+                file_id: source_metadata.file_id,
+                link_count: source_metadata.link_count,
                 link_target: None,
                 content_hash: source_metadata.content_hash,
                 executable: source_metadata.executable,
@@ -2073,6 +2355,8 @@ impl RemoteFuseFs {
             let metadata = RemoteMetadata {
                 kind: "file".to_string(),
                 size_bytes: 0,
+                file_id: None,
+                link_count: 1,
                 link_target: None,
                 content_hash: None,
                 executable: mode & 0o111 != 0,

@@ -198,6 +198,8 @@ pub struct VfsMetadata {
     /// `"File"`, `"Directory"`, `"Symlink"`, or `"Special"`.
     pub kind: String,
     pub size_bytes: BigInt,
+    pub file_id: Option<String>,
+    pub link_count: Option<BigInt>,
     pub link_target: Option<String>,
     pub executable: Option<bool>,
     pub content_hash: Option<String>,
@@ -221,6 +223,8 @@ impl From<VfsStorageMetadata> for VfsMetadata {
             }
             .to_string(),
             size_bytes: BigInt::from(m.size_bytes),
+            file_id: m.file_id,
+            link_count: Some(BigInt::from(m.link_count)),
             link_target: m.link_target,
             executable: Some(m.executable),
             content_hash: m.content_hash,

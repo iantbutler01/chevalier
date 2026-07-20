@@ -267,6 +267,8 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
                         path: manifest.logical_path.clone(),
                         kind: VfsStorageEntryKind::File,
                         size_bytes: manifest.logical_size_bytes.max(0) as u64,
+                        file_id: None,
+                        link_count: 1,
                         link_target: None,
                         executable: false,
                         content_hash: Some(manifest.content_hash.clone()),

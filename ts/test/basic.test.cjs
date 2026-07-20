@@ -51,6 +51,21 @@ test("vfs local round-trip", async () => {
   assert.strictEqual(attrs.contentHash, undefined);
 });
 
+test("vfs local metadata exposes stable hard-link identity", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "chev-hardlink-metadata-test-"));
+  fs.writeFileSync(path.join(root, "original"), "shared");
+  fs.linkSync(path.join(root, "original"), path.join(root, "alias"));
+  const vfs = VfsStorage.local(root);
+
+  const original = await vfs.stat("original");
+  const alias = await vfs.stat("alias");
+
+  assert.ok(original.fileId);
+  assert.strictEqual(alias.fileId, original.fileId);
+  assert.strictEqual(original.linkCount, 2n);
+  assert.strictEqual(alias.linkCount, 2n);
+});
+
 test("vfs bulk metadata preserves request order and missing entries", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "chev-metadata-many-test-"));
   const vfs = VfsStorage.local(root);
@@ -63,6 +78,123 @@ test("vfs bulk metadata preserves request order and missing entries", async () =
   assert.strictEqual(rows[0].sizeBytes, 2n);
   assert.strictEqual(rows[1], null);
   assert.strictEqual(rows[2].path, "a.txt");
+});
+
+test("vfs gateway coordinates leased advisory locks by stable file identity", async () => {
+  const metadata = {
+    path: "lock-a",
+    kind: "File",
+    sizeBytes: 0n,
+    fileId: "stable-file-1",
+    linkCount: 2n,
+  };
+  const store = {
+    async stat(path) {
+      if (path === "lock-a" || path === "lock-alias") return { ...metadata, path };
+      if (path === "other") return { ...metadata, path, fileId: "stable-file-2", linkCount: 1n };
+      return null;
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+  const request = async (body) => {
+    const response = await handler(
+      new Request("http://local/internal/chevalier/vfs/owner/posix-lock/v1", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+    );
+    return { status: response.status, body: await response.json() };
+  };
+  const lock = (mount, owner, kind, start = "0", end = "9223372036854775807", path = "lock-a") =>
+    request({
+      action: "set",
+      path,
+      mount_id: mount,
+      lock_owner: owner,
+      start,
+      end,
+      kind,
+      pid: 1,
+    });
+
+  assert.deepStrictEqual((await lock("mount-a", "owner-a", "write")).body.acquired, true);
+  assert.deepStrictEqual((await lock("mount-a", "owner-a", "write", "0", "9", "other")).body.acquired, true);
+  assert.deepStrictEqual(
+    (await lock("mount-b", "owner-b", "write", "0", "9223372036854775807", "lock-alias")).body.acquired,
+    false,
+  );
+  assert.deepStrictEqual((await lock("mount-b", "owner-b", "write", "0", "9")).body.acquired, false);
+  assert.deepStrictEqual((await lock("mount-b", "owner-b", "write", "10", "19")).body.acquired, false);
+
+  const released = await request({
+    action: "release_owner",
+    mount_id: "mount-a",
+    lock_owner: "owner-a",
+    file_id: "stable-file-1",
+  });
+  assert.strictEqual(released.status, 200);
+  assert.deepStrictEqual((await lock("mount-b", "owner-b", "write", "0", "9", "other")).body.acquired, false);
+  assert.deepStrictEqual((await lock("mount-b", "owner-b", "write", "0", "9")).body.acquired, true);
+  assert.deepStrictEqual((await lock("mount-c", "owner-c", "write", "10", "19")).body.acquired, true);
+  assert.deepStrictEqual((await lock("mount-d", "owner-d", "read", "0", "9")).body.acquired, false);
+
+  assert.deepStrictEqual((await lock("mount-b", "owner-b", "unlock", "0", "9")).body.acquired, true);
+  assert.deepStrictEqual((await lock("mount-d", "owner-d", "read", "0", "9")).body.acquired, true);
+  assert.deepStrictEqual((await lock("mount-e", "owner-e", "read", "0", "9")).body.acquired, true);
+});
+
+test("vfs gateway advisory locks survive handler recreation with shared state", async () => {
+  const byOwner = new Map();
+  const sharedState = {
+    async transact(ownerId, transaction) {
+      const outcome = transaction([...(byOwner.get(ownerId) ?? [])]);
+      byOwner.set(ownerId, outcome.locks);
+      return outcome.result;
+    },
+  };
+  const store = {
+    async stat(path) {
+      return path === "guard" ? {
+        path,
+        kind: "File",
+        sizeBytes: 0n,
+        fileId: "stable-guard",
+        linkCount: 1n,
+      } : null;
+    },
+  };
+  const request = async (handler, mountId) => {
+    const response = await handler(
+      new Request("http://local/internal/chevalier/vfs/owner/posix-lock/v1", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          action: "set",
+          path: "guard",
+          mount_id: mountId,
+          lock_owner: "process",
+          start: "0",
+          end: "9223372036854775807",
+          kind: "write",
+          pid: 1,
+        }),
+      }),
+    );
+    return response.json();
+  };
+
+  const beforeRestart = createVfsGatewayServer({
+    resolveStore: async () => store,
+    advisoryLockState: sharedState,
+  });
+  assert.strictEqual((await request(beforeRestart, "mount-a")).acquired, true);
+
+  const afterRestart = createVfsGatewayServer({
+    resolveStore: async () => store,
+    advisoryLockState: sharedState,
+  });
+  assert.strictEqual((await request(afterRestart, "mount-b")).acquired, false);
 });
 
 test("vfs gateway streams verified uploads and serves bounded ranges", async () => {

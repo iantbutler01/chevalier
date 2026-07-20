@@ -50,10 +50,201 @@ const EXECUTABLE_HEADER = "x-chevalier-vfs-executable";
 const EXPECTED_CONTENT_HASH_HEADER = "x-chevalier-vfs-expected-content-sha256";
 const STREAM_UPLOAD_HEADER = "x-chevalier-vfs-stream-upload";
 const RANGE_FINGERPRINT_HEADER = "x-chevalier-vfs-range-fingerprint";
+const ADVISORY_LOCK_LEASE_MS = 45_000;
+/**
+ * Coordinates leased POSIX locks independently from write authorization and
+ * namespace mutation leases. Production multi-process gateways supply a shared
+ * transactional state store; the default is intentionally process-local for
+ * embedders and tests.
+ */
+class AdvisoryLockCoordinator {
+    constructor(state) {
+        this.state = state;
+    }
+    async handle(ownerId, fileId, request) {
+        const now = Date.now();
+        const mountId = nonEmptyString(request.mount_id);
+        if (mountId === null)
+            return errorResponse(400, "posix lock requires mount_id");
+        if (request.action === "renew_mount") {
+            return this.state.transact(ownerId, (stored) => {
+                const locks = liveLocks(stored, now);
+                for (const lock of locks) {
+                    if (lock.mountId === mountId)
+                        lock.expiresAt = now + ADVISORY_LOCK_LEASE_MS;
+                }
+                return {
+                    locks,
+                    result: json(200, { ok: true, lease_ms: ADVISORY_LOCK_LEASE_MS }),
+                };
+            });
+        }
+        if (request.action === "release_mount") {
+            return this.state.transact(ownerId, (stored) => ({
+                locks: liveLocks(stored, now).filter((lock) => lock.mountId !== mountId),
+                result: json(200, { ok: true }),
+            }));
+        }
+        const lockOwner = nonEmptyString(request.lock_owner);
+        if (lockOwner === null)
+            return errorResponse(400, "posix lock requires lock_owner");
+        if (request.action === "release_owner") {
+            const releasedFileId = nonEmptyString(request.file_id);
+            if (releasedFileId === null)
+                return errorResponse(400, "posix lock release requires file_id");
+            return this.state.transact(ownerId, (stored) => ({
+                locks: liveLocks(stored, now).filter((lock) => lock.mountId !== mountId ||
+                    lock.lockOwner !== lockOwner ||
+                    lock.fileId !== releasedFileId),
+                result: json(200, { ok: true }),
+            }));
+        }
+        if (fileId === null)
+            return errorResponse(501, "stable file identity is unavailable for posix locking");
+        const start = parseLockOffset(request.start, "start");
+        if (start instanceof Response)
+            return start;
+        const end = parseLockOffset(request.end, "end");
+        if (end instanceof Response)
+            return end;
+        if (end < start)
+            return errorResponse(400, "posix lock end precedes start");
+        const kind = request.kind;
+        if (kind !== "read" && kind !== "write" && kind !== "unlock") {
+            return errorResponse(400, "posix lock kind must be read, write, or unlock");
+        }
+        const pid = Number.isSafeInteger(request.pid) && (request.pid ?? -1) >= 0 ? request.pid : 0;
+        const identity = { ownerId, mountId, lockOwner, fileId, start, end, kind, pid };
+        if (request.action === "get") {
+            if (kind === "unlock")
+                return errorResponse(400, "get posix lock cannot query unlock");
+            return this.state.transact(ownerId, (stored) => {
+                const locks = liveLocks(stored, now);
+                const conflict = firstConflict(locks, { ...identity, kind });
+                return {
+                    locks,
+                    result: json(200, {
+                        acquired: conflict === undefined,
+                        conflict: conflict === undefined ? null : lockResponse(conflict),
+                        file_id: fileId,
+                        lease_ms: ADVISORY_LOCK_LEASE_MS,
+                    }),
+                };
+            });
+        }
+        if (request.action !== "set")
+            return errorResponse(400, `unsupported posix lock action: ${request.action}`);
+        return this.state.transact(ownerId, (stored) => {
+            const locks = liveLocks(stored, now);
+            const ownKey = (lock) => lock.mountId === mountId && lock.lockOwner === lockOwner && lock.fileId === fileId;
+            const replacement = locks.flatMap((lock) => {
+                if (!ownKey(lock) || !rangesOverlap(lock.start, lock.end, start, end))
+                    return [lock];
+                return subtractRange(lock, start, end);
+            });
+            if (kind === "unlock") {
+                return {
+                    locks: replacement,
+                    result: json(200, {
+                        acquired: true,
+                        conflict: null,
+                        file_id: fileId,
+                        lease_ms: ADVISORY_LOCK_LEASE_MS,
+                    }),
+                };
+            }
+            const conflict = firstConflict(replacement, { ...identity, kind });
+            if (conflict !== undefined) {
+                return {
+                    locks: replacement,
+                    result: json(200, {
+                        acquired: false,
+                        conflict: lockResponse(conflict),
+                        file_id: fileId,
+                        lease_ms: ADVISORY_LOCK_LEASE_MS,
+                    }),
+                };
+            }
+            replacement.push({
+                ownerId,
+                mountId,
+                lockOwner,
+                fileId,
+                start,
+                end,
+                kind,
+                pid,
+                expiresAt: now + ADVISORY_LOCK_LEASE_MS,
+            });
+            return {
+                locks: replacement,
+                result: json(200, {
+                    acquired: true,
+                    conflict: null,
+                    file_id: fileId,
+                    lease_ms: ADVISORY_LOCK_LEASE_MS,
+                }),
+            };
+        });
+    }
+}
+class InMemoryAdvisoryLockStateStore {
+    constructor() {
+        this.byOwner = new Map();
+    }
+    async transact(ownerId, transaction) {
+        const outcome = transaction([...(this.byOwner.get(ownerId) ?? [])]);
+        this.byOwner.set(ownerId, outcome.locks);
+        return outcome.result;
+    }
+}
+function liveLocks(locks, now) {
+    return locks.filter((lock) => lock.expiresAt > now);
+}
+function firstConflict(locks, request) {
+    return locks.find((lock) => lock.fileId === request.fileId &&
+        !(lock.mountId === request.mountId && lock.lockOwner === request.lockOwner) &&
+        rangesOverlap(lock.start, lock.end, request.start, request.end) &&
+        (lock.kind === "write" || request.kind === "write"));
+}
+function nonEmptyString(value) {
+    return typeof value === "string" && value.trim() !== "" ? value : null;
+}
+function parseLockOffset(value, name) {
+    if (typeof value !== "string" || !/^\d+$/.test(value)) {
+        return errorResponse(400, `posix lock ${name} must be an unsigned decimal string`);
+    }
+    try {
+        return BigInt(value);
+    }
+    catch {
+        return errorResponse(400, `invalid posix lock ${name}`);
+    }
+}
+function rangesOverlap(aStart, aEnd, bStart, bEnd) {
+    return aStart <= bEnd && bStart <= aEnd;
+}
+function subtractRange(lock, start, end) {
+    const out = [];
+    if (lock.start < start)
+        out.push({ ...lock, end: start - 1n });
+    if (lock.end > end)
+        out.push({ ...lock, start: end + 1n });
+    return out;
+}
+function lockResponse(lock) {
+    return {
+        start: lock.start.toString(),
+        end: lock.end.toString(),
+        kind: lock.kind,
+        pid: lock.pid,
+    };
+}
 /** Build a WHATWG `(Request) => Promise<Response>` handler that serves chevalier's
  *  VFS gateway protocol, delegating storage to `resolveStore(ownerId)`. */
 function createVfsGatewayServer(opts) {
     const prefix = opts.routePrefix ?? DEFAULT_ROUTE_PREFIX;
+    const advisoryLocks = new AdvisoryLockCoordinator(opts.advisoryLockState ?? new InMemoryAdvisoryLockStateStore());
     return async function handle(req) {
         try {
             if (opts.authToken !== undefined && opts.authToken !== "") {
@@ -75,6 +266,23 @@ function createVfsGatewayServer(opts) {
             const q = url.searchParams;
             const method = req.method.toUpperCase();
             const relPath = normalizePath(q.get("path"));
+            if (method === "POST" && op === "posix-lock/v1") {
+                const body = (await req.json().catch(() => null));
+                if (body === null || typeof body !== "object" || typeof body.action !== "string") {
+                    return errorResponse(400, "invalid posix lock request");
+                }
+                if (body.action === "renew_mount" || body.action === "release_mount" || body.action === "release_owner") {
+                    return await advisoryLocks.handle(ownerId, null, body);
+                }
+                const lockPath = normalizePath(body.path ?? null);
+                if (lockPath === "" || isGitExcludedPath(lockPath)) {
+                    return errorResponse(400, `invalid posix lock path: ${lockPath}`);
+                }
+                const metadata = await store.stat(lockPath);
+                if (metadata === null)
+                    return errorResponse(404, `not found: ${lockPath}`);
+                return await advisoryLocks.handle(ownerId, metadata.fileId ?? null, body);
+            }
             // ---- reads ----------------------------------------------------------
             if (method === "GET" && op === "stat") {
                 if (isGitExcludedPath(relPath))
@@ -715,6 +923,8 @@ function toRemoteMetadata(md) {
     return {
         kind: wireKind(md.kind),
         size_bytes: Number(md.sizeBytes),
+        file_id: md.fileId ?? null,
+        link_count: Number(md.linkCount ?? 1n),
         executable: md.executable ?? false,
         link_target: md.linkTarget ?? null,
         content_hash: md.contentHash ?? null,
@@ -727,6 +937,8 @@ function toRemoteDirEntry(md) {
         name,
         kind: wireKind(md.kind),
         size_bytes: Number(md.sizeBytes),
+        file_id: md.fileId ?? null,
+        link_count: Number(md.linkCount ?? 1n),
         executable: md.executable ?? false,
         link_target: md.linkTarget ?? null,
         content_hash: md.contentHash ?? null,

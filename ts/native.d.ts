@@ -321,6 +321,8 @@ export interface VfsMetadata {
   /** `"File"`, `"Directory"`, `"Symlink"`, or `"Special"`. */
   kind: string
   sizeBytes: bigint
+  fileId?: string
+  linkCount?: bigint
   linkTarget?: string
   executable?: boolean
   contentHash?: string

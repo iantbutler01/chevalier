@@ -74,6 +74,13 @@ pub struct VfsStorageMetadata {
     pub path: String,
     pub kind: VfsStorageEntryKind,
     pub size_bytes: u64,
+    /// Stable backend identity for one inode/object across path aliases and
+    /// renames. Backends that cannot preserve identity must return `None`.
+    #[serde(default)]
+    pub file_id: Option<String>,
+    /// Number of namespace entries referring to this identity.
+    #[serde(default = "default_link_count")]
+    pub link_count: u64,
     #[serde(default)]
     pub link_target: Option<String>,
     #[serde(default)]
@@ -91,6 +98,8 @@ impl Default for VfsStorageMetadata {
             path: String::new(),
             kind: VfsStorageEntryKind::File,
             size_bytes: 0,
+            file_id: None,
+            link_count: 1,
             link_target: None,
             executable: false,
             content_hash: None,
@@ -100,6 +109,10 @@ impl Default for VfsStorageMetadata {
             object_state: None,
         }
     }
+}
+
+const fn default_link_count() -> u64 {
+    1
 }
 
 impl VfsStorageMetadata {

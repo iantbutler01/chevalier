@@ -11,6 +11,7 @@ use chevalier_sandbox::vfs::{
     VfsWriteManyBody, VfsWriteManyItem, VfsWritePrecondition, scoped_vfs_path,
 };
 use reqwest::{Client, StatusCode, header};
+use serde::{Deserialize, Serialize};
 
 pub const RANGE_FINGERPRINT_HEADER: &str = "x-chevalier-vfs-range-fingerprint";
 /// Transient-failure budget sized to ride out a gateway restart, not mask a
@@ -42,6 +43,41 @@ pub enum RangeRead {
     NotFound,
     /// The file changed since the fingerprint was taken; re-stat and retry.
     Stale,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AdvisoryLockConflict {
+    pub start: String,
+    pub end: String,
+    pub kind: String,
+    pub pid: u32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AdvisoryLockResponse {
+    pub acquired: bool,
+    pub conflict: Option<AdvisoryLockConflict>,
+    pub file_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AdvisoryLockRequest<'a> {
+    action: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_id: Option<&'a str>,
+    mount_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lock_owner: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
 }
 
 impl RemoteVfsClient {
@@ -381,6 +417,103 @@ impl RemoteVfsClient {
         Ok(())
     }
 
+    pub async fn advisory_lock(
+        &self,
+        action: &str,
+        path: &str,
+        mount_id: &str,
+        lock_owner: &str,
+        start: u64,
+        end: u64,
+        kind: &str,
+        pid: u32,
+    ) -> Result<AdvisoryLockResponse> {
+        self.request(
+            self.client
+                .post(self.url("/posix-lock/v1"))
+                .json(&AdvisoryLockRequest {
+                    action,
+                    path: Some(self.path_arg(path)),
+                    file_id: None,
+                    mount_id,
+                    lock_owner: Some(lock_owner),
+                    start: Some(start.to_string()),
+                    end: Some(end.to_string()),
+                    kind: Some(kind),
+                    pid: Some(pid),
+                }),
+        )
+        .await?
+        .json()
+        .await
+        .context("decode posix lock response")
+    }
+
+    pub async fn release_advisory_lock_owner(
+        &self,
+        mount_id: &str,
+        lock_owner: &str,
+        file_id: &str,
+    ) -> Result<()> {
+        self.request(
+            self.client
+                .post(self.url("/posix-lock/v1"))
+                .json(&AdvisoryLockRequest {
+                    action: "release_owner",
+                    path: None,
+                    file_id: Some(file_id),
+                    mount_id,
+                    lock_owner: Some(lock_owner),
+                    start: None,
+                    end: None,
+                    kind: None,
+                    pid: None,
+                }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn renew_advisory_locks(&self, mount_id: &str) -> Result<()> {
+        self.request(
+            self.client
+                .post(self.url("/posix-lock/v1"))
+                .json(&AdvisoryLockRequest {
+                    action: "renew_mount",
+                    path: None,
+                    file_id: None,
+                    mount_id,
+                    lock_owner: None,
+                    start: None,
+                    end: None,
+                    kind: None,
+                    pid: None,
+                }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn release_advisory_lock_mount(&self, mount_id: &str) -> Result<()> {
+        self.request(
+            self.client
+                .post(self.url("/posix-lock/v1"))
+                .json(&AdvisoryLockRequest {
+                    action: "release_mount",
+                    path: None,
+                    file_id: None,
+                    mount_id,
+                    lock_owner: None,
+                    start: None,
+                    end: None,
+                    kind: None,
+                    pid: None,
+                }),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn apply_namespace_batch(
         &self,
         mutations: &[VfsNamespaceMutation],
@@ -610,20 +743,23 @@ impl std::fmt::Display for VfsRequestStatusError {
 impl std::error::Error for VfsRequestStatusError {}
 
 pub fn rejected_request_status(error: &anyhow::Error) -> Option<StatusCode> {
+    request_status(error).filter(|status| {
+        // Only statuses that mean "this exact payload can never succeed".
+        // Auth failures (401/403), route skew during deploys (404), rate
+        // limits (429), and timeouts (408) are transient conditions and
+        // must retain-and-retry, never dead-letter.
+        matches!(
+            *status,
+            StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED
+        )
+    })
+}
+
+pub fn request_status(error: &anyhow::Error) -> Option<StatusCode> {
     error
         .chain()
         .find_map(|cause| cause.downcast_ref::<VfsRequestStatusError>())
         .map(|status_error| status_error.status)
-        .filter(|status| {
-            // Only statuses that mean "this exact payload can never succeed".
-            // Auth failures (401/403), route skew during deploys (404), rate
-            // limits (429), and timeouts (408) are transient conditions and
-            // must retain-and-retry, never dead-letter.
-            matches!(
-                *status,
-                StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED
-            )
-        })
 }
 
 struct ReadFailure {

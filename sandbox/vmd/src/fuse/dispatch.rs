@@ -19,9 +19,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use fuser::{
-    BsdFileFlags, FileHandle, Filesystem, INodeNo, KernelConfig, LockOwner, OpenFlags,
-    RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
+    BsdFileFlags, FileHandle, Filesystem, INodeNo, KernelConfig, LockOwner, OpenFlags, RenameFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry,
+    ReplyLock, ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 use tokio::sync::Semaphore;
 
@@ -190,6 +190,39 @@ impl Filesystem for SpawnedFuseFs {
         reply: ReplyEmpty,
     ) {
         self.spawn(move |fs| fs.release(ino, fh, flags, lock_owner, flush, reply));
+    }
+
+    fn getlk(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        lock_owner: LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        reply: ReplyLock,
+    ) {
+        self.spawn(move |fs| fs.getlk(ino, fh, lock_owner, start, end, typ, pid, reply));
+    }
+
+    fn setlk(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        lock_owner: LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        sleep: bool,
+        reply: ReplyEmpty,
+    ) {
+        self.spawn(move |fs| {
+            fs.setlk(ino, fh, lock_owner, start, end, typ, pid, sleep, reply);
+        });
     }
 
     fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, mode: u32, umask: u32, reply: ReplyEntry) {

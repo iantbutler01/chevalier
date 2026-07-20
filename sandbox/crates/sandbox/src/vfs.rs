@@ -49,6 +49,10 @@ pub struct VfsDirEntry {
     pub kind: String,
     pub size_bytes: u64,
     #[serde(default)]
+    pub file_id: Option<String>,
+    #[serde(default = "default_vfs_link_count")]
+    pub link_count: u64,
+    #[serde(default)]
     pub link_target: Option<String>,
     pub content_hash: Option<String>,
     #[serde(default)]
@@ -61,11 +65,19 @@ pub struct VfsMetadata {
     pub kind: String,
     pub size_bytes: u64,
     #[serde(default)]
+    pub file_id: Option<String>,
+    #[serde(default = "default_vfs_link_count")]
+    pub link_count: u64,
+    #[serde(default)]
     pub link_target: Option<String>,
     pub content_hash: Option<String>,
     #[serde(default)]
     pub executable: bool,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+const fn default_vfs_link_count() -> u64 {
+    1
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1605,6 +1617,8 @@ mod server_tests {
                 name: format!("{owner_id}:{path}:file.txt"),
                 kind: VFS_ENTRY_KIND_FILE.to_string(),
                 size_bytes: 5,
+                file_id: Some("memory:file.txt".to_string()),
+                link_count: 1,
                 link_target: None,
                 content_hash: None,
                 executable: false,
@@ -1619,6 +1633,8 @@ mod server_tests {
                 return Ok(VfsMetadata {
                     kind: VFS_ENTRY_KIND_DIRECTORY.to_string(),
                     size_bytes: 0,
+                    file_id: Some("memory:dir".to_string()),
+                    link_count: 1,
                     link_target: None,
                     content_hash: None,
                     executable: false,
@@ -1631,6 +1647,8 @@ mod server_tests {
             Ok(VfsMetadata {
                 kind: VFS_ENTRY_KIND_FILE.to_string(),
                 size_bytes: bytes.len() as u64,
+                file_id: Some(format!("memory:{path}")),
+                link_count: 1,
                 link_target: None,
                 content_hash: None,
                 executable: false,
@@ -1645,6 +1663,8 @@ mod server_tests {
                 return Ok(VfsMetadata {
                     kind: VFS_ENTRY_KIND_DIRECTORY.to_string(),
                     size_bytes: 0,
+                    file_id: Some("memory:dir".to_string()),
+                    link_count: 1,
                     link_target: None,
                     content_hash: None,
                     executable: false,
@@ -1657,6 +1677,8 @@ mod server_tests {
             Ok(VfsMetadata {
                 kind: VFS_ENTRY_KIND_FILE.to_string(),
                 size_bytes: bytes.len() as u64,
+                file_id: Some(format!("memory:{path}")),
+                link_count: 1,
                 link_target: None,
                 content_hash: None,
                 executable: false,

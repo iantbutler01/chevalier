@@ -232,6 +232,8 @@ impl VfsIndexEntryWithManifest {
             path: self.entry.logical_path,
             kind: self.entry.kind,
             size_bytes: self.entry.size_bytes.max(0) as u64,
+            file_id: None,
+            link_count: 1,
             link_target: None,
             executable: false,
             content_hash: self.entry.content_hash,

@@ -324,6 +324,8 @@ impl LocalVfsStorage {
             path: self.logical_path_for(abs_path)?,
             kind,
             size_bytes: metadata.len(),
+            file_id: local_file_id(&metadata),
+            link_count: local_link_count(&metadata),
             link_target,
             executable: executable_from_metadata(&metadata, kind),
             content_hash,
@@ -1664,6 +1666,26 @@ fn is_excluded_listing_error(error: &VfsStorageError) -> bool {
 
 fn is_excluded_listing_kind(kind: VfsStorageEntryKind) -> bool {
     matches!(kind, VfsStorageEntryKind::Special)
+}
+
+#[cfg(unix)]
+fn local_file_id(metadata: &fs::Metadata) -> Option<String> {
+    Some(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn local_file_id(_metadata: &fs::Metadata) -> Option<String> {
+    None
+}
+
+#[cfg(unix)]
+fn local_link_count(metadata: &fs::Metadata) -> u64 {
+    metadata.nlink()
+}
+
+#[cfg(not(unix))]
+fn local_link_count(_metadata: &fs::Metadata) -> u64 {
+    1
 }
 
 #[cfg(unix)]
