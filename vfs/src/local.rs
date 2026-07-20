@@ -132,7 +132,7 @@ enum PathLockMode {
 const HASH_CACHE_RECENCY_GUARD: Duration = Duration::from_secs(2);
 const HASH_CACHE_MAX_AGE: Duration = Duration::from_secs(30);
 const MAX_PARALLEL_FILE_SYNCS: usize = 8;
-const MAX_PARALLEL_LOCAL_MUTATIONS: usize = 64;
+const MAX_PARALLEL_LOCAL_MUTATIONS: usize = MAX_PARALLEL_FILE_SYNCS;
 // A 10k-file Git working set must fit without a sequential status scan evicting
 // the entries that the same scan is about to revisit. The cache remains
 // hard-bounded; the torture test below reports its observed payload and a
