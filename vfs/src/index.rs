@@ -7,8 +7,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    VfsStorageDirListFilter, VfsStorageEntryKind, VfsStorageMetadata, VfsStorageObjectState,
-    VfsStorageResult,
+    VfsStorageCasPredicate, VfsStorageDirListFilter, VfsStorageEntryKind, VfsStorageError,
+    VfsStorageMetadata, VfsStorageObjectState, VfsStorageResult,
     manifest::{VfsFileManifest, VfsPackRecord},
 };
 
@@ -60,6 +60,18 @@ pub struct VfsPackedFileCommit {
     /// Preserve this identity when replacing content through any hard-link alias.
     #[serde(default)]
     pub file_id: Option<String>,
+    /// Stable identity that must still own `logical_path` at commit time.
+    /// This is checked independently from the content-version predicate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_file_id: Option<String>,
+    /// Content predicate captured by the caller. Unlike
+    /// `expected_current_version`, this is a content-domain CAS value and must
+    /// be checked transactionally against the current entry content hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_predicate: Option<VfsStorageCasPredicate>,
+    /// Deprecated manifest-version CAS retained only for rolling index
+    /// implementations. New object-backed writes leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_current_version: Option<String>,
 }
 
@@ -225,6 +237,23 @@ pub trait VfsManifestIndex: Send + Sync {
         expected_current_version: Option<&str>,
     ) -> VfsStorageResult<Option<VfsIndexEntryWithManifest>>;
 
+    /// Delete with content-domain and stable-identity predicates. Indexes must
+    /// validate both predicates in the same transaction as the delete.
+    async fn delete_file_entry_with_precondition(
+        &self,
+        scope: &VfsIndexScope,
+        logical_path: &str,
+        content_predicate: Option<&VfsStorageCasPredicate>,
+        expected_file_id: Option<&str>,
+    ) -> VfsStorageResult<Option<VfsIndexEntryWithManifest>> {
+        if content_predicate.is_some() || expected_file_id.is_some() {
+            return Err(VfsStorageError::BadRequest(
+                "manifest index does not support typed delete preconditions".to_string(),
+            ));
+        }
+        self.delete_file_entry(scope, logical_path, None).await
+    }
+
     async fn remove_empty_directory(
         &self,
         scope: &VfsIndexScope,
@@ -315,6 +344,7 @@ impl VfsIndexEntryWithManifest {
             file_id: self.entry.file_id,
             link_count: self.entry.link_count.max(1),
             link_target: None,
+            mode: None,
             executable: false,
             content_hash: self.entry.content_hash,
             token_count,

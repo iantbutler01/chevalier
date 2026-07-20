@@ -291,6 +291,7 @@ mod tests {
             link_target: None,
             content_hash: None,
             executable: false,
+            mode: None,
             updated_at: None,
         }
     }
@@ -304,6 +305,7 @@ mod tests {
             link_target: None,
             content_hash: Some(content_hash.to_string()),
             executable: false,
+            mode: None,
             updated_at: None,
         }
     }

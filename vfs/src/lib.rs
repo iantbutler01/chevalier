@@ -39,6 +39,12 @@ pub enum VfsStorageError {
 
 pub type VfsStorageResult<T> = std::result::Result<T, VfsStorageError>;
 
+pub const VFS_POSIX_MODE_MASK: u32 = 0o7777;
+
+pub const fn normalize_vfs_mode(mode: u32) -> u32 {
+    mode & VFS_POSIX_MODE_MASK
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum VfsStorageEntryKind {
@@ -83,6 +89,12 @@ pub struct VfsStorageMetadata {
     pub link_count: u64,
     #[serde(default)]
     pub link_target: Option<String>,
+    /// Exact POSIX permission and special bits when the backend can preserve
+    /// them. File-type bits are excluded. Older backends and persisted data
+    /// omit this field and continue to use `executable` as their compatibility
+    /// projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
     #[serde(default)]
     pub executable: bool,
     pub content_hash: Option<String>,
@@ -101,6 +113,7 @@ impl Default for VfsStorageMetadata {
             file_id: None,
             link_count: 1,
             link_target: None,
+            mode: None,
             executable: false,
             content_hash: None,
             token_count: None,
@@ -126,10 +139,85 @@ impl VfsStorageMetadata {
     }
 }
 
+/// Content compare-and-swap predicate for one logical pathname.
+///
+/// Absence is a first-class state rather than the legacy string sentinel
+/// `"absent"`. Object-backed implementations must compare this predicate to
+/// the current content hash inside the same transaction that publishes the
+/// replacement.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VfsStorageCasPredicate {
+    Absent,
+    ContentFingerprint { fingerprint: String },
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct VfsStorageWritePrecondition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<VfsStorageCasPredicate>,
+    /// Deprecated rolling-upgrade input. New callers and every outbound wire
+    /// adapter use `predicate`. This remains decodeable while older product
+    /// processes are drained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
+    /// Deprecated rolling-upgrade fallback used only when `predicate` and
+    /// `fingerprint` are absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secondary_fingerprint: Option<String>,
+    /// Stable inode/object identity expected at the destination pathname.
+    /// This is independent of content fingerprints and prevents a write from
+    /// following a renamed or replaced pathname onto another identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_file_id: Option<String>,
+}
+
+impl VfsStorageWritePrecondition {
+    pub fn absent() -> Self {
+        Self {
+            predicate: Some(VfsStorageCasPredicate::Absent),
+            ..Self::default()
+        }
+    }
+
+    pub fn content_fingerprint(fingerprint: impl Into<String>) -> Self {
+        Self {
+            predicate: Some(VfsStorageCasPredicate::ContentFingerprint {
+                fingerprint: fingerprint.into(),
+            }),
+            ..Self::default()
+        }
+    }
+
+    /// Normalize typed and rolling-upgrade representations without ever
+    /// conflating a content fingerprint with a database version identifier.
+    pub fn effective_predicate(&self) -> Option<VfsStorageCasPredicate> {
+        self.predicate
+            .clone()
+            .or_else(|| {
+                self.fingerprint
+                    .as_ref()
+                    .or(self.secondary_fingerprint.as_ref())
+                    .map(|fingerprint| {
+                        if fingerprint == "absent" {
+                            VfsStorageCasPredicate::Absent
+                        } else {
+                            VfsStorageCasPredicate::ContentFingerprint {
+                                fingerprint: fingerprint.clone(),
+                            }
+                        }
+                    })
+            })
+            // Before the typed predicate existed, `Some(precondition)` with
+            // no fingerprint represented "the path must be absent". Keep
+            // that rolling-upgrade meaning. An identity-only guard is
+            // intentionally not an absence predicate.
+            .or_else(|| {
+                self.expected_file_id
+                    .is_none()
+                    .then_some(VfsStorageCasPredicate::Absent)
+            })
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -178,6 +266,10 @@ pub struct VfsStorageReadRange {
 pub struct VfsStorageWriteOptions {
     #[serde(default)]
     pub executable: bool,
+    /// Exact POSIX permission and special bits, excluding file-type bits.
+    /// When present this wins over the legacy `executable` projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -231,6 +323,8 @@ pub struct VfsStorageHardLinkResult {
 pub enum VfsStorageNamespaceMutation {
     CreateDirectory {
         path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<u32>,
     },
     CreateSymlink {
         path: String,
@@ -244,6 +338,10 @@ pub enum VfsStorageNamespaceMutation {
     RemoveDirectory {
         path: String,
     },
+    SetMode {
+        path: String,
+        mode: u32,
+    },
     Rename {
         from: String,
         to: String,
@@ -253,10 +351,11 @@ pub enum VfsStorageNamespaceMutation {
 impl VfsStorageNamespaceMutation {
     pub fn paths(&self) -> [&str; 2] {
         match self {
-            Self::CreateDirectory { path }
+            Self::CreateDirectory { path, .. }
             | Self::CreateSymlink { path, .. }
             | Self::DeleteFile { path, .. }
-            | Self::RemoveDirectory { path } => [path.as_str(), ""],
+            | Self::RemoveDirectory { path }
+            | Self::SetMode { path, .. } => [path.as_str(), ""],
             Self::Rename { from, to } => [from.as_str(), to.as_str()],
         }
     }
@@ -372,6 +471,23 @@ pub trait OptimizedVfsStorage: Send + Sync {
 
     async fn mkdir(&self, path: &str) -> VfsStorageResult<()>;
 
+    /// Create a directory while optionally converging its leaf to an exact
+    /// POSIX mode. The legacy method remains the compatibility boundary for
+    /// backends that do not preserve modes.
+    async fn mkdir_with_mode(&self, path: &str, mode: Option<u32>) -> VfsStorageResult<()> {
+        let _ = mode;
+        self.mkdir(path).await
+    }
+
+    /// Change only POSIX permission/special bits without rewriting file
+    /// content. Backends without exact-mode support fail explicitly.
+    async fn set_mode(&self, path: &str, mode: u32) -> VfsStorageResult<()> {
+        let _ = (path, mode);
+        Err(VfsStorageError::BadRequest(
+            "POSIX mode changes are not supported by this VFS backend".to_string(),
+        ))
+    }
+
     /// Create a symbolic link when the backend supports symlink metadata.
     ///
     /// Backends that cannot represent symlinks use this stable BadRequest. The
@@ -436,8 +552,8 @@ pub trait OptimizedVfsStorage: Send + Sync {
     ) -> VfsStorageResult<()> {
         for mutation in mutations {
             match mutation {
-                VfsStorageNamespaceMutation::CreateDirectory { path } => {
-                    self.mkdir(path.as_str()).await?;
+                VfsStorageNamespaceMutation::CreateDirectory { path, mode } => {
+                    self.mkdir_with_mode(path.as_str(), mode).await?;
                 }
                 VfsStorageNamespaceMutation::CreateSymlink { path, target } => {
                     self.create_symlink(path.as_str(), target.as_str()).await?;
@@ -448,6 +564,9 @@ pub trait OptimizedVfsStorage: Send + Sync {
                 }
                 VfsStorageNamespaceMutation::RemoveDirectory { path } => {
                     self.rmdir(path.as_str()).await?;
+                }
+                VfsStorageNamespaceMutation::SetMode { path, mode } => {
+                    self.set_mode(path.as_str(), mode).await?;
                 }
                 VfsStorageNamespaceMutation::Rename { from, to } => {
                     self.rename_with_metadata(from.as_str(), to.as_str())
@@ -463,4 +582,37 @@ pub trait OptimizedVfsStorage: Send + Sync {
         prefix: &str,
         options: VfsStoragePrefetchOptions,
     ) -> VfsStorageResult<VfsStoragePrefetchResult>;
+}
+
+#[cfg(all(test, feature = "gateway"))]
+mod compatibility_tests {
+    use super::{VfsStorageNamespaceMutation, VfsStorageWriteOptions, VfsStorageWritePrecondition};
+
+    #[test]
+    fn legacy_write_shapes_default_new_optional_fields() {
+        let options: VfsStorageWriteOptions =
+            serde_json::from_str(r#"{"executable":true}"#).expect("legacy write options");
+        assert!(options.executable);
+        assert_eq!(options.mode, None);
+
+        let precondition: VfsStorageWritePrecondition =
+            serde_json::from_str(r#"{"fingerprint":"old","secondary_fingerprint":null}"#)
+                .expect("legacy precondition");
+        assert_eq!(precondition.fingerprint.as_deref(), Some("old"));
+        assert_eq!(precondition.expected_file_id, None);
+    }
+
+    #[test]
+    fn legacy_create_directory_defaults_exact_mode() {
+        let mutation: VfsStorageNamespaceMutation =
+            serde_json::from_str(r#"{"kind":"create_directory","path":"legacy"}"#)
+                .expect("legacy directory mutation");
+        assert_eq!(
+            mutation,
+            VfsStorageNamespaceMutation::CreateDirectory {
+                path: "legacy".to_string(),
+                mode: None,
+            },
+        );
+    }
 }

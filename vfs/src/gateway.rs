@@ -13,13 +13,13 @@ use std::{path::Path, time::Duration};
 use tokio_util::io::ReaderStream;
 
 use crate::{
-    OptimizedVfsStorage, VfsStorageDeleteResult, VfsStorageDirListFilter, VfsStorageEntryKind,
-    VfsStorageError, VfsStorageHardLinkResult, VfsStorageMetadata, VfsStorageMetadataFields,
-    VfsStorageNamespaceMutation, VfsStorageObjectState, VfsStoragePrefetchOptions,
-    VfsStoragePrefetchResult, VfsStorageReadIfChanged, VfsStorageReadIfChangedResult,
-    VfsStorageReadRange, VfsStorageRenameResult, VfsStorageResult, VfsStorageSubtreeOptions,
-    VfsStorageWrite, VfsStorageWriteOptions, VfsStorageWritePrecondition, VfsStorageWriteResult,
-    pack::hex_hash,
+    OptimizedVfsStorage, VfsStorageCasPredicate, VfsStorageDeleteResult, VfsStorageDirListFilter,
+    VfsStorageEntryKind, VfsStorageError, VfsStorageHardLinkResult, VfsStorageMetadata,
+    VfsStorageMetadataFields, VfsStorageNamespaceMutation, VfsStorageObjectState,
+    VfsStoragePrefetchOptions, VfsStoragePrefetchResult, VfsStorageReadIfChanged,
+    VfsStorageReadIfChangedResult, VfsStorageReadRange, VfsStorageRenameResult, VfsStorageResult,
+    VfsStorageSubtreeOptions, VfsStorageWrite, VfsStorageWriteOptions, VfsStorageWritePrecondition,
+    VfsStorageWriteResult, normalize_vfs_mode, pack::hex_hash,
 };
 
 const COMPONENT_HEADER: &str = "x-chevalier-vfs-component";
@@ -28,10 +28,11 @@ const REASON_HEADER: &str = "x-chevalier-vfs-reason";
 const RESOURCE_KEY_HEADER: &str = "x-chevalier-vfs-resource-key";
 const SURFACE_KIND_HEADER: &str = "x-chevalier-vfs-surface-kind";
 const LOCK_OWNER_TOKEN_HEADER: &str = "x-chevalier-vfs-lock-owner-token";
+const PRECONDITION_KIND_HEADER: &str = "x-chevalier-vfs-precondition-kind";
 const PRECONDITION_FINGERPRINT_HEADER: &str = "x-chevalier-vfs-precondition-fingerprint";
-const PRECONDITION_SECONDARY_FINGERPRINT_HEADER: &str =
-    "x-chevalier-vfs-precondition-secondary-fingerprint";
+const PRECONDITION_FILE_ID_HEADER: &str = "x-chevalier-vfs-precondition-file-id";
 const EXECUTABLE_HEADER: &str = "x-chevalier-vfs-executable";
+const MODE_HEADER: &str = "x-chevalier-vfs-mode";
 const EXPECTED_CONTENT_HASH_HEADER: &str = "x-chevalier-vfs-expected-content-sha256";
 const STREAM_UPLOAD_HEADER: &str = "x-chevalier-vfs-stream-upload";
 const DEFAULT_COMPONENT: &str = "vfs_gateway_storage";
@@ -230,13 +231,19 @@ impl GatewayVfsStorage {
         precondition: Option<&VfsStorageWritePrecondition>,
     ) -> reqwest::RequestBuilder {
         let mut builder = self.mutation_headers(builder, lease, operation);
-        if let Some(fingerprint) = precondition.and_then(|value| value.fingerprint.as_deref()) {
-            builder = builder.header(PRECONDITION_FINGERPRINT_HEADER, fingerprint);
+        match precondition.and_then(VfsStorageWritePrecondition::effective_predicate) {
+            Some(VfsStorageCasPredicate::Absent) => {
+                builder = builder.header(PRECONDITION_KIND_HEADER, "absent");
+            }
+            Some(VfsStorageCasPredicate::ContentFingerprint { fingerprint }) => {
+                builder = builder
+                    .header(PRECONDITION_KIND_HEADER, "content_fingerprint")
+                    .header(PRECONDITION_FINGERPRINT_HEADER, fingerprint);
+            }
+            None => {}
         }
-        if let Some(fingerprint) =
-            precondition.and_then(|value| value.secondary_fingerprint.as_deref())
-        {
-            builder = builder.header(PRECONDITION_SECONDARY_FINGERPRINT_HEADER, fingerprint);
+        if let Some(file_id) = precondition.and_then(|value| value.expected_file_id.as_deref()) {
+            builder = builder.header(PRECONDITION_FILE_ID_HEADER, file_id);
         }
         builder
     }
@@ -538,7 +545,14 @@ impl OptimizedVfsStorage for GatewayVfsStorage {
             precondition.as_ref(),
         );
         if let Some(options) = options {
-            request = request.header(EXECUTABLE_HEADER, options.executable.to_string());
+            let executable = options
+                .mode
+                .map(|mode| normalize_vfs_mode(mode) & 0o111 != 0)
+                .unwrap_or(options.executable);
+            request = request.header(EXECUTABLE_HEADER, executable.to_string());
+            if let Some(mode) = options.mode {
+                request = request.header(MODE_HEADER, normalize_vfs_mode(mode).to_string());
+            }
         }
         let result = self.send(request).await.map(|_| VfsStorageWriteResult {
             path: path.to_string(),
@@ -597,7 +611,14 @@ impl OptimizedVfsStorage for GatewayVfsStorage {
             precondition.as_ref(),
         );
         if let Some(options) = options {
-            request = request.header(EXECUTABLE_HEADER, options.executable.to_string());
+            let executable = options
+                .mode
+                .map(|mode| normalize_vfs_mode(mode) & 0o111 != 0)
+                .unwrap_or(options.executable);
+            request = request.header(EXECUTABLE_HEADER, executable.to_string());
+            if let Some(mode) = options.mode {
+                request = request.header(MODE_HEADER, normalize_vfs_mode(mode).to_string());
+            }
         }
         let content_hash = expected_content_hash.to_string();
         let result = self.send(request).await.map(|_| VfsStorageWriteResult {
@@ -733,22 +754,36 @@ impl OptimizedVfsStorage for GatewayVfsStorage {
     }
 
     async fn mkdir(&self, path: &str) -> VfsStorageResult<()> {
+        self.mkdir_with_mode(path, None).await
+    }
+
+    async fn mkdir_with_mode(&self, path: &str, mode: Option<u32>) -> VfsStorageResult<()> {
         let lease = self
             .acquire_lease(path, 1, self.cfg.mutation_reason.as_str())
             .await?;
-        let result = self
-            .send(
-                self.mutation_headers(
-                    self.client
-                        .put(self.url("/dir"))
-                        .query(&[("path", self.path_arg(path))]),
-                    &lease,
-                    OP_MKDIR,
-                ),
-            )
-            .await
-            .map(|_| ());
+        let mut request = self.mutation_headers(
+            self.client
+                .put(self.url("/dir"))
+                .query(&[("path", self.path_arg(path))]),
+            &lease,
+            OP_MKDIR,
+        );
+        if let Some(mode) = mode {
+            let mode = normalize_vfs_mode(mode);
+            request = request
+                .header(MODE_HEADER, mode.to_string())
+                .header(EXECUTABLE_HEADER, (mode & 0o111 != 0).to_string());
+        }
+        let result = self.send(request).await.map(|_| ());
         self.release_after(&lease, result).await
+    }
+
+    async fn set_mode(&self, path: &str, mode: u32) -> VfsStorageResult<()> {
+        self.apply_namespace_batch(vec![VfsStorageNamespaceMutation::SetMode {
+            path: path.to_string(),
+            mode: normalize_vfs_mode(mode),
+        }])
+        .await
     }
 
     async fn create_symlink(&self, path: &str, target: &str) -> VfsStorageResult<()> {
@@ -1010,6 +1045,8 @@ struct NamespaceBatchBody {
 enum NamespaceMutation {
     CreateDirectory {
         path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<u32>,
     },
     CreateSymlink {
         path: String,
@@ -1027,13 +1064,18 @@ enum NamespaceMutation {
         from: String,
         to: String,
     },
+    SetMode {
+        path: String,
+        mode: u32,
+    },
 }
 
 impl NamespaceMutation {
     fn from_storage(mutation: VfsStorageNamespaceMutation, storage: &GatewayVfsStorage) -> Self {
         match mutation {
-            VfsStorageNamespaceMutation::CreateDirectory { path } => Self::CreateDirectory {
+            VfsStorageNamespaceMutation::CreateDirectory { path, mode } => Self::CreateDirectory {
                 path: storage.path_arg(path.as_str()),
+                mode: mode.map(normalize_vfs_mode),
             },
             VfsStorageNamespaceMutation::CreateSymlink { path, target } => Self::CreateSymlink {
                 path: storage.path_arg(path.as_str()),
@@ -1049,6 +1091,10 @@ impl NamespaceMutation {
             VfsStorageNamespaceMutation::Rename { from, to } => Self::Rename {
                 from: storage.path_arg(from.as_str()),
                 to: storage.path_arg(to.as_str()),
+            },
+            VfsStorageNamespaceMutation::SetMode { path, mode } => Self::SetMode {
+                path: storage.path_arg(path.as_str()),
+                mode: normalize_vfs_mode(mode),
             },
         }
     }
@@ -1138,15 +1184,17 @@ struct WriteManyItem {
 
 #[derive(Serialize)]
 struct WritePrecondition {
-    fingerprint: Option<String>,
-    secondary_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    predicate: Option<VfsStorageCasPredicate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_file_id: Option<String>,
 }
 
 impl From<VfsStorageWritePrecondition> for WritePrecondition {
     fn from(value: VfsStorageWritePrecondition) -> Self {
         Self {
-            fingerprint: value.fingerprint,
-            secondary_fingerprint: value.secondary_fingerprint,
+            predicate: value.effective_predicate(),
+            expected_file_id: value.expected_file_id,
         }
     }
 }
@@ -1243,6 +1291,8 @@ struct RemoteSubtreeMetadataEntry {
     #[serde(default)]
     executable: bool,
     #[serde(default)]
+    mode: Option<u32>,
+    #[serde(default)]
     link_target: Option<String>,
     content_hash: Option<String>,
     token_count: Option<i32>,
@@ -1264,7 +1314,11 @@ impl RemoteSubtreeMetadataEntry {
         metadata.file_id = self.file_id;
         metadata.link_count = self.link_count;
         metadata.link_target = self.link_target;
-        metadata.executable = self.executable;
+        metadata.mode = self.mode.map(normalize_vfs_mode);
+        metadata.executable = metadata
+            .mode
+            .map(|mode| mode & 0o111 != 0)
+            .unwrap_or(self.executable);
         metadata.content_hash = self.content_hash;
         metadata.token_count = self.token_count;
         metadata.version = self.version;
@@ -1310,6 +1364,8 @@ struct RemoteMetadata {
     #[serde(default)]
     executable: bool,
     #[serde(default)]
+    mode: Option<u32>,
+    #[serde(default)]
     link_target: Option<String>,
     content_hash: Option<String>,
     updated_at: Option<DateTime<Utc>>,
@@ -1321,7 +1377,11 @@ impl RemoteMetadata {
         metadata.file_id = self.file_id;
         metadata.link_count = self.link_count;
         metadata.link_target = self.link_target;
-        metadata.executable = self.executable;
+        metadata.mode = self.mode.map(normalize_vfs_mode);
+        metadata.executable = metadata
+            .mode
+            .map(|mode| mode & 0o111 != 0)
+            .unwrap_or(self.executable);
         metadata.content_hash = self.content_hash;
         metadata.updated_at = self.updated_at;
         Ok(metadata)
@@ -1340,6 +1400,8 @@ struct RemoteDirEntry {
     #[serde(default)]
     executable: bool,
     #[serde(default)]
+    mode: Option<u32>,
+    #[serde(default)]
     link_target: Option<String>,
     content_hash: Option<String>,
     updated_at: Option<DateTime<Utc>>,
@@ -1351,7 +1413,11 @@ impl RemoteDirEntry {
         metadata.file_id = self.file_id;
         metadata.link_count = self.link_count;
         metadata.link_target = self.link_target;
-        metadata.executable = self.executable;
+        metadata.mode = self.mode.map(normalize_vfs_mode);
+        metadata.executable = metadata
+            .mode
+            .map(|mode| mode & 0o111 != 0)
+            .unwrap_or(self.executable);
         metadata.content_hash = self.content_hash;
         metadata.updated_at = self.updated_at;
         Ok(metadata)
@@ -1539,7 +1605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_write_forwards_precondition_and_executable_metadata() {
+    async fn gateway_write_forwards_precondition_and_exact_mode_metadata() {
         let body = Bytes::from_static(b"next");
         let (endpoint, requests) = serve_sequence(vec![
             r#"{"kind":"file","size_bytes":3,"content_hash":"old-hash","updated_at":null}"#
@@ -1556,10 +1622,15 @@ mod tests {
                 "script.sh",
                 body,
                 Some(VfsStorageWritePrecondition {
+                    predicate: None,
                     fingerprint: Some("old-hash".to_string()),
                     secondary_fingerprint: None,
+                    expected_file_id: Some("file-old".to_string()),
                 }),
-                Some(VfsStorageWriteOptions { executable: true }),
+                Some(VfsStorageWriteOptions {
+                    executable: false,
+                    mode: Some(0o750),
+                }),
             )
             .await
             .expect("write with executable metadata");
@@ -1578,8 +1649,20 @@ mod tests {
         assert!(
             write_request
                 .headers
-                .contains("x-chevalier-vfs-executable: true")
+                .contains("x-chevalier-vfs-precondition-kind: content_fingerprint")
         );
+        assert!(
+            write_request
+                .headers
+                .contains("x-chevalier-vfs-precondition-file-id: file-old")
+        );
+        assert!(
+            write_request
+                .headers
+                .contains("x-chevalier-vfs-executable: true"),
+            "the exact mode must remain compatible with legacy executable-only gateways"
+        );
+        assert!(write_request.headers.contains("x-chevalier-vfs-mode: 488"));
         let release_request = requests.recv().expect("release request");
         assert_eq!(release_request.method, "DELETE");
     }
@@ -1864,10 +1947,15 @@ mod tests {
                 staged.path(),
                 Some(&expected),
                 Some(VfsStorageWritePrecondition {
+                    predicate: None,
                     fingerprint: None,
                     secondary_fingerprint: None,
+                    expected_file_id: Some("file-stream".to_string()),
                 }),
-                Some(VfsStorageWriteOptions { executable: false }),
+                Some(VfsStorageWriteOptions {
+                    executable: true,
+                    mode: Some(0o640),
+                }),
             )
             .await
             .expect("stream upload");
@@ -1885,6 +1973,11 @@ mod tests {
                 .headers
                 .contains("x-chevalier-vfs-stream-upload: 1")
         );
+        assert!(
+            upload_request
+                .headers
+                .contains("x-chevalier-vfs-precondition-file-id: file-stream")
+        );
         assert!(upload_request.headers.contains(&format!(
             "x-chevalier-vfs-expected-content-sha256: {expected}"
         )));
@@ -1893,6 +1986,7 @@ mod tests {
                 .headers
                 .contains("x-chevalier-vfs-executable: false")
         );
+        assert!(upload_request.headers.contains("x-chevalier-vfs-mode: 416"));
         assert_eq!(upload_request.body, "stream me");
         let release_request = requests.recv().expect("release request");
         assert_eq!(release_request.target, "/lease");
@@ -2001,8 +2095,10 @@ mod tests {
                     bytes: changed_body,
                     token_count: None,
                     precondition: Some(VfsStorageWritePrecondition {
+                        predicate: None,
                         fingerprint: Some("version-b".to_string()),
                         secondary_fingerprint: Some("secondary-b".to_string()),
+                        expected_file_id: Some("file-b".to_string()),
                     }),
                 },
             ])
@@ -2033,11 +2129,16 @@ mod tests {
         assert_eq!(write_request.target, "/write-many");
         assert!(!write_request.body.contains("a.txt"));
         assert!(write_request.body.contains(r#""path":"scope/b.txt""#));
-        assert!(write_request.body.contains(r#""fingerprint":"version-b""#));
+        assert!(
+            write_request.body.contains(
+                r#""predicate":{"kind":"content_fingerprint","fingerprint":"version-b"}"#
+            )
+        );
+        assert!(!write_request.body.contains("secondary_fingerprint"));
         assert!(
             write_request
                 .body
-                .contains(r#""secondary_fingerprint":"secondary-b""#)
+                .contains(r#""expected_file_id":"file-b""#)
         );
 
         let release_request = requests.recv().expect("release request");
@@ -2060,8 +2161,10 @@ mod tests {
             .delete_file_with_metadata(
                 "a.txt",
                 Some(VfsStorageWritePrecondition {
+                    predicate: None,
                     fingerprint: Some("version-a".to_string()),
                     secondary_fingerprint: Some("secondary-a".to_string()),
+                    expected_file_id: Some("file-a".to_string()),
                 }),
             )
             .await
@@ -2092,7 +2195,17 @@ mod tests {
         assert!(
             delete_request
                 .headers
-                .contains("x-chevalier-vfs-precondition-secondary-fingerprint: secondary-a")
+                .contains("x-chevalier-vfs-precondition-kind: content_fingerprint")
+        );
+        assert!(
+            !delete_request
+                .headers
+                .contains("x-chevalier-vfs-precondition-secondary-fingerprint")
+        );
+        assert!(
+            delete_request
+                .headers
+                .contains("x-chevalier-vfs-precondition-file-id: file-a")
         );
 
         let release_request = requests.recv().expect("release request");
@@ -2111,13 +2224,25 @@ mod tests {
             GatewayVfsStorage::new(GatewayVfsStorageConfig::new(endpoint).with_scope_path("scope"));
 
         storage
-            .apply_namespace_batch(vec![VfsStorageNamespaceMutation::DeleteFile {
-                path: "a.txt".to_string(),
-                precondition: Some(VfsStorageWritePrecondition {
-                    fingerprint: Some("version-a".to_string()),
-                    secondary_fingerprint: Some("secondary-a".to_string()),
-                }),
-            }])
+            .apply_namespace_batch(vec![
+                VfsStorageNamespaceMutation::CreateDirectory {
+                    path: "private".to_string(),
+                    mode: Some(0o40770),
+                },
+                VfsStorageNamespaceMutation::SetMode {
+                    path: "a.txt".to_string(),
+                    mode: 0o100640,
+                },
+                VfsStorageNamespaceMutation::DeleteFile {
+                    path: "a.txt".to_string(),
+                    precondition: Some(VfsStorageWritePrecondition {
+                        predicate: None,
+                        fingerprint: Some("version-a".to_string()),
+                        secondary_fingerprint: Some("secondary-a".to_string()),
+                        expected_file_id: Some("file-a".to_string()),
+                    }),
+                },
+            ])
             .await
             .expect("namespace batch");
 
@@ -2128,16 +2253,69 @@ mod tests {
         let batch_request = requests.recv().expect("namespace request");
         assert_eq!(batch_request.method, "POST");
         assert_eq!(batch_request.target, "/namespace-many");
-        assert!(batch_request.body.contains(r#""path":"scope/a.txt""#));
-        assert!(batch_request.body.contains(r#""fingerprint":"version-a""#));
-        assert!(
-            batch_request
-                .body
-                .contains(r#""secondary_fingerprint":"secondary-a""#)
+        let body: serde_json::Value =
+            serde_json::from_str(&batch_request.body).expect("namespace body");
+        let mutations = body["mutations"].as_array().expect("namespace mutations");
+        assert_eq!(
+            mutations[0],
+            serde_json::json!({
+                "kind": "create_directory",
+                "path": "scope/private",
+                "mode": 0o770,
+            })
         );
+        assert_eq!(
+            mutations[1],
+            serde_json::json!({
+                "kind": "set_mode",
+                "path": "scope/a.txt",
+                "mode": 0o640,
+            })
+        );
+        assert_eq!(mutations[2]["path"], "scope/a.txt");
+        assert_eq!(
+            mutations[2]["precondition"]["predicate"],
+            serde_json::json!({
+                "kind": "content_fingerprint",
+                "fingerprint": "version-a",
+            })
+        );
+        assert!(mutations[2]["precondition"]["secondary_fingerprint"].is_null());
+        assert_eq!(mutations[2]["precondition"]["expected_file_id"], "file-a");
 
         let release_request = requests.recv().expect("release request");
         assert_eq!(release_request.method, "DELETE");
+        assert_eq!(release_request.target, "/lease");
+    }
+
+    #[tokio::test]
+    async fn gateway_mkdir_forwards_masked_mode_and_legacy_executable_projection() {
+        let (endpoint, requests) = serve_sequence(vec![
+            r#"{"resource_key":"rk","owner_token":"ot"}"#.to_string(),
+            String::new(),
+            String::new(),
+        ]);
+        let storage =
+            GatewayVfsStorage::new(GatewayVfsStorageConfig::new(endpoint).with_scope_path("scope"));
+
+        storage
+            .mkdir_with_mode("private", Some(0o100700))
+            .await
+            .expect("mkdir with mode");
+
+        let lease_request = requests.recv().expect("lease request");
+        assert_eq!(lease_request.target, "/lease");
+        let mkdir_request = requests.recv().expect("mkdir request");
+        assert_eq!(mkdir_request.method, "PUT");
+        assert!(mkdir_request.target.starts_with("/dir?"));
+        assert_query_value(&mkdir_request.target, "path", "scope/private");
+        assert!(mkdir_request.headers.contains("x-chevalier-vfs-mode: 448"));
+        assert!(
+            mkdir_request
+                .headers
+                .contains("x-chevalier-vfs-executable: true")
+        );
+        let release_request = requests.recv().expect("release request");
         assert_eq!(release_request.target, "/lease");
     }
 
@@ -2291,11 +2469,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_metadata_surfaces_preserve_defaulted_file_identity() {
+    async fn gateway_metadata_surfaces_preserve_optional_mode_and_legacy_executable() {
         let (endpoint, _requests) = serve_sequence(vec![
-            r#"{"kind":"file","size_bytes":1,"file_id":"inode-1","link_count":3,"content_hash":"h","updated_at":null}"#.to_string(),
-            r#"[{"name":"a","kind":"file","size_bytes":1,"file_id":"inode-1","link_count":3,"content_hash":"h","updated_at":null}]"#.to_string(),
-            r#"{"entries":[{"path":"scope/a","kind":"file","size_bytes":1,"file_id":"inode-1","link_count":3,"content_hash":"h","token_count":null,"version":null,"updated_at":null,"object_state":null}]}"#.to_string(),
+            r#"{"kind":"file","size_bytes":1,"file_id":"inode-1","link_count":3,"mode":33152,"executable":true,"content_hash":"h","updated_at":null}"#.to_string(),
+            r#"[{"name":"a","kind":"file","size_bytes":1,"file_id":"inode-1","link_count":3,"mode":488,"executable":false,"content_hash":"h","updated_at":null}]"#.to_string(),
+            r#"{"entries":[{"path":"scope/a","kind":"file","size_bytes":1,"file_id":"inode-1","link_count":3,"executable":true,"content_hash":"h","token_count":null,"version":null,"updated_at":null,"object_state":null}]}"#.to_string(),
         ]);
         let storage =
             GatewayVfsStorage::new(GatewayVfsStorageConfig::new(endpoint).with_scope_path("scope"));
@@ -2309,10 +2487,22 @@ mod tests {
             .list_subtree_file_metadata("", VfsStorageSubtreeOptions::default())
             .await
             .unwrap();
-        for metadata in [stat, listed[0].clone(), subtree[0].clone()] {
+        for metadata in [&stat, &listed[0], &subtree[0]] {
             assert_eq!(metadata.file_id.as_deref(), Some("inode-1"));
             assert_eq!(metadata.link_count, 3);
         }
+        assert_eq!(stat.mode, Some(0o600), "file-type bits must be masked");
+        assert!(
+            !stat.executable,
+            "exact mode wins over an inconsistent legacy projection"
+        );
+        assert_eq!(listed[0].mode, Some(0o750));
+        assert!(listed[0].executable);
+        assert_eq!(subtree[0].mode, None);
+        assert!(
+            subtree[0].executable,
+            "mode-less legacy metadata keeps its executable projection"
+        );
     }
 
     fn serve_one(response_body: &'static str) -> (String, mpsc::Receiver<RequestRecord>) {

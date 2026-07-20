@@ -16,11 +16,12 @@ use futures::{
 use uuid::Uuid;
 
 use crate::{
-    OptimizedVfsStorage, VfsStorageDeleteResult, VfsStorageDirListFilter, VfsStorageEntryKind,
-    VfsStorageError, VfsStorageHardLinkResult, VfsStorageMetadata, VfsStorageMetadataFields,
-    VfsStoragePrefetchOptions, VfsStoragePrefetchResult, VfsStorageReadIfChanged,
-    VfsStorageReadIfChangedResult, VfsStorageReadRange, VfsStorageRenameResult, VfsStorageResult,
-    VfsStorageSubtreeOptions, VfsStorageWrite, VfsStorageWritePrecondition, VfsStorageWriteResult,
+    OptimizedVfsStorage, VfsStorageCasPredicate, VfsStorageDeleteResult, VfsStorageDirListFilter,
+    VfsStorageEntryKind, VfsStorageError, VfsStorageHardLinkResult, VfsStorageMetadata,
+    VfsStorageMetadataFields, VfsStoragePrefetchOptions, VfsStoragePrefetchResult,
+    VfsStorageReadIfChanged, VfsStorageReadIfChangedResult, VfsStorageReadRange,
+    VfsStorageRenameResult, VfsStorageResult, VfsStorageSubtreeOptions, VfsStorageWrite,
+    VfsStorageWritePrecondition, VfsStorageWriteResult,
     index::{
         VfsIndexEntryWithManifest, VfsIndexScope, VfsManifestIndex, VfsPackedCommit,
         VfsPackedFileCommit,
@@ -157,10 +158,10 @@ impl ObjectBackedVfsStorage {
     }
 
     fn invalidate_file_bytes(&self, path: &str) {
-        if let Ok(mut cache) = self.cache.file_bytes.lock()
-            && let Some(previous) = cache.entries.remove(path)
-        {
-            cache.total_bytes = cache.total_bytes.saturating_sub(previous.bytes.len());
+        if let Ok(mut cache) = self.cache.file_bytes.lock() {
+            if let Some(previous) = cache.entries.remove(path) {
+                cache.total_bytes = cache.total_bytes.saturating_sub(previous.bytes.len());
+            }
         }
     }
 
@@ -384,11 +385,11 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
             .map(|manifest| (manifest.logical_path.clone(), manifest))
             .collect::<HashMap<_, _>>();
         for path in paths {
-            if let Some(manifest) = manifest_by_path.get(path)
-                && let Some(bytes) = self.cached_file_bytes(path, &manifest.content_hash)
-            {
-                results.push((path.clone(), bytes));
-                manifest_by_path.remove(path);
+            if let Some(manifest) = manifest_by_path.get(path) {
+                if let Some(bytes) = self.cached_file_bytes(path, &manifest.content_hash) {
+                    results.push((path.clone(), bytes));
+                    manifest_by_path.remove(path);
+                }
             }
         }
         for path in manifest_by_path
@@ -557,6 +558,27 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
             })
             .collect::<HashMap<_, _>>();
         for (file_id, representative_path) in explicit_by_identity {
+            let expected_file_ids = writes
+                .iter()
+                .filter(|write| {
+                    requested_previous
+                        .get(&write.path)
+                        .and_then(|entry| entry.entry.file_id.as_deref())
+                        == Some(file_id.as_str())
+                })
+                .filter_map(|write| {
+                    write
+                        .precondition
+                        .as_ref()
+                        .and_then(|precondition| precondition.expected_file_id.clone())
+                })
+                .collect::<HashSet<_>>();
+            if expected_file_ids.len() > 1 {
+                return Err(VfsStorageError::Conflict(format!(
+                    "one atomic batch carries conflicting expected identities for hard-link identity {file_id}"
+                )));
+            }
+            let expected_file_id = expected_file_ids.into_iter().next();
             let representative = writes
                 .iter()
                 .find(|write| write.path == representative_path)
@@ -584,7 +606,14 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
                 } else {
                     let mut alias_write = representative.clone();
                     alias_write.path = alias;
-                    alias_write.precondition = None;
+                    alias_write.precondition = expected_file_id.as_ref().map(|expected_file_id| {
+                        VfsStorageWritePrecondition {
+                            predicate: None,
+                            fingerprint: None,
+                            secondary_fingerprint: None,
+                            expected_file_id: Some(expected_file_id.clone()),
+                        }
+                    });
                     writes.push(alias_write);
                 }
             }
@@ -677,15 +706,30 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
                         file_id: previous
                             .get(&write.path)
                             .and_then(|entry| entry.entry.file_id.clone()),
-                        expected_current_version: write
+                        expected_file_id: write
                             .precondition
                             .as_ref()
-                            .and_then(|precondition| precondition.fingerprint.clone())
+                            .and_then(|precondition| precondition.expected_file_id.clone()),
+                        content_predicate: write
+                            .precondition
+                            .as_ref()
+                            .and_then(VfsStorageWritePrecondition::effective_predicate)
                             .or_else(|| {
-                                previous
-                                    .get(&write.path)
-                                    .and_then(|entry| entry.entry.current_version.clone())
+                                Some(
+                                    match previous
+                                        .get(&write.path)
+                                        .and_then(|entry| entry.entry.content_hash.as_ref())
+                                    {
+                                        Some(fingerprint) => {
+                                            VfsStorageCasPredicate::ContentFingerprint {
+                                                fingerprint: fingerprint.clone(),
+                                            }
+                                        }
+                                        None => VfsStorageCasPredicate::Absent,
+                                    },
+                                )
                             }),
+                        expected_current_version: None,
                     }
                 })
                 .collect(),
@@ -764,14 +808,19 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
         path: &str,
         precondition: Option<VfsStorageWritePrecondition>,
     ) -> VfsStorageResult<VfsStorageDeleteResult> {
+        let content_predicate = precondition
+            .as_ref()
+            .and_then(VfsStorageWritePrecondition::effective_predicate);
+        let expected_file_id = precondition
+            .as_ref()
+            .and_then(|precondition| precondition.expected_file_id.as_deref());
         let previous = self
             .index
-            .delete_file_entry(
+            .delete_file_entry_with_precondition(
                 &self.cfg.scope,
                 path,
-                precondition
-                    .as_ref()
-                    .and_then(|precondition| precondition.fingerprint.as_deref()),
+                content_predicate.as_ref(),
+                expected_file_id,
             )
             .await?
             .map(VfsIndexEntryWithManifest::into_storage_metadata);
@@ -1195,11 +1244,35 @@ mod tests {
             self.packed_commit_calls.fetch_add(1, Ordering::Relaxed);
             let mut guard = self.inner.lock().unwrap();
             for file in &commit.files {
-                let actual = guard
+                let actual_file_id = guard
                     .entries
                     .get(&file.logical_path)
-                    .and_then(|entry| entry.entry.current_version.as_deref());
-                if actual != file.expected_current_version.as_deref() {
+                    .and_then(|entry| entry.entry.file_id.as_deref());
+                if file.expected_file_id.as_deref().is_some()
+                    && actual_file_id != file.expected_file_id.as_deref()
+                {
+                    return Err(VfsStorageError::Conflict(format!(
+                        "identity conflict for {}",
+                        file.logical_path
+                    )));
+                }
+                let current = guard.entries.get(&file.logical_path);
+                let content_matches = match file.content_predicate.as_ref() {
+                    None => true,
+                    Some(VfsStorageCasPredicate::Absent) => current.is_none(),
+                    Some(VfsStorageCasPredicate::ContentFingerprint { fingerprint }) => {
+                        current.and_then(|entry| entry.entry.content_hash.as_deref())
+                            == Some(fingerprint.as_str())
+                    }
+                };
+                let version_matches =
+                    file.expected_current_version
+                        .as_deref()
+                        .is_none_or(|expected| {
+                            current.and_then(|entry| entry.entry.current_version.as_deref())
+                                == Some(expected)
+                        });
+                if !content_matches || !version_matches {
                     return Err(VfsStorageError::Conflict(format!(
                         "conflict for {}",
                         file.logical_path
@@ -1405,6 +1478,60 @@ mod tests {
                     Ok(removed)
                 }
             }
+        }
+
+        async fn delete_file_entry_with_precondition(
+            &self,
+            _scope: &VfsIndexScope,
+            logical_path: &str,
+            content_predicate: Option<&VfsStorageCasPredicate>,
+            expected_file_id: Option<&str>,
+        ) -> VfsStorageResult<Option<VfsIndexEntryWithManifest>> {
+            let mut guard = self.inner.lock().unwrap();
+            let current = guard.entries.get(logical_path);
+            if current.is_some_and(|entry| entry.entry.kind == VfsStorageEntryKind::Directory) {
+                return Err(VfsStorageError::BadRequest(format!(
+                    "vfs path {logical_path} is not a file"
+                )));
+            }
+            if expected_file_id.is_some()
+                && current.and_then(|entry| entry.entry.file_id.as_deref()) != expected_file_id
+            {
+                return Err(VfsStorageError::Conflict(format!(
+                    "identity conflict for {logical_path}"
+                )));
+            }
+            let content_matches = match content_predicate {
+                None => true,
+                Some(VfsStorageCasPredicate::Absent) => current.is_none(),
+                Some(VfsStorageCasPredicate::ContentFingerprint { fingerprint }) => {
+                    current.and_then(|entry| entry.entry.content_hash.as_deref())
+                        == Some(fingerprint.as_str())
+                }
+            };
+            if !content_matches {
+                return Err(VfsStorageError::Conflict(format!(
+                    "content conflict for {logical_path}"
+                )));
+            }
+            let removed = guard.entries.remove(logical_path);
+            if let Some(file_id) = removed.as_ref().and_then(|entry| {
+                (entry.entry.link_count > 1)
+                    .then(|| entry.entry.file_id.clone())
+                    .flatten()
+            }) {
+                let link_count = guard
+                    .entries
+                    .values()
+                    .filter(|entry| entry.entry.file_id.as_deref() == Some(file_id.as_str()))
+                    .count() as u64;
+                for entry in guard.entries.values_mut() {
+                    if entry.entry.file_id.as_deref() == Some(file_id.as_str()) {
+                        entry.entry.link_count = link_count;
+                    }
+                }
+            }
+            Ok(removed)
         }
 
         async fn remove_empty_directory(
@@ -2096,13 +2223,6 @@ mod tests {
             .write("guarded.md", Bytes::from_static(b"first"), None)
             .await
             .expect("initial");
-        let first_version = storage
-            .stat("guarded.md")
-            .await
-            .unwrap()
-            .unwrap()
-            .version
-            .unwrap();
         storage
             .write("guarded.md", Bytes::from_static(b"second"), None)
             .await
@@ -2111,15 +2231,92 @@ mod tests {
             .write(
                 "guarded.md",
                 Bytes::from_static(b"third"),
-                Some(VfsStorageWritePrecondition {
-                    fingerprint: Some(first_version),
-                    secondary_fingerprint: None,
-                }),
+                Some(VfsStorageWritePrecondition::content_fingerprint(
+                    first.content_hash.clone(),
+                )),
             )
             .await
             .expect_err("stale precondition");
         assert_eq!(first.content_hash, hex_hash(b"first"));
         assert!(matches!(err, VfsStorageError::Conflict(_)));
+
+        storage
+            .write(
+                "created.md",
+                Bytes::from_static(b"created"),
+                Some(VfsStorageWritePrecondition::absent()),
+            )
+            .await
+            .expect("typed absence allows creation");
+        let error = storage
+            .write(
+                "created.md",
+                Bytes::from_static(b"must-not-replace"),
+                Some(VfsStorageWritePrecondition::absent()),
+            )
+            .await
+            .expect_err("typed absence rejects an existing path");
+        assert!(matches!(error, VfsStorageError::Conflict(_)));
+        assert_eq!(&storage.read("created.md").await.unwrap()[..], b"created");
+    }
+
+    #[tokio::test]
+    async fn object_storage_preserves_and_enforces_expected_file_identity() {
+        let (storage, _dir) = object_storage();
+        storage
+            .write("guarded.md", Bytes::from_static(b"first"), None)
+            .await
+            .expect("initial");
+        let initial = storage
+            .stat("guarded.md")
+            .await
+            .expect("stat")
+            .expect("metadata");
+        let file_id = initial.file_id.clone().expect("stable file identity");
+        let mut precondition = VfsStorageWritePrecondition::content_fingerprint(
+            initial.content_hash.clone().expect("content fingerprint"),
+        );
+        precondition.expected_file_id = Some(file_id.clone());
+        storage
+            .write(
+                "guarded.md",
+                Bytes::from_static(b"second"),
+                Some(precondition),
+            )
+            .await
+            .expect("matching content and identity");
+
+        let current = storage
+            .stat("guarded.md")
+            .await
+            .expect("stat")
+            .expect("metadata");
+        assert_eq!(current.file_id.as_deref(), Some(file_id.as_str()));
+        let mut stale_identity = VfsStorageWritePrecondition::content_fingerprint(
+            current.content_hash.clone().expect("content fingerprint"),
+        );
+        stale_identity.expected_file_id = Some("different-file-id".to_string());
+        let error = storage
+            .write(
+                "guarded.md",
+                Bytes::from_static(b"must-not-land"),
+                Some(stale_identity),
+            )
+            .await
+            .expect_err("identity mismatch");
+        assert!(matches!(error, VfsStorageError::Conflict(_)));
+        assert_eq!(&storage.read("guarded.md").await.unwrap()[..], b"second");
+
+        let mut stale_delete = VfsStorageWritePrecondition::content_fingerprint(
+            current.content_hash.expect("content fingerprint"),
+        );
+        stale_delete.expected_file_id = Some("different-file-id".to_string());
+        let error = storage
+            .delete_file_with_metadata("guarded.md", Some(stale_delete))
+            .await
+            .expect_err("delete identity mismatch");
+        assert!(matches!(error, VfsStorageError::Conflict(_)));
+        assert_eq!(&storage.read("guarded.md").await.unwrap()[..], b"second");
     }
 
     #[tokio::test]
@@ -2200,10 +2397,9 @@ mod tests {
         let err = storage
             .delete_file_with_metadata(
                 "notes/a.md",
-                Some(VfsStorageWritePrecondition {
-                    fingerprint: Some("stale-version".to_string()),
-                    secondary_fingerprint: None,
-                }),
+                Some(VfsStorageWritePrecondition::content_fingerprint(
+                    "stale-content",
+                )),
             )
             .await
             .expect_err("stale delete precondition");

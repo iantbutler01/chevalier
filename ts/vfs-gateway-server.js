@@ -26,6 +26,11 @@ exports.createVfsGatewayServer = createVfsGatewayServer;
 //   - PUT  {owner}/file?path=            -> 2xx (body ignored by client); honors the
 //                                           precondition-fingerprint header, `If-Match`,
 //                                           or `ifMatch` query alias -> 409.
+//                                           Optional identity CAS uses
+//                                           `x-chevalier-vfs-precondition-file-id`.
+//                                           Exact POSIX mode is decimal in
+//                                           `x-chevalier-vfs-mode`; the legacy
+//                                           executable header remains a fallback.
 //                                           `If-Match` is an alias in chevalier's
 //                                           protocol, not a separate HTTP 412 path.
 //                                           Fingerprint is `contentHash`: SHA-256 hex
@@ -45,8 +50,10 @@ const node_os_1 = require("node:os");
 const node_path_1 = require("node:path");
 const DEFAULT_ROUTE_PREFIX = "/internal/chevalier/vfs";
 const PRECONDITION_FINGERPRINT_HEADER = "x-chevalier-vfs-precondition-fingerprint";
+const PRECONDITION_FILE_ID_HEADER = "x-chevalier-vfs-precondition-file-id";
 const IF_MATCH_HEADER = "if-match";
 const EXECUTABLE_HEADER = "x-chevalier-vfs-executable";
+const MODE_HEADER = "x-chevalier-vfs-mode";
 const EXPECTED_CONTENT_HASH_HEADER = "x-chevalier-vfs-expected-content-sha256";
 const STREAM_UPLOAD_HEADER = "x-chevalier-vfs-stream-upload";
 const RANGE_FINGERPRINT_HEADER = "x-chevalier-vfs-range-fingerprint";
@@ -497,6 +504,7 @@ function createVfsGatewayServer(opts) {
                 if (isExcludedPath(relPath))
                     return errorResponse(400, `excluded path: ${relPath}`);
                 const precondition = requestPrecondition(req, q);
+                const expectedFileId = requestExpectedFileId(req);
                 const writeOptions = requestWriteOptions(req);
                 const failed = await enforceFingerprintPrecondition(store, relPath, precondition);
                 if (failed !== null)
@@ -541,7 +549,10 @@ function createVfsGatewayServer(opts) {
                             return errorResponse(409, `streamed upload hash mismatch for ${relPath}`);
                         }
                         const streamingStore = store;
-                        const options = { ...preconditionOptions(precondition), ...writeOptions };
+                        const options = {
+                            ...preconditionOptions(precondition, expectedFileId),
+                            ...writeOptions,
+                        };
                         const res = typeof streamingStore.writeFromFile === "function"
                             ? await streamingStore.writeFromFile(relPath, stagedPath, expectedHash, options)
                             : await store.write(relPath, await (0, promises_1.readFile)(stagedPath), options);
@@ -567,7 +578,7 @@ function createVfsGatewayServer(opts) {
                 let res;
                 try {
                     res = (await store.write(relPath, body, {
-                        ...preconditionOptions(precondition),
+                        ...preconditionOptions(precondition, expectedFileId),
                         ...writeOptions,
                     }));
                 }
@@ -612,7 +623,8 @@ function createVfsGatewayServer(opts) {
             if (method === "PUT" && op === "dir") {
                 if (isExcludedPath(relPath))
                     return errorResponse(400, `excluded path: ${relPath}`);
-                await store.mkdir(relPath);
+                const writeOptions = requestWriteOptions(req);
+                await store.mkdir(relPath, Object.keys(writeOptions).length === 0 ? undefined : writeOptions);
                 return new Response(null, { status: 204 });
             }
             if (method === "PUT" && op === "symlink") {
@@ -753,12 +765,19 @@ function createVfsGatewayServer(opts) {
                 if (typeof streamingStore.writeMany === "function") {
                     const normalizedWrites = writes.map((write) => {
                         const precondition = writeItemPrecondition(write);
+                        const expectedFileId = writeItemExpectedFileId(write);
+                        const wirePrecondition = {
+                            ...(precondition.present ? { fingerprint: precondition.fingerprint } : {}),
+                            ...(expectedFileId === undefined
+                                ? {}
+                                : { expected_file_id: expectedFileId }),
+                        };
                         return {
                             path: write.path,
                             body: write.body,
-                            ...(precondition.present
-                                ? { precondition: { fingerprint: precondition.fingerprint } }
-                                : {}),
+                            ...(Object.keys(wirePrecondition).length === 0
+                                ? {}
+                                : { precondition: wirePrecondition }),
                         };
                     });
                     try {
@@ -791,9 +810,10 @@ function createVfsGatewayServer(opts) {
                     const cur = await store.stat(p);
                     const prev = cur?.contentHash ?? null;
                     const precondition = writeItemPrecondition(write);
+                    const expectedFileId = writeItemExpectedFileId(write);
                     let res;
                     try {
-                        res = (await store.write(p, Buffer.from(write.body), preconditionOptions(precondition)));
+                        res = (await store.write(p, Buffer.from(write.body), preconditionOptions(precondition, expectedFileId)));
                     }
                     catch (e) {
                         const failed = conflictResponseFromStoreError(e, p);
@@ -937,23 +957,62 @@ function requestPrecondition(req, query) {
         return preconditionFromRaw(raw);
     return { present: false };
 }
-function requestWriteOptions(req) {
-    const raw = req.headers.get(EXECUTABLE_HEADER);
-    if (raw === null)
-        return {};
-    if (raw === "true")
-        return { executable: true };
-    if (raw === "false")
-        return { executable: false };
-    throw Object.assign(new Error(`${EXECUTABLE_HEADER} must be true or false`), {
-        code: "VFS_BAD_REQUEST",
-        status: 400,
-    });
-}
-function preconditionOptions(precondition) {
-    if (!precondition.present)
+function parseExpectedFileId(raw, source) {
+    if (raw === undefined || raw === null)
         return undefined;
-    return { ifMatch: precondition.fingerprint };
+    if (typeof raw !== "string" || raw.length === 0) {
+        throw Object.assign(new Error(`${source} must be a non-empty string`), {
+            code: "VFS_BAD_REQUEST",
+            status: 400,
+        });
+    }
+    return raw;
+}
+function requestExpectedFileId(req) {
+    return parseExpectedFileId(req.headers.get(PRECONDITION_FILE_ID_HEADER), PRECONDITION_FILE_ID_HEADER);
+}
+function parseMode(raw, source) {
+    if (raw === undefined || raw === null)
+        return undefined;
+    const value = typeof raw === "string" && /^[0-9]+$/.test(raw)
+        ? Number(raw)
+        : typeof raw === "number"
+            ? raw
+            : Number.NaN;
+    if (!Number.isSafeInteger(value) || value < 0 || value > 0o7777) {
+        throw Object.assign(new Error(`${source} must be an integer between 0 and 4095`), {
+            code: "VFS_BAD_REQUEST",
+            status: 400,
+        });
+    }
+    return value;
+}
+function requestWriteOptions(req) {
+    const rawMode = req.headers.get(MODE_HEADER);
+    const mode = parseMode(rawMode, MODE_HEADER);
+    const rawExecutable = req.headers.get(EXECUTABLE_HEADER);
+    let executable;
+    if (rawExecutable === "true")
+        executable = true;
+    else if (rawExecutable === "false")
+        executable = false;
+    else if (rawExecutable !== null) {
+        throw Object.assign(new Error(`${EXECUTABLE_HEADER} must be true or false`), {
+            code: "VFS_BAD_REQUEST",
+            status: 400,
+        });
+    }
+    if (mode !== undefined)
+        return { executable: (mode & 0o111) !== 0, mode };
+    return executable === undefined ? {} : { executable };
+}
+function preconditionOptions(precondition, expectedFileId) {
+    if (!precondition.present && expectedFileId === undefined)
+        return undefined;
+    return {
+        ...(precondition.present ? { ifMatch: precondition.fingerprint } : {}),
+        ...(expectedFileId === undefined ? {} : { expectedFileId }),
+    };
 }
 function normalizeWriteManyItems(value, isExcludedPath) {
     if (!Array.isArray(value))
@@ -986,6 +1045,7 @@ function normalizeWriteManyItems(value, isExcludedPath) {
         }
         try {
             writeItemPrecondition(write);
+            writeItemExpectedFileId(write);
         }
         catch (error) {
             return errorResponse(400, error instanceof Error ? error.message : String(error));
@@ -1037,7 +1097,31 @@ function normalizeNamespaceMutations(value, isExcludedPath = isGitExcludedPath) 
             });
             continue;
         }
-        if (kind === "create_directory" || kind === "remove_directory") {
+        if (kind === "create_directory") {
+            let mode;
+            try {
+                mode = parseMode(mutation.mode, "create_directory mode");
+            }
+            catch (error) {
+                return errorResponse(400, error instanceof Error ? error.message : String(error));
+            }
+            out.push({ kind, path, ...(mode === undefined ? {} : { mode }) });
+            continue;
+        }
+        if (kind === "set_mode") {
+            let mode;
+            try {
+                mode = parseMode(mutation.mode, "set_mode mode");
+            }
+            catch (error) {
+                return errorResponse(400, error instanceof Error ? error.message : String(error));
+            }
+            if (mode === undefined)
+                return errorResponse(400, "set_mode requires mode");
+            out.push({ kind, path, mode });
+            continue;
+        }
+        if (kind === "remove_directory") {
             out.push({ kind, path });
             continue;
         }
@@ -1076,6 +1160,9 @@ function writeItemPrecondition(write) {
         throw new Error("invalid write precondition: ifMatch/fingerprint must be a string or null");
     }
     return preconditionFromRaw(raw);
+}
+function writeItemExpectedFileId(write) {
+    return parseExpectedFileId(ownValue(write.precondition, "expected_file_id"), "invalid write precondition: expected_file_id");
 }
 function conflictResponseFromStoreError(error, path) {
     const message = error instanceof Error ? error.message : String(error);
@@ -1127,12 +1214,14 @@ function wireKind(kind) {
     return "file";
 }
 function toRemoteMetadata(md) {
+    const mode = md.mode ?? null;
     return {
         kind: wireKind(md.kind),
         size_bytes: Number(md.sizeBytes),
         file_id: md.fileId ?? null,
         link_count: Number(md.linkCount ?? 1n),
-        executable: md.executable ?? false,
+        mode,
+        executable: mode === null ? md.executable ?? false : (mode & 0o111) !== 0,
         link_target: md.linkTarget ?? null,
         content_hash: md.contentHash ?? null,
         updated_at: md.updatedAt ?? null,
@@ -1140,13 +1229,15 @@ function toRemoteMetadata(md) {
 }
 function toRemoteDirEntry(md) {
     const name = md.path.split("/").filter((s) => s !== "").pop() ?? md.path;
+    const mode = md.mode ?? null;
     return {
         name,
         kind: wireKind(md.kind),
         size_bytes: Number(md.sizeBytes),
         file_id: md.fileId ?? null,
         link_count: Number(md.linkCount ?? 1n),
-        executable: md.executable ?? false,
+        mode,
+        executable: mode === null ? md.executable ?? false : (mode & 0o111) !== 0,
         link_target: md.linkTarget ?? null,
         content_hash: md.contentHash ?? null,
         updated_at: md.updatedAt ?? null,

@@ -3,13 +3,15 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use chevalier_sandbox::vfs::{
     CHEVALIER_VFS_COMPONENT_HEADER, CHEVALIER_VFS_EXECUTABLE_HEADER,
-    CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, CHEVALIER_VFS_OPERATION_HEADER,
-    CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER, CHEVALIER_VFS_RESOURCE_KEY_HEADER,
-    CHEVALIER_VFS_SURFACE_KIND_HEADER, VFS_COMPONENT_VM_RUNTIME, VfsDirEntry as RemoteDirEntry,
-    VfsHardLinkAliasBody, VfsHardLinkAliasResponse, VfsHardLinkBody, VfsHardLinkMetadataResponse,
-    VfsLeaseAcquireRequest, VfsLeaseGrant as LeaseGrant, VfsLeaseReleaseRequest,
-    VfsMetadata as RemoteMetadata, VfsNamespaceMutation, VfsNamespaceMutationBatchBody,
-    VfsWriteManyBody, VfsWriteManyItem, VfsWritePrecondition, scoped_vfs_path,
+    CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, CHEVALIER_VFS_MODE_HEADER,
+    CHEVALIER_VFS_OPERATION_HEADER, CHEVALIER_VFS_PRECONDITION_FILE_ID_HEADER,
+    CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER, CHEVALIER_VFS_PRECONDITION_KIND_HEADER,
+    CHEVALIER_VFS_RESOURCE_KEY_HEADER, CHEVALIER_VFS_SURFACE_KIND_HEADER, VFS_COMPONENT_VM_RUNTIME,
+    VfsCasPredicate, VfsDirEntry as RemoteDirEntry, VfsHardLinkAliasBody, VfsHardLinkAliasResponse,
+    VfsHardLinkBody, VfsHardLinkMetadataResponse, VfsLeaseAcquireRequest,
+    VfsLeaseGrant as LeaseGrant, VfsLeaseReleaseRequest, VfsMetadata as RemoteMetadata,
+    VfsNamespaceMutation, VfsNamespaceMutationBatchBody, VfsWriteManyBody, VfsWriteManyItem,
+    VfsWritePrecondition, scoped_vfs_path,
 };
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
@@ -38,6 +40,7 @@ pub struct RemoteWrite {
     pub path: String,
     pub bytes: Vec<u8>,
     pub base_content_hash: Option<String>,
+    pub expected_file_id: Option<String>,
 }
 
 /// Outcome of a fingerprint-pinned ranged read.
@@ -223,10 +226,12 @@ impl RemoteVfsClient {
         path: &str,
         bytes: &[u8],
         executable: bool,
+        mode: Option<u32>,
         lease: &LeaseGrant,
         surface_kind: &str,
         operation: &str,
         base_content_hash: Option<&str>,
+        expected_file_id: Option<&str>,
     ) -> Result<()> {
         let mut request = self
             .client
@@ -244,12 +249,8 @@ impl RemoteVfsClient {
                 CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
                 lease.owner_token.to_string(),
             );
-        if let Some(base_content_hash) = base_content_hash {
-            request = request.header(
-                CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER,
-                base_content_hash,
-            );
-        }
+        request = with_mode_header(request, mode);
+        request = with_precondition_headers(request, base_content_hash, expected_file_id);
         self.request(request.body(bytes.to_vec())).await?;
         Ok(())
     }
@@ -284,27 +285,27 @@ impl RemoteVfsClient {
     pub async fn mkdir(
         &self,
         path: &str,
+        mode: Option<u32>,
         lease: &LeaseGrant,
         surface_kind: &str,
         operation: &str,
     ) -> Result<()> {
-        self.request(
-            self.client
-                .put(self.url("/dir"))
-                .query(&[("path", self.path_arg(path))])
-                .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
-                .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
-                .header(CHEVALIER_VFS_OPERATION_HEADER, operation)
-                .header(
-                    CHEVALIER_VFS_RESOURCE_KEY_HEADER,
-                    lease.resource_key.as_str(),
-                )
-                .header(
-                    CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
-                    lease.owner_token.to_string(),
-                ),
-        )
-        .await?;
+        let request = self
+            .client
+            .put(self.url("/dir"))
+            .query(&[("path", self.path_arg(path))])
+            .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
+            .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
+            .header(CHEVALIER_VFS_OPERATION_HEADER, operation)
+            .header(
+                CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+                lease.resource_key.as_str(),
+            )
+            .header(
+                CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                lease.owner_token.to_string(),
+            );
+        self.request(with_mode_header(request, mode)).await?;
         Ok(())
     }
 
@@ -657,16 +658,7 @@ impl RemoteVfsClient {
         let body = VfsWriteManyBody {
             writes: writes
                 .into_iter()
-                .map(|write| VfsWriteManyItem {
-                    path: self.path_arg(write.path.as_str()),
-                    body: write.bytes,
-                    precondition: write
-                        .base_content_hash
-                        .map(|fingerprint| VfsWritePrecondition {
-                            fingerprint: Some(fingerprint),
-                            secondary_fingerprint: None,
-                        }),
-                })
+                .map(|write| self.scope_remote_write(write))
                 .collect(),
         };
         let result = self
@@ -698,9 +690,10 @@ impl RemoteVfsClient {
 
     fn scope_namespace_mutation(&self, mutation: &VfsNamespaceMutation) -> VfsNamespaceMutation {
         match mutation {
-            VfsNamespaceMutation::CreateDirectory { path } => {
+            VfsNamespaceMutation::CreateDirectory { path, mode } => {
                 VfsNamespaceMutation::CreateDirectory {
                     path: self.path_arg(path),
+                    mode: mode.map(|mode| mode & 0o7777),
                 }
             }
             VfsNamespaceMutation::CreateSymlink { path, target } => {
@@ -724,6 +717,33 @@ impl RemoteVfsClient {
                 from: self.path_arg(from),
                 to: self.path_arg(to),
             },
+            VfsNamespaceMutation::SetMode { path, mode } => VfsNamespaceMutation::SetMode {
+                path: self.path_arg(path),
+                mode: mode & 0o7777,
+            },
+        }
+    }
+
+    fn scope_remote_write(&self, write: RemoteWrite) -> VfsWriteManyItem {
+        let precondition = (write.base_content_hash.is_some() || write.expected_file_id.is_some())
+            .then_some(VfsWritePrecondition {
+                predicate: write.base_content_hash.as_ref().map(|fingerprint| {
+                    if fingerprint == "absent" {
+                        VfsCasPredicate::Absent
+                    } else {
+                        VfsCasPredicate::ContentFingerprint {
+                            fingerprint: fingerprint.clone(),
+                        }
+                    }
+                }),
+                fingerprint: None,
+                secondary_fingerprint: None,
+                expected_file_id: write.expected_file_id,
+            });
+        VfsWriteManyItem {
+            path: self.path_arg(write.path.as_str()),
+            body: write.bytes,
+            precondition,
         }
     }
 
@@ -819,6 +839,42 @@ impl RemoteVfsClient {
             }
         }
     }
+}
+
+fn with_mode_header(
+    request: reqwest::RequestBuilder,
+    mode: Option<u32>,
+) -> reqwest::RequestBuilder {
+    match mode {
+        Some(mode) => request.header(CHEVALIER_VFS_MODE_HEADER, (mode & 0o7777).to_string()),
+        None => request,
+    }
+}
+
+fn with_precondition_headers(
+    mut request: reqwest::RequestBuilder,
+    base_content_hash: Option<&str>,
+    expected_file_id: Option<&str>,
+) -> reqwest::RequestBuilder {
+    if let Some(base_content_hash) = base_content_hash {
+        if base_content_hash == "absent" {
+            request = request.header(CHEVALIER_VFS_PRECONDITION_KIND_HEADER, "absent");
+        } else {
+            request = request
+                .header(
+                    CHEVALIER_VFS_PRECONDITION_KIND_HEADER,
+                    "content_fingerprint",
+                )
+                .header(
+                    CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER,
+                    base_content_hash,
+                );
+        }
+    }
+    if let Some(expected_file_id) = expected_file_id {
+        request = request.header(CHEVALIER_VFS_PRECONDITION_FILE_ID_HEADER, expected_file_id);
+    }
+    request
 }
 
 /// HTTP status carried through anyhow chains so journal replay can tell a
@@ -948,4 +1004,186 @@ fn common_parent<'a>(paths: impl Iterator<Item = &'a str>) -> String {
         common.truncate(shared);
     }
     common.join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_mode_header_is_optional_and_masked() {
+        let request = with_mode_header(
+            reqwest::Client::new().put("http://localhost"),
+            Some(0o106755),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            request
+                .headers()
+                .get(CHEVALIER_VFS_MODE_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            0o6755.to_string()
+        );
+
+        let request = with_mode_header(reqwest::Client::new().put("http://localhost"), None)
+            .build()
+            .unwrap();
+        assert!(!request.headers().contains_key(CHEVALIER_VFS_MODE_HEADER));
+    }
+
+    #[test]
+    fn direct_write_headers_preserve_identity_only_preconditions() {
+        let request = with_precondition_headers(
+            reqwest::Client::new().put("http://localhost"),
+            None,
+            Some("file-1"),
+        )
+        .build()
+        .unwrap();
+        assert!(
+            !request
+                .headers()
+                .contains_key(CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER)
+        );
+        assert!(
+            !request
+                .headers()
+                .contains_key(CHEVALIER_VFS_PRECONDITION_KIND_HEADER)
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(CHEVALIER_VFS_PRECONDITION_FILE_ID_HEADER)
+                .unwrap(),
+            "file-1"
+        );
+
+        let absent = with_precondition_headers(
+            reqwest::Client::new().put("http://localhost"),
+            Some("absent"),
+            None,
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            absent
+                .headers()
+                .get(CHEVALIER_VFS_PRECONDITION_KIND_HEADER)
+                .unwrap(),
+            "absent"
+        );
+        assert!(
+            !absent
+                .headers()
+                .contains_key(CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER)
+        );
+
+        let content = with_precondition_headers(
+            reqwest::Client::new().put("http://localhost"),
+            Some("sha256-content"),
+            None,
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            content
+                .headers()
+                .get(CHEVALIER_VFS_PRECONDITION_KIND_HEADER)
+                .unwrap(),
+            "content_fingerprint"
+        );
+        assert_eq!(
+            content
+                .headers()
+                .get(CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER)
+                .unwrap(),
+            "sha256-content"
+        );
+    }
+
+    #[test]
+    fn namespace_scoping_preserves_optional_exact_modes() {
+        let client = RemoteVfsClient::new("http://localhost", "token", "scope").unwrap();
+
+        assert_eq!(
+            client.scope_namespace_mutation(&VfsNamespaceMutation::CreateDirectory {
+                path: "tree".to_string(),
+                mode: Some(0o104775),
+            }),
+            VfsNamespaceMutation::CreateDirectory {
+                path: "scope/tree".to_string(),
+                mode: Some(0o4775),
+            }
+        );
+        assert_eq!(
+            client.scope_namespace_mutation(&VfsNamespaceMutation::CreateDirectory {
+                path: "legacy".to_string(),
+                mode: None,
+            }),
+            VfsNamespaceMutation::CreateDirectory {
+                path: "scope/legacy".to_string(),
+                mode: None,
+            }
+        );
+        assert_eq!(
+            client.scope_namespace_mutation(&VfsNamespaceMutation::SetMode {
+                path: "script".to_string(),
+                mode: 0o106755,
+            }),
+            VfsNamespaceMutation::SetMode {
+                path: "scope/script".to_string(),
+                mode: 0o6755,
+            }
+        );
+    }
+
+    #[test]
+    fn write_many_preserves_identity_only_and_absent_preconditions() {
+        let client = RemoteVfsClient::new("http://localhost", "token", "scope").unwrap();
+        let identity_only = client.scope_remote_write(RemoteWrite {
+            path: "tracked".to_string(),
+            bytes: b"next".to_vec(),
+            base_content_hash: None,
+            expected_file_id: Some("file-1".to_string()),
+        });
+        assert_eq!(identity_only.path, "scope/tracked");
+        assert_eq!(
+            identity_only
+                .precondition
+                .as_ref()
+                .and_then(|precondition| precondition.expected_file_id.as_deref()),
+            Some("file-1")
+        );
+        assert_eq!(
+            identity_only
+                .precondition
+                .as_ref()
+                .and_then(|precondition| precondition.predicate.as_ref()),
+            None
+        );
+
+        let absent = client.scope_remote_write(RemoteWrite {
+            path: "new".to_string(),
+            bytes: b"new".to_vec(),
+            base_content_hash: Some("absent".to_string()),
+            expected_file_id: None,
+        });
+        assert_eq!(
+            absent
+                .precondition
+                .as_ref()
+                .and_then(|precondition| precondition.predicate.as_ref()),
+            Some(&VfsCasPredicate::Absent),
+        );
+        assert!(
+            absent
+                .precondition
+                .as_ref()
+                .is_some_and(|precondition| precondition.fingerprint.is_none()
+                    && precondition.secondary_fingerprint.is_none())
+        );
+    }
 }

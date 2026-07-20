@@ -263,11 +263,11 @@ const commandResultText = (result) =>
     .filter(Boolean)
     .join("\n");
 
-const collectExec = async (handle, label, marker, onMarker) => {
+const collectExecAtMarkers = async (handle, label, markerSteps = []) => {
   let code = null;
   let stdout = "";
   let stderr = "";
-  let markerHandled = marker === undefined;
+  let markerIndex = 0;
   for (;;) {
     const event = await withTimeout(handle.next(), `${label} output`);
     if (event === null) break;
@@ -277,8 +277,12 @@ const collectExec = async (handle, label, marker, onMarker) => {
     if (event.type === "stderr" && event.data) {
       stderr += Buffer.from(event.data).toString("utf8");
     }
-    if (!markerHandled && stdout.includes(marker)) {
-      markerHandled = true;
+    while (
+      markerIndex < markerSteps.length &&
+      stdout.includes(markerSteps[markerIndex].marker)
+    ) {
+      const { onMarker } = markerSteps[markerIndex];
+      markerIndex += 1;
       await onMarker(handle);
     }
     if (event.type === "exit") {
@@ -290,11 +294,18 @@ const collectExec = async (handle, label, marker, onMarker) => {
       break;
     }
   }
-  if (!markerHandled) {
-    throw new Error(`${label} exited without marker ${marker}`);
+  if (markerIndex < markerSteps.length) {
+    throw new Error(`${label} exited without marker ${markerSteps[markerIndex].marker}`);
   }
   return { code, stdout, stderr };
 };
+
+const collectExec = async (handle, label, marker, onMarker) =>
+  collectExecAtMarkers(
+    handle,
+    label,
+    marker === undefined ? [] : [{ marker, onMarker }],
+  );
 
 const startGuest = async (session, command, { timeoutSecs = 180, interactive = false } = {}) =>
   withTimeout(
@@ -318,6 +329,13 @@ const execGuestAtMarker = async (session, command, marker, onMarker, timeoutSecs
     command.slice(0, 100),
     marker,
     onMarker,
+  );
+
+const execGuestAtMarkers = async (session, command, markerSteps, timeoutSecs = 180) =>
+  collectExecAtMarkers(
+    await startGuest(session, command, { timeoutSecs, interactive: true }),
+    command.slice(0, 100),
+    markerSteps,
   );
 
 const results = [];
@@ -624,29 +642,42 @@ echo NAMESPACE_VISIBLE`,
 
   await check(5, "terminal gateway outage fails fsync honestly then replays exact bytes", async () => {
     await execGuest(first, "printf stable >/workspace/fault-terminal");
-    await setGatewayMode("reject");
-    const writer = await execGuestAtMarker(
+    const writer = await execGuestAtMarkers(
       first,
       `python3 - <<'PY'
 import os,sys
 fd=os.open("/workspace/fault-terminal", os.O_RDWR)
 os.ftruncate(fd,0)
 os.write(fd,b"terminal-recovered")
+print("DIRTY_FD_READY", flush=True)
+sys.stdin.readline()
 try:
     os.fsync(fd)
     print("FSYNC_WRONG_SUCCESS", flush=True)
+    sys.exit(2)
 except OSError as error:
     print("FSYNC_FAILED_HONESTLY:%s" % error.errno, flush=True)
 sys.stdin.readline()
 os.close(fd)
 print("CLOSE_AFTER_RECOVERY")
 PY`,
-      "FSYNC_FAILED_HONESTLY:",
-      async (handle) => {
-        await setGatewayMode("online");
-        await handle.write(Buffer.from("recover\n"));
-        await handle.eof();
-      },
+      [
+        {
+          marker: "DIRTY_FD_READY",
+          onMarker: async (handle) => {
+            await setGatewayMode("reject");
+            await handle.write(Buffer.from("outage\n"));
+          },
+        },
+        {
+          marker: "FSYNC_FAILED_HONESTLY:",
+          onMarker: async (handle) => {
+            await setGatewayMode("online");
+            await handle.write(Buffer.from("recover\n"));
+            await handle.eof();
+          },
+        },
+      ],
       120,
     );
     const reader = await execGuest(

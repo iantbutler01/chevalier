@@ -9,9 +9,10 @@ use bytes::Bytes;
 use chevalier_vfs::gateway::{GatewayVfsStorage, GatewayVfsStorageConfig};
 use chevalier_vfs::local::LocalVfsStorage;
 use chevalier_vfs::{
-    OptimizedVfsStorage, VfsStorageDirListFilter, VfsStorageEntryKind, VfsStorageError,
-    VfsStorageMetadata, VfsStorageMetadataFields, VfsStorageNamespaceMutation,
-    VfsStorageObjectState, VfsStorageWrite, VfsStorageWriteOptions, VfsStorageWritePrecondition,
+    OptimizedVfsStorage, VFS_POSIX_MODE_MASK, VfsStorageCasPredicate, VfsStorageDirListFilter,
+    VfsStorageEntryKind, VfsStorageError, VfsStorageMetadata, VfsStorageMetadataFields,
+    VfsStorageNamespaceMutation, VfsStorageObjectState, VfsStorageWrite, VfsStorageWriteOptions,
+    VfsStorageWritePrecondition,
 };
 use napi::bindgen_prelude::{BigInt, Buffer};
 use napi_derive::napi;
@@ -89,21 +90,42 @@ fn precondition_from_options(
     let Some(options) = options_object(options)? else {
         return Ok(None);
     };
-    let Some(if_match) = option_field(options, "ifMatch", "if_match") else {
-        return Ok(None);
+    let if_match = option_field(options, "ifMatch", "if_match");
+    let expected_file_id = match option_field(options, "expectedFileId", "expected_file_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if !value.is_empty() => Some(value.clone()),
+        Some(Value::String(_)) => {
+            return Err(invalid_options_err(
+                "invalid VFS options: expectedFileId must be a non-empty string",
+            ));
+        }
+        Some(_) => {
+            return Err(invalid_options_err(
+                "invalid VFS options: expectedFileId must be a non-empty string",
+            ));
+        }
     };
-    let fingerprint = match if_match {
-        Value::Null => None,
-        Value::String(value) => normalize_if_match(value.clone()),
-        _ => {
+    if if_match.is_none() && expected_file_id.is_none() {
+        return Ok(None);
+    }
+    let predicate = match if_match {
+        None => None,
+        Some(Value::Null) => Some(VfsStorageCasPredicate::Absent),
+        Some(Value::String(value)) => match normalize_if_match(value.clone()) {
+            Some(fingerprint) => Some(VfsStorageCasPredicate::ContentFingerprint { fingerprint }),
+            None => Some(VfsStorageCasPredicate::Absent),
+        },
+        Some(_) => {
             return Err(invalid_options_err(
                 "invalid VFS options: ifMatch must be a string or null",
             ));
         }
     };
     Ok(Some(VfsStorageWritePrecondition {
-        fingerprint,
+        predicate,
+        fingerprint: None,
         secondary_fingerprint: None,
+        expected_file_id,
     }))
 }
 
@@ -113,16 +135,72 @@ fn write_options_from_options(
     let Some(options) = options_object(options)? else {
         return Ok(None);
     };
+    let mode = mode_from_object(options, "invalid VFS options: mode")?;
     let executable = match option_field(options, "executable", "executable") {
-        None | Some(Value::Null) => return Ok(None),
-        Some(Value::Bool(value)) => *value,
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(value)) => Some(*value),
         Some(_) => {
             return Err(invalid_options_err(
                 "invalid VFS options: executable must be a boolean",
             ));
         }
     };
-    Ok(Some(VfsStorageWriteOptions { executable }))
+    if mode.is_none() && executable.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(VfsStorageWriteOptions {
+        executable: mode
+            .map(|value| value & 0o111 != 0)
+            .or(executable)
+            .unwrap_or(false),
+        mode,
+    }))
+}
+
+fn mode_from_object(options: &Map<String, Value>, context: &str) -> napi::Result<Option<u32>> {
+    match option_field(options, "mode", "mode") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .filter(|value| *value <= u64::from(VFS_POSIX_MODE_MASK))
+            .map(|value| Some(value as u32))
+            .ok_or_else(|| {
+                invalid_options_err(format!(
+                    "{context} must be an integer between 0 and {VFS_POSIX_MODE_MASK}"
+                ))
+            }),
+        Some(_) => Err(invalid_options_err(format!(
+            "{context} must be an integer between 0 and {VFS_POSIX_MODE_MASK}"
+        ))),
+    }
+}
+
+fn mode_from_options(options: Option<&Value>, context: &str) -> napi::Result<Option<u32>> {
+    let Some(options) = options_object(options)? else {
+        return Ok(None);
+    };
+    mode_from_object(options, context)
+}
+
+fn validate_namespace_modes(mutations: &Value) -> napi::Result<()> {
+    let Some(mutations) = mutations.as_array() else {
+        return Ok(());
+    };
+    for mutation in mutations {
+        let Some(mutation) = mutation.as_object() else {
+            continue;
+        };
+        let kind = mutation.get("kind").and_then(Value::as_str);
+        if matches!(kind, Some("create_directory" | "set_mode")) {
+            let mode = mode_from_object(mutation, "invalid namespace mode")?;
+            if kind == Some("set_mode") && mode.is_none() {
+                return Err(invalid_options_err(
+                    "invalid namespace mode: set_mode requires mode",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn list_filter_from_options(options: Option<&Value>) -> napi::Result<VfsStorageDirListFilter> {
@@ -201,6 +279,7 @@ pub struct VfsMetadata {
     pub file_id: Option<String>,
     pub link_count: Option<BigInt>,
     pub link_target: Option<String>,
+    pub mode: Option<u32>,
     pub executable: Option<bool>,
     pub content_hash: Option<String>,
     pub token_count: Option<i32>,
@@ -232,6 +311,7 @@ impl From<VfsStorageMetadata> for VfsMetadata {
             file_id: m.file_id,
             link_count: Some(BigInt::from(m.link_count)),
             link_target: m.link_target,
+            mode: m.mode,
             executable: Some(m.executable),
             content_hash: m.content_hash,
             token_count: m.token_count,
@@ -258,7 +338,10 @@ pub struct GatewayOptions {
 pub struct VfsWriteOptions {
     #[napi(ts_type = "string | null")]
     pub if_match: Option<String>,
+    #[napi(ts_type = "string | null")]
+    pub expected_file_id: Option<String>,
     pub executable: Option<bool>,
+    pub mode: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -441,10 +524,14 @@ impl VfsStorage {
             .collect())
     }
 
-    /// Create a directory.
-    #[napi]
-    pub async fn mkdir(&self, path: String) -> napi::Result<()> {
-        self.inner.mkdir(&path).await.map_err(vfs_err)
+    /// Create a directory, optionally with an exact POSIX mode.
+    #[napi(ts_args_type = "path: string, options?: { mode?: number | null } | null")]
+    pub async fn mkdir(&self, path: String, options: Option<Value>) -> napi::Result<()> {
+        let mode = mode_from_options(options.as_ref(), "invalid VFS mkdir mode")?;
+        self.inner
+            .mkdir_with_mode(&path, mode)
+            .await
+            .map_err(vfs_err)
     }
 
     /// Create a symbolic link.
@@ -522,6 +609,7 @@ impl VfsStorage {
     /// Apply an ordered namespace batch in one backend operation.
     #[napi]
     pub async fn apply_namespace_batch(&self, mutations: Value) -> napi::Result<()> {
+        validate_namespace_modes(&mutations)?;
         let mutations = serde_json::from_value::<Vec<VfsStorageNamespaceMutation>>(mutations)
             .map_err(|error| invalid_options_err(format!("invalid namespace batch: {error}")))?;
         self.inner

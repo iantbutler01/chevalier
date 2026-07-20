@@ -36,6 +36,19 @@ struct JournalWrite {
     staged_file: String,
     size_bytes: u64,
     base_content_hash: Option<String>,
+    /// Stable identity that must still own `path` when this write commits.
+    /// Old journals predate identity-aware publication and intentionally
+    /// decode this as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_file_id: Option<String>,
+}
+
+type WriteTarget = (String, Option<String>);
+
+impl JournalWrite {
+    fn target(&self) -> WriteTarget {
+        (self.path.clone(), self.expected_file_id.clone())
+    }
 }
 
 struct JournalState {
@@ -54,6 +67,10 @@ struct JournalState {
     /// so exactly one fsync/close waiter observes the failure (POSIX
     /// deferred-writeback semantics) without wedging later flushes.
     dead_letter_error: Option<String>,
+    /// Terminal publication failures keyed by the exact enqueue id. A handle
+    /// barrier consumes only its own entry, so concurrent fsync/close waiters
+    /// cannot steal another file's deferred error.
+    terminal_errors: HashMap<u64, String>,
 }
 
 type DeadLetterHook = Box<dyn Fn(&str) + Send + Sync>;
@@ -109,6 +126,7 @@ impl WriteJournal {
                 journal_needs_repair: false,
                 last_error: None,
                 dead_letter_error: None,
+                terminal_errors: HashMap::new(),
             }),
             changed: Condvar::new(),
             journal_path: journal_path.to_path_buf(),
@@ -133,7 +151,8 @@ impl WriteJournal {
         path: &str,
         bytes: &[u8],
         base_content_hash: Option<String>,
-    ) -> Result<()> {
+        expected_file_id: Option<String>,
+    ) -> Result<u64> {
         let mut state = self
             .shared
             .state
@@ -160,6 +179,7 @@ impl WriteJournal {
             staged_file,
             size_bytes: bytes.len() as u64,
             base_content_hash,
+            expected_file_id,
         };
         append_json_line(&mut state.journal, &write, "append vfs write journal")?;
         state.pending.push_back(write);
@@ -168,7 +188,7 @@ impl WriteJournal {
             state.force_flush = true;
         }
         self.shared.changed.notify_all();
-        Ok(())
+        Ok(id)
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -200,6 +220,41 @@ impl WriteJournal {
         if let Some(error) = state.last_error.clone() {
             return Err(anyhow!(error));
         }
+        Ok(())
+    }
+
+    /// Wait for one exact enqueue to resolve and report only that operation's
+    /// terminal error. The global journal barrier remains available for
+    /// namespace ordering, but file fsync/close should use this method.
+    pub fn flush_through(&self, id: u64) -> Result<()> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
+        state.force_flush = true;
+        self.shared.changed.notify_all();
+        let deadline = Instant::now() + FLUSH_RETRY_TIMEOUT;
+        while state.pending.iter().any(|write| write.id == id) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!(state.last_error.clone().unwrap_or_else(|| {
+                    format!("timed out flushing vfs write journal operation {id}")
+                })));
+            }
+            let waited = self
+                .shared
+                .changed
+                .wait_timeout(state, remaining)
+                .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
+            state = waited.0;
+        }
+        if let Some(error) = state.terminal_errors.remove(&id) {
+            return Err(anyhow!(error));
+        }
+        // `last_error` summarizes the journal worker globally and may belong
+        // to another pathname. Once this exact id has left `pending`, only its
+        // own terminal result is relevant to this handle's fsync/close.
         Ok(())
     }
 
@@ -295,6 +350,7 @@ fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, 
                         path: write.path.clone(),
                         bytes,
                         base_content_hash: write.base_content_hash.clone(),
+                        expected_file_id: write.expected_file_id.clone(),
                     })
                     .with_context(|| format!("read staged vfs write {}", write.staged_file))
             })
@@ -306,7 +362,7 @@ fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, 
                     .iter()
                     .map(|write| {
                         (
-                            write.path.clone(),
+                            (write.path.clone(), write.expected_file_id.clone()),
                             content_hash_for_bytes(write.bytes.as_slice()),
                         )
                     })
@@ -407,68 +463,116 @@ fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, 
 
 #[derive(Default)]
 struct BatchResolution {
-    /// path -> committed content hash, for rebasing queued follow-on writes.
-    committed: HashMap<String, String>,
+    /// (path, stable identity) -> committed content hash, for rebasing only
+    /// the queued writes that still address the same inode incarnation.
+    committed: HashMap<WriteTarget, String>,
+    /// Open inode identities whose last namespace alias disappeared. Their
+    /// local bytes remain valid until final close, but no WAL entry may
+    /// recreate the retired pathname.
+    retired: HashSet<WriteTarget>,
     /// Coalesced writes the gateway rejected with a 4xx, with the error text.
     dead_lettered: Vec<(JournalWrite, String)>,
-    /// Paths that hit a transient failure and stay pending.
-    retained: Vec<String>,
+    /// Targets that hit a transient failure and stay pending.
+    retained: Vec<WriteTarget>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum RejectedWriteOutcome {
     Committed(String),
+    Retired,
     DeadLetter(String),
     Retained,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct VisibleWriteState {
+    content_hash: Option<String>,
+    file_id: Option<String>,
 }
 
 fn resolve_rejected_write(
     write: &JournalWrite,
     bytes: Vec<u8>,
     mut submit: impl FnMut(RemoteWrite) -> Result<()>,
-    mut current_content_hash: impl FnMut() -> Result<Option<String>>,
+    mut current_state: impl FnMut(&str) -> Result<Option<VisibleWriteState>>,
+    mut surviving_alias: impl FnMut(&str, &str) -> Result<Option<String>>,
 ) -> RejectedWriteOutcome {
     let content_hash = content_hash_for_bytes(bytes.as_slice());
-    let initial = RemoteWrite {
-        path: write.path.clone(),
+    let mut candidate_path = write.path.clone();
+    let mut base_content_hash = write.base_content_hash.clone();
+    let mut error = match submit(RemoteWrite {
+        path: candidate_path.clone(),
         bytes: bytes.clone(),
-        base_content_hash: write.base_content_hash.clone(),
+        base_content_hash: base_content_hash.clone(),
+        expected_file_id: write.expected_file_id.clone(),
+    }) {
+        Ok(()) => return RejectedWriteOutcome::Committed(content_hash),
+        Err(error) => error,
     };
-    match submit(initial) {
-        Ok(()) => RejectedWriteOutcome::Committed(content_hash),
-        Err(error)
-            if matches!(
-                rejected_request_status(&error),
-                Some(StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED)
-            ) =>
+
+    // A path hint may go stale repeatedly under cross-mount rename churn.
+    // Each retry revalidates stable identity and carries it atomically into
+    // the write; the bounded loop prevents a hostile namespace from pinning
+    // one journal worker forever.
+    for _ in 0..4 {
+        if !matches!(
+            rejected_request_status(&error),
+            Some(StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED)
+        ) {
+            return if rejected_request_status(&error).is_some() {
+                RejectedWriteOutcome::DeadLetter(error.to_string())
+            } else {
+                RejectedWriteOutcome::Retained
+            };
+        }
+
+        let current = match current_state(candidate_path.as_str()) {
+            Ok(current) => current,
+            Err(_) => return RejectedWriteOutcome::Retained,
+        };
+        let identity_matches = match write.expected_file_id.as_deref() {
+            Some(expected) => {
+                current.as_ref().and_then(|state| state.file_id.as_deref()) == Some(expected)
+            }
+            None => true,
+        };
+        if !identity_matches {
+            let Some(expected_file_id) = write.expected_file_id.as_deref() else {
+                return RejectedWriteOutcome::DeadLetter(error.to_string());
+            };
+            candidate_path = match surviving_alias(expected_file_id, candidate_path.as_str()) {
+                Ok(Some(alias)) => alias,
+                Ok(None) => return RejectedWriteOutcome::Retired,
+                Err(_) => return RejectedWriteOutcome::Retained,
+            };
+            // An alias is another name for the same inode, so the original
+            // content CAS base remains the correct write precondition.
+            base_content_hash = write.base_content_hash.clone();
+        } else if current
+            .as_ref()
+            .and_then(|state| state.content_hash.as_deref())
+            == Some(content_hash.as_str())
         {
             // A precondition rejection can mean the write already landed (lost
             // response or a partially committed batch). Matching bytes are not
-            // proof of durability: the first request may have made page-cache
-            // bytes visible and then failed its file/directory barrier. Force
-            // an exact-content CAS repair and retire the WAL only after that
-            // repair returns success.
-            match current_content_hash() {
-                Ok(Some(current)) if current == content_hash => {
-                    let repair = RemoteWrite {
-                        path: write.path.clone(),
-                        bytes,
-                        base_content_hash: Some(content_hash.clone()),
-                    };
-                    match submit(repair) {
-                        Ok(()) => RejectedWriteOutcome::Committed(content_hash),
-                        Err(_) => RejectedWriteOutcome::Retained,
-                    }
-                }
-                Ok(_) => RejectedWriteOutcome::DeadLetter(error.to_string()),
-                Err(_) => RejectedWriteOutcome::Retained,
-            }
+            // proof of durability: force an exact-content, exact-identity CAS
+            // repair and retire the WAL only after that repair succeeds.
+            base_content_hash = Some(content_hash.clone());
+        } else {
+            return RejectedWriteOutcome::DeadLetter(error.to_string());
         }
-        Err(error) if rejected_request_status(&error).is_some() => {
-            RejectedWriteOutcome::DeadLetter(error.to_string())
-        }
-        Err(_) => RejectedWriteOutcome::Retained,
+
+        error = match submit(RemoteWrite {
+            path: candidate_path.clone(),
+            bytes: bytes.clone(),
+            base_content_hash: base_content_hash.clone(),
+            expected_file_id: write.expected_file_id.clone(),
+        }) {
+            Ok(()) => return RejectedWriteOutcome::Committed(content_hash),
+            Err(error) => error,
+        };
     }
+    RejectedWriteOutcome::Retained
 }
 
 fn resolve_rejected_batch(
@@ -495,22 +599,29 @@ fn resolve_rejected_batch(
             write,
             bytes,
             |remote| tokio.block_on(client.write_many(vec![remote], surface)),
-            || {
-                tokio
-                    .block_on(client.stat(write.path.as_str()))
-                    .map(|metadata| metadata.and_then(|metadata| metadata.content_hash))
+            |path| {
+                tokio.block_on(client.stat(path)).map(|metadata| {
+                    metadata.map(|metadata| VisibleWriteState {
+                        content_hash: metadata.content_hash,
+                        file_id: metadata.file_id,
+                    })
+                })
+            },
+            |file_id, excluding_path| {
+                tokio.block_on(client.find_hard_link_alias(file_id, excluding_path))
             },
         ) {
             RejectedWriteOutcome::Committed(content_hash) => {
-                resolution
-                    .committed
-                    .insert(write.path.clone(), content_hash);
+                resolution.committed.insert(write.target(), content_hash);
+            }
+            RejectedWriteOutcome::Retired => {
+                resolution.retired.insert(write.target());
             }
             RejectedWriteOutcome::DeadLetter(error) => {
                 resolution.dead_lettered.push((write.clone(), error));
             }
             RejectedWriteOutcome::Retained => {
-                resolution.retained.push(write.path.clone());
+                resolution.retained.push(write.target());
             }
         }
     }
@@ -526,18 +637,25 @@ fn apply_batch_resolution(
 ) {
     let pending_before = state.pending.clone();
     let dead_letter_error_before = state.dead_letter_error.clone();
-    let mut resolved_paths = HashSet::<&str>::new();
-    resolved_paths.extend(resolution.committed.keys().map(String::as_str));
+    let terminal_errors_before = state.terminal_errors.clone();
+    let mut resolved_targets = resolution
+        .committed
+        .keys()
+        .cloned()
+        .collect::<HashSet<WriteTarget>>();
+    resolved_targets.extend(resolution.retired.iter().cloned());
     let mut dead_lettered_paths = Vec::<String>::new();
-    let mut preservation_failures = Vec::<String>::new();
+    let mut dead_lettered_targets = HashMap::<WriteTarget, String>::new();
+    let mut preservation_failures = Vec::<WriteTarget>::new();
     for (write, error) in &resolution.dead_lettered {
         // Only count the entry resolved once its bytes are safely preserved.
         // If preservation fails (disk full, permissions), the entry stays in
         // the journal and the worker retries the whole resolution later.
         match dead_letter_write(shared, write, error) {
             Ok(record_path) => {
-                resolved_paths.insert(write.path.as_str());
+                resolved_targets.insert(write.target());
                 dead_lettered_paths.push(write.path.clone());
+                dead_lettered_targets.insert(write.target(), error.clone());
                 tracing::error!(
                     journal = %shared.journal_path.display(),
                     path = %write.path,
@@ -548,7 +666,7 @@ fn apply_batch_resolution(
                 );
             }
             Err(record_error) => {
-                preservation_failures.push(write.path.clone());
+                preservation_failures.push(write.target());
                 tracing::error!(
                     journal = %shared.journal_path.display(),
                     path = %write.path,
@@ -561,7 +679,7 @@ fn apply_batch_resolution(
     }
     let resolved_ids = batch
         .iter()
-        .filter(|write| resolved_paths.contains(write.path.as_str()))
+        .filter(|write| resolved_targets.contains(&write.target()))
         .map(|write| write.id)
         .collect::<HashSet<_>>();
     state
@@ -569,13 +687,14 @@ fn apply_batch_resolution(
         .retain(|write| !resolved_ids.contains(&write.id));
     let committed_batch = coalesced
         .iter()
-        .filter(|write| resolution.committed.contains_key(write.path.as_str()))
+        .filter(|write| resolution.committed.contains_key(&write.target()))
         .cloned()
         .collect::<Vec<_>>();
     rebase_pending_after_commit(&mut state.pending, &committed_batch, &resolution.committed);
     if let Err(error) = rewrite_journal(&shared.journal_path, state) {
         state.pending = pending_before;
         state.dead_letter_error = dead_letter_error_before;
+        state.terminal_errors = terminal_errors_before;
         state.last_error = Some(error.to_string());
         return;
     }
@@ -585,6 +704,17 @@ fn apply_batch_resolution(
         .cloned()
         .collect::<Vec<_>>();
     remove_staged_after_wal(shared, &resolved);
+    for write in batch {
+        if let Some(error) = dead_lettered_targets.get(&write.target()) {
+            state.terminal_errors.insert(
+                write.id,
+                format!(
+                    "vfs write {} rejected by the gateway and dead-lettered: {error}",
+                    write.path
+                ),
+            );
+        }
+    }
     if !dead_lettered_paths.is_empty() {
         state.dead_letter_error = Some(format!(
             "vfs write(s) rejected by the gateway and dead-lettered under {}: {}",
@@ -597,8 +727,12 @@ fn apply_batch_resolution(
             }
         }
     }
-    let mut unresolved = resolution.retained.clone();
-    unresolved.extend(preservation_failures);
+    let mut unresolved = resolution
+        .retained
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    unresolved.extend(preservation_failures.into_iter().map(|(path, _)| path));
     state.last_error = if unresolved.is_empty() {
         None
     } else {
@@ -633,6 +767,7 @@ fn dead_letter_write(shared: &Shared, write: &JournalWrite, error: &str) -> Resu
         "preserved_file": preserved_name,
         "size_bytes": write.size_bytes,
         "base_content_hash": write.base_content_hash,
+        "expected_file_id": write.expected_file_id,
         "error": error,
         "dead_lettered_at_unix": unix_seconds,
     });
@@ -752,16 +887,17 @@ fn remove_dead_letter_temporary(path: &Path) -> Result<()> {
 
 fn coalesce_batch(batch: &[JournalWrite]) -> Vec<JournalWrite> {
     let mut writes = Vec::<JournalWrite>::new();
-    let mut positions = HashMap::<String, usize>::new();
+    let mut positions = HashMap::<WriteTarget, usize>::new();
     for write in batch {
-        if let Some(position) = positions.get(write.path.as_str()).copied() {
+        let target = write.target();
+        if let Some(position) = positions.get(&target).copied() {
             let base_content_hash = writes[position].base_content_hash.clone();
             writes[position] = JournalWrite {
                 base_content_hash,
                 ..write.clone()
             };
         } else {
-            positions.insert(write.path.clone(), writes.len());
+            positions.insert(target, writes.len());
             writes.push(write.clone());
         }
     }
@@ -771,24 +907,25 @@ fn coalesce_batch(batch: &[JournalWrite]) -> Vec<JournalWrite> {
 fn rebase_pending_after_commit(
     pending: &mut VecDeque<JournalWrite>,
     committed_batch: &[JournalWrite],
-    committed_hashes: &HashMap<String, String>,
+    committed_hashes: &HashMap<WriteTarget, String>,
 ) {
-    let mut committed_bases = HashMap::<String, HashSet<Option<String>>>::new();
+    let mut committed_bases = HashMap::<WriteTarget, HashSet<Option<String>>>::new();
     for write in committed_batch {
         committed_bases
-            .entry(write.path.clone())
+            .entry(write.target())
             .or_default()
             .insert(write.base_content_hash.clone());
     }
     for write in pending {
-        let Some(committed_hash) = committed_hashes.get(write.path.as_str()) else {
+        let target = write.target();
+        let Some(committed_hash) = committed_hashes.get(&target) else {
             continue;
         };
         if write.base_content_hash.as_ref() == Some(committed_hash) {
             continue;
         }
         if committed_bases
-            .get(write.path.as_str())
+            .get(&target)
             .is_some_and(|bases| bases.contains(&write.base_content_hash))
         {
             write.base_content_hash = Some(committed_hash.clone());
@@ -1181,6 +1318,7 @@ mod tests {
                 staged_file: "1.bin".to_string(),
                 size_bytes: 10,
                 base_content_hash: Some("base".to_string()),
+                expected_file_id: None,
             },
             JournalWrite {
                 id: 2,
@@ -1188,6 +1326,7 @@ mod tests {
                 staged_file: "2.bin".to_string(),
                 size_bytes: 20,
                 base_content_hash: None,
+                expected_file_id: None,
             },
             JournalWrite {
                 id: 3,
@@ -1195,6 +1334,7 @@ mod tests {
                 staged_file: "3.bin".to_string(),
                 size_bytes: 30,
                 base_content_hash: Some("intermediate".to_string()),
+                expected_file_id: None,
             },
         ];
 
@@ -1208,6 +1348,35 @@ mod tests {
     }
 
     #[test]
+    fn coalescing_never_crosses_stable_file_identity() {
+        let entry = |id: u64, expected_file_id: &str, base: &str| JournalWrite {
+            id,
+            path: "config".to_string(),
+            staged_file: format!("{id}.bin"),
+            size_bytes: id,
+            base_content_hash: Some(base.to_string()),
+            expected_file_id: Some(expected_file_id.to_string()),
+        };
+        let batch = vec![
+            entry(1, "inode-old", "old-base"),
+            entry(2, "inode-old", "old-intermediate"),
+            entry(3, "inode-replacement", "replacement-base"),
+        ];
+
+        let coalesced = coalesce_batch(&batch);
+
+        assert_eq!(coalesced.len(), 2);
+        assert_eq!(coalesced[0].id, 2, "latest bytes win within one inode");
+        assert_eq!(
+            coalesced[0].base_content_hash.as_deref(),
+            Some("old-base"),
+            "the first CAS base remains authoritative within that inode"
+        );
+        assert_eq!(coalesced[0].expected_file_id.as_deref(), Some("inode-old"));
+        assert_eq!(coalesced[1], batch[2]);
+    }
+
+    #[test]
     fn successful_batch_rebases_only_its_queued_write_chain() {
         let committed = vec![JournalWrite {
             id: 1,
@@ -1215,6 +1384,7 @@ mod tests {
             staged_file: "1.bin".to_string(),
             size_bytes: 10,
             base_content_hash: Some("base".to_string()),
+            expected_file_id: None,
         }];
         let mut pending = VecDeque::from([
             JournalWrite {
@@ -1223,6 +1393,7 @@ mod tests {
                 staged_file: "2.bin".to_string(),
                 size_bytes: 20,
                 base_content_hash: Some("base".to_string()),
+                expected_file_id: None,
             },
             JournalWrite {
                 id: 3,
@@ -1230,6 +1401,7 @@ mod tests {
                 staged_file: "3.bin".to_string(),
                 size_bytes: 30,
                 base_content_hash: Some("external".to_string()),
+                expected_file_id: None,
             },
             JournalWrite {
                 id: 4,
@@ -1237,17 +1409,51 @@ mod tests {
                 staged_file: "4.bin".to_string(),
                 size_bytes: 40,
                 base_content_hash: Some("readme-base".to_string()),
+                expected_file_id: None,
             },
         ]);
         rebase_pending_after_commit(
             &mut pending,
             &committed,
-            &HashMap::from([("src/main.rs".to_string(), "committed".to_string())]),
+            &HashMap::from([(("src/main.rs".to_string(), None), "committed".to_string())]),
         );
 
         assert_eq!(pending[0].base_content_hash.as_deref(), Some("committed"));
         assert_eq!(pending[1].base_content_hash.as_deref(), Some("external"));
         assert_eq!(pending[2].base_content_hash.as_deref(), Some("readme-base"));
+    }
+
+    #[test]
+    fn successful_batch_never_rebases_a_reused_path_with_another_identity() {
+        let entry = |id: u64, expected_file_id: &str| JournalWrite {
+            id,
+            path: "config".to_string(),
+            staged_file: format!("{id}.bin"),
+            size_bytes: id,
+            base_content_hash: Some("same-base".to_string()),
+            expected_file_id: Some(expected_file_id.to_string()),
+        };
+        let committed = vec![entry(1, "inode-old")];
+        let mut pending = VecDeque::from([entry(2, "inode-old"), entry(3, "inode-replacement")]);
+
+        rebase_pending_after_commit(
+            &mut pending,
+            &committed,
+            &HashMap::from([(
+                ("config".to_string(), Some("inode-old".to_string())),
+                "old-committed".to_string(),
+            )]),
+        );
+
+        assert_eq!(
+            pending[0].base_content_hash.as_deref(),
+            Some("old-committed")
+        );
+        assert_eq!(
+            pending[1].base_content_hash.as_deref(),
+            Some("same-base"),
+            "a path replacement is a separate WAL chain"
+        );
     }
 
     #[test]
@@ -1272,6 +1478,7 @@ mod tests {
                     staged_file: "1.bin".to_string(),
                     size_bytes: 4,
                     base_content_hash: None,
+                    expected_file_id: None,
                 }]),
                 journal: open_append(&journal_path).expect("journal"),
                 next_id: 2,
@@ -1281,6 +1488,7 @@ mod tests {
                 journal_needs_repair: false,
                 last_error: None,
                 dead_letter_error: None,
+                terminal_errors: HashMap::new(),
             }),
             changed: Condvar::new(),
             journal_path,
@@ -1329,6 +1537,7 @@ mod tests {
                 journal_needs_repair: false,
                 last_error: Some("rewrite failed".to_string()),
                 dead_letter_error: None,
+                terminal_errors: HashMap::new(),
             }),
             changed: Condvar::new(),
             journal_path,
@@ -1378,6 +1587,7 @@ mod tests {
             staged_file: "1.bin".to_string(),
             size_bytes: b"desired".len() as u64,
             base_content_hash: Some("old".to_string()),
+            expected_file_id: None,
         };
         let desired_hash = content_hash_for_bytes(b"desired");
         let mut submitted_bases = Vec::new();
@@ -1397,7 +1607,13 @@ mod tests {
                     Ok(())
                 }
             },
-            || Ok(Some(desired_hash.clone())),
+            |_| {
+                Ok(Some(VisibleWriteState {
+                    content_hash: Some(desired_hash.clone()),
+                    file_id: None,
+                }))
+            },
+            |_, _| unreachable!("identity-less CAS repair never resolves aliases"),
         );
 
         assert_eq!(
@@ -1412,6 +1628,119 @@ mod tests {
     }
 
     #[test]
+    fn identity_mismatch_retargets_a_surviving_alias_without_touching_replacement_bytes() {
+        let write = JournalWrite {
+            id: 1,
+            path: "config".to_string(),
+            staged_file: "1.bin".to_string(),
+            size_bytes: b"identical".len() as u64,
+            base_content_hash: Some("old".to_string()),
+            expected_file_id: Some("inode-old".to_string()),
+        };
+        let desired_hash = content_hash_for_bytes(b"identical");
+        let mut submissions = Vec::new();
+
+        let outcome = resolve_rejected_write(
+            &write,
+            b"identical".to_vec(),
+            |remote| {
+                submissions.push((
+                    remote.path,
+                    remote.expected_file_id,
+                    remote.base_content_hash,
+                ));
+                if submissions.len() == 1 {
+                    Err(
+                        anyhow::Error::new(super::super::client::VfsRequestStatusError {
+                            status: StatusCode::PRECONDITION_FAILED,
+                        })
+                        .context("stable file identity changed"),
+                    )
+                } else {
+                    Ok(())
+                }
+            },
+            |path| {
+                assert_eq!(path, "config");
+                Ok(Some(VisibleWriteState {
+                    content_hash: Some(desired_hash.clone()),
+                    file_id: Some("inode-replacement".to_string()),
+                }))
+            },
+            |file_id, excluding_path| {
+                assert_eq!(file_id, "inode-old");
+                assert_eq!(excluding_path, "config");
+                Ok(Some("renamed-config".to_string()))
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            RejectedWriteOutcome::Committed(desired_hash.clone())
+        );
+        assert_eq!(
+            submissions,
+            [
+                (
+                    "config".to_string(),
+                    Some("inode-old".to_string()),
+                    Some("old".to_string()),
+                ),
+                (
+                    "renamed-config".to_string(),
+                    Some("inode-old".to_string()),
+                    Some("old".to_string()),
+                ),
+            ],
+            "retry must carry identity and the original inode CAS to its surviving alias"
+        );
+    }
+
+    #[test]
+    fn identity_mismatch_with_no_surviving_alias_retires_without_resurrection() {
+        let write = JournalWrite {
+            id: 1,
+            path: "config".to_string(),
+            staged_file: "1.bin".to_string(),
+            size_bytes: b"local open bytes".len() as u64,
+            base_content_hash: Some("old".to_string()),
+            expected_file_id: Some("inode-unlinked".to_string()),
+        };
+        let mut submissions = 0;
+
+        let outcome = resolve_rejected_write(
+            &write,
+            b"local open bytes".to_vec(),
+            |_| {
+                submissions += 1;
+                Err(
+                    anyhow::Error::new(super::super::client::VfsRequestStatusError {
+                        status: StatusCode::CONFLICT,
+                    })
+                    .context("pathname no longer owns the open inode"),
+                )
+            },
+            |_| {
+                Ok(Some(VisibleWriteState {
+                    content_hash: Some("replacement-hash".to_string()),
+                    file_id: Some("inode-replacement".to_string()),
+                }))
+            },
+            |file_id, excluding_path| {
+                assert_eq!(file_id, "inode-unlinked");
+                assert_eq!(excluding_path, "config");
+                Ok(None)
+            },
+        );
+
+        assert_eq!(outcome, RejectedWriteOutcome::Retired);
+        assert_eq!(
+            submissions, 1,
+            "last-unlink retirement must not recreate the stale pathname"
+        );
+    }
+
+    #[test]
     fn failed_exact_cas_repair_retains_the_wal() {
         let write = JournalWrite {
             id: 1,
@@ -1419,6 +1748,7 @@ mod tests {
             staged_file: "1.bin".to_string(),
             size_bytes: b"desired".len() as u64,
             base_content_hash: Some("old".to_string()),
+            expected_file_id: None,
         };
         let desired_hash = content_hash_for_bytes(b"desired");
         let mut submissions = 0;
@@ -1438,7 +1768,13 @@ mod tests {
                     Err(anyhow!("repair response lost"))
                 }
             },
-            || Ok(Some(desired_hash.clone())),
+            |_| {
+                Ok(Some(VisibleWriteState {
+                    content_hash: Some(desired_hash.clone()),
+                    file_id: None,
+                }))
+            },
+            |_, _| unreachable!("identity-less CAS repair never resolves aliases"),
         );
 
         assert_eq!(outcome, RejectedWriteOutcome::Retained);
@@ -1465,16 +1801,18 @@ mod tests {
                 _ => unreachable!("test journal id"),
             },
             base_content_hash: base.map(str::to_string),
+            expected_file_id: None,
         };
-        let batch = vec![
-            entry(1, "src/main.rs", Some("base")),
-            entry(2, "probe.txt", Some("stale")),
-        ];
+        let rejected = JournalWrite {
+            expected_file_id: Some("file-probe".to_string()),
+            ..entry(2, "probe.txt", Some("stale"))
+        };
+        let batch = vec![entry(1, "src/main.rs", Some("base")), rejected.clone()];
         let shared = Shared {
             state: Mutex::new(JournalState {
                 pending: VecDeque::from([
                     entry(1, "src/main.rs", Some("base")),
-                    entry(2, "probe.txt", Some("stale")),
+                    rejected.clone(),
                     entry(3, "src/main.rs", Some("base")),
                 ]),
                 journal: open_append(&journal_path).expect("journal"),
@@ -1485,6 +1823,7 @@ mod tests {
                 journal_needs_repair: false,
                 last_error: Some("vfs request failed: 409".to_string()),
                 dead_letter_error: None,
+                terminal_errors: HashMap::new(),
             }),
             changed: Condvar::new(),
             journal_path: journal_path.clone(),
@@ -1492,11 +1831,12 @@ mod tests {
             on_dead_letter: None,
         };
         let resolution = BatchResolution {
-            committed: HashMap::from([("src/main.rs".to_string(), "committed-hash".to_string())]),
-            dead_lettered: vec![(
-                entry(2, "probe.txt", Some("stale")),
-                "vfs request failed: 409 Conflict".to_string(),
-            )],
+            committed: HashMap::from([(
+                ("src/main.rs".to_string(), None),
+                "committed-hash".to_string(),
+            )]),
+            retired: HashSet::new(),
+            dead_lettered: vec![(rejected, "vfs request failed: 409 Conflict".to_string())],
             retained: Vec::new(),
         };
 
@@ -1522,6 +1862,17 @@ mod tests {
                     .is_some_and(|error| error.contains("probe.txt")),
                 "a dead-letter must latch an error for the next flush waiter"
             );
+            assert!(
+                !state.terminal_errors.contains_key(&1),
+                "the committed operation must not inherit another target's error"
+            );
+            assert!(
+                state
+                    .terminal_errors
+                    .get(&2)
+                    .is_some_and(|error| error.contains("probe.txt")),
+                "the rejected operation must retain its own terminal error"
+            );
         }
 
         let dead_letter_dir = journal_path.with_extension("dead-letter");
@@ -1530,6 +1881,7 @@ mod tests {
         assert!(records.contains("409"));
         let record: serde_json::Value =
             serde_json::from_str(records.lines().next().expect("one record")).expect("json");
+        assert_eq!(record["expected_file_id"], "file-probe");
         let preserved_file = record["preserved_file"].as_str().expect("preserved_file");
         assert_eq!(
             fs::read(dead_letter_dir.join(preserved_file)).expect("preserved bytes"),
@@ -1569,6 +1921,7 @@ mod tests {
             staged_file: "1.bin".to_string(),
             size_bytes: 14,
             base_content_hash: Some("stale".to_string()),
+            expected_file_id: None,
         };
         let shared = Shared {
             state: Mutex::new(JournalState {
@@ -1581,6 +1934,7 @@ mod tests {
                 journal_needs_repair: false,
                 last_error: Some("vfs request failed: 409".to_string()),
                 dead_letter_error: None,
+                terminal_errors: HashMap::new(),
             }),
             changed: Condvar::new(),
             journal_path: journal_path.clone(),
@@ -1589,6 +1943,7 @@ mod tests {
         };
         let resolution = BatchResolution {
             committed: HashMap::new(),
+            retired: HashSet::new(),
             dead_lettered: vec![(entry.clone(), "vfs request failed: 409".to_string())],
             retained: Vec::new(),
         };
@@ -1621,6 +1976,7 @@ mod tests {
             staged_file: "1.bin".to_string(),
             size_bytes: 14,
             base_content_hash: Some("stale".to_string()),
+            expected_file_id: None,
         };
         let shared = Shared {
             state: Mutex::new(JournalState {
@@ -1633,6 +1989,7 @@ mod tests {
                 journal_needs_repair: false,
                 last_error: Some("vfs request failed: 409".to_string()),
                 dead_letter_error: None,
+                terminal_errors: HashMap::new(),
             }),
             changed: Condvar::new(),
             journal_path: journal_path.clone(),
@@ -1643,6 +2000,7 @@ mod tests {
         };
         let resolution = BatchResolution {
             committed: HashMap::new(),
+            retired: HashSet::new(),
             dead_lettered: vec![(entry.clone(), "vfs request failed: 409".to_string())],
             retained: Vec::new(),
         };
@@ -1672,6 +2030,7 @@ mod tests {
                     staged_file: "1.bin".to_string(),
                     size_bytes: 4,
                     base_content_hash: None,
+                    expected_file_id: None,
                 }]),
                 journal: open_append(&journal_path).expect("journal"),
                 next_id: 2,
@@ -1681,6 +2040,7 @@ mod tests {
                 journal_needs_repair: false,
                 last_error: None,
                 dead_letter_error: None,
+                terminal_errors: HashMap::new(),
             }),
             changed: Condvar::new(),
             journal_path,
@@ -1705,6 +2065,50 @@ mod tests {
     }
 
     #[test]
+    fn exact_flush_barrier_ignores_unrelated_worker_error_and_consumes_only_its_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("writes.jsonl");
+        let staging_dir = dir.path().join("writes");
+        fs::create_dir_all(&staging_dir).expect("staging dir");
+        let shared = Arc::new(Shared {
+            state: Mutex::new(JournalState {
+                pending: VecDeque::new(),
+                journal: open_append(&journal_path).expect("journal"),
+                next_id: 3,
+                force_flush: false,
+                flushing: false,
+                stop: false,
+                journal_needs_repair: false,
+                last_error: Some("transient failure for another pathname".to_string()),
+                dead_letter_error: None,
+                terminal_errors: HashMap::from([(
+                    2,
+                    "vfs write rejected for probe.txt".to_string(),
+                )]),
+            }),
+            changed: Condvar::new(),
+            journal_path,
+            staging_dir,
+            on_dead_letter: None,
+        });
+        let journal = WriteJournal {
+            shared,
+            worker: Mutex::new(None),
+        };
+
+        journal
+            .flush_through(1)
+            .expect("another path's transient error must not fail this barrier");
+        let error = journal
+            .flush_through(2)
+            .expect_err("the rejected operation observes its own terminal error");
+        assert!(error.to_string().contains("probe.txt"));
+        journal
+            .flush_through(2)
+            .expect("the exact deferred error is consumed once");
+    }
+
+    #[test]
     fn large_write_wal_streams_across_small_reader_buffers() {
         const RECORDS: u64 = 12_000;
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1720,6 +2124,7 @@ mod tests {
                         staged_file: format!("{id}.bin"),
                         size_bytes: id,
                         base_content_hash: Some(format!("base-{id}")),
+                        expected_file_id: None,
                     },
                 )
                 .expect("serialize");
@@ -1735,6 +2140,36 @@ mod tests {
         assert_eq!(pending.len(), RECORDS as usize);
         assert_eq!(pending.front().expect("first").id, 1);
         assert_eq!(pending.back().expect("last").id, RECORDS);
+    }
+
+    #[test]
+    fn restart_preserves_identity_preconditions_and_accepts_legacy_records() {
+        let path = Path::new("memory-write-journal.jsonl");
+        let legacy =
+            br#"{"id":1,"path":"legacy","staged_file":"1.bin","size_bytes":1,"base_content_hash":null}"#;
+        let identity_aware = JournalWrite {
+            id: 2,
+            path: "config".to_string(),
+            staged_file: "2.bin".to_string(),
+            size_bytes: 2,
+            base_content_hash: Some("base".to_string()),
+            expected_file_id: Some("inode-stable".to_string()),
+        };
+        let mut bytes = legacy.to_vec();
+        bytes.push(b'\n');
+        bytes.extend(serde_json::to_vec(&identity_aware).expect("serialize identity-aware WAL"));
+        bytes.push(b'\n');
+
+        let (reopened, repair_tail) =
+            decode_journal(BufReader::new(Cursor::new(bytes)), path).expect("restart WAL");
+
+        assert!(!repair_tail);
+        assert_eq!(reopened.len(), 2);
+        assert_eq!(
+            reopened[0].expected_file_id, None,
+            "pre-upgrade WAL entries remain readable"
+        );
+        assert_eq!(reopened[1], identity_aware);
     }
 
     #[test]
@@ -1765,6 +2200,7 @@ mod tests {
             staged_file: "1.bin".to_string(),
             size_bytes: 5,
             base_content_hash: None,
+            expected_file_id: None,
         };
         let mut torn_bytes = serde_json::to_vec(&first).expect("serialize");
         torn_bytes.push(b'\n');
@@ -1815,6 +2251,7 @@ mod tests {
                 journal_needs_repair: false,
                 last_error: None,
                 dead_letter_error: None,
+                terminal_errors: HashMap::new(),
             }),
             changed: Condvar::new(),
             journal_path: journal_path.clone(),
@@ -1827,6 +2264,7 @@ mod tests {
             staged_file: "1.bin".to_string(),
             size_bytes: LARGE_BYTES,
             base_content_hash: None,
+            expected_file_id: None,
         };
 
         dead_letter_write(&shared, &write, "rejected").expect("dead letter");
@@ -1882,6 +2320,7 @@ mod tests {
             staged_file: "1.bin".to_string(),
             size_bytes: 4,
             base_content_hash: None,
+            expected_file_id: None,
         };
         fs::create_dir(dead_letter_dir.join("records.jsonl")).expect("metadata blocker");
         dead_letter_write(
@@ -1896,6 +2335,7 @@ mod tests {
                     journal_needs_repair: false,
                     last_error: None,
                     dead_letter_error: None,
+                    terminal_errors: HashMap::new(),
                 }),
                 changed: Condvar::new(),
                 journal_path: journal_path.clone(),
@@ -1938,6 +2378,7 @@ mod tests {
                 journal_needs_repair: false,
                 last_error: None,
                 dead_letter_error: None,
+                terminal_errors: HashMap::new(),
             }),
             changed: Condvar::new(),
             journal_path: journal_path.clone(),
@@ -1970,6 +2411,7 @@ mod tests {
             staged_file: "1.bin".to_string(),
             size_bytes: 5,
             base_content_hash: None,
+            expected_file_id: None,
         };
         let mut bytes = serde_json::to_vec(&first).expect("serialize");
         bytes.extend_from_slice(b"\n{\"id\":2,\"path\":\"torn");
@@ -1998,6 +2440,7 @@ mod tests {
             staged_file: "7.bin".to_string(),
             size_bytes: 8,
             base_content_hash: Some("base".to_string()),
+            expected_file_id: None,
         };
         fs::write(
             &journal_path,
@@ -2041,6 +2484,7 @@ mod tests {
             staged_file: "1.bin".to_string(),
             size_bytes: 15,
             base_content_hash: Some("base".to_string()),
+            expected_file_id: None,
         };
         fs::write(staging_dir.join("1.bin"), b"committed bytes").expect("stage");
         fs::write(
@@ -2063,6 +2507,7 @@ mod tests {
                 journal_needs_repair: false,
                 last_error: None,
                 dead_letter_error: None,
+                terminal_errors: HashMap::new(),
             }),
             changed: Condvar::new(),
             journal_path: journal_path.clone(),
@@ -2077,9 +2522,10 @@ mod tests {
             std::slice::from_ref(&entry),
             BatchResolution {
                 committed: HashMap::from([(
-                    entry.path.clone(),
+                    entry.target(),
                     content_hash_for_bytes(b"committed bytes"),
                 )]),
+                retired: HashSet::new(),
                 dead_lettered: Vec::new(),
                 retained: Vec::new(),
             },
@@ -2119,6 +2565,7 @@ mod tests {
                 staged_file: "1.bin".to_string(),
                 size_bytes: 5,
                 base_content_hash: None,
+                expected_file_id: None,
             };
             fs::write(staging_dir.join("1.bin"), b"first").expect("stage first");
             fs::write(
@@ -2137,6 +2584,7 @@ mod tests {
                     journal_needs_repair: false,
                     last_error: None,
                     dead_letter_error: None,
+                    terminal_errors: HashMap::new(),
                 }),
                 changed: Condvar::new(),
                 journal_path: journal_path.clone(),
@@ -2158,7 +2606,7 @@ mod tests {
 
             arm_rewrite_fault(fault);
             journal
-                .enqueue("later.txt", b"later", None)
+                .enqueue("later.txt", b"later", None, None)
                 .expect_err("append cannot bypass a failed canonical repair");
             {
                 let state = shared.state.lock().expect("state");
@@ -2168,7 +2616,7 @@ mod tests {
             }
 
             journal
-                .enqueue("later.txt", b"later", None)
+                .enqueue("later.txt", b"later", None, None)
                 .expect("next append repairs and reanchors the live WAL");
             assert_eq!(
                 read_journal(&journal_path)
@@ -2197,6 +2645,7 @@ mod tests {
             staged_file: "1.bin".to_string(),
             size_bytes: 7,
             base_content_hash: None,
+            expected_file_id: None,
         };
         let error = validate_staged_writes(dir.path(), &VecDeque::from([entry]))
             .expect_err("missing staged content is corruption, not an empty write");
@@ -2212,6 +2661,7 @@ mod tests {
             staged_file: "1.bin".to_string(),
             size_bytes: 4,
             base_content_hash: None,
+            expected_file_id: None,
         };
         fs::write(dir.path().join("1.bin"), b"kept").expect("referenced");
         fs::write(dir.path().join("2.bin"), b"orphan").expect("orphan");

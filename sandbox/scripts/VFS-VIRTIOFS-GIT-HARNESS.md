@@ -69,12 +69,24 @@ Checks cover:
    chmod, sparse/random-offset writes, truncate, atomic replacement, open-unlink
    lifetime, unlink/rmdir, fsync/close/rename barriers, and bidirectional HTTP
    coherence.
-2. Same-mount and simultaneous cross-mount `O_CREAT|O_EXCL`.
+2. Same-mount and synchronized cross-mount `O_CREAT|O_EXCL`: both mounts first
+   complete a negative lookup, then issue the exclusive create while the winner
+   keeps its descriptor open until the loser has received `EEXIST`; the winner's
+   inode, exact mode, bytes, and authoritative stable file identity are checked
+   from both mounts and the backing store. The same check then synchronizes two
+   ordinary `O_CREAT|O_RDWR` callers after negative lookups, holds both
+   descriptors open, publishes `A` and then `B` through opposite mounts, and
+   requires both descriptors, both path views, and the backing store to converge
+   on one stable identity, exact mode `0640`, and bytes `AB`.
 3. Same/cross-mount flock, POSIX byte ranges, release, disjoint ranges, and a
    blocking lock handoff.
 4. Three-alias hard-link inode/link-count identity, writes through every alias,
-   cross-mount rename/unlink coherence, and read/write through an open
-   descriptor after final pathname unlink without resurrection.
+   cross-mount rename/unlink coherence, publication through an open descriptor
+   after another mount deletes and first reuses its pathname with the same old
+   bytes, a cold first read plus `fchmod`/truncate/write after the replacement
+   diverges, stable-file-identity protection for both bytes and mode, and
+   read/write after final pathname unlink with `st_nlink == 0` and no
+   resurrection.
 5. Conventional in-worktree `.git` init/add/commit/branch/merge/rebase/stash/fsck.
 6. A 1,000-file Git workload with machine-readable add/commit/cold-status/
    warm-status/gc/full-fsck timings.

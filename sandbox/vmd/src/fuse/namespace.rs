@@ -723,6 +723,7 @@ mod tests {
             state: Mutex::new(JournalState {
                 pending: VecDeque::from([VfsNamespaceMutation::CreateDirectory {
                     path: "src".to_string(),
+                    mode: None,
                 }]),
                 journal: open_append(&journal_path).expect("journal"),
                 force_flush: false,
@@ -766,12 +767,14 @@ mod tests {
         let journal_path = dir.path().join("namespace.jsonl");
         let mkdir = VfsNamespaceMutation::CreateDirectory {
             path: "src".to_string(),
+            mode: None,
         };
         let rejected = VfsNamespaceMutation::RemoveDirectory {
             path: "probe".to_string(),
         };
         let retained = VfsNamespaceMutation::CreateDirectory {
             path: "src/later".to_string(),
+            mode: None,
         };
         let shared = Shared {
             state: Mutex::new(JournalState {
@@ -820,6 +823,7 @@ mod tests {
         let journal_path = dir.path().join("namespace.jsonl");
         let applied = VfsNamespaceMutation::CreateDirectory {
             path: "src".to_string(),
+            mode: None,
         };
         let failed = VfsNamespaceMutation::Rename {
             from: "src/old.rs".to_string(),
@@ -878,6 +882,7 @@ mod tests {
         };
         let later = VfsNamespaceMutation::CreateDirectory {
             path: "src/later".to_string(),
+            mode: None,
         };
         // A directory at the record-file path makes append fail
         // deterministically.
@@ -1024,6 +1029,7 @@ mod tests {
 
         let first = VfsNamespaceMutation::CreateDirectory {
             path: "first".to_string(),
+            mode: None,
         };
         let mut torn_bytes = serde_json::to_vec(&first).expect("serialize");
         torn_bytes.push(b'\n');
@@ -1050,6 +1056,7 @@ mod tests {
         let journal_path = dir.path().join("namespace.jsonl");
         let first = VfsNamespaceMutation::CreateDirectory {
             path: "first".to_string(),
+            mode: None,
         };
         let mut bytes = serde_json::to_vec(&first).expect("serialize");
         bytes.extend_from_slice(b"\n{\"kind\":\"rename\",\"from\":\"torn");
@@ -1070,6 +1077,7 @@ mod tests {
         let journal_path = dir.path().join("namespace.jsonl");
         let first = VfsNamespaceMutation::CreateDirectory {
             path: "first".to_string(),
+            mode: None,
         };
         fs::write(
             &journal_path,
@@ -1147,6 +1155,7 @@ mod tests {
             let journal_path = dir.path().join("namespace.jsonl");
             let first = VfsNamespaceMutation::CreateDirectory {
                 path: "first".to_string(),
+                mode: None,
             };
             fs::write(
                 &journal_path,
@@ -1181,6 +1190,7 @@ mod tests {
             };
             let later = VfsNamespaceMutation::CreateDirectory {
                 path: "later".to_string(),
+                mode: None,
             };
 
             arm_rewrite_fault(fault);

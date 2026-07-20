@@ -134,8 +134,8 @@ export declare class VfsStorage {
   listDir(path: string, options?: { maxHashBytes?: number | null } | null): Promise<Array<VfsMetadata>>
   /** Read metadata for an indexed set of paths in one backend request. */
   metadataMany(paths: Array<string>): Promise<Array<VfsMetadata | undefined | null>>
-  /** Create a directory. */
-  mkdir(path: string): Promise<void>
+  /** Create a directory, optionally with an exact POSIX mode. */
+  mkdir(path: string, options?: { mode?: number | null } | null): Promise<void>
   /** Create a symbolic link. */
   createSymlink(path: string, target: string): Promise<void>
   /** Create a second pathname for one shared regular-file identity. */
@@ -332,6 +332,7 @@ export interface VfsMetadata {
   fileId?: string
   linkCount?: bigint
   linkTarget?: string
+  mode?: number
   executable?: boolean
   contentHash?: string
   tokenCount?: number
@@ -354,5 +355,7 @@ export interface VfsObjectState {
 /** Write options for VFS storage. */
 export interface VfsWriteOptions {
   ifMatch?: string | null
+  expectedFileId?: string | null
   executable?: boolean
+  mode?: number
 }

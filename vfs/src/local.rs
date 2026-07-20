@@ -4,10 +4,16 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
+use std::ffi::CString;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -21,13 +27,13 @@ use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as AsyncRw
 use uuid::Uuid;
 
 use crate::{
-    OptimizedVfsStorage, VfsStorageDeleteResult, VfsStorageDirListFilter, VfsStorageDirListOrder,
-    VfsStorageEntryKind, VfsStorageError, VfsStorageHardLinkResult, VfsStorageMetadata,
-    VfsStorageMetadataFields, VfsStorageNamespaceMutation, VfsStorageObjectState,
-    VfsStoragePrefetchOptions, VfsStoragePrefetchResult, VfsStorageReadIfChanged,
-    VfsStorageReadIfChangedResult, VfsStorageReadRange, VfsStorageRenameResult, VfsStorageResult,
-    VfsStorageSubtreeOptions, VfsStorageWrite, VfsStorageWriteOptions, VfsStorageWritePrecondition,
-    VfsStorageWriteResult,
+    OptimizedVfsStorage, VfsStorageCasPredicate, VfsStorageDeleteResult, VfsStorageDirListFilter,
+    VfsStorageDirListOrder, VfsStorageEntryKind, VfsStorageError, VfsStorageHardLinkResult,
+    VfsStorageMetadata, VfsStorageMetadataFields, VfsStorageNamespaceMutation,
+    VfsStorageObjectState, VfsStoragePrefetchOptions, VfsStoragePrefetchResult,
+    VfsStorageReadIfChanged, VfsStorageReadIfChangedResult, VfsStorageReadRange,
+    VfsStorageRenameResult, VfsStorageResult, VfsStorageSubtreeOptions, VfsStorageWrite,
+    VfsStorageWriteOptions, VfsStorageWritePrecondition, VfsStorageWriteResult, normalize_vfs_mode,
     pack::{SlotCompression, hex_hash},
 };
 
@@ -35,6 +41,7 @@ use crate::{
 pub struct LocalVfsStorage {
     root: PathBuf,
     hash_cache: Arc<Mutex<HashMap<PathBuf, CachedFileHash>>>,
+    incomplete_absent_writes: Arc<Mutex<HashMap<PathBuf, IncompleteAbsentWrite>>>,
     path_locks: PathLockTable,
     #[cfg(test)]
     durability_sync_observer: Option<DurabilitySyncObserver>,
@@ -78,6 +85,13 @@ struct CachedFileHash {
     cached_at: SystemTime,
     hash: String,
     trusted_write: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IncompleteAbsentWrite {
+    content_hash: String,
+    file_id: Option<String>,
+    options: Option<VfsStorageWriteOptions>,
 }
 
 /// Per-path async mutual exclusion for the check+install critical section.
@@ -224,6 +238,7 @@ impl LocalVfsStorage {
         Self {
             root: root.into(),
             hash_cache: Arc::new(Mutex::new(HashMap::new())),
+            incomplete_absent_writes: Arc::new(Mutex::new(HashMap::new())),
             path_locks: PathLockTable::default(),
             #[cfg(test)]
             durability_sync_observer: None,
@@ -234,6 +249,59 @@ impl LocalVfsStorage {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    fn remember_incomplete_absent_write(
+        &self,
+        path: PathBuf,
+        metadata: &fs::Metadata,
+        content_hash: String,
+        options: Option<VfsStorageWriteOptions>,
+    ) {
+        self.incomplete_absent_writes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                path,
+                IncompleteAbsentWrite {
+                    content_hash,
+                    file_id: local_file_id(metadata),
+                    options,
+                },
+            );
+    }
+
+    fn clear_incomplete_absent_write(&self, path: &Path) {
+        self.incomplete_absent_writes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(path);
+    }
+
+    fn permits_incomplete_absent_replay(
+        &self,
+        path: &Path,
+        content_hash: &str,
+        options: Option<&VfsStorageWriteOptions>,
+    ) -> VfsStorageResult<bool> {
+        let Some(record) = self
+            .incomplete_absent_writes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(path)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(VfsStorageError::Internal(error.to_string())),
+        };
+        Ok(record.content_hash == content_hash
+            && record.file_id == local_file_id(&metadata)
+            && record.options.as_ref() == options)
     }
 
     fn sync_file(&self, file: &fs::File, path: &Path) -> VfsStorageResult<()> {
@@ -247,18 +315,26 @@ impl LocalVfsStorage {
     }
 
     fn sync_directory(&self, path: &Path) -> VfsStorageResult<()> {
+        let directory = fs::File::open(path).map_err(|error| {
+            VfsStorageError::Internal(format!(
+                "open local VFS directory {} for sync: {error}",
+                path.display()
+            ))
+        })?;
+        self.sync_directory_handle(&directory, path)
+    }
+
+    fn sync_directory_handle(&self, directory: &fs::File, path: &Path) -> VfsStorageResult<()> {
         #[cfg(test)]
         if let Some(observer) = self.durability_sync_observer.as_ref() {
             (observer.0)(&DurabilitySyncEvent::Directory(path.to_path_buf()))?;
         }
-        fs::File::open(path)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| {
-                VfsStorageError::Internal(format!(
-                    "sync local VFS directory {}: {error}",
-                    path.display()
-                ))
-            })
+        directory.sync_all().map_err(|error| {
+            VfsStorageError::Internal(format!(
+                "sync local VFS directory {}: {error}",
+                path.display()
+            ))
+        })
     }
 
     async fn run_blocking<T>(
@@ -387,6 +463,7 @@ impl LocalVfsStorage {
             file_id: local_file_id(&metadata),
             link_count: local_link_count(&metadata),
             link_target,
+            mode: posix_mode_from_metadata(&metadata),
             executable: executable_from_metadata(&metadata, kind),
             content_hash,
             token_count: None,
@@ -487,8 +564,18 @@ impl LocalVfsStorage {
             Err(err) => return Err(VfsStorageError::Internal(err.to_string())),
         };
         Ok(VfsStorageWritePrecondition {
+            predicate: Some(if fingerprint == "absent" {
+                VfsStorageCasPredicate::Absent
+            } else {
+                VfsStorageCasPredicate::ContentFingerprint {
+                    fingerprint: fingerprint.clone(),
+                }
+            }),
+            // Rolling-upgrade projection for callers that still inspect the
+            // legacy field. Comparisons below use the typed predicate.
             fingerprint: Some(fingerprint),
             secondary_fingerprint: None,
+            expected_file_id: None,
         })
     }
 
@@ -500,18 +587,40 @@ impl LocalVfsStorage {
         let Some(precondition) = precondition else {
             return Ok(());
         };
-        let expected = precondition.fingerprint.as_deref().unwrap_or("absent");
-        let actual = self
-            .write_precondition(path)?
-            .fingerprint
-            .unwrap_or_else(|| "absent".to_string());
-        if actual == expected {
+        self.assert_expected_file_id(path, precondition)?;
+        let Some(expected) = precondition.effective_predicate() else {
+            return Ok(());
+        };
+        let actual = self.write_precondition(path)?.effective_predicate();
+        if actual.as_ref() == Some(&expected) {
             Ok(())
         } else {
             Err(VfsStorageError::Conflict(format!(
                 "local vfs write precondition failed for {path}"
             )))
         }
+    }
+
+    fn assert_expected_file_id(
+        &self,
+        path: &str,
+        precondition: &VfsStorageWritePrecondition,
+    ) -> VfsStorageResult<()> {
+        if let Some(expected_file_id) = precondition.expected_file_id.as_deref() {
+            let abs_path = self.abs_path(path)?;
+            self.assert_no_symlink_ancestor(&abs_path)?;
+            let actual_file_id = match fs::symlink_metadata(&abs_path) {
+                Ok(metadata) => local_file_id(&metadata),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(VfsStorageError::Internal(error.to_string())),
+            };
+            if actual_file_id.as_deref() != Some(expected_file_id) {
+                return Err(VfsStorageError::Conflict(format!(
+                    "local vfs write identity precondition failed for {path}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     async fn lock_write_paths(&self, paths: impl IntoIterator<Item = String>) -> PathLocks {
@@ -524,14 +633,17 @@ impl LocalVfsStorage {
                     .unwrap_or_else(|err| err.into_inner())
                     .get(&abs_path)
                     .and_then(|entry| entry.file_id.clone());
-                let file_id = cached_file_id.or_else(|| {
-                    fs::symlink_metadata(abs_path)
-                        .ok()
-                        .filter(|metadata| metadata.is_file())
-                        .and_then(|metadata| local_file_id(&metadata))
-                });
-                if let Some(file_id) = file_id {
+                let live_file_id = fs::symlink_metadata(abs_path)
+                    .ok()
+                    .filter(|metadata| metadata.is_file())
+                    .and_then(|metadata| local_file_id(&metadata));
+                if let Some(file_id) = cached_file_id.as_deref() {
                     keys.push(format!("\0inode:{file_id}"));
+                }
+                if let Some(file_id) = live_file_id.as_deref() {
+                    if cached_file_id.as_deref() != Some(file_id) {
+                        keys.push(format!("\0inode:{file_id}"));
+                    }
                 }
             }
             keys.push(path);
@@ -998,11 +1110,23 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                     destination: storage.abs_path(&path)?,
                     path: path.clone(),
                     content_hash: desired_hash,
-                    requested_executable: options.as_ref().map(|value| value.executable),
+                    requested_options: options,
                 };
                 match storage.assert_precondition(&path, precondition.as_ref()) {
                     Ok(()) => {}
                     Err(conflict @ VfsStorageError::Conflict(_)) => {
+                        if let Some(precondition) = precondition.as_ref() {
+                            storage.assert_expected_file_id(&path, precondition)?;
+                        }
+                        if !precondition_allows_exact_replay(precondition.as_ref())
+                            && !storage.permits_incomplete_absent_replay(
+                                &replay.destination,
+                                &replay.content_hash,
+                                replay.requested_options.as_ref(),
+                            )?
+                        {
+                            return Err(conflict);
+                        }
                         if open_exact_write_replay_target(&storage, &replay)?.is_none() {
                             return Err(conflict);
                         }
@@ -1024,7 +1148,11 @@ impl OptimizedVfsStorage for LocalVfsStorage {
             let previous_hash = storage
                 .metadata_for_abs(&abs_path)?
                 .and_then(|metadata| metadata.content_hash);
-            let previous_mode = existing_regular_file_mode(&abs_path)?;
+            let previous_mode = if options.is_some() {
+                existing_regular_file_mode(&abs_path)?
+            } else {
+                None
+            };
             if let Some(parent) = abs_path.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
@@ -1038,9 +1166,13 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                 Uuid::new_v4()
             ));
 
-            let install = (|| -> VfsStorageResult<String> {
+            let install = (|| -> VfsStorageResult<(String, bool)> {
                 let mut source = open_regular_file(&source_path)?;
-                let mut staged = fs::File::create(&tmp_path)
+                let mut staged = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp_path)
                     .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
                 let mut hasher = sha2::Sha256::new();
                 let mut buffer = vec![0_u8; 1024 * 1024];
@@ -1065,13 +1197,26 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                         "staged VFS upload hash mismatch for {path}"
                     )));
                 }
-                let executable = options.as_ref().map(|value| value.executable);
-                apply_executable_option(&tmp_path, executable, previous_mode)?;
-                sync_paths_bounded(&storage, std::slice::from_ref(&tmp_path))?;
-                if let Some(sync_target) =
-                    install_staged_file_preserving_identity(&storage, &tmp_path, &abs_path)?
-                {
-                    apply_executable_option(&abs_path, executable, previous_mode)?;
+                apply_write_options(&tmp_path, options.as_ref(), previous_mode)?;
+                storage.sync_file(&staged, &tmp_path)?;
+                storage.assert_precondition(&path, precondition.as_ref())?;
+                let sync_target = install_staged_file_preserving_identity(
+                    &storage, &tmp_path, &staged, &abs_path,
+                )?;
+                let published_absent_write =
+                    sync_target.is_none() && precondition_expects_absent(precondition.as_ref());
+                if published_absent_write {
+                    let metadata = fs::symlink_metadata(&abs_path)
+                        .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+                    storage.remember_incomplete_absent_write(
+                        abs_path.clone(),
+                        &metadata,
+                        content_hash.clone(),
+                        options.clone(),
+                    );
+                }
+                if let Some(sync_target) = sync_target {
+                    apply_write_options(&abs_path, options.as_ref(), previous_mode)?;
                     storage.sync_file(&sync_target, &abs_path)?;
                 }
                 if let Some(parent) = abs_path.parent() {
@@ -1079,11 +1224,11 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                     collect_directory_chain(&storage.root, parent, &mut touched_directories)?;
                     sync_directories_deepest_first(&storage, touched_directories)?;
                 }
-                Ok(content_hash)
+                Ok((content_hash, published_absent_write))
             })();
 
-            let content_hash = match install {
-                Ok(content_hash) => content_hash,
+            let (content_hash, published_absent_write) = match install {
+                Ok(result) => result,
                 Err(error) => {
                     let _ = fs::remove_file(&tmp_path);
                     return Err(error);
@@ -1092,6 +1237,9 @@ impl OptimizedVfsStorage for LocalVfsStorage {
             let metadata = fs::symlink_metadata(&abs_path)
                 .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
             storage.remember_written_hash(&abs_path, &metadata, content_hash.clone());
+            if published_absent_write {
+                storage.clear_incomplete_absent_write(&abs_path);
+            }
             Ok(VfsStorageWriteResult {
                 path,
                 changed: previous_hash.as_deref() != Some(content_hash.as_str()),
@@ -1145,7 +1293,7 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                     destination: storage.abs_path(&write.path)?,
                     path: write.path.clone(),
                     content_hash: next_hash,
-                    requested_executable: None,
+                    requested_options: None,
                 };
                 if open_exact_write_replay_target(&storage, &replay)?.is_some() {
                     replays.push(replay);
@@ -1162,6 +1310,10 @@ impl OptimizedVfsStorage for LocalVfsStorage {
     }
 
     async fn mkdir(&self, path: &str) -> VfsStorageResult<()> {
+        self.mkdir_with_mode(path, None).await
+    }
+
+    async fn mkdir_with_mode(&self, path: &str, mode: Option<u32>) -> VfsStorageResult<()> {
         let path = path.to_string();
         let _locks = self.lock_write_paths([path.clone()]).await;
         self.run_blocking(move |storage| {
@@ -1169,7 +1321,27 @@ impl OptimizedVfsStorage for LocalVfsStorage {
             storage.assert_no_symlink_ancestor(&abs_path)?;
             fs::create_dir_all(&abs_path)
                 .map_err(|err| VfsStorageError::Internal(err.to_string()))?;
-            sync_directory_chains(&storage, [abs_path])
+            let sync_target = mode.and_then(|_| open_mode_sync_target(&abs_path).ok());
+            apply_directory_mode(&abs_path, mode)?;
+            if mode.is_some() {
+                sync_mode_target(&storage, &abs_path, sync_target)?;
+                sync_directory_chains(&storage, abs_path.parent().map(Path::to_path_buf))
+            } else {
+                sync_directory_chains(&storage, [abs_path])
+            }
+        })
+        .await
+    }
+
+    async fn set_mode(&self, path: &str, mode: u32) -> VfsStorageResult<()> {
+        let path = path.to_string();
+        let _locks = self.lock_write_paths([path.clone()]).await;
+        self.run_blocking(move |storage| {
+            let abs_path = storage.abs_path(&path)?;
+            storage.assert_no_symlink_ancestor(&abs_path)?;
+            let sync_target = open_mode_sync_target(&abs_path).ok();
+            apply_exact_mode(&abs_path, mode, false)?;
+            sync_mode_target(&storage, &abs_path, sync_target)
         })
         .await
     }
@@ -1463,7 +1635,7 @@ impl OptimizedVfsStorage for LocalVfsStorage {
             let mut touched_directories = HashSet::new();
             for mutation in mutations {
                 match mutation {
-                    VfsStorageNamespaceMutation::CreateDirectory { path } => {
+                    VfsStorageNamespaceMutation::CreateDirectory { path, mode } => {
                         let abs_path = storage.abs_path(path.as_str())?;
                         storage.assert_no_symlink_ancestor(&abs_path)?;
                         fs::create_dir_all(&abs_path).map_err(|error| {
@@ -1483,11 +1655,25 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                                 VfsStorageError::Internal(error.to_string())
                             }
                         })?;
-                        collect_directory_chain(
-                            &storage.root,
-                            &abs_path,
-                            &mut touched_directories,
-                        )?;
+                        let sync_target =
+                            mode.and_then(|_| open_mode_sync_target(&abs_path).ok());
+                        apply_directory_mode(&abs_path, mode)?;
+                        if mode.is_some() {
+                            sync_mode_target(&storage, &abs_path, sync_target)?;
+                            if let Some(parent) = abs_path.parent() {
+                                collect_directory_chain(
+                                    &storage.root,
+                                    parent,
+                                    &mut touched_directories,
+                                )?;
+                            }
+                        } else {
+                            collect_directory_chain(
+                                &storage.root,
+                                &abs_path,
+                                &mut touched_directories,
+                            )?;
+                        }
                     }
                     VfsStorageNamespaceMutation::CreateSymlink { path, target } => {
                         let abs_path = storage.abs_path(path.as_str())?;
@@ -1568,6 +1754,14 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                             Err(error) => {
                                 return Err(VfsStorageError::Internal(error.to_string()));
                             }
+                        }
+                    }
+                    VfsStorageNamespaceMutation::SetMode { path, mode } => {
+                        let abs_path = storage.abs_path(path.as_str())?;
+                        storage.assert_no_symlink_ancestor(&abs_path)?;
+                        let sync_target = open_mode_sync_target(&abs_path).ok();
+                        if apply_exact_mode(&abs_path, mode, true)? {
+                            sync_mode_target(&storage, &abs_path, sync_target)?;
                         }
                     }
                     VfsStorageNamespaceMutation::Rename { from, to } => {
@@ -1661,7 +1855,7 @@ struct ExactWriteReplay {
     path: String,
     destination: PathBuf,
     content_hash: String,
-    requested_executable: Option<bool>,
+    requested_options: Option<VfsStorageWriteOptions>,
 }
 
 fn partition_conditional_write_replays(
@@ -1685,11 +1879,24 @@ fn partition_conditional_write_replays(
         match storage.assert_precondition(&write.path, write.precondition.as_ref()) {
             Ok(()) => pending.push((write, options)),
             Err(conflict @ VfsStorageError::Conflict(_)) => {
+                if let Some(precondition) = write.precondition.as_ref() {
+                    storage.assert_expected_file_id(&write.path, precondition)?;
+                }
+                let destination = storage.abs_path(&write.path)?;
+                if !precondition_allows_exact_replay(write.precondition.as_ref())
+                    && !storage.permits_incomplete_absent_replay(
+                        &destination,
+                        &desired_hash,
+                        options.as_ref(),
+                    )?
+                {
+                    return Err(conflict);
+                }
                 let replay = ExactWriteReplay {
-                    destination: storage.abs_path(&write.path)?,
+                    destination,
                     path: write.path,
                     content_hash: desired_hash,
-                    requested_executable: options.as_ref().map(|value| value.executable),
+                    requested_options: options,
                 };
                 if open_exact_write_replay_target(storage, &replay)?.is_none() {
                     return Err(conflict);
@@ -1700,6 +1907,19 @@ fn partition_conditional_write_replays(
         }
     }
     Ok((pending, replays))
+}
+
+fn precondition_allows_exact_replay(precondition: Option<&VfsStorageWritePrecondition>) -> bool {
+    precondition.is_some_and(|precondition| precondition.effective_predicate().is_some())
+}
+
+fn precondition_expects_absent(precondition: Option<&VfsStorageWritePrecondition>) -> bool {
+    precondition.is_some_and(|precondition| {
+        matches!(
+            precondition.effective_predicate(),
+            Some(VfsStorageCasPredicate::Absent)
+        ) && precondition.expected_file_id.is_none()
+    })
 }
 
 fn open_exact_write_replay_target(
@@ -1752,15 +1972,15 @@ fn complete_exact_write_replays(
                     replay.path
                 ))
             })?;
-            if let Some(executable) = replay.requested_executable {
+            if let Some(options) = replay.requested_options.as_ref() {
                 let previous_mode = existing_regular_file_mode(&replay.destination)?;
-                apply_executable_option(&replay.destination, Some(executable), previous_mode)?;
+                apply_write_options(&replay.destination, Some(options), previous_mode)?;
                 let metadata = file
                     .metadata()
                     .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
-                if executable_from_metadata(&metadata, VfsStorageEntryKind::File) != executable {
+                if !write_options_match(&metadata, options) {
                     return Err(VfsStorageError::Internal(format!(
-                        "local VFS executable mode did not converge for {}",
+                        "local VFS mode did not converge for {}",
                         replay.path
                     )));
                 }
@@ -1796,9 +2016,10 @@ fn complete_exact_write_replays(
             .metadata()
             .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
         if !metadata_identity_matches(&synced_metadata, &metadata)
-            || replay.requested_executable.is_some_and(|requested| {
-                executable_from_metadata(&metadata, VfsStorageEntryKind::File) != requested
-            })
+            || replay
+                .requested_options
+                .as_ref()
+                .is_some_and(|options| !write_options_match(&metadata, options))
         {
             return Err(VfsStorageError::Conflict(format!(
                 "local vfs write replay changed before durability completed for {}",
@@ -1806,6 +2027,7 @@ fn complete_exact_write_replays(
             )));
         }
         storage.remember_written_hash(&replay.destination, &metadata, replay.content_hash.clone());
+        storage.clear_incomplete_absent_write(&replay.destination);
         results.push(VfsStorageWriteResult {
             path: replay.path.clone(),
             content_hash: replay.content_hash.clone(),
@@ -1852,8 +2074,7 @@ fn install_writes_with_options(
         let previous_hash = storage
             .metadata_for_abs(&abs_path)?
             .and_then(|metadata| metadata.content_hash);
-        let executable = options.as_ref().map(|options| options.executable);
-        let previous_mode = if executable.is_some() {
+        let previous_mode = if options.is_some() {
             existing_regular_file_mode(&abs_path)?
         } else {
             None
@@ -1872,14 +2093,17 @@ fn install_writes_with_options(
         ));
         fs::write(&tmp_path, &write.bytes)
             .map_err(|err| VfsStorageError::Internal(err.to_string()))?;
-        apply_executable_option(&tmp_path, executable, previous_mode)?;
+        let temporary_file = open_mode_sync_target(&tmp_path)?;
+        apply_write_options(&tmp_path, options.as_ref(), previous_mode)?;
         staged.push(StagedWrite {
             path: write.path,
             destination: abs_path,
             temporary: tmp_path,
+            temporary_file,
             content_hash,
             previous_hash,
-            executable,
+            options,
+            precondition: write.precondition,
             previous_mode,
         });
     }
@@ -1890,7 +2114,37 @@ fn install_writes_with_options(
         .iter()
         .map(|write| write.temporary.clone())
         .collect::<Vec<_>>();
-    if let Err(error) = sync_paths_bounded(storage, &staged_paths) {
+    let staged_sync_targets = staged
+        .iter()
+        .map(|write| {
+            Ok(FileSyncTarget {
+                path: write.temporary.clone(),
+                file: write
+                    .temporary_file
+                    .try_clone()
+                    .map_err(|error| VfsStorageError::Internal(error.to_string()))?,
+            })
+        })
+        .collect::<VfsStorageResult<Vec<_>>>();
+    let staged_sync_targets = match staged_sync_targets {
+        Ok(targets) => targets,
+        Err(error) => {
+            for path in staged_paths {
+                let _ = fs::remove_file(path);
+            }
+            return Err(error);
+        }
+    };
+    if let Err(error) = sync_files_bounded(storage, &staged_sync_targets) {
+        for path in staged_paths {
+            let _ = fs::remove_file(path);
+        }
+        return Err(error);
+    }
+    if let Err(error) = staged
+        .iter()
+        .try_for_each(|write| storage.assert_precondition(&write.path, write.precondition.as_ref()))
+    {
         for path in staged_paths {
             let _ = fs::remove_file(path);
         }
@@ -1901,12 +2155,30 @@ fn install_writes_with_options(
     let mut sync_targets = Vec::with_capacity(MAX_PARALLEL_FILE_SYNCS);
     let mut touched_directories = HashSet::new();
     for staged in staged {
-        if let Some(target) = install_staged_file_preserving_identity(
+        let sync_target = install_staged_file_preserving_identity(
             storage,
             &staged.temporary,
+            &staged.temporary_file,
             &staged.destination,
-        )? {
-            apply_executable_option(&staged.destination, staged.executable, staged.previous_mode)?;
+        )?;
+        let published_absent_write =
+            sync_target.is_none() && precondition_expects_absent(staged.precondition.as_ref());
+        if published_absent_write {
+            let metadata = fs::symlink_metadata(&staged.destination)
+                .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+            storage.remember_incomplete_absent_write(
+                staged.destination.clone(),
+                &metadata,
+                staged.content_hash.clone(),
+                staged.options.clone(),
+            );
+        }
+        if let Some(target) = sync_target {
+            apply_write_options(
+                &staged.destination,
+                staged.options.as_ref(),
+                staged.previous_mode,
+            )?;
             sync_targets.push(FileSyncTarget {
                 path: staged.destination.clone(),
                 file: target,
@@ -1924,17 +2196,21 @@ fn install_writes_with_options(
             staged.destination,
             staged.content_hash,
             staged.previous_hash,
+            published_absent_write,
         ));
     }
     sync_files_bounded(storage, &sync_targets)?;
     sync_directories_deepest_first(storage, touched_directories)?;
 
     let mut results = Vec::with_capacity(installed.len());
-    for (path, abs_path, content_hash, previous_hash) in installed {
+    for (path, abs_path, content_hash, previous_hash, published_absent_write) in installed {
         let metadata = fs::symlink_metadata(&abs_path)
             .map_err(|err| VfsStorageError::Internal(err.to_string()))?;
         storage.invalidate_hash_identity(&metadata);
         storage.remember_written_hash(&abs_path, &metadata, content_hash.clone());
+        if published_absent_write {
+            storage.clear_incomplete_absent_write(&abs_path);
+        }
         results.push(VfsStorageWriteResult {
             path,
             content_hash,
@@ -1949,15 +2225,18 @@ struct StagedWrite {
     path: String,
     destination: PathBuf,
     temporary: PathBuf,
+    temporary_file: fs::File,
     content_hash: String,
     previous_hash: Option<String>,
-    executable: Option<bool>,
+    options: Option<VfsStorageWriteOptions>,
+    precondition: Option<VfsStorageWritePrecondition>,
     previous_mode: Option<u32>,
 }
 
 fn install_staged_file_preserving_identity(
     storage: &LocalVfsStorage,
     staged_path: &Path,
+    staged_file: &fs::File,
     destination: &Path,
 ) -> VfsStorageResult<Option<fs::File>> {
     let existing = match fs::symlink_metadata(destination) {
@@ -1972,7 +2251,12 @@ fn install_staged_file_preserving_identity(
         // required even at nlink=1 so open handles and stable file identity
         // survive ordinary writes. Atomic replacement remains available to
         // callers through rename(2) of a separately created pathname.
-        let mut source = open_regular_file(staged_path)?;
+        let mut source = staged_file
+            .try_clone()
+            .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+        source
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
         let mut target = fs::OpenOptions::new()
             .write(true)
             .truncate(true)
@@ -2000,33 +2284,6 @@ fn install_staged_file_preserving_identity(
 struct FileSyncTarget {
     path: PathBuf,
     file: fs::File,
-}
-
-fn sync_paths_bounded(storage: &LocalVfsStorage, paths: &[PathBuf]) -> VfsStorageResult<()> {
-    if paths.is_empty() {
-        return Ok(());
-    }
-    let worker_count = paths.len().min(MAX_PARALLEL_FILE_SYNCS);
-    let chunk_size = paths.len().div_ceil(worker_count);
-    std::thread::scope(|scope| {
-        let workers = paths
-            .chunks(chunk_size)
-            .map(|chunk| {
-                scope.spawn(move || {
-                    for path in chunk {
-                        let file = fs::OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .open(path)
-                            .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
-                        storage.sync_file(&file, path)?;
-                    }
-                    Ok(())
-                })
-            })
-            .collect::<Vec<_>>();
-        join_sync_workers(workers)
-    })
 }
 
 fn sync_files_bounded(storage: &LocalVfsStorage, files: &[FileSyncTarget]) -> VfsStorageResult<()> {
@@ -2537,9 +2794,22 @@ fn executable_from_metadata(_metadata: &fs::Metadata, _kind: VfsStorageEntryKind
 }
 
 #[cfg(unix)]
+fn posix_mode_from_metadata(metadata: &fs::Metadata) -> Option<u32> {
+    (metadata.is_file() || metadata.is_dir())
+        .then(|| normalize_vfs_mode(metadata.permissions().mode()))
+}
+
+#[cfg(not(unix))]
+fn posix_mode_from_metadata(_metadata: &fs::Metadata) -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
 fn existing_regular_file_mode(path: &Path) -> VfsStorageResult<Option<u32>> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() => Ok(Some(metadata.permissions().mode() & 0o777)),
+        Ok(metadata) if metadata.is_file() => {
+            Ok(Some(normalize_vfs_mode(metadata.permissions().mode())))
+        }
         Ok(_) => Ok(None),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(VfsStorageError::Internal(err.to_string())),
@@ -2552,35 +2822,259 @@ fn existing_regular_file_mode(_path: &Path) -> VfsStorageResult<Option<u32>> {
 }
 
 #[cfg(unix)]
-fn apply_executable_option(
+fn apply_write_options(
     path: &Path,
-    executable: Option<bool>,
+    options: Option<&VfsStorageWriteOptions>,
     previous_mode: Option<u32>,
 ) -> VfsStorageResult<()> {
-    let Some(executable) = executable else {
+    let Some(options) = options else {
         return Ok(());
     };
     let metadata =
         fs::symlink_metadata(path).map_err(|err| VfsStorageError::Internal(err.to_string()))?;
-    let current_mode = metadata.permissions().mode() & 0o777;
-    let target_mode = match (previous_mode, executable) {
-        (Some(mode), true) => mode | 0o111,
-        (Some(mode), false) => mode & !0o111,
-        (None, true) => 0o755,
-        (None, false) => current_mode & !0o111,
-    };
-    let mut permissions = metadata.permissions();
-    permissions.set_mode(target_mode);
-    fs::set_permissions(path, permissions).map_err(|err| VfsStorageError::Internal(err.to_string()))
+    let current_mode = normalize_vfs_mode(metadata.permissions().mode());
+    let target_mode = options.mode.map(normalize_vfs_mode).unwrap_or_else(|| {
+        match (previous_mode, options.executable) {
+            (Some(mode), true) => mode | 0o111,
+            (Some(mode), false) => mode & !0o111,
+            (None, true) => 0o755,
+            (None, false) => current_mode & !0o111,
+        }
+    });
+    apply_exact_mode(path, target_mode, false)?;
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn apply_executable_option(
+fn apply_write_options(
     _path: &Path,
-    _executable: Option<bool>,
+    options: Option<&VfsStorageWriteOptions>,
     _previous_mode: Option<u32>,
 ) -> VfsStorageResult<()> {
+    if options.and_then(|options| options.mode).is_some() {
+        return Err(VfsStorageError::BadRequest(
+            "exact POSIX mode is not supported on this platform".to_string(),
+        ));
+    }
     Ok(())
+}
+
+#[cfg(unix)]
+fn write_options_match(metadata: &fs::Metadata, options: &VfsStorageWriteOptions) -> bool {
+    if let Some(mode) = options.mode {
+        return posix_mode_from_metadata(metadata) == Some(normalize_vfs_mode(mode));
+    }
+    executable_from_metadata(metadata, VfsStorageEntryKind::File) == options.executable
+}
+
+#[cfg(not(unix))]
+fn write_options_match(_metadata: &fs::Metadata, options: &VfsStorageWriteOptions) -> bool {
+    options.mode.is_none()
+}
+
+#[cfg(unix)]
+fn apply_directory_mode(path: &Path, mode: Option<u32>) -> VfsStorageResult<()> {
+    let Some(mode) = mode else {
+        return Ok(());
+    };
+    apply_exact_mode(path, mode, false)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn apply_directory_mode(_path: &Path, mode: Option<u32>) -> VfsStorageResult<()> {
+    if mode.is_some() {
+        return Err(VfsStorageError::BadRequest(
+            "exact POSIX mode is not supported on this platform".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn apply_exact_mode(path: &Path, mode: u32, allow_missing: bool) -> VfsStorageResult<bool> {
+    let path_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(VfsStorageError::NotFound(path.display().to_string()));
+        }
+        Err(error) => return Err(VfsStorageError::Internal(error.to_string())),
+    };
+    if !path_metadata.is_file() && !path_metadata.is_dir() {
+        return Err(VfsStorageError::BadRequest(format!(
+            "POSIX mode changes require a regular file or directory: {}",
+            path.display()
+        )));
+    }
+    let target_mode = normalize_vfs_mode(mode);
+    let updated = set_mode_nofollow(path, target_mode)?;
+    let path_after =
+        fs::symlink_metadata(path).map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+    if !metadata_identity_matches(&path_metadata, &updated)
+        || !metadata_identity_matches(&updated, &path_after)
+        || posix_mode_from_metadata(&updated) != Some(target_mode)
+    {
+        return Err(VfsStorageError::Conflict(format!(
+            "local VFS mode target changed before convergence for {}",
+            path.display()
+        )));
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn set_mode_nofollow(path: &Path, mode: u32) -> VfsStorageResult<fs::Metadata> {
+    let encoded = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        VfsStorageError::BadRequest(format!("local VFS path contains NUL: {}", path.display()))
+    })?;
+    let raw_fd = unsafe {
+        libc::open(
+            encoded.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw_fd < 0 {
+        return Err(VfsStorageError::Internal(
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    let target = unsafe { fs::File::from_raw_fd(raw_fd) };
+    let before = target
+        .metadata()
+        .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+    if !before.is_file() && !before.is_dir() {
+        return Err(VfsStorageError::BadRequest(format!(
+            "POSIX mode changes require a regular file or directory: {}",
+            path.display()
+        )));
+    }
+    let empty = [0_u8];
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_fchmodat2,
+            target.as_raw_fd(),
+            empty.as_ptr().cast::<libc::c_char>(),
+            mode as libc::mode_t,
+            libc::AT_EMPTY_PATH,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        let fallback = error
+            .raw_os_error()
+            .is_some_and(|code| matches!(code, libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP));
+        if !fallback {
+            return Err(VfsStorageError::Internal(error.to_string()));
+        }
+        let descriptor_path = CString::new(format!("/proc/self/fd/{}", target.as_raw_fd()))
+            .expect("descriptor path contains no NUL");
+        if unsafe { libc::chmod(descriptor_path.as_ptr(), mode as libc::mode_t) } != 0 {
+            return Err(VfsStorageError::Internal(
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+    }
+    target
+        .metadata()
+        .map_err(|error| VfsStorageError::Internal(error.to_string()))
+}
+
+#[cfg(target_os = "macos")]
+fn set_mode_nofollow(path: &Path, mode: u32) -> VfsStorageResult<fs::Metadata> {
+    let encoded = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        VfsStorageError::BadRequest(format!("local VFS path contains NUL: {}", path.display()))
+    })?;
+    if unsafe {
+        libc::fchmodat(
+            libc::AT_FDCWD,
+            encoded.as_ptr(),
+            mode as libc::mode_t,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(VfsStorageError::Internal(
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    fs::symlink_metadata(path).map_err(|error| VfsStorageError::Internal(error.to_string()))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn set_mode_nofollow(path: &Path, mode: u32) -> VfsStorageResult<fs::Metadata> {
+    let encoded = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        VfsStorageError::BadRequest(format!("local VFS path contains NUL: {}", path.display()))
+    })?;
+    if unsafe {
+        libc::fchmodat(
+            libc::AT_FDCWD,
+            encoded.as_ptr(),
+            mode as libc::mode_t,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(VfsStorageError::Internal(
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    fs::symlink_metadata(path).map_err(|error| VfsStorageError::Internal(error.to_string()))
+}
+
+#[cfg(not(unix))]
+fn apply_exact_mode(_path: &Path, _mode: u32, _allow_missing: bool) -> VfsStorageResult<bool> {
+    Err(VfsStorageError::BadRequest(
+        "exact POSIX mode is not supported on this platform".to_string(),
+    ))
+}
+
+fn open_mode_sync_target(path: &Path) -> VfsStorageResult<fs::File> {
+    let open = |read: bool, write: bool| {
+        let mut options = fs::OpenOptions::new();
+        options.read(read).write(write);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.open(path)
+    };
+    open(true, false)
+        .or_else(|_| open(false, true))
+        .map_err(|error| VfsStorageError::Internal(error.to_string()))
+}
+
+fn sync_mode_target(
+    storage: &LocalVfsStorage,
+    path: &Path,
+    opened_before_mode_change: Option<fs::File>,
+) -> VfsStorageResult<()> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err(VfsStorageError::BadRequest(format!(
+            "POSIX mode changes require a regular file or directory: {}",
+            path.display()
+        )));
+    }
+    let file = match opened_before_mode_change {
+        Some(file) => file,
+        None => open_mode_sync_target(path)?,
+    };
+    let opened = file
+        .metadata()
+        .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+    if !metadata_identity_matches(&metadata, &opened) {
+        return Err(VfsStorageError::Conflict(format!(
+            "local VFS mode target changed before durability for {}",
+            path.display()
+        )));
+    }
+    if metadata.is_dir() {
+        storage.sync_directory_handle(&file, path)
+    } else {
+        storage.sync_file(&file, path)
+    }
 }
 
 fn modified_at(metadata: &fs::Metadata) -> Option<DateTime<Utc>> {
@@ -2698,6 +3192,16 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn path_mode(path: &Path) -> u32 {
+        normalize_vfs_mode(
+            fs::symlink_metadata(path)
+                .expect("mode metadata")
+                .permissions()
+                .mode(),
+        )
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn local_new_file_syncs_data_and_mode_before_directory_chain() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2724,7 +3228,10 @@ mod tests {
                 "one/two/tool.sh",
                 Bytes::from_static(b"#!/bin/sh\nexit 0\n"),
                 None,
-                Some(VfsStorageWriteOptions { executable: true }),
+                Some(VfsStorageWriteOptions {
+                    executable: true,
+                    mode: None,
+                }),
             )
             .await
             .expect("durable executable write");
@@ -2826,8 +3333,10 @@ mod tests {
             Ok(())
         });
         let precondition = VfsStorageWritePrecondition {
+            predicate: None,
             fingerprint: Some(hex_hash(b"old")),
             secondary_fingerprint: None,
+            expected_file_id: None,
         };
 
         let first = storage
@@ -2835,7 +3344,10 @@ mod tests {
                 "nested/value",
                 Bytes::from_static(b"desired"),
                 Some(precondition.clone()),
-                Some(VfsStorageWriteOptions { executable: true }),
+                Some(VfsStorageWriteOptions {
+                    executable: true,
+                    mode: None,
+                }),
             )
             .await;
         assert!(first.is_err(), "file barrier failure must prevent ack");
@@ -2847,7 +3359,10 @@ mod tests {
                 "nested/value",
                 Bytes::from_static(b"desired"),
                 Some(precondition.clone()),
-                Some(VfsStorageWriteOptions { executable: true }),
+                Some(VfsStorageWriteOptions {
+                    executable: true,
+                    mode: None,
+                }),
             )
             .await
             .expect("exact desired-state replay");
@@ -2867,7 +3382,10 @@ mod tests {
                 "nested/value",
                 Bytes::from_static(b"different"),
                 Some(precondition.clone()),
-                Some(VfsStorageWriteOptions { executable: true }),
+                Some(VfsStorageWriteOptions {
+                    executable: true,
+                    mode: None,
+                }),
             )
             .await;
         assert!(matches!(mismatch, Err(VfsStorageError::Conflict(_))));
@@ -2881,7 +3399,10 @@ mod tests {
                 "nested/value",
                 Bytes::from_static(b"desired"),
                 Some(precondition),
-                Some(VfsStorageWriteOptions { executable: true }),
+                Some(VfsStorageWriteOptions {
+                    executable: true,
+                    mode: None,
+                }),
             )
             .await
             .expect("exact-byte replay must restore requested mode");
@@ -2917,8 +3438,10 @@ mod tests {
             Ok(())
         });
         let precondition = VfsStorageWritePrecondition {
+            predicate: None,
             fingerprint: None,
             secondary_fingerprint: None,
+            expected_file_id: None,
         };
 
         let first = storage
@@ -2926,7 +3449,10 @@ mod tests {
                 "nested/value",
                 Bytes::from_static(b"desired"),
                 Some(precondition.clone()),
-                Some(VfsStorageWriteOptions { executable: true }),
+                Some(VfsStorageWriteOptions {
+                    executable: true,
+                    mode: None,
+                }),
             )
             .await;
         assert!(first.is_err(), "directory barrier failure must prevent ack");
@@ -2938,7 +3464,10 @@ mod tests {
                 "nested/value",
                 Bytes::from_static(b"desired"),
                 Some(precondition.clone()),
-                Some(VfsStorageWriteOptions { executable: true }),
+                Some(VfsStorageWriteOptions {
+                    executable: true,
+                    mode: None,
+                }),
             )
             .await
             .expect("exact new-path replay");
@@ -2954,16 +3483,29 @@ mod tests {
         let mut permissions = fs::metadata(&destination).expect("metadata").permissions();
         permissions.set_mode(0o644);
         fs::set_permissions(&destination, permissions).expect("mode mismatch");
-        let mismatch = storage
+        let completed_retry = storage
             .write_with_options(
                 "nested/value",
                 Bytes::from_static(b"desired"),
                 Some(precondition),
-                Some(VfsStorageWriteOptions { executable: true }),
+                Some(VfsStorageWriteOptions {
+                    executable: true,
+                    mode: None,
+                }),
             )
-            .await
-            .expect("exact bytes allow requested mode recovery");
-        assert!(!mismatch.changed);
+            .await;
+        assert!(
+            matches!(completed_retry, Err(VfsStorageError::Conflict(_))),
+            "a completed expect-absent operation must not authorize later identical creators",
+        );
+        assert_eq!(
+            fs::metadata(&destination)
+                .expect("preserved metadata")
+                .permissions()
+                .mode()
+                & 0o111,
+            0,
+        );
     }
 
     #[cfg(unix)]
@@ -2988,8 +3530,10 @@ mod tests {
             Ok(())
         });
         let stale = VfsStorageWritePrecondition {
+            predicate: None,
             fingerprint: Some(hex_hash(b"old")),
             secondary_fingerprint: None,
+            expected_file_id: None,
         };
 
         let replaced = storage
@@ -3027,8 +3571,10 @@ mod tests {
                     bytes: Bytes::from_static(b"desired"),
                     token_count: None,
                     precondition: Some(VfsStorageWritePrecondition {
+                        predicate: None,
                         fingerprint: Some(hex_hash(b"old")),
                         secondary_fingerprint: None,
+                        expected_file_id: None,
                     }),
                 },
                 VfsStorageWrite {
@@ -3036,8 +3582,10 @@ mod tests {
                     bytes: Bytes::from_static(b"new"),
                     token_count: None,
                     precondition: Some(VfsStorageWritePrecondition {
+                        predicate: None,
                         fingerprint: None,
                         secondary_fingerprint: None,
+                        expected_file_id: None,
                     }),
                 },
             ])
@@ -3125,8 +3673,10 @@ mod tests {
             Ok(())
         });
         let precondition = VfsStorageWritePrecondition {
+            predicate: None,
             fingerprint: Some(hex_hash(b"old")),
             secondary_fingerprint: None,
+            expected_file_id: None,
         };
 
         assert!(
@@ -3321,8 +3871,10 @@ mod tests {
         });
 
         let precondition = VfsStorageWritePrecondition {
+            predicate: None,
             fingerprint: Some(hex_hash(b"value")),
             secondary_fingerprint: None,
+            expected_file_id: None,
         };
         let first = storage
             .delete_file_with_metadata("nested/value", Some(precondition.clone()))
@@ -3486,8 +4038,10 @@ mod tests {
         let mutation = VfsStorageNamespaceMutation::DeleteFile {
             path: "nested/value".to_string(),
             precondition: Some(VfsStorageWritePrecondition {
+                predicate: None,
                 fingerprint: Some(hex_hash(b"value")),
                 secondary_fingerprint: None,
+                expected_file_id: None,
             }),
         };
 
@@ -3747,6 +4301,36 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_path_lock_covers_cached_and_live_file_identities() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        storage
+            .write("path", Bytes::from_static(b"cached"), None)
+            .await
+            .expect("cached inode");
+        let cached_id = storage
+            .stat("path")
+            .await
+            .expect("cached stat")
+            .expect("cached metadata")
+            .file_id
+            .expect("cached identity");
+        fs::rename(dir.path().join("path"), dir.path().join("old-alias"))
+            .expect("replace cached path");
+        fs::write(dir.path().join("path"), b"live").expect("live inode");
+        let live_id =
+            local_file_id(&fs::symlink_metadata(dir.path().join("path")).expect("live metadata"))
+                .expect("live identity");
+        assert_ne!(cached_id, live_id);
+
+        let locks = storage.lock_write_paths(["path".to_string()]).await;
+        assert!(locks.keys.contains(&format!("\0inode:{cached_id}")));
+        assert!(locks.keys.contains(&format!("\0inode:{live_id}")));
+        assert!(locks.keys.contains(&"path".to_string()));
+    }
+
     #[tokio::test]
     async fn local_storage_round_trips_batch_and_range_reads() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3805,6 +4389,7 @@ mod tests {
         let mutations = vec![
             VfsStorageNamespaceMutation::CreateDirectory {
                 path: "tree".to_string(),
+                mode: None,
             },
             VfsStorageNamespaceMutation::Rename {
                 from: "incoming.txt".to_string(),
@@ -3995,15 +4580,19 @@ mod tests {
                 VfsStorageNamespaceMutation::DeleteFile {
                     path: "a.txt".to_string(),
                     precondition: Some(VfsStorageWritePrecondition {
+                        predicate: None,
                         fingerprint: Some(hash_a.clone()),
                         secondary_fingerprint: None,
+                        expected_file_id: None,
                     }),
                 },
                 VfsStorageNamespaceMutation::DeleteFile {
                     path: "b.txt".to_string(),
                     precondition: Some(VfsStorageWritePrecondition {
+                        predicate: None,
                         fingerprint: Some("stale".to_string()),
                         secondary_fingerprint: None,
+                        expected_file_id: None,
                     }),
                 },
             ])
@@ -4017,15 +4606,19 @@ mod tests {
                 VfsStorageNamespaceMutation::DeleteFile {
                     path: "a.txt".to_string(),
                     precondition: Some(VfsStorageWritePrecondition {
+                        predicate: None,
                         fingerprint: Some(hash_a),
                         secondary_fingerprint: None,
+                        expected_file_id: None,
                     }),
                 },
                 VfsStorageNamespaceMutation::DeleteFile {
                     path: "b.txt".to_string(),
                     precondition: Some(VfsStorageWritePrecondition {
+                        predicate: None,
                         fingerprint: Some(hex_hash(b"b")),
                         secondary_fingerprint: None,
+                        expected_file_id: None,
                     }),
                 },
             ])
@@ -4302,8 +4895,10 @@ mod tests {
             .delete_file_with_metadata(
                 "link.txt",
                 Some(VfsStorageWritePrecondition {
+                    predicate: None,
                     fingerprint: Some("symlink:stale".to_string()),
                     secondary_fingerprint: None,
+                    expected_file_id: None,
                 }),
             )
             .await;
@@ -4314,8 +4909,10 @@ mod tests {
             .delete_file_with_metadata(
                 "link.txt",
                 Some(VfsStorageWritePrecondition {
+                    predicate: None,
                     fingerprint: Some(expected),
                     secondary_fingerprint: None,
+                    expected_file_id: None,
                 }),
             )
             .await
@@ -4498,6 +5095,7 @@ mod tests {
             .expect("stat")
             .expect("metadata");
         assert!(metadata.executable);
+        assert_eq!(metadata.mode, Some(0o755));
 
         let listed = storage
             .list_dir_with_metadata("", VfsStorageDirListFilter::default())
@@ -4510,6 +5108,208 @@ mod tests {
             .await
             .expect("subtree");
         assert!(subtree.iter().any(|entry| entry.executable));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_write_mode_wins_and_replay_repairs_mode_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        let first = storage
+            .write("tool", Bytes::from_static(b"old"), None)
+            .await
+            .expect("initial write");
+        let file_id = storage
+            .stat("tool")
+            .await
+            .expect("stat")
+            .expect("metadata")
+            .file_id
+            .expect("stable identity");
+        let precondition = VfsStorageWritePrecondition {
+            predicate: None,
+            fingerprint: Some(first.content_hash),
+            secondary_fingerprint: None,
+            expected_file_id: Some(file_id),
+        };
+        storage
+            .write_with_options(
+                "tool",
+                Bytes::from_static(b"desired"),
+                Some(precondition.clone()),
+                Some(VfsStorageWriteOptions {
+                    executable: true,
+                    mode: Some(0o1000640),
+                }),
+            )
+            .await
+            .expect("exact mode write");
+        assert_eq!(path_mode(&dir.path().join("tool")), 0o640);
+        let metadata = storage.stat("tool").await.expect("stat").expect("metadata");
+        assert_eq!(metadata.mode, Some(0o640));
+        assert!(!metadata.executable, "exact mode overrides executable");
+
+        fs::set_permissions(dir.path().join("tool"), fs::Permissions::from_mode(0o600))
+            .expect("force mode mismatch");
+        let replay = storage
+            .write_with_options(
+                "tool",
+                Bytes::from_static(b"desired"),
+                Some(precondition),
+                Some(VfsStorageWriteOptions {
+                    executable: true,
+                    mode: Some(0o640),
+                }),
+            )
+            .await
+            .expect("same-byte exact-mode replay");
+        assert!(!replay.changed);
+        assert_eq!(path_mode(&dir.path().join("tool")), 0o640);
+
+        storage
+            .write_with_options(
+                "zero",
+                Bytes::from_static(b"zero"),
+                Some(VfsStorageWritePrecondition {
+                    predicate: None,
+                    fingerprint: None,
+                    secondary_fingerprint: None,
+                    expected_file_id: None,
+                }),
+                Some(VfsStorageWriteOptions {
+                    executable: true,
+                    mode: Some(0o000),
+                }),
+            )
+            .await
+            .expect("zero-mode write");
+        assert_eq!(path_mode(&dir.path().join("zero")), 0o000);
+        storage
+            .set_mode("zero", 0o600)
+            .await
+            .expect("recover zero-mode file");
+        assert_eq!(
+            fs::read(dir.path().join("zero")).expect("zero-mode bytes"),
+            b"zero",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_directory_modes_are_idempotent_and_legacy_mkdir_preserves_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        storage
+            .mkdir_with_mode("parent/leaf", Some(0o750))
+            .await
+            .expect("mode-aware mkdir");
+        let leaf = dir.path().join("parent/leaf");
+        assert_eq!(path_mode(&leaf), 0o750);
+        assert_eq!(
+            storage
+                .stat("parent/leaf")
+                .await
+                .expect("stat")
+                .expect("metadata")
+                .mode,
+            Some(0o750),
+        );
+
+        fs::set_permissions(&leaf, fs::Permissions::from_mode(0o700))
+            .expect("force directory mode mismatch");
+        storage
+            .apply_namespace_batch(vec![VfsStorageNamespaceMutation::CreateDirectory {
+                path: "parent/leaf".to_string(),
+                mode: Some(0o750),
+            }])
+            .await
+            .expect("mkdir replay");
+        assert_eq!(path_mode(&leaf), 0o750);
+
+        fs::set_permissions(&leaf, fs::Permissions::from_mode(0o711))
+            .expect("set legacy preserved mode");
+        storage.mkdir("parent/leaf").await.expect("legacy mkdir");
+        assert_eq!(path_mode(&leaf), 0o711);
+
+        storage
+            .mkdir_with_mode("zero", Some(0o000))
+            .await
+            .expect("zero-mode mkdir");
+        assert_eq!(path_mode(&dir.path().join("zero")), 0o000);
+        storage
+            .set_mode("zero", 0o700)
+            .await
+            .expect("recover zero-mode directory");
+
+        storage
+            .mkdir_with_mode("umask-proof", Some(0o777))
+            .await
+            .expect("exact mode must not be masked twice");
+        assert_eq!(path_mode(&dir.path().join("umask-proof")), 0o777);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn set_mode_is_replayable_for_files_directories_and_mode_zero_recovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        storage
+            .write("file", Bytes::from_static(b"value"), None)
+            .await
+            .expect("file");
+        storage.mkdir("directory").await.expect("directory");
+        let mutations = vec![
+            VfsStorageNamespaceMutation::SetMode {
+                path: "file".to_string(),
+                mode: 0o1000640,
+            },
+            VfsStorageNamespaceMutation::SetMode {
+                path: "directory".to_string(),
+                mode: 0o751,
+            },
+        ];
+        storage
+            .apply_namespace_batch(mutations.clone())
+            .await
+            .expect("set modes");
+        storage
+            .apply_namespace_batch(mutations)
+            .await
+            .expect("replay set modes");
+        assert_eq!(path_mode(&dir.path().join("file")), 0o640);
+        assert_eq!(path_mode(&dir.path().join("directory")), 0o751);
+
+        storage.set_mode("file", 0o000).await.expect("lock file");
+        storage
+            .set_mode("directory", 0o000)
+            .await
+            .expect("lock directory");
+        assert_eq!(path_mode(&dir.path().join("file")), 0o000);
+        assert_eq!(path_mode(&dir.path().join("directory")), 0o000);
+        storage.set_mode("file", 0o640).await.expect("recover file");
+        storage
+            .set_mode("directory", 0o755)
+            .await
+            .expect("recover directory");
+        assert_eq!(path_mode(&dir.path().join("file")), 0o640);
+        assert_eq!(path_mode(&dir.path().join("directory")), 0o755);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn set_mode_rejects_a_final_symlink_without_touching_its_target() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path().join("root");
+        fs::create_dir(&root).expect("root");
+        let target = base.path().join("target");
+        fs::write(&target, b"target").expect("target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).expect("target mode");
+        symlink(&target, root.join("link")).expect("symlink");
+        let storage = LocalVfsStorage::new(&root);
+
+        let result = storage.set_mode("link", 0o777).await;
+        assert!(matches!(result, Err(VfsStorageError::BadRequest(_))));
+        assert_eq!(path_mode(&target), 0o640);
     }
 
     #[tokio::test]
@@ -4691,7 +5491,10 @@ mod tests {
                 "bin/tool",
                 Bytes::from_static(b"tool"),
                 None,
-                Some(VfsStorageWriteOptions { executable: true }),
+                Some(VfsStorageWriteOptions {
+                    executable: true,
+                    mode: None,
+                }),
             )
             .await
             .expect("write executable");
@@ -4721,7 +5524,10 @@ mod tests {
                 "bin/existing",
                 Bytes::from_static(b"new"),
                 None,
-                Some(VfsStorageWriteOptions { executable: true }),
+                Some(VfsStorageWriteOptions {
+                    executable: true,
+                    mode: None,
+                }),
             )
             .await
             .expect("rewrite executable");
@@ -4742,8 +5548,10 @@ mod tests {
             .await
             .expect("initial write");
         let precondition = VfsStorageWritePrecondition {
+            predicate: None,
             fingerprint: Some(first.content_hash),
             secondary_fingerprint: None,
+            expected_file_id: None,
         };
         storage
             .write("guarded.txt", Bytes::from_static(b"second"), None)
@@ -4758,6 +5566,194 @@ mod tests {
             .await
             .expect_err("stale precondition");
         assert!(matches!(err, VfsStorageError::Conflict(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_storage_enforces_identity_only_and_combined_preconditions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        storage
+            .write("guarded.txt", Bytes::from_static(b"first"), None)
+            .await
+            .expect("initial write");
+        let metadata = storage
+            .stat("guarded.txt")
+            .await
+            .expect("stat")
+            .expect("metadata");
+        let file_id = metadata.file_id.expect("stable identity");
+
+        storage
+            .write(
+                "guarded.txt",
+                Bytes::from_static(b"identity-only"),
+                Some(VfsStorageWritePrecondition {
+                    predicate: None,
+                    fingerprint: None,
+                    secondary_fingerprint: None,
+                    expected_file_id: Some(file_id.clone()),
+                }),
+            )
+            .await
+            .expect("identity-only write");
+        let mismatch = storage
+            .write(
+                "guarded.txt",
+                Bytes::from_static(b"wrong"),
+                Some(VfsStorageWritePrecondition {
+                    predicate: None,
+                    fingerprint: None,
+                    secondary_fingerprint: None,
+                    expected_file_id: Some("unix:0:0".to_string()),
+                }),
+            )
+            .await;
+        assert!(matches!(mismatch, Err(VfsStorageError::Conflict(_))));
+        assert_eq!(
+            fs::read(dir.path().join("guarded.txt")).expect("preserved bytes"),
+            b"identity-only",
+        );
+
+        let current_hash = hex_hash(b"identity-only");
+        storage
+            .write(
+                "guarded.txt",
+                Bytes::from_static(b"combined"),
+                Some(VfsStorageWritePrecondition {
+                    predicate: None,
+                    fingerprint: Some(current_hash),
+                    secondary_fingerprint: None,
+                    expected_file_id: Some(file_id),
+                }),
+            )
+            .await
+            .expect("combined identity and content precondition");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn identity_precondition_rejects_replacement_during_staging() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let destination = dir.path().join("guarded");
+        let replacement = dir.path().join("replacement");
+        let displaced = dir.path().join("displaced");
+        fs::write(&destination, b"old").expect("destination");
+        fs::write(&replacement, b"replacement").expect("replacement");
+        let original = fs::symlink_metadata(&destination).expect("metadata");
+        let expected_file_id = local_file_id(&original).expect("stable identity");
+        let swap_once = Arc::new(AtomicBool::new(true));
+        let observed_swap = Arc::clone(&swap_once);
+        let observed_destination = destination.clone();
+        let observed_replacement = replacement.clone();
+        let observed_displaced = displaced.clone();
+        let storage = storage_with_durability_observer(dir.path(), move |event| {
+            if matches!(event, DurabilitySyncEvent::File(path) if path != &observed_destination)
+                && observed_swap.swap(false, AtomicBoolOrdering::SeqCst)
+            {
+                fs::rename(&observed_destination, &observed_displaced)
+                    .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+                fs::rename(&observed_replacement, &observed_destination)
+                    .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+            }
+            Ok(())
+        });
+
+        let result = storage
+            .write(
+                "guarded",
+                Bytes::from_static(b"desired"),
+                Some(VfsStorageWritePrecondition {
+                    predicate: None,
+                    fingerprint: Some(hex_hash(b"old")),
+                    secondary_fingerprint: None,
+                    expected_file_id: Some(expected_file_id),
+                }),
+            )
+            .await;
+        assert!(matches!(result, Err(VfsStorageError::Conflict(_))));
+        assert_eq!(
+            fs::read(&destination).expect("replacement bytes"),
+            b"replacement"
+        );
+        assert_eq!(fs::read(&displaced).expect("original bytes"), b"old");
+        assert!(
+            fs::read_dir(dir.path()).expect("root").all(|entry| !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")),
+            "identity-race failure must clean staged files",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn identity_mismatch_never_converts_to_exact_byte_replay() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let destination = dir.path().join("guarded");
+        fs::write(&destination, b"desired").expect("destination");
+        let storage = LocalVfsStorage::new(dir.path());
+
+        let result = storage
+            .write(
+                "guarded",
+                Bytes::from_static(b"desired"),
+                Some(VfsStorageWritePrecondition {
+                    predicate: None,
+                    fingerprint: Some(hex_hash(b"old")),
+                    secondary_fingerprint: None,
+                    expected_file_id: Some("unix:0:0".to_string()),
+                }),
+            )
+            .await;
+        assert!(matches!(result, Err(VfsStorageError::Conflict(_))));
+        assert_eq!(fs::read(destination).expect("bytes"), b"desired");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn identical_expect_absent_creators_yield_one_conflict() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let create = |storage: LocalVfsStorage, barrier: Arc<tokio::sync::Barrier>| async move {
+            barrier.wait().await;
+            storage
+                .write_with_options(
+                    "created",
+                    Bytes::from_static(b"identical"),
+                    Some(VfsStorageWritePrecondition {
+                        predicate: None,
+                        fingerprint: None,
+                        secondary_fingerprint: None,
+                        expected_file_id: None,
+                    }),
+                    Some(VfsStorageWriteOptions {
+                        executable: false,
+                        mode: Some(0o640),
+                    }),
+                )
+                .await
+        };
+        let (left, right) = tokio::join!(
+            create(storage.clone(), Arc::clone(&barrier)),
+            create(storage.clone(), barrier),
+        );
+        let outcomes = [left, right];
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| matches!(result, Err(VfsStorageError::Conflict(_))))
+                .count(),
+            1,
+        );
+        assert_eq!(
+            fs::read(dir.path().join("created")).expect("created bytes"),
+            b"identical",
+        );
+        assert_eq!(path_mode(&dir.path().join("created")), 0o640);
     }
 
     #[tokio::test]
@@ -4780,10 +5776,15 @@ mod tests {
                 &source,
                 Some(&expected),
                 Some(VfsStorageWritePrecondition {
+                    predicate: None,
                     fingerprint: Some(original.content_hash),
                     secondary_fingerprint: None,
+                    expected_file_id: None,
                 }),
-                Some(VfsStorageWriteOptions { executable: false }),
+                Some(VfsStorageWriteOptions {
+                    executable: false,
+                    mode: None,
+                }),
             )
             .await
             .expect("streamed install");
@@ -4800,8 +5801,10 @@ mod tests {
                 &source,
                 Some(&expected),
                 Some(VfsStorageWritePrecondition {
+                    predicate: None,
                     fingerprint: Some(result.content_hash),
                     secondary_fingerprint: None,
+                    expected_file_id: None,
                 }),
                 None,
             )
@@ -4823,8 +5826,10 @@ mod tests {
             .await
             .expect("initial write");
         let precondition = VfsStorageWritePrecondition {
+            predicate: None,
             fingerprint: Some(first.content_hash),
             secondary_fingerprint: None,
+            expected_file_id: None,
         };
         let barrier = Arc::new(Barrier::new(2));
         let left_storage = storage.clone();
@@ -5237,8 +6242,10 @@ mod tests {
             .await
             .expect("link");
         let precondition = VfsStorageWritePrecondition {
+            predicate: None,
             fingerprint: Some(initial.content_hash),
             secondary_fingerprint: None,
+            expected_file_id: None,
         };
         let left = {
             let storage = storage.clone();

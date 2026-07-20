@@ -337,15 +337,24 @@ const commandResultText = (result) =>
     .filter(Boolean)
     .join("\n");
 
-const drainExec = async (handle, label) => {
+const collectExecAtMarkers = async (handle, label, markerSteps = []) => {
   let code = null;
   let stdout = "";
   let stderr = "";
+  let markerIndex = 0;
   for (;;) {
     const event = await withTimeout(handle.next(), `${label} output`);
     if (event === null) break;
     if (event.type === "stdout" && event.data) stdout += Buffer.from(event.data).toString("utf8");
     if (event.type === "stderr" && event.data) stderr += Buffer.from(event.data).toString("utf8");
+    while (
+      markerIndex < markerSteps.length &&
+      stdout.includes(markerSteps[markerIndex].marker)
+    ) {
+      const { onMarker } = markerSteps[markerIndex];
+      markerIndex += 1;
+      await onMarker(handle);
+    }
     if (event.type === "exit") {
       code = event.code ?? 0;
       break;
@@ -355,14 +364,24 @@ const drainExec = async (handle, label) => {
       break;
     }
   }
+  if (markerIndex < markerSteps.length) {
+    throw new Error(`${label} exited without marker ${markerSteps[markerIndex].marker}`);
+  }
   return { code, stdout, stderr };
 };
 
-const startGuest = async (session, command, timeoutSecs = 300) =>
+const drainExec = async (handle, label) => collectExecAtMarkers(handle, label);
+
+const startGuest = async (
+  session,
+  command,
+  timeoutSecs = 300,
+  { interactive = false } = {},
+) =>
   withTimeout(
     session.exec(`set -euo pipefail\n${command}`, {
       shell: "/bin/bash",
-      closeStdinOnStart: true,
+      closeStdinOnStart: !interactive,
       timeoutSecs,
       env: {
         GIT_AUTHOR_NAME: "Chevalier VFS Conformance",
@@ -376,6 +395,18 @@ const startGuest = async (session, command, timeoutSecs = 300) =>
 
 const execGuest = async (session, command, timeoutSecs = 300) =>
   drainExec(await startGuest(session, command, timeoutSecs), command.slice(0, 100));
+
+const execGuestAtMarkers = async (
+  session,
+  command,
+  markerSteps,
+  timeoutSecs = 300,
+) =>
+  collectExecAtMarkers(
+    await startGuest(session, command, timeoutSecs, { interactive: true }),
+    command.slice(0, 100),
+    markerSteps,
+  );
 
 const results = [];
 const check = async (id, name, body) => {
@@ -523,7 +554,9 @@ with open(mode_file, "wb") as f:
     f.flush()
     os.fsync(f.fileno())
 os.chmod(mode_file, 0o751)
-assert stat.S_IMODE(os.stat(mode_file).st_mode) == 0o751
+mode = stat.S_IMODE(os.stat(mode_file).st_mode)
+print(f"MODE_FILE_LOCAL_ACTUAL:{mode:o}")
+assert mode == 0o751
 os.symlink("mode-file", root + "/mode-link")
 assert stat.S_ISLNK(os.lstat(root + "/mode-link").st_mode)
 assert os.readlink(root + "/mode-link") == "mode-file"
@@ -588,7 +621,9 @@ import os, stat
 root = "/workspace/ops"
 assert "ops" in os.listdir("/workspace")
 assert stat.S_ISDIR(os.stat(root).st_mode)
-assert stat.S_IMODE(os.stat(root + "/mode-file").st_mode) == 0o751
+mode = stat.S_IMODE(os.stat(root + "/mode-file").st_mode)
+print(f"MODE_FILE_CROSS_ACTUAL:{mode:o}")
+assert mode == 0o751
 assert stat.S_ISLNK(os.lstat(root + "/mode-link").st_mode)
 assert os.readlink(root + "/mode-link") == "mode-file"
 fd = os.open(root + "/sparse", os.O_RDONLY)
@@ -617,13 +652,13 @@ PY`,
 
   second = await createSession("b");
 
-  await check(2, "same-mount and cross-mount O_CREAT|O_EXCL", async () => {
+  await check(2, "same/cross-mount exclusive and ordinary O_CREAT convergence", async () => {
     const same = await execGuest(
       first,
       `rm -f /workspace/exclusive-same /tmp/exclusive-same-*
 for n in 1 2; do
   (python3 - "$n" <<'PY'
-import os, sys
+import os, stat, sys
 try:
     fd = os.open("/workspace/exclusive-same", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
     os.close(fd)
@@ -637,24 +672,284 @@ wait
 cat /tmp/exclusive-same-*`,
     );
     await execGuest(first, "rm -f /workspace/exclusive-cross");
-    const contender = (label) => `sleep 1; python3 - <<'PY'
-import os
+    let readyCount = 0;
+    let resolveReady;
+    const bothReady = new Promise((resolve) => {
+      resolveReady = resolve;
+    });
+    let resultCount = 0;
+    let resolveResults;
+    const bothResults = new Promise((resolve) => {
+      resolveResults = resolve;
+    });
+    const contender = (label) => `python3 - <<'PY'
+import os, stat, sys
+path = "/workspace/exclusive-cross"
+os.umask(0)
 try:
-    fd = os.open("/workspace/exclusive-cross", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    os.close(fd)
-    print("ACQUIRED:${label}")
+    os.lstat(path)
+    raise AssertionError("exclusive path existed before synchronized create")
+except FileNotFoundError:
+    pass
+print("EXCLUSIVE_READY:${label}", flush=True)
+assert sys.stdin.readline() == "go\\n"
+fd = None
+try:
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o642)
+    outcome = "ACQUIRED"
 except FileExistsError:
-    print("REJECTED:${label}")
+    outcome = "EEXIST"
+print("EXCLUSIVE_RESULT:${label}:" + outcome, flush=True)
+assert sys.stdin.readline() == "finish\\n"
+if fd is not None:
+    opened = os.fstat(fd)
+    assert stat.S_ISREG(opened.st_mode)
+    assert stat.S_IMODE(opened.st_mode) == 0o642
+    payload = b"WINNER:${label}\\n"
+    os.write(fd, payload)
+    os.fsync(fd)
+    published = os.fstat(fd)
+    assert published.st_ino == opened.st_ino
+    assert published.st_size == len(payload)
+    print(f"EXCLUSIVE_PUBLISHED:${label}:ino={published.st_ino}:mode={stat.S_IMODE(published.st_mode):o}", flush=True)
+    os.close(fd)
+else:
+    print("EXCLUSIVE_REJECTED:${label}:EEXIST", flush=True)
 PY`;
+    const runContender = (session, label) =>
+      execGuestAtMarkers(
+        session,
+        contender(label),
+        [
+          {
+            marker: `EXCLUSIVE_READY:${label}`,
+            onMarker: async (handle) => {
+              readyCount += 1;
+              if (readyCount === 2) resolveReady();
+              await bothReady;
+              await handle.write(Buffer.from("go\n"));
+            },
+          },
+          {
+            marker: `EXCLUSIVE_RESULT:${label}:`,
+            onMarker: async (handle) => {
+              resultCount += 1;
+              if (resultCount === 2) resolveResults();
+              await bothResults;
+              await handle.write(Buffer.from("finish\n"));
+              await handle.eof();
+            },
+          },
+        ],
+        60,
+      );
     const [a, b] = await Promise.all([
-      drainExec(await startGuest(first, contender("A")), "exclusive A"),
-      drainExec(await startGuest(second, contender("B")), "exclusive B"),
+      runContender(first, "A"),
+      runContender(second, "B"),
     ]);
     const sameAcquired = (same.stdout.match(/ACQUIRED:/g) || []).length;
-    const crossAcquired = (`${a.stdout}${b.stdout}`.match(/ACQUIRED:/g) || []).length;
+    const crossOutput = `${a.stdout}\n${b.stdout}`;
+    const crossAcquired = (crossOutput.match(/EXCLUSIVE_RESULT:[AB]:ACQUIRED/g) || []).length;
+    const crossRejected = (crossOutput.match(/EXCLUSIVE_RESULT:[AB]:EEXIST/g) || []).length;
+    const winner = crossOutput.match(/EXCLUSIVE_RESULT:([AB]):ACQUIRED/)?.[1] ?? null;
+    const publishedInode = Number(
+      crossOutput.match(/EXCLUSIVE_PUBLISHED:[AB]:ino=([0-9]+):mode=642/)?.[1] ?? 0,
+    );
+    const verifyWinner = (label, requireInode) => `python3 - <<'PY'
+import os, stat
+path = "/workspace/exclusive-cross"
+entry = os.stat(path)
+assert stat.S_ISREG(entry.st_mode)
+assert stat.S_IMODE(entry.st_mode) == 0o642
+assert open(path, "rb").read() == b"WINNER:${label}\\n"
+${requireInode ? `assert entry.st_ino == ${publishedInode}` : "assert entry.st_ino > 1"}
+print(f"EXCLUSIVE_VISIBLE:${label}:ino={entry.st_ino}:mode={stat.S_IMODE(entry.st_mode):o}")
+PY`;
+    const [visibleA, visibleB, authoritativeEntry, authoritativeBytes] = await Promise.all([
+      execGuest(first, verifyWinner(winner, winner === "A")),
+      execGuest(second, verifyWinner(winner, winner === "B")),
+      storage.stat(`${scopePath}/exclusive-cross`),
+      storage.read(`${scopePath}/exclusive-cross`),
+    ]);
+    await execGuest(first, "rm -f /workspace/create-shared");
+    let ordinaryReadyCount = 0;
+    let resolveOrdinaryReady;
+    const ordinaryReady = new Promise((resolve) => {
+      resolveOrdinaryReady = resolve;
+    });
+    let ordinaryOpenCount = 0;
+    let resolveOrdinaryOpen;
+    const ordinaryOpen = new Promise((resolve) => {
+      resolveOrdinaryOpen = resolve;
+    });
+    let resolveAPublished;
+    const aPublished = new Promise((resolve) => {
+      resolveAPublished = resolve;
+    });
+    let resolveBPublished;
+    const bPublished = new Promise((resolve) => {
+      resolveBPublished = resolve;
+    });
+    const ordinaryCreator = (label) => `python3 - <<'PY'
+import os, stat, sys
+path = "/workspace/create-shared"
+os.umask(0)
+try:
+    os.lstat(path)
+    raise AssertionError("ordinary-create path existed before synchronized create")
+except FileNotFoundError:
+    pass
+print("ORDINARY_READY:${label}", flush=True)
+assert sys.stdin.readline() == "go\\n"
+fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o640)
+opened = os.fstat(fd)
+assert stat.S_ISREG(opened.st_mode)
+assert stat.S_IMODE(opened.st_mode) == 0o640
+print(f"ORDINARY_OPENED:${label}:ino={opened.st_ino}", flush=True)
+if "${label}" == "A":
+    assert sys.stdin.readline() == "publish\\n"
+    assert os.pwrite(fd, b"A", 0) == 1
+    os.fsync(fd)
+    print("ORDINARY_A_PUBLISHED", flush=True)
+    assert sys.stdin.readline() == "verify\\n"
+    assert os.pread(fd, 2, 0) == b"AB"
+else:
+    assert sys.stdin.readline() == "observe\\n"
+    assert os.pread(fd, 1, 0) == b"A"
+    assert os.pwrite(fd, b"B", 1) == 1
+    os.fsync(fd)
+    print("ORDINARY_B_PUBLISHED", flush=True)
+    assert sys.stdin.readline() == "verify\\n"
+    assert os.pread(fd, 2, 0) == b"AB"
+closed = os.fstat(fd)
+assert closed.st_ino == opened.st_ino
+assert stat.S_IMODE(closed.st_mode) == 0o640
+os.close(fd)
+print("ORDINARY_DONE:${label}", flush=True)
+PY`;
+    const runOrdinaryCreator = (session, label) =>
+      execGuestAtMarkers(
+        session,
+        ordinaryCreator(label),
+        [
+          {
+            marker: `ORDINARY_READY:${label}`,
+            onMarker: async (handle) => {
+              ordinaryReadyCount += 1;
+              if (ordinaryReadyCount === 2) resolveOrdinaryReady();
+              await ordinaryReady;
+              await handle.write(Buffer.from("go\n"));
+            },
+          },
+          {
+            marker: `ORDINARY_OPENED:${label}:`,
+            onMarker: async (handle) => {
+              ordinaryOpenCount += 1;
+              if (ordinaryOpenCount === 2) resolveOrdinaryOpen();
+              await ordinaryOpen;
+              if (label === "A") {
+                await handle.write(Buffer.from("publish\n"));
+              } else {
+                await aPublished;
+                await handle.write(Buffer.from("observe\n"));
+              }
+            },
+          },
+          ...(label === "A"
+            ? [
+                {
+                  marker: "ORDINARY_A_PUBLISHED",
+                  onMarker: async (handle) => {
+                    resolveAPublished();
+                    await bPublished;
+                    await handle.write(Buffer.from("verify\n"));
+                    await handle.eof();
+                  },
+                },
+              ]
+            : [
+                {
+                  marker: "ORDINARY_B_PUBLISHED",
+                  onMarker: async (handle) => {
+                    resolveBPublished();
+                    await handle.write(Buffer.from("verify\n"));
+                    await handle.eof();
+                  },
+                },
+              ]),
+        ],
+        60,
+      );
+    const [ordinaryA, ordinaryB] = await Promise.all([
+      runOrdinaryCreator(first, "A"),
+      runOrdinaryCreator(second, "B"),
+    ]);
+    const [
+      ordinaryVisibleA,
+      ordinaryVisibleB,
+      ordinaryAuthoritativeEntry,
+      ordinaryAuthoritativeBytes,
+    ] = await Promise.all([
+      execGuest(
+        first,
+        `python3 - <<'PY'
+import os, stat
+entry = os.stat("/workspace/create-shared")
+assert stat.S_IMODE(entry.st_mode) == 0o640
+assert open("/workspace/create-shared", "rb").read() == b"AB"
+print(f"ORDINARY_VISIBLE:A:ino={entry.st_ino}")
+PY`,
+      ),
+      execGuest(
+        second,
+        `python3 - <<'PY'
+import os, stat
+entry = os.stat("/workspace/create-shared")
+assert stat.S_IMODE(entry.st_mode) == 0o640
+assert open("/workspace/create-shared", "rb").read() == b"AB"
+print(f"ORDINARY_VISIBLE:B:ino={entry.st_ino}")
+PY`,
+      ),
+      storage.stat(`${scopePath}/create-shared`),
+      storage.read(`${scopePath}/create-shared`),
+    ]);
     return {
-      pass: same.code === 0 && a.code === 0 && b.code === 0 && sameAcquired === 1 && crossAcquired === 1,
-      detail: `same acquired=${sameAcquired}; cross acquired=${crossAcquired}`,
+      pass:
+        same.code === 0 &&
+        a.code === 0 &&
+        b.code === 0 &&
+        sameAcquired === 1 &&
+        crossAcquired === 1 &&
+        crossRejected === 1 &&
+        publishedInode > 1 &&
+        visibleA.code === 0 &&
+        visibleB.code === 0 &&
+        authoritativeEntry !== null &&
+        authoritativeEntry.fileId !== undefined &&
+        authoritativeEntry.mode === 0o642 &&
+        authoritativeBytes.toString("utf8") === `WINNER:${winner}\n` &&
+        ordinaryA.code === 0 &&
+        ordinaryB.code === 0 &&
+        ordinaryVisibleA.code === 0 &&
+        ordinaryVisibleB.code === 0 &&
+        ordinaryAuthoritativeEntry !== null &&
+        ordinaryAuthoritativeEntry.fileId !== undefined &&
+        ordinaryAuthoritativeEntry.mode === 0o640 &&
+        ordinaryAuthoritativeBytes.toString("utf8") === "AB",
+      detail: [
+        `same acquired=${sameAcquired}`,
+        `cross acquired=${crossAcquired} rejected=${crossRejected} winner=${winner}`,
+        commandResultText(a),
+        commandResultText(b),
+        commandResultText(visibleA),
+        commandResultText(visibleB),
+        `authoritative fileId=${authoritativeEntry?.fileId ?? "missing"} mode=${authoritativeEntry?.mode?.toString(8) ?? "missing"} bytes=${JSON.stringify(authoritativeBytes.toString("utf8"))}`,
+        commandResultText(ordinaryA),
+        commandResultText(ordinaryB),
+        commandResultText(ordinaryVisibleA),
+        commandResultText(ordinaryVisibleB),
+        `ordinary authoritative fileId=${ordinaryAuthoritativeEntry?.fileId ?? "missing"} mode=${ordinaryAuthoritativeEntry?.mode?.toString(8) ?? "missing"} bytes=${JSON.stringify(ordinaryAuthoritativeBytes.toString("utf8"))}`,
+      ].join("\n"),
     };
   });
 
@@ -784,7 +1079,7 @@ PY`,
       first,
       `rm -f /workspace/hard-a /workspace/hard-b /workspace/hard-c /workspace/hard-renamed
 python3 - <<'PY'
-import os
+import os, stat
 paths = ["/workspace/hard-a", "/workspace/hard-b", "/workspace/hard-c"]
 with open(paths[0], "wb") as f:
     f.write(b"before")
@@ -845,15 +1140,135 @@ assert all(open(path, "rb").read() == b"CROSS-ALIAS" for path in remaining)
 print(f"HARD_CROSS_RENAME_UNLINK_OK:ino={inode}:nlink=2")
 PY`,
     );
-    const openLifetime = await execGuest(
+    const [authoritativeC, authoritativeRenamed, authoritativeCBytes, authoritativeRenamedBytes] =
+      await Promise.all([
+        storage.stat(`${scopePath}/hard-c`),
+        storage.stat(`${scopePath}/hard-renamed`),
+        storage.read(`${scopePath}/hard-c`).catch(() => null),
+        storage.read(`${scopePath}/hard-renamed`).catch(() => null),
+      ]);
+    const authoritative = {
+      cExists: authoritativeC !== null,
+      renamedExists: authoritativeRenamed !== null,
+      sameIdentity:
+        authoritativeC?.fileId !== undefined &&
+        authoritativeC.fileId === authoritativeRenamed?.fileId,
+      cLinkCount: authoritativeC?.linkCount?.toString() ?? null,
+      renamedLinkCount: authoritativeRenamed?.linkCount?.toString() ?? null,
+      bytesAliased:
+        authoritativeCBytes?.toString("utf8") === "CROSS-ALIAS" &&
+        authoritativeRenamedBytes?.toString("utf8") === "CROSS-ALIAS",
+    };
+    let remoteUnlink = null;
+    const crossMountOpenLifetime = await execGuestAtMarkers(
       first,
       `python3 - <<'PY'
-import os
+import os, stat, sys
 c = "/workspace/hard-c"
 renamed = "/workspace/hard-renamed"
 sc, sr = os.stat(c), os.stat(renamed)
 assert sc.st_ino == sr.st_ino and sc.st_nlink == sr.st_nlink == 2
-assert open(c, "rb").read() == open(renamed, "rb").read() == b"CROSS-ALIAS"
+fd = os.open(renamed, os.O_RDWR)
+inode = os.fstat(fd).st_ino
+print(f"HARD_REMOTE_UNLINK_READY:ino={inode}", flush=True)
+assert sys.stdin.readline() == "continue\\n"
+assert os.pread(fd, 11, 0) == b"CROSS-ALIAS"
+os.fchmod(fd, 0o640)
+os.ftruncate(fd, 0)
+os.write(fd, b"REMOTE-OPEN")
+os.fsync(fd)
+replacement = os.stat(renamed)
+surviving = os.stat(c)
+assert replacement.st_ino != inode
+assert surviving.st_ino == inode
+assert replacement.st_nlink == surviving.st_nlink == os.fstat(fd).st_nlink == 1
+assert stat.S_IMODE(os.fstat(fd).st_mode) == 0o640
+assert stat.S_IMODE(surviving.st_mode) == 0o640
+assert stat.S_IMODE(replacement.st_mode) == 0o644
+assert os.pread(fd, 11, 0) == b"REMOTE-OPEN"
+assert open(c, "rb").read() == b"REMOTE-OPEN"
+assert open(renamed, "rb").read() == b"REPLACEMENT"
+os.close(fd)
+print(f"HARD_REMOTE_UNLINK_REUSE_FSYNC_OK:ino={inode}:replacement={replacement.st_ino}:nlink=1")
+PY`,
+      [
+        {
+          marker: "HARD_REMOTE_UNLINK_READY:",
+          onMarker: async (handle) => {
+            remoteUnlink = await execGuest(
+              second,
+              `python3 - <<'PY'
+import os, stat
+c = "/workspace/hard-c"
+renamed = "/workspace/hard-renamed"
+sc, sr = os.stat(c), os.stat(renamed)
+assert sc.st_ino == sr.st_ino and sc.st_nlink == sr.st_nlink == 2
+os.unlink(renamed)
+dirfd = os.open("/workspace", os.O_RDONLY | os.O_DIRECTORY)
+os.fsync(dirfd)
+os.close(dirfd)
+assert not os.path.lexists(renamed)
+assert os.stat(c).st_ino == sc.st_ino
+assert os.stat(c).st_nlink == 1
+with open(renamed, "xb") as replacement:
+    replacement.write(b"CROSS-ALIAS")
+    replacement.flush()
+    os.fsync(replacement.fileno())
+os.chmod(renamed, 0o644)
+with open(renamed, "r+b") as replacement:
+    replacement.seek(0)
+    replacement.write(b"REPLACEMENT")
+    replacement.truncate()
+    replacement.flush()
+    os.fsync(replacement.fileno())
+dirfd = os.open("/workspace", os.O_RDONLY | os.O_DIRECTORY)
+os.fsync(dirfd)
+os.close(dirfd)
+replacement = os.stat(renamed)
+assert replacement.st_ino != sc.st_ino and replacement.st_nlink == 1
+assert stat.S_IMODE(replacement.st_mode) == 0o644
+assert open(c, "rb").read() == b"CROSS-ALIAS"
+assert open(renamed, "rb").read() == b"REPLACEMENT"
+print(f"HARD_REMOTE_ALIAS_REUSED:old={sc.st_ino}:replacement={replacement.st_ino}:nlink=1")
+PY`,
+            );
+            await handle.write(Buffer.from("continue\n"));
+            await handle.eof();
+          },
+        },
+      ],
+    );
+    const [
+      authoritativeCAfter,
+      authoritativeRenamedAfter,
+      authoritativeCBytesAfter,
+      authoritativeRenamedBytesAfter,
+    ] =
+      await Promise.all([
+        storage.stat(`${scopePath}/hard-c`),
+        storage.stat(`${scopePath}/hard-renamed`),
+        storage.read(`${scopePath}/hard-c`).catch(() => null),
+        storage.read(`${scopePath}/hard-renamed`).catch(() => null),
+      ]);
+    const authoritativeAfterRemoteReuse = {
+      cExists: authoritativeCAfter !== null,
+      renamedExists: authoritativeRenamedAfter !== null,
+      sameIdentity:
+        authoritativeCAfter?.fileId !== undefined &&
+        authoritativeCAfter.fileId === authoritativeRenamedAfter?.fileId,
+      cLinkCount: authoritativeCAfter?.linkCount?.toString() ?? null,
+      renamedLinkCount: authoritativeRenamedAfter?.linkCount?.toString() ?? null,
+      cMode: authoritativeCAfter?.mode?.toString(8) ?? null,
+      renamedMode: authoritativeRenamedAfter?.mode?.toString(8) ?? null,
+      cBytes: authoritativeCBytesAfter?.toString("utf8") ?? null,
+      renamedBytes: authoritativeRenamedBytesAfter?.toString("utf8") ?? null,
+    };
+    const finalOpenLifetime = await execGuest(
+      first,
+      `python3 - <<'PY'
+import os
+c = "/workspace/hard-c"
+assert open(c, "rb").read() == b"REMOTE-OPEN"
 fd = os.open(c, os.O_RDWR)
 inode = os.fstat(fd).st_ino
 os.unlink(c)
@@ -861,23 +1276,13 @@ dirfd = os.open("/workspace", os.O_RDONLY | os.O_DIRECTORY)
 os.fsync(dirfd)
 os.close(dirfd)
 assert not os.path.lexists(c)
-assert os.stat(renamed).st_ino == inode
-assert os.stat(renamed).st_nlink == os.fstat(fd).st_nlink == 1
-os.pwrite(fd, b"FD", 0)
-os.fsync(fd)
-assert os.pread(fd, 11, 0) == b"FDOSS-ALIAS"
-assert open(renamed, "rb").read() == b"FDOSS-ALIAS"
-os.unlink(renamed)
-dirfd = os.open("/workspace", os.O_RDONLY | os.O_DIRECTORY)
-os.fsync(dirfd)
-os.close(dirfd)
-assert not os.path.lexists(renamed)
 assert os.fstat(fd).st_ino == inode and os.fstat(fd).st_nlink == 0
 os.pwrite(fd, b"!", 11)
 os.fsync(fd)
-assert os.pread(fd, 12, 0) == b"FDOSS-ALIAS!"
+assert os.pread(fd, 12, 0) == b"REMOTE-OPEN!"
 os.close(fd)
-assert not os.path.lexists(c) and not os.path.lexists(renamed)
+assert not os.path.lexists(c)
+assert open("/workspace/hard-renamed", "rb").read() == b"REPLACEMENT"
 print(f"HARD_OPEN_FINAL_UNLINK_OK:ino={inode}:nlink=0")
 PY`,
     );
@@ -889,15 +1294,48 @@ for path in (
     "/workspace/hard-a",
     "/workspace/hard-b",
     "/workspace/hard-c",
-    "/workspace/hard-renamed",
 ):
     assert not os.path.lexists(path), path
+assert open("/workspace/hard-renamed", "rb").read() == b"REPLACEMENT"
+os.unlink("/workspace/hard-renamed")
+dirfd = os.open("/workspace", os.O_RDONLY | os.O_DIRECTORY)
+os.fsync(dirfd)
+os.close(dirfd)
+assert not os.path.lexists("/workspace/hard-renamed")
 print("HARD_PATHS_NEVER_RESURRECTED")
 PY`,
     );
     return {
-      pass: a.code === 0 && b.code === 0 && openLifetime.code === 0 && final.code === 0,
-      detail: [a, b, openLifetime, final].map(commandResultText).join("\n"),
+      pass:
+        a.code === 0 &&
+        b.code === 0 &&
+        authoritative.cExists &&
+        authoritative.renamedExists &&
+        authoritative.sameIdentity &&
+        authoritative.cLinkCount === "2" &&
+        authoritative.renamedLinkCount === "2" &&
+        authoritative.bytesAliased &&
+        remoteUnlink?.code === 0 &&
+        crossMountOpenLifetime.code === 0 &&
+        authoritativeAfterRemoteReuse.cExists &&
+        authoritativeAfterRemoteReuse.renamedExists &&
+        !authoritativeAfterRemoteReuse.sameIdentity &&
+        authoritativeAfterRemoteReuse.cLinkCount === "1" &&
+        authoritativeAfterRemoteReuse.renamedLinkCount === "1" &&
+        authoritativeAfterRemoteReuse.cMode === "640" &&
+        authoritativeAfterRemoteReuse.renamedMode === "644" &&
+        authoritativeAfterRemoteReuse.cBytes === "REMOTE-OPEN" &&
+        authoritativeAfterRemoteReuse.renamedBytes === "REPLACEMENT" &&
+        finalOpenLifetime.code === 0 &&
+        final.code === 0,
+      detail:
+        `${[a, b, remoteUnlink, crossMountOpenLifetime, finalOpenLifetime, final]
+          .filter(Boolean)
+          .map(commandResultText)
+          .join("\n")}` +
+        `\nauthoritative=${JSON.stringify(authoritative)}` +
+        `\nauthoritativeAfterRemoteReuse=${JSON.stringify(authoritativeAfterRemoteReuse)}`,
+      evidence: { authoritative, authoritativeAfterRemoteReuse },
     };
   });
 
@@ -907,6 +1345,8 @@ PY`,
       `rm -rf /workspace/worktree
 mkdir /workspace/worktree
 ${git("init")}
+default_branch="$(${git("symbolic-ref --short HEAD")})"
+test -n "$default_branch"
 printf base\\n >/workspace/worktree/base.txt
 ${git("add base.txt")}
 ${git("commit -m base")}
@@ -914,18 +1354,18 @@ ${git("checkout -b feature")}
 printf feature\\n >/workspace/worktree/feature.txt
 ${git("add feature.txt")}
 ${git("commit -m feature")}
-(${git("checkout master")} 2>/dev/null || ${git("checkout main")})
+${git('checkout "$default_branch"')}
 ${git("merge --no-edit feature")}
 ${git("checkout -b rebase-target")}
 printf rebase\\n >/workspace/worktree/rebase.txt
 ${git("add rebase.txt")}
 ${git("commit -m rebase")}
-(${git("checkout master")} 2>/dev/null || ${git("checkout main")})
+${git('checkout "$default_branch"')}
 printf upstream\\n >/workspace/worktree/upstream.txt
 ${git("add upstream.txt")}
 ${git("commit -m upstream")}
 ${git("checkout rebase-target")}
-(${git("rebase master")} 2>/dev/null || ${git("rebase main")})
+${git('rebase "$default_branch"')}
 printf dirty\\n >>/workspace/worktree/base.txt
 ${git("stash push -m harness")}
 ${git("stash show --stat stash@{0}")}
@@ -1039,10 +1479,12 @@ ${git("rev-parse HEAD")}`,
     const reader = await execGuest(
       second,
       `${git("rev-parse HEAD")}
-test "$(cat /workspace/worktree/barrier.txt)" = barrier
 python3 - <<'PY'
-import os, stat
+import hashlib, os, stat
 root = "/workspace/worktree"
+barrier = open(root + "/barrier.txt", "rb").read()
+print(f"BARRIER_CROSS_SIZE:{len(barrier)}:SHA256:{hashlib.sha256(barrier).hexdigest()}")
+assert barrier == b"barrier\\n"
 assert stat.S_IMODE(os.stat("/workspace/ops/mode-file").st_mode) == 0o751
 assert open("/workspace/ops/mode-file", "rb").read() == b"mode"
 sparse = os.open("/workspace/ops/sparse", os.O_RDONLY)
@@ -1195,10 +1637,12 @@ PY`,
       first,
       `actual="$(${git("rev-parse HEAD")})"
 test "$actual" = "${expectedHead}"
-test "$(cat /workspace/worktree/barrier.txt)" = barrier
 python3 - <<'PY'
-import os, stat
+import hashlib, os, stat
 root = "/workspace/worktree"
+barrier = open(root + "/barrier.txt", "rb").read()
+print(f"BARRIER_REPLACEMENT_SIZE:{len(barrier)}:SHA256:{hashlib.sha256(barrier).hexdigest()}")
+assert barrier == b"barrier\\n"
 assert stat.S_IMODE(os.stat("/workspace/ops/mode-file").st_mode) == 0o751
 assert open("/workspace/ops/mode-file", "rb").read() == b"mode"
 sparse = os.open("/workspace/ops/sparse", os.O_RDONLY)

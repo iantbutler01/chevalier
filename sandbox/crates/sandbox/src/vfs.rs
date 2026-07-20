@@ -18,11 +18,14 @@ pub const CHEVALIER_VFS_OPERATION_HEADER: &str = "x-chevalier-vfs-operation";
 pub const CHEVALIER_VFS_REASON_HEADER: &str = "x-chevalier-vfs-reason";
 pub const CHEVALIER_VFS_RESOURCE_KEY_HEADER: &str = "x-chevalier-vfs-resource-key";
 pub const CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER: &str = "x-chevalier-vfs-lock-owner-token";
+pub const CHEVALIER_VFS_PRECONDITION_KIND_HEADER: &str = "x-chevalier-vfs-precondition-kind";
 pub const CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER: &str =
     "x-chevalier-vfs-precondition-fingerprint";
 pub const CHEVALIER_VFS_PRECONDITION_SECONDARY_FINGERPRINT_HEADER: &str =
     "x-chevalier-vfs-precondition-secondary-fingerprint";
+pub const CHEVALIER_VFS_PRECONDITION_FILE_ID_HEADER: &str = "x-chevalier-vfs-precondition-file-id";
 pub const CHEVALIER_VFS_EXECUTABLE_HEADER: &str = "x-chevalier-vfs-executable";
+pub const CHEVALIER_VFS_MODE_HEADER: &str = "x-chevalier-vfs-mode";
 
 pub const VFS_COMPONENT_VM_RUNTIME: &str = "vm_runtime";
 pub const VFS_ENTRY_KIND_FILE: &str = "file";
@@ -57,6 +60,13 @@ pub struct VfsDirEntry {
     pub content_hash: Option<String>,
     #[serde(default)]
     pub executable: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_vfs_mode",
+        serialize_with = "serialize_vfs_mode"
+    )]
+    pub mode: Option<u32>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -73,11 +83,58 @@ pub struct VfsMetadata {
     pub content_hash: Option<String>,
     #[serde(default)]
     pub executable: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_vfs_mode",
+        serialize_with = "serialize_vfs_mode"
+    )]
+    pub mode: Option<u32>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 const fn default_vfs_link_count() -> u64 {
     1
+}
+
+fn deserialize_vfs_mode<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mode = Option::<u32>::deserialize(deserializer)?;
+    if mode.is_some_and(|mode| mode > 0o7777) {
+        return Err(serde::de::Error::custom(
+            "vfs mode must be an integer between 0 and 0o7777",
+        ));
+    }
+    Ok(mode)
+}
+
+fn serialize_vfs_mode<S>(mode: &Option<u32>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    mode.map(|mode| mode & 0o7777).serialize(serializer)
+}
+
+fn deserialize_required_vfs_mode<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mode = u32::deserialize(deserializer)?;
+    if mode > 0o7777 {
+        return Err(serde::de::Error::custom(
+            "vfs mode must be an integer between 0 and 0o7777",
+        ));
+    }
+    Ok(mode)
+}
+
+fn serialize_required_vfs_mode<S>(mode: &u32, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    (*mode & 0o7777).serialize(serializer)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -134,6 +191,13 @@ pub struct VfsNamespaceMutationBatchBody {
 pub enum VfsNamespaceMutation {
     CreateDirectory {
         path: String,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_vfs_mode",
+            serialize_with = "serialize_vfs_mode"
+        )]
+        mode: Option<u32>,
     },
     CreateSymlink {
         path: String,
@@ -151,15 +215,24 @@ pub enum VfsNamespaceMutation {
         from: String,
         to: String,
     },
+    SetMode {
+        path: String,
+        #[serde(
+            deserialize_with = "deserialize_required_vfs_mode",
+            serialize_with = "serialize_required_vfs_mode"
+        )]
+        mode: u32,
+    },
 }
 
 impl VfsNamespaceMutation {
     pub fn paths(&self) -> [&str; 2] {
         match self {
-            Self::CreateDirectory { path }
+            Self::CreateDirectory { path, .. }
             | Self::CreateSymlink { path, .. }
             | Self::DeleteFile { path, .. }
-            | Self::RemoveDirectory { path } => [path.as_str(), ""],
+            | Self::RemoveDirectory { path }
+            | Self::SetMode { path, .. } => [path.as_str(), ""],
             Self::Rename { from, to } => [from.as_str(), to.as_str()],
         }
     }
@@ -212,6 +285,15 @@ pub struct VfsSubtreeMetadataEntry {
     #[serde(default)]
     pub link_target: Option<String>,
     pub content_hash: Option<String>,
+    #[serde(default)]
+    pub executable: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_vfs_mode",
+        serialize_with = "serialize_vfs_mode"
+    )]
+    pub mode: Option<u32>,
     pub token_count: Option<i32>,
     pub version: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -259,11 +341,50 @@ pub struct VfsPrefetchSubtreeResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VfsCasPredicate {
+    Absent,
+    ContentFingerprint { fingerprint: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct VfsWritePrecondition {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<VfsCasPredicate>,
+    /// Rolling-upgrade inputs accepted from older gateway clients. New clients
+    /// serialize only `predicate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secondary_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_file_id: Option<String>,
+}
+
+impl VfsWritePrecondition {
+    pub fn effective_predicate(&self) -> Option<VfsCasPredicate> {
+        self.predicate
+            .clone()
+            .or_else(|| {
+                self.fingerprint
+                    .as_ref()
+                    .or(self.secondary_fingerprint.as_ref())
+                    .map(|fingerprint| {
+                        if fingerprint == "absent" {
+                            VfsCasPredicate::Absent
+                        } else {
+                            VfsCasPredicate::ContentFingerprint {
+                                fingerprint: fingerprint.clone(),
+                            }
+                        }
+                    })
+            })
+            .or_else(|| {
+                self.expected_file_id
+                    .is_none()
+                    .then_some(VfsCasPredicate::Absent)
+            })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -339,6 +460,7 @@ pub struct VfsWriteHeaders {
     pub operation: String,
     pub reason: String,
     pub executable: Option<bool>,
+    pub mode: Option<u32>,
     pub owner_token: Uuid,
 }
 
@@ -349,6 +471,7 @@ pub struct VfsWriteRequest {
     pub body: Bytes,
     pub headers: VfsWriteHeaders,
     pub scope: VfsWriteScope,
+    pub precondition: Option<VfsWritePrecondition>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -518,14 +641,15 @@ mod server {
 
     use super::{
         CHEVALIER_VFS_COMPONENT_HEADER, CHEVALIER_VFS_EXECUTABLE_HEADER,
-        CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, CHEVALIER_VFS_OPERATION_HEADER,
-        CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER,
+        CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, CHEVALIER_VFS_MODE_HEADER,
+        CHEVALIER_VFS_OPERATION_HEADER, CHEVALIER_VFS_PRECONDITION_FILE_ID_HEADER,
+        CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER, CHEVALIER_VFS_PRECONDITION_KIND_HEADER,
         CHEVALIER_VFS_PRECONDITION_SECONDARY_FINGERPRINT_HEADER, CHEVALIER_VFS_REASON_HEADER,
         CHEVALIER_VFS_RESOURCE_KEY_HEADER, CHEVALIER_VFS_ROUTE_PREFIX, CHEVALIER_VFS_RUN_ID_HEADER,
         CHEVALIER_VFS_SURFACE_KIND_HEADER, DEFAULT_VFS_BODY_LIMIT_BYTES, VFS_COMPONENT_VM_RUNTIME,
         VFS_ENTRY_KIND_FILE, VFS_OPERATION_LINK, VFS_OPERATION_MKDIR,
         VFS_OPERATION_NAMESPACE_BATCH, VFS_OPERATION_RENAME, VFS_OPERATION_RMDIR,
-        VFS_OPERATION_SYMLINK, VFS_OPERATION_UNLINK, VFS_OPERATION_WRITE_THROUGH,
+        VFS_OPERATION_SYMLINK, VFS_OPERATION_UNLINK, VFS_OPERATION_WRITE_THROUGH, VfsCasPredicate,
         VfsDeleteMetadataResponse, VfsDirEntry, VfsGatewayError, VfsHardLinkAliasBody,
         VfsHardLinkAliasResponse, VfsHardLinkBody, VfsHardLinkMetadataResponse, VfsHardLinkRequest,
         VfsHeaderAliases, VfsLeaseAcquire, VfsLeaseAcquireRequest, VfsLeaseGrant,
@@ -636,6 +760,11 @@ mod server {
             Ok(VfsDeleteMetadataResponse { previous: None })
         }
         async fn mkdir(&self, request: VfsNamespaceMutationRequest) -> VfsResult<()>;
+        async fn set_mode(&self, _request: VfsNamespaceMutationRequest) -> VfsResult<()> {
+            Err(VfsGatewayError::BadRequest(
+                "gateway backend does not support exact mode changes".to_string(),
+            ))
+        }
         async fn create_symlink(&self, _request: VfsSymlinkRequest) -> VfsResult<()> {
             Err(VfsGatewayError::BadRequest(
                 "gateway backend does not support symlink creation".to_string(),
@@ -677,11 +806,13 @@ mod server {
         ) -> VfsResult<()> {
             for mutation in request.mutations {
                 match mutation {
-                    VfsNamespaceMutation::CreateDirectory { path } => {
+                    VfsNamespaceMutation::CreateDirectory { path, mode } => {
+                        let mut headers = request.headers.clone();
+                        headers.mode = mode.map(|mode| mode & 0o7777).or(headers.mode);
                         self.mkdir(VfsNamespaceMutationRequest {
                             owner_id: request.owner_id.clone(),
                             path,
-                            headers: request.headers.clone(),
+                            headers,
                             scope: request.scope.clone(),
                             precondition: None,
                         })
@@ -724,6 +855,18 @@ mod server {
                             to,
                             headers: request.headers.clone(),
                             scope: request.scope.clone(),
+                        })
+                        .await?;
+                    }
+                    VfsNamespaceMutation::SetMode { path, mode } => {
+                        let mut headers = request.headers.clone();
+                        headers.mode = Some(mode & 0o7777);
+                        self.set_mode(VfsNamespaceMutationRequest {
+                            owner_id: request.owner_id.clone(),
+                            path,
+                            headers,
+                            scope: request.scope.clone(),
+                            precondition: None,
                         })
                         .await?;
                     }
@@ -1167,6 +1310,7 @@ mod server {
                 body,
                 headers: write_headers,
                 scope,
+                precondition: parse_write_precondition_headers(&headers)?,
             })
             .await?;
         Ok(StatusCode::NO_CONTENT)
@@ -1372,21 +1516,67 @@ mod server {
             path: path.to_string(),
             headers: write_headers,
             scope,
-            precondition: parse_write_precondition_headers(headers),
+            precondition: parse_write_precondition_headers(headers)?,
         })
     }
 
-    fn parse_write_precondition_headers(headers: &HeaderMap) -> Option<VfsWritePrecondition> {
+    fn parse_write_precondition_headers(
+        headers: &HeaderMap,
+    ) -> VfsResult<Option<VfsWritePrecondition>> {
+        let kind = header_value(headers, CHEVALIER_VFS_PRECONDITION_KIND_HEADER, &[]);
         let fingerprint = header_value(headers, CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER, &[]);
         let secondary_fingerprint = header_value(
             headers,
             CHEVALIER_VFS_PRECONDITION_SECONDARY_FINGERPRINT_HEADER,
             &[],
         );
-        (fingerprint.is_some() || secondary_fingerprint.is_some()).then_some(VfsWritePrecondition {
-            fingerprint,
-            secondary_fingerprint,
-        })
+        let expected_file_id =
+            header_value(headers, CHEVALIER_VFS_PRECONDITION_FILE_ID_HEADER, &[]);
+        let predicate = match kind.as_deref() {
+            Some("absent") => {
+                if fingerprint.is_some() || secondary_fingerprint.is_some() {
+                    return Err(VfsGatewayError::BadRequest(
+                        "absent VFS precondition cannot include a fingerprint".to_string(),
+                    ));
+                }
+                Some(VfsCasPredicate::Absent)
+            }
+            Some("content_fingerprint") => {
+                let fingerprint = fingerprint.as_ref().ok_or_else(|| {
+                    VfsGatewayError::BadRequest(
+                        "content_fingerprint VFS precondition requires a fingerprint".to_string(),
+                    )
+                })?;
+                Some(VfsCasPredicate::ContentFingerprint {
+                    fingerprint: fingerprint.clone(),
+                })
+            }
+            Some(other) => {
+                return Err(VfsGatewayError::BadRequest(format!(
+                    "unsupported VFS precondition kind: {other}"
+                )));
+            }
+            None => fingerprint
+                .as_ref()
+                .or(secondary_fingerprint.as_ref())
+                .map(|fingerprint| {
+                    if fingerprint == "absent" {
+                        VfsCasPredicate::Absent
+                    } else {
+                        VfsCasPredicate::ContentFingerprint {
+                            fingerprint: fingerprint.clone(),
+                        }
+                    }
+                }),
+        };
+        Ok(
+            (predicate.is_some() || expected_file_id.is_some()).then_some(VfsWritePrecondition {
+                predicate,
+                fingerprint,
+                secondary_fingerprint,
+                expected_file_id,
+            }),
+        )
     }
 
     async fn post_rename<S, B>(
@@ -1566,6 +1756,21 @@ mod server {
                     ))),
                 })
                 .transpose()?,
+            mode: header_value(headers, CHEVALIER_VFS_MODE_HEADER, &[])
+                .map(|value| {
+                    let mode = value.parse::<u32>().map_err(|_| {
+                        VfsGatewayError::BadRequest(format!(
+                            "invalid {CHEVALIER_VFS_MODE_HEADER}: expected an integer from 0 to 4095"
+                        ))
+                    })?;
+                    if mode > 0o7777 {
+                        return Err(VfsGatewayError::BadRequest(format!(
+                            "invalid {CHEVALIER_VFS_MODE_HEADER}: expected an integer from 0 to 4095"
+                        )));
+                    }
+                    Ok(mode)
+                })
+                .transpose()?,
             owner_token: parse_required_uuid_header(
                 headers,
                 CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
@@ -1652,7 +1857,10 @@ pub use server::{VfsGatewayBackend, chevalier_vfs_routes, vfs_routes};
 
 #[cfg(test)]
 mod tests {
-    use super::{VfsGatewayError, owner_vfs_endpoint, parse_vfs_range_header, scoped_vfs_path};
+    use super::{
+        VfsGatewayError, VfsMetadata, VfsNamespaceMutation, VfsSubtreeMetadataEntry,
+        owner_vfs_endpoint, parse_vfs_range_header, scoped_vfs_path,
+    };
 
     #[test]
     fn endpoint_helper_uses_generic_chevalier_vfs_route() {
@@ -1670,6 +1878,150 @@ mod tests {
         );
         assert_eq!(scoped_vfs_path("", "/logs/out.txt"), "logs/out.txt");
         assert_eq!(scoped_vfs_path("workspace", ""), "workspace");
+    }
+
+    #[test]
+    fn metadata_without_exact_mode_retains_legacy_executable_fallback() {
+        let metadata: VfsMetadata = serde_json::from_value(serde_json::json!({
+            "kind": "file",
+            "size_bytes": 1,
+            "content_hash": null,
+            "executable": true,
+            "updated_at": null,
+        }))
+        .unwrap();
+
+        assert_eq!(metadata.mode, None);
+        assert!(metadata.executable);
+    }
+
+    #[test]
+    fn metadata_exact_mode_is_accepted_on_decode_and_masked_on_trusted_encode() {
+        let metadata: VfsMetadata = serde_json::from_value(serde_json::json!({
+            "kind": "file",
+            "size_bytes": 1,
+            "content_hash": null,
+            "executable": true,
+            "mode": 0o755,
+            "updated_at": null,
+        }))
+        .unwrap();
+        assert_eq!(metadata.mode, Some(0o755));
+
+        let mut metadata = metadata;
+        metadata.mode = Some(0o106755);
+        assert_eq!(serde_json::to_value(metadata).unwrap()["mode"], 0o6755);
+    }
+
+    #[test]
+    fn subtree_metadata_supports_legacy_executable_and_optional_exact_mode() {
+        let legacy: VfsSubtreeMetadataEntry = serde_json::from_value(serde_json::json!({
+            "path": "script",
+            "kind": "file",
+            "size_bytes": 1,
+            "content_hash": null,
+            "token_count": null,
+            "version": null,
+            "updated_at": null,
+            "object_state": null,
+        }))
+        .unwrap();
+        assert!(!legacy.executable);
+        assert_eq!(legacy.mode, None);
+
+        let exact: VfsSubtreeMetadataEntry = serde_json::from_value(serde_json::json!({
+            "path": "script",
+            "kind": "file",
+            "size_bytes": 1,
+            "content_hash": null,
+            "executable": true,
+            "mode": 0o6755,
+            "token_count": null,
+            "version": null,
+            "updated_at": null,
+            "object_state": null,
+        }))
+        .unwrap();
+        assert!(exact.executable);
+        assert_eq!(exact.mode, Some(0o6755));
+    }
+
+    #[test]
+    fn directory_mutation_mode_is_optional_and_exact() {
+        let legacy: VfsNamespaceMutation = serde_json::from_value(serde_json::json!({
+            "kind": "create_directory",
+            "path": "tree",
+        }))
+        .unwrap();
+        assert_eq!(
+            legacy,
+            VfsNamespaceMutation::CreateDirectory {
+                path: "tree".to_string(),
+                mode: None,
+            }
+        );
+
+        let exact: VfsNamespaceMutation = serde_json::from_value(serde_json::json!({
+            "kind": "create_directory",
+            "path": "tree",
+            "mode": 0o4775,
+        }))
+        .unwrap();
+        assert_eq!(
+            exact,
+            VfsNamespaceMutation::CreateDirectory {
+                path: "tree".to_string(),
+                mode: Some(0o4775),
+            }
+        );
+    }
+
+    #[test]
+    fn set_mode_mutation_accepts_exact_permission_bits() {
+        let mutation: VfsNamespaceMutation = serde_json::from_value(serde_json::json!({
+            "kind": "set_mode",
+            "path": "script",
+            "mode": 0o6755,
+        }))
+        .unwrap();
+        assert_eq!(
+            mutation,
+            VfsNamespaceMutation::SetMode {
+                path: "script".to_string(),
+                mode: 0o6755,
+            }
+        );
+        assert_eq!(serde_json::to_value(mutation).unwrap()["mode"], 0o6755);
+    }
+
+    #[test]
+    fn external_exact_modes_reject_negative_or_out_of_range_values() {
+        assert!(
+            serde_json::from_value::<VfsMetadata>(serde_json::json!({
+                "kind": "file",
+                "size_bytes": 1,
+                "content_hash": null,
+                "mode": 0o100755,
+                "updated_at": null,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<VfsNamespaceMutation>(serde_json::json!({
+                "kind": "create_directory",
+                "path": "tree",
+                "mode": -1,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<VfsNamespaceMutation>(serde_json::json!({
+                "kind": "set_mode",
+                "path": "script",
+                "mode": 0o100755,
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1704,7 +2056,8 @@ mod server_tests {
     use uuid::Uuid;
 
     use super::{
-        CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, CHEVALIER_VFS_OPERATION_HEADER,
+        CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, CHEVALIER_VFS_MODE_HEADER,
+        CHEVALIER_VFS_OPERATION_HEADER, CHEVALIER_VFS_PRECONDITION_FILE_ID_HEADER,
         CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER,
         CHEVALIER_VFS_PRECONDITION_SECONDARY_FINGERPRINT_HEADER, CHEVALIER_VFS_RESOURCE_KEY_HEADER,
         VFS_ENTRY_KIND_DIRECTORY, VFS_ENTRY_KIND_FILE, VFS_OPERATION_SETATTR_SIZE,
@@ -1753,6 +2106,7 @@ mod server_tests {
                 link_target: None,
                 content_hash: None,
                 executable: false,
+                mode: None,
                 updated_at: None,
             }])
         }
@@ -1769,6 +2123,7 @@ mod server_tests {
                     link_target: None,
                     content_hash: None,
                     executable: false,
+                    mode: None,
                     updated_at: None,
                 });
             }
@@ -1783,6 +2138,7 @@ mod server_tests {
                 link_target: None,
                 content_hash: None,
                 executable: false,
+                mode: None,
                 updated_at: None,
             })
         }
@@ -1799,6 +2155,7 @@ mod server_tests {
                     link_target: None,
                     content_hash: None,
                     executable: false,
+                    mode: None,
                     updated_at: None,
                 });
             }
@@ -1813,6 +2170,7 @@ mod server_tests {
                 link_target: None,
                 content_hash: None,
                 executable: false,
+                mode: None,
                 updated_at: None,
             })
         }
@@ -2144,7 +2502,8 @@ mod server_tests {
                                     "body": [111, 110, 101],
                                     "precondition": {
                                         "fingerprint": "version-1",
-                                        "secondary_fingerprint": "secondary-1"
+                                        "secondary_fingerprint": "secondary-1",
+                                        "expected_file_id": "file-1"
                                     }
                                 },
                                 {"path": "second.txt", "body": [116, 119, 111]},
@@ -2182,6 +2541,15 @@ mod server_tests {
                 .as_deref(),
             Some("secondary-1")
         );
+        assert_eq!(
+            inner.write_many[0].writes[0]
+                .precondition
+                .as_ref()
+                .unwrap()
+                .expected_file_id
+                .as_deref(),
+            Some("file-1")
+        );
         assert!(inner.write_many[0].writes[1].precondition.is_none());
         assert_eq!(inner.files.get("first.txt").unwrap().as_ref(), b"one");
         assert_eq!(inner.files.get("second.txt").unwrap().as_ref(), b"two");
@@ -2208,8 +2576,9 @@ mod server_tests {
                     .body(Body::from(
                         serde_json::to_vec(&serde_json::json!({
                             "mutations": [
-                                {"kind": "create_directory", "path": "tree"},
+                                {"kind": "create_directory", "path": "tree", "mode": 509},
                                 {"kind": "rename", "from": "source.txt", "to": "tree/result.txt"},
+                                {"kind": "set_mode", "path": "tree/result.txt", "mode": 3565},
                                 {
                                     "kind": "delete_file",
                                     "path": "tree/result.txt",
@@ -2232,16 +2601,23 @@ mod server_tests {
             vec![
                 VfsNamespaceMutation::CreateDirectory {
                     path: "tree".to_string(),
+                    mode: Some(0o775),
                 },
                 VfsNamespaceMutation::Rename {
                     from: "source.txt".to_string(),
                     to: "tree/result.txt".to_string(),
                 },
+                VfsNamespaceMutation::SetMode {
+                    path: "tree/result.txt".to_string(),
+                    mode: 0o6755,
+                },
                 VfsNamespaceMutation::DeleteFile {
                     path: "tree/result.txt".to_string(),
                     precondition: Some(VfsWritePrecondition {
+                        predicate: None,
                         fingerprint: Some("version-1".to_string()),
                         secondary_fingerprint: None,
+                        expected_file_id: None,
                     }),
                 },
             ]
@@ -2336,6 +2712,12 @@ mod server_tests {
                         "secondary-new",
                     );
             }
+            if method == "PUT" {
+                builder = builder.header(CHEVALIER_VFS_MODE_HEADER, 0o750.to_string());
+            }
+            if method == "PUT" && uri.contains("/file?") {
+                builder = builder.header(CHEVALIER_VFS_PRECONDITION_FILE_ID_HEADER, "file-new");
+            }
             let response = app
                 .clone()
                 .oneshot(builder.body(Body::from(body)).unwrap())
@@ -2351,6 +2733,15 @@ mod server_tests {
         assert_eq!(inner.symlinks.len(), 1);
         assert_eq!(inner.rmdirs.len(), 1);
         assert_eq!(inner.renames.len(), 1);
+        assert_eq!(inner.writes[0].headers.mode, Some(0o750));
+        assert_eq!(
+            inner.writes[0]
+                .precondition
+                .as_ref()
+                .and_then(|precondition| precondition.expected_file_id.as_deref()),
+            Some("file-new")
+        );
+        assert_eq!(inner.mkdirs[0].headers.mode, Some(0o750));
         assert_eq!(inner.symlinks[0].path, "link.txt");
         assert_eq!(inner.symlinks[0].target, "target.txt");
         let delete_precondition = inner.deletes[0]
@@ -2366,6 +2757,37 @@ mod server_tests {
             Some("secondary-new")
         );
         assert!(inner.files.contains_key("renamed.txt"));
+    }
+
+    #[tokio::test]
+    async fn gateway_rejects_invalid_external_mode_headers() {
+        let owner_token = Uuid::new_v4();
+        let backend = MemoryBackend::default();
+        let app =
+            chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
+
+        for mode in ["not-a-mode", "-1", "33256"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/internal/chevalier/vfs/owner-1/file?path=new.txt")
+                        .header(CHEVALIER_VFS_RESOURCE_KEY_HEADER, "owner:owner-1:workspace")
+                        .header(
+                            CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                            owner_token.to_string(),
+                        )
+                        .header(CHEVALIER_VFS_MODE_HEADER, mode)
+                        .body(Body::from("new"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        assert!(backend.inner.lock().unwrap().writes.is_empty());
     }
 
     #[tokio::test]

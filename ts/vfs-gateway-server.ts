@@ -21,8 +21,14 @@
 //   - GET  {owner}/file/raw?path=        -> 200 bytes (Range -> 206) | 404
 //   - GET  {owner}/tree?path=&name_like= -> 200 RemoteDirEntry[]
 //   - PUT  {owner}/file?path=            -> 2xx (body ignored by client); honors the
-//                                           precondition-fingerprint header, `If-Match`,
-//                                           or `ifMatch` query alias -> 409.
+//                                           typed precondition-kind +
+//                                           precondition-fingerprint headers, with
+//                                           legacy `If-Match` / `ifMatch` aliases -> 409.
+//                                           Optional identity CAS uses
+//                                           `x-chevalier-vfs-precondition-file-id`.
+//                                           Exact POSIX mode is decimal in
+//                                           `x-chevalier-vfs-mode`; the legacy
+//                                           executable header remains a fallback.
 //                                           `If-Match` is an alias in chevalier's
 //                                           protocol, not a separate HTTP 412 path.
 //                                           Fingerprint is `contentHash`: SHA-256 hex
@@ -43,9 +49,12 @@ import { join, posix } from "node:path";
 import type { VfsStorage, VfsMetadata } from "./native.js";
 
 const DEFAULT_ROUTE_PREFIX = "/internal/chevalier/vfs";
+const PRECONDITION_KIND_HEADER = "x-chevalier-vfs-precondition-kind";
 const PRECONDITION_FINGERPRINT_HEADER = "x-chevalier-vfs-precondition-fingerprint";
+const PRECONDITION_FILE_ID_HEADER = "x-chevalier-vfs-precondition-file-id";
 const IF_MATCH_HEADER = "if-match";
 const EXECUTABLE_HEADER = "x-chevalier-vfs-executable";
+const MODE_HEADER = "x-chevalier-vfs-mode";
 const EXPECTED_CONTENT_HASH_HEADER = "x-chevalier-vfs-expected-content-sha256";
 const STREAM_UPLOAD_HEADER = "x-chevalier-vfs-stream-upload";
 const RANGE_FINGERPRINT_HEADER = "x-chevalier-vfs-range-fingerprint";
@@ -407,12 +416,17 @@ type StreamingVfsStorage = VfsStorage & {
     path: string,
     sourcePath: string,
     expectedContentHash: string,
-    options?: { ifMatch?: string | null; executable?: boolean } | null,
+    options?: {
+      ifMatch?: string | null;
+      expectedFileId?: string | null;
+      executable?: boolean;
+      mode?: number;
+    } | null,
   ) => Promise<unknown>;
   writeMany?: (writes: Array<{
     path: string;
     body: number[];
-    precondition?: { fingerprint?: string | null };
+    precondition?: { predicate?: VfsCasPredicate; expected_file_id?: string };
   }>) => Promise<StreamingWriteManyResult[]>;
 };
 
@@ -639,6 +653,7 @@ export function createVfsGatewayServer(
       if (method === "PUT" && op === "file") {
         if (isExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
         const precondition = requestPrecondition(req, q);
+        const expectedFileId = requestExpectedFileId(req);
         const writeOptions = requestWriteOptions(req);
         const failed = await enforceFingerprintPrecondition(store, relPath, precondition);
         if (failed !== null) return failed;
@@ -678,7 +693,10 @@ export function createVfsGatewayServer(
               return errorResponse(409, `streamed upload hash mismatch for ${relPath}`);
             }
             const streamingStore = store as StreamingVfsStorage;
-            const options = { ...preconditionOptions(precondition), ...writeOptions };
+            const options = {
+              ...preconditionOptions(precondition, expectedFileId),
+              ...writeOptions,
+            };
             const res =
               typeof streamingStore.writeFromFile === "function"
                 ? await streamingStore.writeFromFile(relPath, stagedPath, expectedHash, options)
@@ -712,7 +730,7 @@ export function createVfsGatewayServer(
         };
         try {
           res = (await store.write(relPath, body, {
-            ...preconditionOptions(precondition),
+            ...preconditionOptions(precondition, expectedFileId),
             ...writeOptions,
           })) as {
             content_hash?: string;
@@ -757,7 +775,11 @@ export function createVfsGatewayServer(
 
       if (method === "PUT" && op === "dir") {
         if (isExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
-        await store.mkdir(relPath);
+        const writeOptions = requestWriteOptions(req);
+        await store.mkdir(
+          relPath,
+          Object.keys(writeOptions).length === 0 ? undefined : writeOptions,
+        );
         return new Response(null, { status: 204 });
       }
       if (method === "PUT" && op === "symlink") {
@@ -899,12 +921,19 @@ export function createVfsGatewayServer(
         if (typeof streamingStore.writeMany === "function") {
           const normalizedWrites = writes.map((write) => {
             const precondition = writeItemPrecondition(write);
+            const expectedFileId = writeItemExpectedFileId(write);
+            const wirePrecondition = {
+              ...(precondition.present ? { predicate: precondition.predicate } : {}),
+              ...(expectedFileId === undefined
+                ? {}
+                : { expected_file_id: expectedFileId }),
+            };
             return {
               path: write.path,
               body: write.body,
-              ...(precondition.present
-                ? { precondition: { fingerprint: precondition.fingerprint } }
-                : {}),
+              ...(Object.keys(wirePrecondition).length === 0
+                ? {}
+                : { precondition: wirePrecondition }),
             };
           });
           try {
@@ -934,6 +963,7 @@ export function createVfsGatewayServer(
           const cur = await store.stat(p);
           const prev = cur?.contentHash ?? null;
           const precondition = writeItemPrecondition(write);
+          const expectedFileId = writeItemExpectedFileId(write);
           let res: {
             content_hash?: string;
             contentHash?: string;
@@ -945,7 +975,7 @@ export function createVfsGatewayServer(
             res = (await store.write(
               p,
               Buffer.from(write.body),
-              preconditionOptions(precondition),
+              preconditionOptions(precondition, expectedFileId),
             )) as {
               content_hash?: string;
               contentHash?: string;
@@ -1073,9 +1103,13 @@ function isVfsBadRequestError(error: unknown): boolean {
   return value?.code === "VFS_BAD_REQUEST" || vfsErrorStatus(error) === 400;
 }
 
+type VfsCasPredicate =
+  | { kind: "absent" }
+  | { kind: "content_fingerprint"; fingerprint: string };
+
 type FingerprintPrecondition =
   | { present: false }
-  | { present: true; fingerprint: string | null };
+  | { present: true; predicate: VfsCasPredicate };
 
 function normalizeFingerprint(raw: string | null | undefined): string | null {
   if (raw === null || raw === undefined) return null;
@@ -1093,7 +1127,14 @@ function normalizeFingerprint(raw: string | null | undefined): string | null {
 }
 
 function preconditionFromRaw(raw: string | null): FingerprintPrecondition {
-  return { present: true, fingerprint: normalizeFingerprint(raw) };
+  const fingerprint = normalizeFingerprint(raw);
+  return {
+    present: true,
+    predicate:
+      fingerprint === null
+        ? { kind: "absent" }
+        : { kind: "content_fingerprint", fingerprint },
+  };
 }
 
 function queryIfMatch(query: URLSearchParams): string | null {
@@ -1101,30 +1142,105 @@ function queryIfMatch(query: URLSearchParams): string | null {
 }
 
 function requestPrecondition(req: Request, query: URLSearchParams): FingerprintPrecondition {
+  const kind = req.headers.get(PRECONDITION_KIND_HEADER);
   const raw =
     req.headers.get(PRECONDITION_FINGERPRINT_HEADER) ??
     req.headers.get(IF_MATCH_HEADER) ??
     queryIfMatch(query);
+  if (kind === "absent") {
+    if (raw !== null) throw badPrecondition("absent precondition cannot include a fingerprint");
+    return { present: true, predicate: { kind: "absent" } };
+  }
+  if (kind === "content_fingerprint") {
+    if (raw === null) throw badPrecondition("content_fingerprint precondition requires a fingerprint");
+    const normalized = normalizeFingerprint(raw);
+    if (normalized === null) {
+      throw badPrecondition("content_fingerprint precondition requires a non-empty fingerprint");
+    }
+    return {
+      present: true,
+      predicate: { kind: "content_fingerprint", fingerprint: normalized },
+    };
+  }
+  if (kind !== null) throw badPrecondition(`unsupported precondition kind: ${kind}`);
   if (raw !== null) return preconditionFromRaw(raw);
   return { present: false };
 }
 
-function requestWriteOptions(req: Request): { executable?: boolean } {
-  const raw = req.headers.get(EXECUTABLE_HEADER);
-  if (raw === null) return {};
-  if (raw === "true") return { executable: true };
-  if (raw === "false") return { executable: false };
-  throw Object.assign(new Error(`${EXECUTABLE_HEADER} must be true or false`), {
-    code: "VFS_BAD_REQUEST",
-    status: 400,
-  });
+function badPrecondition(message: string): Error {
+  return Object.assign(new Error(message), { code: "VFS_BAD_REQUEST", status: 400 });
+}
+
+function parseExpectedFileId(raw: unknown, source: string): string | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "string" || raw.length === 0) {
+    throw Object.assign(new Error(`${source} must be a non-empty string`), {
+      code: "VFS_BAD_REQUEST",
+      status: 400,
+    });
+  }
+  return raw;
+}
+
+function requestExpectedFileId(req: Request): string | undefined {
+  return parseExpectedFileId(
+    req.headers.get(PRECONDITION_FILE_ID_HEADER),
+    PRECONDITION_FILE_ID_HEADER,
+  );
+}
+
+type WriteOptions = { executable?: boolean; mode?: number };
+
+function parseMode(raw: unknown, source: string): number | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const value =
+    typeof raw === "string" && /^[0-9]+$/.test(raw)
+      ? Number(raw)
+      : typeof raw === "number"
+        ? raw
+        : Number.NaN;
+  if (!Number.isSafeInteger(value) || value < 0 || value > 0o7777) {
+    throw Object.assign(new Error(`${source} must be an integer between 0 and 4095`), {
+      code: "VFS_BAD_REQUEST",
+      status: 400,
+    });
+  }
+  return value;
+}
+
+function requestWriteOptions(req: Request): WriteOptions {
+  const rawMode = req.headers.get(MODE_HEADER);
+  const mode = parseMode(rawMode, MODE_HEADER);
+  const rawExecutable = req.headers.get(EXECUTABLE_HEADER);
+  let executable: boolean | undefined;
+  if (rawExecutable === "true") executable = true;
+  else if (rawExecutable === "false") executable = false;
+  else if (rawExecutable !== null) {
+    throw Object.assign(new Error(`${EXECUTABLE_HEADER} must be true or false`), {
+      code: "VFS_BAD_REQUEST",
+      status: 400,
+    });
+  }
+  if (mode !== undefined) return { executable: (mode & 0o111) !== 0, mode };
+  return executable === undefined ? {} : { executable };
 }
 
 function preconditionOptions(
   precondition: FingerprintPrecondition,
-): { ifMatch?: string | null } | undefined {
-  if (!precondition.present) return undefined;
-  return { ifMatch: precondition.fingerprint };
+  expectedFileId?: string,
+): { ifMatch?: string | null; expectedFileId?: string } | undefined {
+  if (!precondition.present && expectedFileId === undefined) return undefined;
+  return {
+    ...(precondition.present
+      ? {
+          ifMatch:
+            precondition.predicate.kind === "absent"
+              ? null
+              : precondition.predicate.fingerprint,
+        }
+      : {}),
+    ...(expectedFileId === undefined ? {} : { expectedFileId }),
+  };
 }
 
 type WriteManyRequestItem = {
@@ -1133,9 +1249,11 @@ type WriteManyRequestItem = {
   ifMatch?: string | null;
   if_match?: string | null;
   precondition?: {
+    predicate?: VfsCasPredicate;
     fingerprint?: string | null;
     ifMatch?: string | null;
     if_match?: string | null;
+    expected_file_id?: string | null;
   };
 };
 
@@ -1175,6 +1293,7 @@ function normalizeWriteManyItems(
     }
     try {
       writeItemPrecondition(write as WriteManyRequestItem);
+      writeItemExpectedFileId(write as WriteManyRequestItem);
     } catch (error) {
       return errorResponse(400, error instanceof Error ? error.message : String(error));
     }
@@ -1184,12 +1303,16 @@ function normalizeWriteManyItems(
 }
 
 type NamespaceMutation =
-  | { kind: "create_directory"; path: string }
+  | { kind: "create_directory"; path: string; mode?: number }
+  | { kind: "set_mode"; path: string; mode: number }
   | { kind: "create_symlink"; path: string; target: string }
   | {
       kind: "delete_file";
       path: string;
-      precondition?: { fingerprint?: string | null };
+      precondition?: {
+        predicate?: VfsCasPredicate;
+        expected_file_id?: string;
+      };
     }
   | { kind: "remove_directory"; path: string }
   | { kind: "rename"; from: string; to: string };
@@ -1221,21 +1344,50 @@ function normalizeNamespaceMutations(
     if (path === "" || isExcludedPath(path)) return errorResponse(400, `invalid namespace path: ${path}`);
     if (kind === "delete_file") {
       let precondition: FingerprintPrecondition;
+      let expectedFileId: string | undefined;
       try {
         precondition = writeItemPrecondition(mutation as WriteManyRequestItem);
+        expectedFileId = writeItemExpectedFileId(mutation as WriteManyRequestItem);
       } catch (error) {
         return errorResponse(400, error instanceof Error ? error.message : String(error));
       }
+      const wirePrecondition = {
+        ...(precondition.present ? { predicate: precondition.predicate } : {}),
+        ...(expectedFileId === undefined
+          ? {}
+          : { expected_file_id: expectedFileId }),
+      };
       out.push({
         kind,
         path,
-        ...(precondition.present
-          ? { precondition: { fingerprint: precondition.fingerprint } }
+        ...(Object.keys(wirePrecondition).length > 0
+          ? { precondition: wirePrecondition }
           : {}),
       });
       continue;
     }
-    if (kind === "create_directory" || kind === "remove_directory") {
+    if (kind === "create_directory") {
+      let mode: number | undefined;
+      try {
+        mode = parseMode(mutation.mode, "create_directory mode");
+      } catch (error) {
+        return errorResponse(400, error instanceof Error ? error.message : String(error));
+      }
+      out.push({ kind, path, ...(mode === undefined ? {} : { mode }) });
+      continue;
+    }
+    if (kind === "set_mode") {
+      let mode: number | undefined;
+      try {
+        mode = parseMode(mutation.mode, "set_mode mode");
+      } catch (error) {
+        return errorResponse(400, error instanceof Error ? error.message : String(error));
+      }
+      if (mode === undefined) return errorResponse(400, "set_mode requires mode");
+      out.push({ kind, path, mode });
+      continue;
+    }
+    if (kind === "remove_directory") {
       out.push({ kind, path });
       continue;
     }
@@ -1260,6 +1412,29 @@ function ownValue<T extends object, K extends PropertyKey>(obj: T | null | undef
 }
 
 function writeItemPrecondition(write: WriteManyRequestItem): FingerprintPrecondition {
+  const predicate = ownValue(write.precondition, "predicate");
+  if (predicate !== undefined) {
+    if (typeof predicate !== "object" || predicate === null || Array.isArray(predicate)) {
+      throw new Error("invalid write precondition: predicate must be an object");
+    }
+    const kind = ownValue(predicate, "kind");
+    if (kind === "absent") {
+      return { present: true, predicate: { kind: "absent" } };
+    }
+    if (kind === "content_fingerprint") {
+      const fingerprint = ownValue(predicate, "fingerprint");
+      if (typeof fingerprint !== "string" || fingerprint.length === 0) {
+        throw new Error(
+          "invalid write precondition: content_fingerprint requires a non-empty fingerprint",
+        );
+      }
+      return {
+        present: true,
+        predicate: { kind: "content_fingerprint", fingerprint },
+      };
+    }
+    throw new Error(`invalid write precondition kind: ${String(kind)}`);
+  }
   let raw = ownValue(write.precondition, "fingerprint");
   if (raw === undefined) raw = ownValue(write.precondition, "ifMatch");
   if (raw === undefined) raw = ownValue(write.precondition, "if_match");
@@ -1270,6 +1445,13 @@ function writeItemPrecondition(write: WriteManyRequestItem): FingerprintPrecondi
     throw new Error("invalid write precondition: ifMatch/fingerprint must be a string or null");
   }
   return preconditionFromRaw(raw);
+}
+
+function writeItemExpectedFileId(write: WriteManyRequestItem): string | undefined {
+  return parseExpectedFileId(
+    ownValue(write.precondition, "expected_file_id"),
+    "invalid write precondition: expected_file_id",
+  );
 }
 
 function conflictResponseFromStoreError(error: unknown, path: string): Response | null {
@@ -1304,7 +1486,13 @@ async function enforceFingerprintPrecondition(
   if (!precondition.present) return null;
   const cur = await store.stat(path);
   const curHash = mutationFingerprint(cur);
-  if (precondition.fingerprint === curHash) return null;
+  if (
+    (precondition.predicate.kind === "absent" && cur === null) ||
+    (precondition.predicate.kind === "content_fingerprint" &&
+      precondition.predicate.fingerprint === curHash)
+  ) {
+    return null;
+  }
   // CAS mismatch -> 409 Conflict; the file is NOT touched (no clobber).
   return errorResponse(409, `precondition failed for ${path}`);
 }
@@ -1329,12 +1517,14 @@ function wireKind(kind: string): "file" | "directory" | "symlink" | "special" {
 }
 
 function toRemoteMetadata(md: VfsMetadata) {
+  const mode = md.mode ?? null;
   return {
     kind: wireKind(md.kind),
     size_bytes: Number(md.sizeBytes),
     file_id: md.fileId ?? null,
     link_count: Number(md.linkCount ?? 1n),
-    executable: md.executable ?? false,
+    mode,
+    executable: mode === null ? md.executable ?? false : (mode & 0o111) !== 0,
     link_target: md.linkTarget ?? null,
     content_hash: md.contentHash ?? null,
     updated_at: md.updatedAt ?? null,
@@ -1343,13 +1533,15 @@ function toRemoteMetadata(md: VfsMetadata) {
 
 function toRemoteDirEntry(md: VfsMetadata) {
   const name = md.path.split("/").filter((s) => s !== "").pop() ?? md.path;
+  const mode = md.mode ?? null;
   return {
     name,
     kind: wireKind(md.kind),
     size_bytes: Number(md.sizeBytes),
     file_id: md.fileId ?? null,
     link_count: Number(md.linkCount ?? 1n),
-    executable: md.executable ?? false,
+    mode,
+    executable: mode === null ? md.executable ?? false : (mode & 0o111) !== 0,
     link_target: md.linkTarget ?? null,
     content_hash: md.contentHash ?? null,
     updated_at: md.updatedAt ?? null,

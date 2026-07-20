@@ -399,8 +399,10 @@ mod postgres {
         for round in 0..100_u64 {
             let current = first.stat("tree/source").await.unwrap().unwrap();
             let precondition = VfsStorageWritePrecondition {
+                predicate: None,
                 fingerprint: current.version,
                 secondary_fingerprint: None,
+                expected_file_id: None,
             };
             let (left, right) = tokio::join!(
                 first.write(
@@ -563,7 +565,7 @@ mod postgres {
             .expect_err("identity lock acquisition must time out");
         let elapsed = started.elapsed();
         assert!(
-            matches!(error, VfsStorageError::Conflict(ref message) if message.contains("timed out acquiring VFS file-identity lock")),
+            matches!(error, VfsStorageError::Internal(ref message) if message.contains("timed out acquiring VFS file-identity lock")),
             "{error:?}",
         );
         assert!(elapsed >= std::time::Duration::from_millis(1_500));
@@ -658,8 +660,10 @@ mod postgres {
             bytes: Bytes::from_static(b"stale"),
             token_count: None,
             precondition: Some(VfsStorageWritePrecondition {
+                predicate: None,
                 fingerprint: Some(stale_version),
                 secondary_fingerprint: None,
+                expected_file_id: None,
             }),
         });
         let before_counts = sqlx::query_as::<_, (i64, i64, i64)>(

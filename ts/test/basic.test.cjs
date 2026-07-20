@@ -51,6 +51,98 @@ test("vfs local round-trip", async () => {
   assert.strictEqual(attrs.contentHash, undefined);
 });
 
+test(
+  "vfs local preserves exact POSIX modes across writes, mkdir, and namespace updates",
+  { skip: process.platform === "win32" },
+  async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "chev-mode-test-"));
+    const vfs = VfsStorage.local(root);
+
+    await vfs.write("script.sh", Buffer.from("#!/bin/sh\n"), {
+      // Exact mode wins over a contradictory rolling-upgrade compatibility bit.
+      executable: false,
+      mode: 0o751,
+    });
+    let metadata = await vfs.stat("script.sh");
+    assert.strictEqual(metadata.mode, 0o751);
+    assert.strictEqual(metadata.executable, true);
+    assert.strictEqual(fs.statSync(path.join(root, "script.sh")).mode & 0o7777, 0o751);
+
+    await vfs.write("script.sh", Buffer.from("#!/bin/sh\n"), { mode: 0o640 });
+    metadata = await vfs.stat("script.sh");
+    assert.strictEqual(metadata.mode, 0o640);
+    assert.strictEqual(metadata.executable, false);
+
+    await vfs.mkdir("private", { mode: 0o750 });
+    assert.strictEqual((await vfs.stat("private")).mode, 0o750);
+    await vfs.applyNamespaceBatch([
+      { kind: "set_mode", path: "private", mode: 0o700 },
+    ]);
+    assert.strictEqual((await vfs.stat("private")).mode, 0o700);
+
+    await assert.rejects(
+      vfs.write("invalid", Buffer.from("x"), { mode: 0o10000 }),
+      /mode must be an integer between 0 and 4095/,
+    );
+    await assert.rejects(
+      vfs.mkdir("invalid-dir", { mode: -1 }),
+      /mode must be an integer between 0 and 4095/,
+    );
+    await assert.rejects(
+      vfs.applyNamespaceBatch([{ kind: "set_mode", path: "private", mode: 4096 }]),
+      /mode must be an integer between 0 and 4095/,
+    );
+  },
+);
+
+test("vfs local forwards expected file identity preconditions through N-API writes", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "chev-file-id-precondition-test-"));
+  const vfs = VfsStorage.local(root);
+  await vfs.write("guarded.txt", Buffer.from("initial"));
+
+  let expectedFileId = (await vfs.stat("guarded.txt")).fileId;
+  assert.strictEqual(typeof expectedFileId, "string");
+  await vfs.write("guarded.txt", Buffer.from("direct"), { expectedFileId });
+  await assert.rejects(
+    vfs.write("guarded.txt", Buffer.from("stale"), { expectedFileId: "inode:stale" }),
+    /identity precondition failed/,
+  );
+
+  expectedFileId = (await vfs.stat("guarded.txt")).fileId;
+  const stagedPath = path.join(root, "staged-payload");
+  const stagedBody = Buffer.from("streamed");
+  fs.writeFileSync(stagedPath, stagedBody);
+  await vfs.writeFromFile(
+    "guarded.txt",
+    stagedPath,
+    createHash("sha256").update(stagedBody).digest("hex"),
+    { expectedFileId },
+  );
+
+  expectedFileId = (await vfs.stat("guarded.txt")).fileId;
+  await vfs.writeMany([
+    {
+      path: "guarded.txt",
+      body: [...Buffer.from("batch")],
+      precondition: { expected_file_id: expectedFileId },
+    },
+  ]);
+  await assert.rejects(
+    vfs.writeMany([
+      {
+        path: "guarded.txt",
+        body: [...Buffer.from("stale-batch")],
+        precondition: { expected_file_id: "inode:stale" },
+      },
+    ]),
+    /identity precondition failed/,
+  );
+  await assert.rejects(
+    vfs.write("guarded.txt", Buffer.from("invalid"), { expectedFileId: "" }),
+    /expectedFileId must be a non-empty string/,
+  );
+});
+
 test("vfs local metadata exposes stable hard-link identity", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "chev-hardlink-metadata-test-"));
   fs.writeFileSync(path.join(root, "original"), "shared");
@@ -323,6 +415,183 @@ test("vfs gateway forwards conditional writes into the backing store", async () 
   );
 });
 
+test("vfs gateway propagates expected file identity through every write path", async () => {
+  const seen = [];
+  const directStore = {
+    async stat() {
+      return null;
+    },
+    async write(path, data, options) {
+      seen.push({ op: "write", path, body: data.toString("utf8"), options });
+      return { contentHash: "direct-hash", previousHash: null, changed: true };
+    },
+    async writeFromFile(path, sourcePath, expectedHash, options) {
+      seen.push({
+        op: "writeFromFile",
+        path,
+        body: fs.readFileSync(sourcePath, "utf8"),
+        expectedHash,
+        options,
+      });
+      return { contentHash: expectedHash, previousHash: null, changed: true };
+    },
+    async writeMany(writes) {
+      seen.push({ op: "writeMany", writes });
+      return writes.map((write) => ({
+        path: write.path,
+        contentHash: "batch-hash",
+        previousHash: null,
+        changed: true,
+      }));
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: async () => directStore });
+
+  const direct = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/file?path=direct.txt", {
+      method: "PUT",
+      headers: { "x-chevalier-vfs-precondition-file-id": "inode:direct" },
+      body: "direct",
+    }),
+  );
+  assert.strictEqual(direct.status, 200);
+
+  const streamedBody = Buffer.from("streamed");
+  const streamedHash = createHash("sha256").update(streamedBody).digest("hex");
+  const streamed = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/file?path=streamed.txt", {
+      method: "PUT",
+      headers: {
+        "content-length": String(streamedBody.length),
+        "x-chevalier-vfs-expected-content-sha256": streamedHash,
+        "x-chevalier-vfs-precondition-file-id": "inode:streamed",
+        "x-chevalier-vfs-stream-upload": "1",
+      },
+      body: streamedBody,
+    }),
+  );
+  assert.strictEqual(streamed.status, 200);
+
+  const batch = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/write-many", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        writes: [
+          {
+            path: "batch.txt",
+            body: [...Buffer.from("batch")],
+            precondition: { expected_file_id: "inode:batch" },
+          },
+        ],
+      }),
+    }),
+  );
+  assert.strictEqual(batch.status, 200);
+  assert.deepStrictEqual(seen, [
+    {
+      op: "write",
+      path: "direct.txt",
+      body: "direct",
+      options: { expectedFileId: "inode:direct" },
+    },
+    {
+      op: "writeFromFile",
+      path: "streamed.txt",
+      body: "streamed",
+      expectedHash: streamedHash,
+      options: { expectedFileId: "inode:streamed" },
+    },
+    {
+      op: "writeMany",
+      writes: [
+        {
+          path: "batch.txt",
+          body: [...Buffer.from("batch")],
+          precondition: { expected_file_id: "inode:batch" },
+        },
+      ],
+    },
+  ]);
+
+  const fallbackSeen = [];
+  const fallbackHandler = createVfsGatewayServer({
+    resolveStore: async () => ({
+      async stat() {
+        return null;
+      },
+      async write(path, data, options) {
+        fallbackSeen.push({ path, body: data.toString("utf8"), options });
+        return { contentHash: "fallback-hash", previousHash: null, changed: true };
+      },
+    }),
+  });
+  const fallback = await fallbackHandler(
+    new Request("http://local/internal/chevalier/vfs/owner/write-many", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        writes: [
+          {
+            path: "fallback.txt",
+            body: [...Buffer.from("fallback")],
+            precondition: { expected_file_id: "inode:fallback" },
+          },
+        ],
+      }),
+    }),
+  );
+  assert.strictEqual(fallback.status, 200);
+  assert.deepStrictEqual(fallbackSeen, [
+    {
+      path: "fallback.txt",
+      body: "fallback",
+      options: { expectedFileId: "inode:fallback" },
+    },
+  ]);
+});
+
+test("vfs gateway rejects invalid expected file identity preconditions", async () => {
+  let writes = 0;
+  const handler = createVfsGatewayServer({
+    resolveStore: async () => ({
+      async write() {
+        writes += 1;
+      },
+      async writeMany() {
+        writes += 1;
+      },
+    }),
+  });
+
+  const emptyHeader = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/file?path=direct.txt", {
+      method: "PUT",
+      headers: { "x-chevalier-vfs-precondition-file-id": "" },
+      body: "direct",
+    }),
+  );
+  assert.strictEqual(emptyHeader.status, 400);
+
+  const invalidBatch = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/write-many", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        writes: [
+          {
+            path: "batch.txt",
+            body: [1],
+            precondition: { expected_file_id: 42 },
+          },
+        ],
+      }),
+    }),
+  );
+  assert.strictEqual(invalidBatch.status, 400);
+  assert.strictEqual(writes, 0);
+});
+
 test("vfs gateway forwards executable metadata on writes", async () => {
   const seen = [];
   const store = {
@@ -348,6 +617,151 @@ test("vfs gateway forwards executable metadata on writes", async () => {
   assert.deepStrictEqual(seen, [
     { path: "script.sh", body: "#!/bin/sh\n", options: { executable: true } },
   ]);
+});
+
+test("vfs gateway forwards exact modes and derives the legacy executable bit", async () => {
+  const seen = [];
+  const store = {
+    async stat() {
+      return null;
+    },
+    async write(path, data, options) {
+      seen.push({ op: "write", path, body: data.toString("utf8"), options });
+      return { contentHash: "hash", previousHash: null, changed: true };
+    },
+    async mkdir(path, options) {
+      seen.push({ op: "mkdir", path, options });
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+
+  const writeResponse = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/file?path=script.sh", {
+      method: "PUT",
+      headers: {
+        "x-chevalier-vfs-mode": String(0o4751),
+        // Exact mode is authoritative when a rolling-upgrade caller sends both.
+        "x-chevalier-vfs-executable": "false",
+      },
+      body: "#!/bin/sh\n",
+    }),
+  );
+  const mkdirResponse = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/dir?path=private", {
+      method: "PUT",
+      headers: { "x-chevalier-vfs-mode": String(0o750) },
+    }),
+  );
+
+  assert.strictEqual(writeResponse.status, 200);
+  assert.strictEqual(mkdirResponse.status, 204);
+  assert.deepStrictEqual(seen, [
+    {
+      op: "write",
+      path: "script.sh",
+      body: "#!/bin/sh\n",
+      options: { executable: true, mode: 0o4751 },
+    },
+    {
+      op: "mkdir",
+      path: "private",
+      options: { executable: true, mode: 0o750 },
+    },
+  ]);
+});
+
+test("vfs gateway rejects malformed or out-of-range exact modes", async () => {
+  let writes = 0;
+  const store = {
+    async stat() {
+      return null;
+    },
+    async write() {
+      writes += 1;
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+
+  for (const mode of ["0o751", "-1", "4096", "1.5", "nope"]) {
+    const response = await handler(
+      new Request("http://local/internal/chevalier/vfs/owner/file?path=script.sh", {
+        method: "PUT",
+        headers: { "x-chevalier-vfs-mode": mode },
+        body: "body",
+      }),
+    );
+    assert.strictEqual(response.status, 400, `mode ${mode} must be rejected`);
+  }
+  assert.strictEqual(writes, 0);
+});
+
+test("vfs gateway emits exact mode metadata with legacy executable fallback", async () => {
+  const store = {
+    async stat(path) {
+      return {
+        path,
+        kind: "File",
+        sizeBytes: 1n,
+        mode: 0o751,
+        executable: false,
+        contentHash: "hash",
+      };
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+
+  const response = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/stat?path=script.sh"),
+  );
+  assert.strictEqual(response.status, 200);
+  const metadata = await response.json();
+  assert.strictEqual(metadata.mode, 0o751);
+  assert.strictEqual(metadata.executable, true);
+});
+
+test("vfs gateway preserves exact directory modes in namespace batches", async () => {
+  const seen = [];
+  const store = {
+    async applyNamespaceBatch(mutations) {
+      seen.push(mutations);
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+  const response = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/namespace-many", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        mutations: [
+          { kind: "create_directory", path: "private", mode: 0o2750 },
+          { kind: "set_mode", path: "private", mode: 0o750 },
+        ],
+      }),
+    }),
+  );
+
+  assert.strictEqual(response.status, 204);
+  assert.deepStrictEqual(seen, [
+    [
+      { kind: "create_directory", path: "private", mode: 0o2750 },
+      { kind: "set_mode", path: "private", mode: 0o750 },
+    ],
+  ]);
+
+  for (const mutation of [
+    { kind: "create_directory", path: "invalid", mode: 4096 },
+    { kind: "set_mode", path: "private" },
+  ]) {
+    const invalid = await handler(
+      new Request("http://local/internal/chevalier/vfs/owner/namespace-many", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ mutations: [mutation] }),
+      }),
+    );
+    assert.strictEqual(invalid.status, 400);
+  }
+  assert.strictEqual(seen.length, 1);
 });
 
 test("vfs gateway reports backing-store listing failures as 500, not an empty-looking 404", async () => {
@@ -658,9 +1072,16 @@ test("vfs gateway forwards conditional namespace batches and maps CAS races to 4
             {
               kind: "delete_file",
               path: "a.txt",
-              precondition: { fingerprint: '"sha256:old"' },
+              precondition: {
+                predicate: { kind: "content_fingerprint", fingerprint: "old" },
+                expected_file_id: "inode:a",
+              },
             },
-            { kind: "delete_file", path: "b.txt", precondition: { fingerprint: null } },
+            {
+              kind: "delete_file",
+              path: "b.txt",
+              precondition: { predicate: { kind: "absent" } },
+            },
           ],
         }),
       }),
@@ -669,8 +1090,19 @@ test("vfs gateway forwards conditional namespace batches and maps CAS races to 4
   const matched = await request();
   assert.strictEqual(matched.status, 204);
   assert.deepStrictEqual(seen[0], [
-    { kind: "delete_file", path: "a.txt", precondition: { fingerprint: "old" } },
-    { kind: "delete_file", path: "b.txt", precondition: { fingerprint: null } },
+    {
+      kind: "delete_file",
+      path: "a.txt",
+      precondition: {
+        predicate: { kind: "content_fingerprint", fingerprint: "old" },
+        expected_file_id: "inode:a",
+      },
+    },
+    {
+      kind: "delete_file",
+      path: "b.txt",
+      precondition: { predicate: { kind: "absent" } },
+    },
   ]);
 
   fail = true;
