@@ -23,7 +23,10 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use sha2::Digest;
-use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as AsyncRwLock};
+use tokio::sync::{
+    OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock as AsyncRwLock,
+    Semaphore,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -102,15 +105,17 @@ struct IncompleteAbsentWrite {
 /// every worker parked in a `Condvar::wait`, with no thread left to run — and release
 /// — the lock holder. The map's `std::sync::Mutex` is only ever held for the brief
 /// fetch-or-create, never across an `.await`.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct PathLockTable {
     inner: Arc<Mutex<HashMap<String, Arc<AsyncRwLock<()>>>>>,
+    mutation_admission: Arc<Semaphore>,
 }
 
 struct PathLocks {
     guards: Vec<PathLockGuard>,
     keys: Vec<String>,
     table: PathLockTable,
+    _mutation_admission: Option<OwnedSemaphorePermit>,
 }
 
 enum PathLockGuard {
@@ -127,6 +132,7 @@ enum PathLockMode {
 const HASH_CACHE_RECENCY_GUARD: Duration = Duration::from_secs(2);
 const HASH_CACHE_MAX_AGE: Duration = Duration::from_secs(30);
 const MAX_PARALLEL_FILE_SYNCS: usize = 8;
+const MAX_PARALLEL_LOCAL_MUTATIONS: usize = MAX_PARALLEL_FILE_SYNCS;
 // A 10k-file Git working set must fit without a sequential status scan evicting
 // the entries that the same scan is about to revisit. The cache remains
 // hard-bounded; the torture test below reports its observed payload and a
@@ -139,26 +145,47 @@ impl std::fmt::Debug for PathLockTable {
     }
 }
 
+impl Default for PathLockTable {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            // Local mutations can include file and directory durability barriers.
+            // Bound them before path locks are acquired so an object-write burst
+            // cannot fill Tokio's blocking queue and starve metadata reads.
+            mutation_admission: Arc::new(Semaphore::new(MAX_PARALLEL_LOCAL_MUTATIONS)),
+        }
+    }
+}
+
 impl PathLockTable {
     /// Acquire intent-read locks for ancestors and exclusive locks for mutation
     /// targets. Sibling mutations remain concurrent, while an ancestor rename or
     /// removal excludes every descendant mutation. Keys are acquired in global
     /// lexical order so overlapping multi-path operations cannot deadlock.
     async fn lock(&self, paths: impl IntoIterator<Item = String>) -> PathLocks {
-        self.lock_with_target_mode(paths, PathLockMode::Write).await
+        let admission = self
+            .mutation_admission
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("local VFS mutation admission semaphore must remain open");
+        self.lock_with_target_mode(paths, PathLockMode::Write, Some(admission))
+            .await
     }
 
     /// Point reads share their target lock. They still exclude an exact-path
     /// mutation, but a directory stat/list or subtree scan no longer takes an
     /// exclusive ancestor lock that stalls every descendant operation.
     async fn lock_read(&self, paths: impl IntoIterator<Item = String>) -> PathLocks {
-        self.lock_with_target_mode(paths, PathLockMode::Read).await
+        self.lock_with_target_mode(paths, PathLockMode::Read, None)
+            .await
     }
 
     async fn lock_with_target_mode(
         &self,
         paths: impl IntoIterator<Item = String>,
         target_mode: PathLockMode,
+        mutation_admission: Option<OwnedSemaphorePermit>,
     ) -> PathLocks {
         let mut modes = HashMap::new();
         for path in paths {
@@ -223,6 +250,7 @@ impl PathLockTable {
             guards,
             keys: requested.into_iter().map(|(key, _)| key).collect(),
             table: self.clone(),
+            _mutation_admission: mutation_admission,
         }
     }
 }
@@ -4449,6 +4477,33 @@ mod tests {
             tree_lock.try_write_owned().is_ok(),
             "the exact directory mutation should proceed after its read releases",
         );
+    }
+
+    #[tokio::test]
+    async fn mutation_admission_preserves_a_metadata_lane_during_write_bursts() {
+        let table = PathLockTable::default();
+        let mut admitted = Vec::new();
+        for index in 0..MAX_PARALLEL_LOCAL_MUTATIONS {
+            admitted.push(table.lock([format!("objects/{index}")]).await);
+        }
+
+        assert_eq!(
+            table.mutation_admission.available_permits(),
+            0,
+            "mutation concurrency must remain bounded",
+        );
+        let read = table.lock_read(["objects/metadata".to_string()]).await;
+        drop(read);
+
+        admitted.pop();
+        assert_eq!(
+            table.mutation_admission.available_permits(),
+            1,
+            "a mutation slot must be released with its path locks",
+        );
+        let next = table.lock(["objects/next".to_string()]).await;
+        assert_eq!(table.mutation_admission.available_permits(), 0);
+        drop(next);
     }
 
     #[cfg(unix)]
