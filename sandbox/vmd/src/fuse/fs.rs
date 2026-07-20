@@ -752,7 +752,10 @@ impl RemoteFuseFs {
         let current = self
             .tokio
             .block_on(self.client.stat(path))
-            .map_err(|_| Errno::EIO)?;
+            .map_err(|error| {
+                tracing::warn!(path, file_id, error = %error, "vfs identity stat failed");
+                Errno::EIO
+            })?;
         if current
             .as_ref()
             .and_then(|metadata| metadata.file_id.as_deref())
@@ -766,14 +769,30 @@ impl RemoteFuseFs {
         let Some(alias) = self
             .tokio
             .block_on(self.client.find_hard_link_alias(file_id, path))
-            .map_err(|_| Errno::EIO)?
+            .map_err(|error| {
+                tracing::warn!(
+                    path,
+                    file_id,
+                    error = %error,
+                    "vfs hard-link alias lookup failed"
+                );
+                Errno::EIO
+            })?
         else {
             return Ok(StableFileRoute::Unlinked);
         };
         let metadata = self
             .tokio
             .block_on(self.client.stat(&alias))
-            .map_err(|_| Errno::EIO)?
+            .map_err(|error| {
+                tracing::warn!(
+                    path = alias,
+                    file_id,
+                    error = %error,
+                    "vfs hard-link alias stat failed"
+                );
+                Errno::EIO
+            })?
             .ok_or(Errno::EAGAIN)?;
         if metadata.file_id.as_deref() != Some(file_id) {
             return Err(Errno::EAGAIN);
@@ -2112,14 +2131,20 @@ impl RemoteFuseFs {
 
     fn flush_namespace(&self) -> FuseResult<()> {
         match self.namespace.as_ref() {
-            Some(namespace) => namespace.flush().map_err(|_| Errno::EIO),
+            Some(namespace) => namespace.flush().map_err(|error| {
+                tracing::warn!(error = %error, "vfs namespace barrier failed");
+                Errno::EIO
+            }),
             None => Ok(()),
         }
     }
 
     fn flush_writes(&self) -> FuseResult<()> {
         match self.writes.as_ref() {
-            Some(writes) => writes.flush().map_err(|_| Errno::EIO),
+            Some(writes) => writes.flush().map_err(|error| {
+                tracing::warn!(error = %error, "vfs write barrier failed");
+                Errno::EIO
+            }),
             None => Ok(()),
         }
     }
@@ -3894,7 +3919,10 @@ impl RemoteFuseFs {
         })();
         match result {
             Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
-            Err(err) => reply.error(err),
+            Err(err) => {
+                tracing::warn!(ino = ino.0, errno = ?err, "vfs open failed");
+                reply.error(err);
+            }
         }
     }
 
@@ -3924,7 +3952,17 @@ impl RemoteFuseFs {
         })();
         match result {
             Ok(bytes) => reply.data(&bytes),
-            Err(err) => reply.error(err),
+            Err(err) => {
+                tracing::warn!(
+                    ino = ino.0,
+                    fh = fh.0,
+                    offset,
+                    size,
+                    errno = ?err,
+                    "vfs read failed"
+                );
+                reply.error(err);
+            }
         }
     }
 

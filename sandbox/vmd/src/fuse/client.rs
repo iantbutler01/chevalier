@@ -795,6 +795,11 @@ impl RemoteVfsClient {
         retry_timeout: Duration,
         mut decode: impl FnMut(StatusCode, &[u8]) -> Result<T>,
     ) -> Result<T> {
+        let request_url = builder
+            .try_clone()
+            .and_then(|request| request.build().ok())
+            .map(|request| request.url().to_string())
+            .unwrap_or_else(|| "<unavailable>".to_string());
         let deadline = Instant::now() + retry_timeout;
         let mut retry_delay = READ_RETRY_DELAY_MIN;
         loop {
@@ -842,7 +847,16 @@ impl RemoteVfsClient {
                     tokio::time::sleep(retry_delay).await;
                     retry_delay = retry_delay.saturating_mul(2).min(READ_RETRY_DELAY_MAX);
                 }
-                Err(failure) => return Err(failure.error),
+                Err(failure) => {
+                    tracing::warn!(
+                        url = request_url,
+                        transient = failure.transient,
+                        retry_timeout_ms = retry_timeout.as_millis() as u64,
+                        error = %failure.error,
+                        "vfs read failed"
+                    );
+                    return Err(failure.error);
+                }
             }
         }
     }
