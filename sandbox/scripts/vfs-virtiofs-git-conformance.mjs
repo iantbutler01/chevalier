@@ -601,6 +601,12 @@ os.unlink(root + "/remove-me")
 os.rmdir(root + "/empty")
 assert not os.path.exists(root + "/remove-me")
 assert not os.path.exists(root + "/empty")
+
+session_shrink = "/workspace/session-shrink"
+with open(session_shrink, "wb") as f:
+    f.write(b"x" * 47 + b"\\n")
+assert os.stat(session_shrink).st_size == 48
+assert open(session_shrink, "rb").read() == b"x" * 47 + b"\\n"
 print("ONE_VM_TOPOLOGY_AND_OPS_OK")
 PY`,
     );
@@ -613,6 +619,7 @@ PY`,
       30_000,
     );
     const bytes = Buffer.from(await response.arrayBuffer()).toString("utf8");
+    await first.writeFile("/workspace/session-shrink", Buffer.from("short\n"));
     await storage.write(`${scopePath}/host-written`, Buffer.from("host-visible\n"));
     const hostVisible = await execGuest(
       first,
@@ -636,6 +643,8 @@ assert not os.path.exists(root + "/replace-source")
 assert not os.path.exists(root + "/open-unlink")
 assert not os.path.exists(root + "/remove-me")
 assert not os.path.exists(root + "/empty")
+assert os.stat("/workspace/session-shrink").st_size == 6
+assert open("/workspace/session-shrink", "rb").read() == b"short\\n"
 assert open("/workspace/host-written", "rb").read() == b"host-visible\\n"
 print("HOST_WRITE_VISIBLE_IN_ONE_VM")
 PY`,

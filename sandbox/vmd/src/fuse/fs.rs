@@ -1115,7 +1115,11 @@ impl RemoteFuseFs {
         state: &FileState,
         authoritative: Option<&RemoteMetadata>,
     ) -> RemoteMetadata {
-        let use_buffer = state.loaded || state.dirty || state.unlinked;
+        // A clean loaded handle is only a read cache. Direct gateway and other
+        // mount writers may have advanced the same stable inode since it was
+        // loaded, so fstat must use the freshly resolved authoritative
+        // metadata. Only unpublished/dirty or unlinked handle state is local.
+        let use_buffer = state.dirty || state.created || state.unlinked;
         RemoteMetadata {
             kind: "file".to_string(),
             size_bytes: if use_buffer {
@@ -2895,6 +2899,23 @@ mod tests {
         let existing = handles.files.get(&existing_handle).unwrap();
         assert_eq!(existing.mode, 0o751);
         assert_eq!(existing.base_mode, Some(0o751));
+        let authoritative = RemoteMetadata {
+            kind: "file".to_string(),
+            size_bytes: 6,
+            file_id: None,
+            link_count: 1,
+            link_target: None,
+            content_hash: Some(content_hash_for_bytes(b"short\n")),
+            executable: false,
+            mode: Some(0o644),
+            updated_at: None,
+        };
+        assert_eq!(
+            fs.metadata_for_handle_state(existing, Some(&authoritative))
+                .size_bytes,
+            6,
+            "a clean loaded handle must not hide a shorter gateway replacement"
+        );
 
         let created = handles.files.get(&created_handle).unwrap();
         assert_eq!(created.mode, 0o640);
