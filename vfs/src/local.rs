@@ -2245,7 +2245,7 @@ fn install_staged_file_preserving_identity(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(VfsStorageError::Internal(error.to_string())),
     };
-    if existing.is_some() {
+    if let Some(existing) = existing.as_ref() {
         // A write to an existing pathname mutates that inode; it does not
         // replace the directory entry with a newly allocated inode. This is
         // required even at nlink=1 so open handles and stable file identity
@@ -2257,18 +2257,18 @@ fn install_staged_file_preserving_identity(
         source
             .seek(SeekFrom::Start(0))
             .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
-        let mut target = fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(destination)
+        let mut target = open_existing_regular_file_for_rewrite(destination, existing)?;
+        target
+            .set_len(0)
+            .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+        target
+            .seek(SeekFrom::Start(0))
             .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
         std::io::copy(&mut source, &mut target)
             .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
         fs::remove_file(staged_path)
             .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
-        if let Some(metadata) = existing.as_ref() {
-            storage.invalidate_hash_identity(metadata);
-        }
+        storage.invalidate_hash_identity(existing);
         Ok(Some(target))
     } else {
         // The caller has already made the staged inode's data and final mode
@@ -2279,6 +2279,99 @@ fn install_staged_file_preserving_identity(
         storage.invalidate_hash(destination);
         Ok(None)
     }
+}
+
+fn open_regular_file_write_only(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    options.open(path)
+}
+
+#[cfg(unix)]
+fn open_existing_regular_file_for_rewrite(
+    path: &Path,
+    expected: &fs::Metadata,
+) -> VfsStorageResult<fs::File> {
+    match open_regular_file_write_only(path) {
+        Ok(file) => {
+            let opened = file
+                .metadata()
+                .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+            if !metadata_identity_matches(expected, &opened) {
+                return Err(VfsStorageError::Conflict(format!(
+                    "local VFS write target changed before open: {}",
+                    path.display()
+                )));
+            }
+            return Ok(file);
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::PermissionDenied => {
+            return Err(VfsStorageError::Internal(error.to_string()));
+        }
+        Err(_) => {}
+    }
+
+    // POSIX checks access at open(2), then the granted descriptor remains
+    // writable after chmod. The gateway must model an already-open guest file
+    // even when its exact logical mode is 0444/000 (Git loose objects use this
+    // routinely). Briefly grant owner-write under the inode/path lock, open the
+    // descriptor, and restore the exact mode on that descriptor before bytes
+    // are changed. This preserves inode identity and hard-link aliasing.
+    let original_mode = normalize_vfs_mode(expected.permissions().mode());
+    let writable_mode = original_mode | 0o200;
+    let writable = set_mode_nofollow(path, writable_mode)?;
+    if !metadata_identity_matches(expected, &writable) {
+        let _ = set_mode_nofollow(path, original_mode);
+        return Err(VfsStorageError::Conflict(format!(
+            "local VFS write target changed while granting write access: {}",
+            path.display()
+        )));
+    }
+    let opened = open_regular_file_write_only(path);
+    let file = match opened {
+        Ok(file) => file,
+        Err(open_error) => {
+            set_mode_nofollow(path, original_mode)?;
+            return Err(VfsStorageError::Internal(open_error.to_string()));
+        }
+    };
+    if let Err(restore_error) = file.set_permissions(fs::Permissions::from_mode(original_mode)) {
+        let _ = set_mode_nofollow(path, original_mode);
+        return Err(VfsStorageError::Internal(restore_error.to_string()));
+    }
+    let restored = file
+        .metadata()
+        .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+    if !metadata_identity_matches(expected, &restored)
+        || posix_mode_from_metadata(&restored) != Some(original_mode)
+    {
+        return Err(VfsStorageError::Conflict(format!(
+            "local VFS write target changed before mode restoration: {}",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_existing_regular_file_for_rewrite(
+    path: &Path,
+    expected: &fs::Metadata,
+) -> VfsStorageResult<fs::File> {
+    let file = open_regular_file_write_only(path)
+        .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+    if !metadata_identity_matches(expected, &opened) {
+        return Err(VfsStorageError::Conflict(format!(
+            "local VFS write target changed before open: {}",
+            path.display()
+        )));
+    }
+    Ok(file)
 }
 
 struct FileSyncTarget {
@@ -5192,6 +5285,65 @@ mod tests {
             fs::read(dir.path().join("zero")).expect("zero-mode bytes"),
             b"zero",
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_rewrites_read_only_inode_without_changing_identity_or_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        let reserved = storage
+            .write_with_options(
+                "git-object",
+                Bytes::new(),
+                Some(VfsStorageWritePrecondition {
+                    predicate: Some(VfsStorageCasPredicate::Absent),
+                    fingerprint: None,
+                    secondary_fingerprint: None,
+                    expected_file_id: None,
+                }),
+                Some(VfsStorageWriteOptions {
+                    executable: false,
+                    mode: Some(0o444),
+                }),
+            )
+            .await
+            .expect("reserve read-only object");
+        let before = storage
+            .stat("git-object")
+            .await
+            .expect("stat")
+            .expect("metadata");
+        let file_id = before.file_id.clone().expect("stable identity");
+
+        storage
+            .write(
+                "git-object",
+                Bytes::from_static(b"compressed-git-object"),
+                Some(VfsStorageWritePrecondition {
+                    predicate: Some(VfsStorageCasPredicate::ContentFingerprint {
+                        fingerprint: reserved.content_hash,
+                    }),
+                    fingerprint: None,
+                    secondary_fingerprint: None,
+                    expected_file_id: Some(file_id.clone()),
+                }),
+            )
+            .await
+            .expect("rewrite through the already-open guest semantics");
+
+        assert_eq!(
+            fs::read(dir.path().join("git-object")).expect("object bytes"),
+            b"compressed-git-object"
+        );
+        assert_eq!(path_mode(&dir.path().join("git-object")), 0o444);
+        let after = storage
+            .stat("git-object")
+            .await
+            .expect("stat")
+            .expect("metadata");
+        assert_eq!(after.file_id.as_deref(), Some(file_id.as_str()));
+        assert_eq!(after.mode, Some(0o444));
     }
 
     #[cfg(unix)]

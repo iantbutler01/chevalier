@@ -1262,6 +1262,11 @@ impl RemoteFuseFs {
         if handles.files.len() >= MAX_OPEN_HANDLES {
             return Err(Errno::EMFILE);
         }
+        // An O_EXCL create can already have an empty gateway placeholder while
+        // its creator still owns handle-local bytes and pathname mutations.
+        // Presence of an authoritative content hash distinguishes that case
+        // from the older fully-local create whose first publication is absent.
+        let has_remote_baseline = !created || base_content_hash.is_some();
         let fh = handles.next;
         handles.next += 1;
         handles.files.insert(
@@ -1273,11 +1278,11 @@ impl RemoteFuseFs {
                 unlinked: false,
                 buffer: initial,
                 mode: normalize_mode(mode),
-                base_mode: (!created).then_some(normalize_mode(mode)),
+                base_mode: has_remote_baseline.then_some(normalize_mode(mode)),
                 created,
                 dirty: false,
                 loaded,
-                base_content_hash: if created {
+                base_content_hash: if created && base_content_hash.is_none() {
                     Some("absent".to_string())
                 } else {
                     base_content_hash
@@ -2644,6 +2649,18 @@ mod tests {
         let created_handle = fs
             .next_handle("created", Vec::new(), true, None, 0o640, true, None, 1)
             .unwrap();
+        let reserved_handle = fs
+            .next_handle(
+                "reserved",
+                Vec::new(),
+                true,
+                Some("empty-hash".to_string()),
+                0o644,
+                true,
+                Some("inode-reserved".to_string()),
+                1,
+            )
+            .unwrap();
 
         let handles = fs.lock_handles().unwrap();
         let existing = handles.files.get(&existing_handle).unwrap();
@@ -2660,6 +2677,18 @@ mod tests {
             created.base_content_hash.as_deref(),
             Some("absent"),
             "first publication must use an if-absent CAS"
+        );
+
+        let reserved = handles.files.get(&reserved_handle).unwrap();
+        assert!(
+            reserved.created,
+            "the creator still owns pathname mutations"
+        );
+        assert_eq!(reserved.base_mode, Some(0o644));
+        assert_eq!(
+            reserved.base_content_hash.as_deref(),
+            Some("empty-hash"),
+            "an O_EXCL placeholder is the creator's authoritative CAS baseline"
         );
     }
 
@@ -4321,7 +4350,7 @@ impl RemoteFuseFs {
                 loaded,
                 metadata.content_hash.clone(),
                 metadata_mode(&metadata),
-                false,
+                reserved,
                 metadata.file_id.clone(),
                 metadata.link_count,
             )?;
