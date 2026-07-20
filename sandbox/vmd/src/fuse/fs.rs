@@ -1636,13 +1636,21 @@ mod tests {
 impl RemoteFuseFs {
     pub(super) fn init_op(&self, config: &mut KernelConfig) -> io::Result<()> {
         let requested = self.requested_init_capabilities();
-        if requested.is_empty() {
-            return Ok(());
+        let available = config.capabilities();
+        let supported = requested & available;
+        let unsupported = requested & !available;
+        if !supported.is_empty()
+            && let Err(rejected) = config.add_capabilities(supported)
+        {
+            tracing::warn!(
+                ?rejected,
+                "vfs fuse kernel rejected capabilities it previously advertised"
+            );
         }
-        if let Err(unsupported) = config.add_capabilities(requested) {
+        if !unsupported.is_empty() {
             tracing::warn!(
                 ?unsupported,
-                "vfs fuse kernel did not accept requested cache capabilities"
+                "vfs fuse kernel does not support requested capabilities"
             );
         }
         Ok(())
