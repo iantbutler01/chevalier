@@ -14,7 +14,7 @@ export type McpClientConfig = {
 };
 export { McpClient, McpServer, VfsStorage, version } from "./native.js";
 export { createVfsGatewayServer } from "./vfs-gateway-server.js";
-export type { VfsAdvisoryLock, VfsAdvisoryLockKind, VfsAdvisoryLockStateStore, VfsAdvisoryLockTransactionResult, VfsGatewayServerOptions, } from "./vfs-gateway-server.js";
+export type { VfsAdvisoryLock, VfsAdvisoryLockKind, VfsAdvisoryLockNamespace, VfsAdvisoryLockStateStore, VfsAdvisoryLockTransactionResult, VfsGatewayServerOptions, } from "./vfs-gateway-server.js";
 /** Error thrown by Chevalier, carrying a machine-readable `code` and a
  *  `retryable` hint parsed from the engine. */
 export declare class ChevalierError extends Error {

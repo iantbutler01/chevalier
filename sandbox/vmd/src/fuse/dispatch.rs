@@ -12,29 +12,133 @@
 //! Kernel-side parallelism is raised to match in `init` (`max_background`
 //! defaults to 12, which would throttle the whole exercise from above).
 
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::SystemTime;
 
 use fuser::{
-    BsdFileFlags, FileHandle, Filesystem, INodeNo, KernelConfig, LockOwner, OpenFlags, RenameFlags,
-    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry,
-    ReplyLock, ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
+    BsdFileFlags, FileHandle, Filesystem, INodeNo, InterruptResult, KernelConfig, LockNamespace,
+    LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyWrite, Request,
+    RequestId, TimeOrNow, WriteFlags,
 };
 use tokio::sync::Semaphore;
 
-use super::fs::RemoteFuseFs;
+use super::fs::{LockWaitCancellation, RemoteFuseFs};
 
 /// Upper bound on concurrently executing FUSE ops per mount. The gateway
 /// sustains far more, but each op holds a blocking-pool thread; 64 keeps a
 /// dep-tree scan saturating the wire without monopolizing the pool.
 const MAX_IN_FLIGHT_OPS: usize = 64;
+const MAX_IN_FLIGHT_BLOCKING_LOCKS: usize = 32;
+
+#[derive(Default)]
+struct LockWaitRegistry {
+    waits: Mutex<HashMap<RequestId, LockWaitEntry>>,
+}
+
+struct LockWaitEntry {
+    cancellation: Weak<LockWaitCancellation>,
+    ino: INodeNo,
+    lock_owner: LockOwner,
+    namespace: LockNamespace,
+}
+
+impl LockWaitRegistry {
+    fn register(
+        self: &Arc<Self>,
+        request_id: RequestId,
+        ino: INodeNo,
+        lock_owner: LockOwner,
+        namespace: LockNamespace,
+    ) -> LockWaitRegistration {
+        let cancellation = Arc::new(LockWaitCancellation::new());
+        self.waits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                request_id,
+                LockWaitEntry {
+                    cancellation: Arc::downgrade(&cancellation),
+                    ino,
+                    lock_owner,
+                    namespace,
+                },
+            );
+        LockWaitRegistration {
+            request_id,
+            cancellation,
+            registry: Arc::downgrade(self),
+        }
+    }
+
+    fn cancel(&self, request_id: RequestId) -> bool {
+        let cancellation = {
+            let mut waits = self
+                .waits
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(cancellation) = waits
+                .get(&request_id)
+                .and_then(|entry| entry.cancellation.upgrade())
+            else {
+                waits.remove(&request_id);
+                return false;
+            };
+            cancellation
+        };
+        cancellation.cancel()
+    }
+
+    fn cancel_owner(&self, ino: INodeNo, lock_owner: LockOwner, namespace: LockNamespace) {
+        let cancellations = self
+            .waits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter(|entry| {
+                entry.ino == ino && entry.lock_owner == lock_owner && entry.namespace == namespace
+            })
+            .filter_map(|entry| entry.cancellation.upgrade())
+            .collect::<Vec<_>>();
+        for cancellation in cancellations {
+            cancellation.cancel();
+        }
+    }
+}
+
+struct LockWaitRegistration {
+    request_id: RequestId,
+    cancellation: Arc<LockWaitCancellation>,
+    registry: Weak<LockWaitRegistry>,
+}
+
+impl LockWaitRegistration {
+    fn cancellation(&self) -> &LockWaitCancellation {
+        &self.cancellation
+    }
+}
+
+impl Drop for LockWaitRegistration {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.upgrade() {
+            registry
+                .waits
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.request_id);
+        }
+    }
+}
 
 pub struct SpawnedFuseFs {
     inner: Arc<RemoteFuseFs>,
     ops: Arc<Semaphore>,
+    blocking_lock_ops: Arc<Semaphore>,
+    lock_waits: Arc<LockWaitRegistry>,
 }
 
 impl SpawnedFuseFs {
@@ -42,6 +146,8 @@ impl SpawnedFuseFs {
         Self {
             inner: Arc::new(inner),
             ops: Arc::new(Semaphore::new(MAX_IN_FLIGHT_OPS)),
+            blocking_lock_ops: Arc::new(Semaphore::new(MAX_IN_FLIGHT_BLOCKING_LOCKS)),
+            lock_waits: Arc::new(LockWaitRegistry::default()),
         }
     }
 
@@ -50,8 +156,19 @@ impl SpawnedFuseFs {
     }
 
     fn spawn(&self, op: impl FnOnce(&RemoteFuseFs) + Send + 'static) {
+        self.spawn_with_semaphore(Arc::clone(&self.ops), op);
+    }
+
+    fn spawn_blocking_lock(&self, op: impl FnOnce(&RemoteFuseFs) + Send + 'static) {
+        self.spawn_with_semaphore(Arc::clone(&self.blocking_lock_ops), op);
+    }
+
+    fn spawn_with_semaphore(
+        &self,
+        ops: Arc<Semaphore>,
+        op: impl FnOnce(&RemoteFuseFs) + Send + 'static,
+    ) {
         let inner = Arc::clone(&self.inner);
-        let ops = Arc::clone(&self.ops);
         let tokio = inner.tokio_handle();
         tokio.spawn_blocking(move || {
             // Blocking-pool threads may block on the runtime; a closed
@@ -81,6 +198,14 @@ impl Filesystem for SpawnedFuseFs {
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
         // Purely in-memory; not worth a pool hop.
         self.inner.forget(ino, nlookup);
+    }
+
+    fn interrupt(&self, _req: &Request, request_id: RequestId) -> InterruptResult {
+        if self.lock_waits.cancel(request_id) {
+            InterruptResult::Handled
+        } else {
+            InterruptResult::Unhandled
+        }
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
@@ -128,11 +253,25 @@ impl Filesystem for SpawnedFuseFs {
         self.inner.opendir(ino, flags, reply);
     }
 
-    fn readdir(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, reply: ReplyDirectory) {
+    fn readdir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        reply: ReplyDirectory,
+    ) {
         self.spawn(move |fs| fs.readdir(ino, fh, offset, reply));
     }
 
-    fn readdirplus(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, reply: ReplyDirectoryPlus) {
+    fn readdirplus(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        reply: ReplyDirectoryPlus,
+    ) {
         self.spawn(move |fs| fs.readdirplus(ino, fh, offset, reply));
     }
 
@@ -168,14 +307,41 @@ impl Filesystem for SpawnedFuseFs {
         reply: ReplyWrite,
     ) {
         let data = data.to_vec();
-        self.spawn(move |fs| fs.write(ino, fh, offset, &data, write_flags, flags, lock_owner, reply));
+        self.spawn(move |fs| {
+            fs.write(
+                ino,
+                fh,
+                offset,
+                &data,
+                write_flags,
+                flags,
+                lock_owner,
+                reply,
+            )
+        });
     }
 
-    fn flush(&self, _req: &Request, ino: INodeNo, fh: FileHandle, lock_owner: LockOwner, reply: ReplyEmpty) {
+    fn flush(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        self.lock_waits
+            .cancel_owner(ino, lock_owner, LockNamespace::Posix);
         self.spawn(move |fs| fs.flush(ino, fh, lock_owner, reply));
     }
 
-    fn fsync(&self, _req: &Request, ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
+    fn fsync(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
         self.spawn(move |fs| fs.fsync(ino, fh, datasync, reply));
     }
 
@@ -189,6 +355,10 @@ impl Filesystem for SpawnedFuseFs {
         flush: bool,
         reply: ReplyEmpty,
     ) {
+        if let Some(lock_owner) = lock_owner {
+            self.lock_waits
+                .cancel_owner(ino, lock_owner, LockNamespace::Flock);
+        }
         self.spawn(move |fs| fs.release(ino, fh, flags, lock_owner, flush, reply));
     }
 
@@ -198,21 +368,35 @@ impl Filesystem for SpawnedFuseFs {
         ino: INodeNo,
         fh: FileHandle,
         lock_owner: LockOwner,
+        lock_namespace: LockNamespace,
         start: u64,
         end: u64,
         typ: i32,
         pid: u32,
         reply: ReplyLock,
     ) {
-        self.spawn(move |fs| fs.getlk(ino, fh, lock_owner, start, end, typ, pid, reply));
+        self.spawn(move |fs| {
+            fs.getlk(
+                ino,
+                fh,
+                lock_owner,
+                lock_namespace,
+                start,
+                end,
+                typ,
+                pid,
+                reply,
+            );
+        });
     }
 
     fn setlk(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         fh: FileHandle,
         lock_owner: LockOwner,
+        lock_namespace: LockNamespace,
         start: u64,
         end: u64,
         typ: i32,
@@ -220,17 +404,53 @@ impl Filesystem for SpawnedFuseFs {
         sleep: bool,
         reply: ReplyEmpty,
     ) {
-        self.spawn(move |fs| {
-            fs.setlk(ino, fh, lock_owner, start, end, typ, pid, sleep, reply);
+        let wait = (sleep && typ != i32::from(libc::F_UNLCK)).then(|| {
+            self.lock_waits
+                .register(req.unique(), ino, lock_owner, lock_namespace)
         });
+        let op = move |fs: &RemoteFuseFs| {
+            fs.setlk(
+                ino,
+                fh,
+                lock_owner,
+                lock_namespace,
+                start,
+                end,
+                typ,
+                pid,
+                sleep,
+                wait.as_ref().map(LockWaitRegistration::cancellation),
+                reply,
+            );
+        };
+        if sleep {
+            self.spawn_blocking_lock(op);
+        } else {
+            self.spawn(op);
+        }
     }
 
-    fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, mode: u32, umask: u32, reply: ReplyEntry) {
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        reply: ReplyEntry,
+    ) {
         let name: OsString = name.to_owned();
         self.spawn(move |fs| fs.mkdir(parent, &name, mode, umask, reply));
     }
 
-    fn symlink(&self, _req: &Request, parent: INodeNo, link_name: &OsStr, target: &Path, reply: ReplyEntry) {
+    fn symlink(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
         let link_name: OsString = link_name.to_owned();
         let target = target.to_path_buf();
         self.spawn(move |fs| fs.symlink(parent, &link_name, &target, reply));
@@ -261,7 +481,14 @@ impl Filesystem for SpawnedFuseFs {
         self.spawn(move |fs| fs.rename(parent, &name, newparent, &newname, flags, reply));
     }
 
-    fn link(&self, _req: &Request, ino: INodeNo, newparent: INodeNo, newname: &OsStr, reply: ReplyEntry) {
+    fn link(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
         let newname: OsString = newname.to_owned();
         self.spawn(move |fs| fs.link(ino, newparent, &newname, reply));
     }
@@ -278,5 +505,42 @@ impl Filesystem for SpawnedFuseFs {
     ) {
         let name: OsString = name.to_owned();
         self.spawn(move |fs| fs.create(parent, &name, mode, umask, flags, reply));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use fuser::{INodeNo, LockNamespace, LockOwner, RequestId};
+
+    use super::LockWaitRegistry;
+
+    #[test]
+    fn lock_wait_registry_cancels_only_the_exact_live_request() {
+        let registry = Arc::new(LockWaitRegistry::default());
+        let request = registry.register(
+            RequestId(41),
+            INodeNo(7),
+            LockOwner(8),
+            LockNamespace::Posix,
+        );
+        let other = registry.register(
+            RequestId(42),
+            INodeNo(7),
+            LockOwner(9),
+            LockNamespace::Flock,
+        );
+
+        assert!(registry.cancel(RequestId(41)));
+        assert!(!registry.cancel(RequestId(41)));
+        assert!(!registry.cancel(RequestId(99)));
+        registry.cancel_owner(INodeNo(7), LockOwner(9), LockNamespace::Flock);
+        assert!(!registry.cancel(RequestId(42)));
+
+        drop(request);
+        drop(other);
+        assert!(!registry.cancel(RequestId(41)));
+        assert!(!registry.cancel(RequestId(42)));
     }
 }

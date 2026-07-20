@@ -1,6 +1,8 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -8,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use chevalier_sandbox::vfs::{VFS_SURFACE_KIND_VM_SHARED, VFS_SURFACE_KIND_VM_WORKSPACE};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
@@ -20,8 +23,13 @@ const RETRY_DELAY_MAX: Duration = Duration::from_secs(5);
 const FLUSH_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BATCH_WRITES: usize = 256;
 const MAX_BATCH_BYTES: u64 = 16 * 1024 * 1024;
+const JOURNAL_READ_BUFFER_BYTES: usize = 64 * 1024;
+/// Journal records contain metadata and bounded paths, never file payloads.
+/// One MiB is far above the supported path envelope while keeping a corrupt
+/// or unterminated JSONL record from forcing an unbounded allocation.
+const MAX_JOURNAL_RECORD_BYTES: usize = 1024 * 1024;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 struct JournalWrite {
     id: u64,
     path: String,
@@ -37,6 +45,10 @@ struct JournalState {
     force_flush: bool,
     flushing: bool,
     stop: bool,
+    /// A rewrite crossed or may have crossed the atomic rename boundary but
+    /// did not complete both parent-directory sync and append-handle reopen.
+    /// No later append may proceed until the full pending state is rewritten.
+    journal_needs_repair: bool,
     last_error: Option<String>,
     /// Latched when writes were dead-lettered; consumed by the next flush()
     /// so exactly one fsync/close waiter observes the failure (POSIX
@@ -75,7 +87,10 @@ impl WriteJournal {
                 staging_dir.display()
             )
         })?;
+        sync_parent_directory(&staging_dir)?;
         let pending = read_journal(journal_path)?;
+        validate_staged_writes(&staging_dir, &pending)?;
+        remove_orphaned_staged_writes(&staging_dir, &pending)?;
         let next_id = pending
             .iter()
             .map(|write| write.id)
@@ -91,6 +106,7 @@ impl WriteJournal {
                 force_flush: false,
                 flushing: false,
                 stop: false,
+                journal_needs_repair: false,
                 last_error: None,
                 dead_letter_error: None,
             }),
@@ -123,6 +139,7 @@ impl WriteJournal {
             .state
             .lock()
             .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
+        repair_before_append(&self.shared.journal_path, &mut state)?;
         let id = state.next_id;
         state.next_id = state.next_id.saturating_add(1);
         let staged_file = format!("{id}.bin");
@@ -132,9 +149,11 @@ impl WriteJournal {
             let mut file = File::create(&temporary)
                 .with_context(|| format!("create staged vfs write {}", temporary.display()))?;
             file.write_all(bytes).context("stage vfs write bytes")?;
+            file.sync_data().context("sync staged vfs write bytes")?;
         }
         fs::rename(&temporary, &staged_path)
             .with_context(|| format!("install staged vfs write {}", staged_path.display()))?;
+        sync_parent_directory(&staged_path)?;
         let write = JournalWrite {
             id,
             path: path.to_string(),
@@ -142,11 +161,7 @@ impl WriteJournal {
             size_bytes: bytes.len() as u64,
             base_content_hash,
         };
-        serde_json::to_writer(&mut state.journal, &write).context("append vfs write journal")?;
-        state
-            .journal
-            .write_all(b"\n")
-            .context("append vfs write journal")?;
+        append_json_line(&mut state.journal, &write, "append vfs write journal")?;
         state.pending.push_back(write);
         state.last_error = None;
         if state.pending.len() >= MAX_BATCH_WRITES {
@@ -303,9 +318,9 @@ fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, 
         // same batch can never succeed. Resolve each write individually so one
         // poisoned entry cannot wedge the journal forever.
         let resolution = match &result {
-            Err(error) if rejected_request_status(error).is_some() => Some(
-                resolve_rejected_batch(&shared, &client, &tokio, &coalesced, surface),
-            ),
+            Err(error) if rejected_request_status(error).is_some() => Some(resolve_rejected_batch(
+                &shared, &client, &tokio, &coalesced, surface,
+            )),
             _ => None,
         };
         let mut state = match shared.state.lock() {
@@ -333,10 +348,9 @@ fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, 
         match result {
             Ok(()) => {
                 let recovered = state.last_error.take();
+                let pending_before = state.pending.clone();
                 for _ in 0..batch.len() {
-                    if let Some(write) = state.pending.pop_front() {
-                        let _ = fs::remove_file(shared.staging_dir.join(write.staged_file));
-                    }
+                    state.pending.pop_front();
                 }
                 rebase_pending_after_commit(
                     &mut state.pending,
@@ -344,8 +358,13 @@ fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, 
                     &committed_hashes,
                 );
                 if let Err(error) = rewrite_journal(&shared.journal_path, &mut state) {
+                    // The old durable WAL still names this batch. Keep both
+                    // the in-memory entries and staged bytes so reconnect can
+                    // resolve an ambiguous remote completion safely.
+                    state.pending = pending_before;
                     state.last_error = Some(error.to_string());
                 } else {
+                    remove_staged_after_wal(&shared, &batch);
                     state.last_error = None;
                     if let Some(error) = recovered {
                         tracing::info!(
@@ -396,6 +415,62 @@ struct BatchResolution {
     retained: Vec<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RejectedWriteOutcome {
+    Committed(String),
+    DeadLetter(String),
+    Retained,
+}
+
+fn resolve_rejected_write(
+    write: &JournalWrite,
+    bytes: Vec<u8>,
+    mut submit: impl FnMut(RemoteWrite) -> Result<()>,
+    mut current_content_hash: impl FnMut() -> Result<Option<String>>,
+) -> RejectedWriteOutcome {
+    let content_hash = content_hash_for_bytes(bytes.as_slice());
+    let initial = RemoteWrite {
+        path: write.path.clone(),
+        bytes: bytes.clone(),
+        base_content_hash: write.base_content_hash.clone(),
+    };
+    match submit(initial) {
+        Ok(()) => RejectedWriteOutcome::Committed(content_hash),
+        Err(error)
+            if matches!(
+                rejected_request_status(&error),
+                Some(StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED)
+            ) =>
+        {
+            // A precondition rejection can mean the write already landed (lost
+            // response or a partially committed batch). Matching bytes are not
+            // proof of durability: the first request may have made page-cache
+            // bytes visible and then failed its file/directory barrier. Force
+            // an exact-content CAS repair and retire the WAL only after that
+            // repair returns success.
+            match current_content_hash() {
+                Ok(Some(current)) if current == content_hash => {
+                    let repair = RemoteWrite {
+                        path: write.path.clone(),
+                        bytes,
+                        base_content_hash: Some(content_hash.clone()),
+                    };
+                    match submit(repair) {
+                        Ok(()) => RejectedWriteOutcome::Committed(content_hash),
+                        Err(_) => RejectedWriteOutcome::Retained,
+                    }
+                }
+                Ok(_) => RejectedWriteOutcome::DeadLetter(error.to_string()),
+                Err(_) => RejectedWriteOutcome::Retained,
+            }
+        }
+        Err(error) if rejected_request_status(&error).is_some() => {
+            RejectedWriteOutcome::DeadLetter(error.to_string())
+        }
+        Err(_) => RejectedWriteOutcome::Retained,
+    }
+}
+
 fn resolve_rejected_batch(
     shared: &Shared,
     client: &RemoteVfsClient,
@@ -416,38 +491,27 @@ fn resolve_rejected_batch(
                 continue;
             }
         };
-        let content_hash = content_hash_for_bytes(bytes.as_slice());
-        let single = RemoteWrite {
-            path: write.path.clone(),
+        match resolve_rejected_write(
+            write,
             bytes,
-            base_content_hash: write.base_content_hash.clone(),
-        };
-        match tokio.block_on(client.write_many(vec![single], surface)) {
-            Ok(()) => {
-                resolution.committed.insert(write.path.clone(), content_hash);
+            |remote| tokio.block_on(client.write_many(vec![remote], surface)),
+            || {
+                tokio
+                    .block_on(client.stat(write.path.as_str()))
+                    .map(|metadata| metadata.and_then(|metadata| metadata.content_hash))
+            },
+        ) {
+            RejectedWriteOutcome::Committed(content_hash) => {
+                resolution
+                    .committed
+                    .insert(write.path.clone(), content_hash);
             }
-            Err(error) if rejected_request_status(&error).is_some() => {
-                // A 409 can mean the write already landed (lost response on a
-                // prior attempt, or a batch that partially committed before
-                // rejection). If the gateway's current content IS this write,
-                // it is committed, not dead.
-                match tokio.block_on(client.stat(write.path.as_str())) {
-                    Ok(Some(metadata))
-                        if metadata.content_hash.as_deref() == Some(content_hash.as_str()) =>
-                    {
-                        resolution.committed.insert(write.path.clone(), content_hash);
-                    }
-                    Ok(_) => {
-                        resolution
-                            .dead_lettered
-                            .push((write.clone(), error.to_string()));
-                    }
-                    // Cannot tell committed from rejected without the stat —
-                    // keep the write pending rather than guessing.
-                    Err(_) => resolution.retained.push(write.path.clone()),
-                }
+            RejectedWriteOutcome::DeadLetter(error) => {
+                resolution.dead_lettered.push((write.clone(), error));
             }
-            Err(_) => resolution.retained.push(write.path.clone()),
+            RejectedWriteOutcome::Retained => {
+                resolution.retained.push(write.path.clone());
+            }
         }
     }
     resolution
@@ -460,6 +524,8 @@ fn apply_batch_resolution(
     coalesced: &[JournalWrite],
     resolution: BatchResolution,
 ) {
+    let pending_before = state.pending.clone();
+    let dead_letter_error_before = state.dead_letter_error.clone();
     let mut resolved_paths = HashSet::<&str>::new();
     resolved_paths.extend(resolution.committed.keys().map(String::as_str));
     let mut dead_lettered_paths = Vec::<String>::new();
@@ -501,19 +567,24 @@ fn apply_batch_resolution(
     state
         .pending
         .retain(|write| !resolved_ids.contains(&write.id));
-    for write in batch {
-        if resolved_ids.contains(&write.id) {
-            // Dead-lettered staged files were moved already; committed and
-            // superseded ones are safe to drop.
-            let _ = fs::remove_file(shared.staging_dir.join(write.staged_file.as_str()));
-        }
-    }
     let committed_batch = coalesced
         .iter()
         .filter(|write| resolution.committed.contains_key(write.path.as_str()))
         .cloned()
         .collect::<Vec<_>>();
     rebase_pending_after_commit(&mut state.pending, &committed_batch, &resolution.committed);
+    if let Err(error) = rewrite_journal(&shared.journal_path, state) {
+        state.pending = pending_before;
+        state.dead_letter_error = dead_letter_error_before;
+        state.last_error = Some(error.to_string());
+        return;
+    }
+    let resolved = batch
+        .iter()
+        .filter(|write| resolved_ids.contains(&write.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    remove_staged_after_wal(shared, &resolved);
     if !dead_lettered_paths.is_empty() {
         state.dead_letter_error = Some(format!(
             "vfs write(s) rejected by the gateway and dead-lettered under {}: {}",
@@ -525,10 +596,6 @@ fn apply_batch_resolution(
                 on_dead_letter(path.as_str());
             }
         }
-    }
-    if let Err(error) = rewrite_journal(&shared.journal_path, state) {
-        state.last_error = Some(error.to_string());
-        return;
     }
     let mut unresolved = resolution.retained.clone();
     unresolved.extend(preservation_failures);
@@ -551,23 +618,14 @@ fn dead_letter_write(shared: &Shared, write: &JournalWrite, error: &str) -> Resu
             dead_letter_dir.display()
         )
     })?;
+    sync_parent_directory(&dead_letter_dir)?;
     let unix_seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or_default();
     let staged = shared.staging_dir.join(write.staged_file.as_str());
-    // Journal ids restart after a drained-journal reboot, so id alone is not
-    // unique in the persistent dead-letter directory. Never clobber an
-    // earlier preserved file.
-    let mut preserved_name = format!("{unix_seconds}-{}.bin", write.id);
-    let mut suffix = 0u32;
-    while dead_letter_dir.join(preserved_name.as_str()).exists() {
-        suffix += 1;
-        preserved_name = format!("{unix_seconds}-{}-{suffix}.bin", write.id);
-    }
-    let preserved = dead_letter_dir.join(preserved_name.as_str());
-    fs::rename(&staged, &preserved)
-        .with_context(|| format!("preserve rejected vfs write {}", staged.display()))?;
+    let preserved_name =
+        preserve_staged_write(&staged, &dead_letter_dir, write.id, write.size_bytes)?;
     let record_path = dead_letter_dir.join("records.jsonl");
     let record = serde_json::json!({
         "id": write.id,
@@ -579,9 +637,117 @@ fn dead_letter_write(shared: &Shared, write: &JournalWrite, error: &str) -> Resu
         "dead_lettered_at_unix": unix_seconds,
     });
     let mut file = open_append(&record_path)?;
-    serde_json::to_writer(&mut file, &record).context("append vfs dead letter record")?;
-    file.write_all(b"\n").context("append vfs dead letter record")?;
+    append_json_line(&mut file, &record, "append vfs dead letter record")?;
     Ok(record_path)
+}
+
+fn preserve_staged_write(
+    staged: &Path,
+    dead_letter_dir: &Path,
+    id: u64,
+    expected_size: u64,
+) -> Result<String> {
+    // Publish only a completely copied and synced inode. A crash can leave the
+    // temporary link behind, so its deterministic per-journal-id name is
+    // removed before and after every attempt.
+    let temporary = dead_letter_dir.join(format!(".pending-{id}.tmp"));
+    remove_dead_letter_temporary(&temporary)?;
+    let result = (|| {
+        let mut target = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .with_context(|| format!("create rejected vfs write {}", temporary.display()))?;
+        let content_hash = stream_exact_file(staged, Some(&mut target), expected_size)?;
+        target
+            .sync_data()
+            .context("sync preserved rejected vfs bytes")?;
+
+        // Content-addressing makes the ambiguous window between publishing
+        // the bytes and appending their metadata idempotent. A retry reuses
+        // the exact complete file instead of accumulating timestamp suffixes.
+        let preserved_name = format!("{content_hash}.bin");
+        let preserved = dead_letter_dir.join(preserved_name.as_str());
+        match fs::hard_link(&temporary, &preserved) {
+            Ok(()) => sync_parent_directory(&preserved)?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing_hash = stream_exact_file(&preserved, None, expected_size)
+                    .with_context(|| {
+                        format!(
+                            "validate existing rejected vfs write {}",
+                            preserved.display()
+                        )
+                    })?;
+                if existing_hash != content_hash {
+                    return Err(anyhow!(
+                        "existing rejected vfs write {} does not match its content hash",
+                        preserved.display(),
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("publish rejected vfs write {}", preserved.display())
+                });
+            }
+        }
+        Ok(preserved_name)
+    })();
+    let cleanup = remove_dead_letter_temporary(&temporary);
+    match (result, cleanup) {
+        (Ok(name), Ok(())) => Ok(name),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup_error)) => Err(error.context(format!(
+            "also failed to clean rejected vfs temporary: {cleanup_error}"
+        ))),
+    }
+}
+
+fn stream_exact_file(
+    source: &Path,
+    mut target: Option<&mut File>,
+    expected_size: u64,
+) -> Result<String> {
+    let source_file = File::open(source)
+        .with_context(|| format!("open rejected vfs write {}", source.display()))?;
+    let mut source_reader = source_file.take(expected_size.saturating_add(1));
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; JOURNAL_READ_BUFFER_BYTES];
+    let mut copied = 0u64;
+    loop {
+        let read = source_reader
+            .read(&mut buffer)
+            .with_context(|| format!("read rejected vfs write {}", source.display()))?;
+        if read == 0 {
+            break;
+        }
+        if let Some(file) = target.as_mut() {
+            file.write_all(&buffer[..read])
+                .context("stream preserved rejected vfs bytes")?;
+        }
+        hasher.update(&buffer[..read]);
+        copied = copied.saturating_add(read as u64);
+    }
+    if copied != expected_size {
+        return Err(anyhow!(
+            "rejected vfs write {} has {} bytes but journal requires {}",
+            source.display(),
+            copied,
+            expected_size,
+        ));
+    }
+    Ok(hex_encode(hasher.finalize().as_ref()))
+}
+
+fn remove_dead_letter_temporary(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => sync_parent_directory(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("remove rejected vfs temporary {}", path.display()))
+        }
+    }
 }
 
 fn coalesce_batch(batch: &[JournalWrite]) -> Vec<JournalWrite> {
@@ -665,21 +831,176 @@ fn read_journal(path: &Path) -> Result<VecDeque<JournalWrite>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(VecDeque::new()),
         Err(error) => return Err(error).context("open vfs write journal"),
     };
-    let mut pending = VecDeque::new();
-    for line in BufReader::new(file).lines() {
-        let line = line.context("read vfs write journal")?;
-        if !line.trim().is_empty() {
-            pending.push_back(serde_json::from_str(&line).context("decode vfs write journal")?);
-        }
+    let reader = BufReader::with_capacity(JOURNAL_READ_BUFFER_BYTES, file);
+    let (pending, repair_tail) = decode_journal(reader, path)?;
+    if repair_tail {
+        rewrite_pending(path, &pending)?;
     }
     Ok(pending)
 }
 
+fn decode_journal(mut reader: impl BufRead, path: &Path) -> Result<(VecDeque<JournalWrite>, bool)> {
+    let mut pending = VecDeque::new();
+    let mut repair_tail = false;
+    let mut line = Vec::new();
+    let mut line_number = 0usize;
+    loop {
+        let Some(record) =
+            read_bounded_record(&mut reader, &mut line, path, "read vfs write journal")?
+        else {
+            break;
+        };
+        line_number += 1;
+        if record.oversized {
+            if record.terminated {
+                return Err(anyhow!(
+                    "vfs write journal record {} in {} exceeds the {} byte maximum",
+                    line_number,
+                    path.display(),
+                    MAX_JOURNAL_RECORD_BYTES,
+                ));
+            }
+            // An oversized unterminated record is necessarily the final
+            // append. Treat it exactly like any other torn tail, but drain it
+            // without retaining more than MAX_JOURNAL_RECORD_BYTES.
+            repair_tail = true;
+            tracing::warn!(
+                journal = %path.display(),
+                record = line_number,
+                maximum_bytes = MAX_JOURNAL_RECORD_BYTES,
+                "truncating oversized torn final vfs write journal record"
+            );
+            continue;
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
+            if !record.terminated {
+                repair_tail = true;
+            }
+            continue;
+        }
+        match serde_json::from_slice::<JournalWrite>(&line) {
+            Ok(write) => {
+                pending.push_back(write);
+                if !record.terminated {
+                    repair_tail = true;
+                }
+            }
+            Err(error) if !record.terminated => {
+                // An append can be torn only at the unterminated tail. Drop
+                // that incomplete record and canonicalize before reopening
+                // for append; accepting any earlier corruption would silently
+                // reorder or lose writes.
+                repair_tail = true;
+                tracing::warn!(
+                    journal = %path.display(),
+                    error = %error,
+                    "truncating torn final vfs write journal record"
+                );
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "decode vfs write journal record {} in {}",
+                        line_number,
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok((pending, repair_tail))
+}
+
+struct JournalRecordRead {
+    terminated: bool,
+    oversized: bool,
+}
+
+fn read_bounded_record(
+    reader: &mut impl BufRead,
+    record: &mut Vec<u8>,
+    path: &Path,
+    context: &'static str,
+) -> Result<Option<JournalRecordRead>> {
+    record.clear();
+    let mut read_any = false;
+    let mut oversized = false;
+    loop {
+        let buffer = reader
+            .fill_buf()
+            .with_context(|| format!("{context} {}", path.display()))?;
+        if buffer.is_empty() {
+            return Ok(read_any.then_some(JournalRecordRead {
+                terminated: false,
+                oversized,
+            }));
+        }
+        read_any = true;
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(buffer.len(), |index| index + 1);
+        if !oversized {
+            let content_bytes = newline.unwrap_or(consumed);
+            let remaining = MAX_JOURNAL_RECORD_BYTES.saturating_sub(record.len());
+            let retained = content_bytes.min(remaining);
+            record.extend_from_slice(&buffer[..retained]);
+            oversized = content_bytes > remaining;
+        }
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(JournalRecordRead {
+                terminated: true,
+                oversized,
+            }));
+        }
+    }
+}
+
 fn rewrite_journal(path: &Path, state: &mut JournalState) -> Result<()> {
+    state.journal_needs_repair = true;
+    let rewrite_result = rewrite_pending(path, &state.pending);
+    let reopen_result: Result<File> = (|| {
+        #[cfg(test)]
+        fail_rewrite_if_armed(RewriteFault::ReopenAfterRewrite)?;
+        open_append(path)
+    })();
+    match reopen_result {
+        Ok(journal) => {
+            state.journal = journal;
+            if rewrite_result.is_ok() {
+                state.journal_needs_repair = false;
+            }
+            rewrite_result
+        }
+        Err(reopen_error) => match rewrite_result {
+            Ok(()) => Err(reopen_error),
+            Err(error) => Err(error.context(format!(
+                "also failed to reopen vfs write journal after rewrite: {reopen_error}"
+            ))),
+        },
+    }
+}
+
+fn repair_before_append(path: &Path, state: &mut JournalState) -> Result<()> {
+    if !state.journal_needs_repair {
+        return Ok(());
+    }
+    match rewrite_journal(path, state) {
+        Ok(()) => {
+            state.last_error = None;
+            Ok(())
+        }
+        Err(error) => {
+            state.last_error = Some(error.to_string());
+            Err(error).context("repair vfs write journal before append")
+        }
+    }
+}
+
+fn rewrite_pending(path: &Path, pending: &VecDeque<JournalWrite>) -> Result<()> {
     let temporary = path.with_extension("jsonl.tmp");
     {
         let mut writer = BufWriter::new(File::create(&temporary)?);
-        for write in &state.pending {
+        for write in pending {
             serde_json::to_writer(&mut writer, write).context("rewrite vfs write journal")?;
             writer
                 .write_all(b"\n")
@@ -692,24 +1013,164 @@ fn rewrite_journal(path: &Path, state: &mut JournalState) -> Result<()> {
             .context("sync vfs write journal")?;
     }
     fs::rename(&temporary, path).with_context(|| format!("replace {}", path.display()))?;
-    state.journal = open_append(path)?;
+    #[cfg(test)]
+    fail_rewrite_if_armed(RewriteFault::ParentSyncAfterRename)?;
+    sync_parent_directory(path)?;
     Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RewriteFault {
+    ParentSyncAfterRename,
+    ReopenAfterRewrite,
+}
+
+#[cfg(test)]
+thread_local! {
+    static NEXT_REWRITE_FAULT: Cell<Option<RewriteFault>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+fn arm_rewrite_fault(fault: RewriteFault) {
+    NEXT_REWRITE_FAULT.with(|slot| slot.set(Some(fault)));
+}
+
+#[cfg(test)]
+fn fail_rewrite_if_armed(fault: RewriteFault) -> Result<()> {
+    NEXT_REWRITE_FAULT.with(|slot| {
+        if slot.get() == Some(fault) {
+            slot.set(None);
+            Err(anyhow!("injected vfs write journal rewrite fault"))
+        } else {
+            Ok(())
+        }
+    })
 }
 
 fn open_append(path: &Path) -> Result<File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    OpenOptions::new()
+    let existed = path.exists();
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .with_context(|| format!("open {}", path.display()))
+        .with_context(|| format!("open {}", path.display()))?;
+    if !existed {
+        sync_parent_directory(path)?;
+    }
+    Ok(file)
+}
+
+fn append_json_line(file: &mut File, value: &impl Serialize, context: &'static str) -> Result<()> {
+    serde_json::to_writer(&mut *file, value).with_context(|| context)?;
+    file.write_all(b"\n").with_context(|| context)?;
+    file.sync_data()
+        .with_context(|| format!("sync {context}"))?;
+    Ok(())
+}
+
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no containing directory", path.display()))?;
+    File::open(parent)
+        .with_context(|| format!("open containing directory {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("sync containing directory {}", parent.display()))
+}
+
+fn validate_staged_writes(staging_dir: &Path, pending: &VecDeque<JournalWrite>) -> Result<()> {
+    for write in pending {
+        let staged = staging_dir.join(write.staged_file.as_str());
+        let metadata = fs::metadata(&staged)
+            .with_context(|| format!("validate staged vfs write {}", staged.display()))?;
+        if metadata.len() != write.size_bytes {
+            return Err(anyhow!(
+                "staged vfs write {} has {} bytes but journal requires {}",
+                staged.display(),
+                metadata.len(),
+                write.size_bytes
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remove_orphaned_staged_writes(
+    staging_dir: &Path,
+    pending: &VecDeque<JournalWrite>,
+) -> Result<()> {
+    let referenced = pending
+        .iter()
+        .map(|write| write.staged_file.as_str())
+        .collect::<HashSet<_>>();
+    let mut removed = false;
+    for entry in fs::read_dir(staging_dir)
+        .with_context(|| format!("list vfs write staging directory {}", staging_dir.display()))?
+    {
+        let entry = entry.context("read vfs write staging entry")?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if (name.ends_with(".bin") || name.ends_with(".tmp")) && !referenced.contains(name.as_ref())
+        {
+            fs::remove_file(entry.path()).with_context(|| {
+                format!(
+                    "remove orphaned staged vfs write {}",
+                    entry.path().display()
+                )
+            })?;
+            removed = true;
+        }
+    }
+    if removed {
+        File::open(staging_dir)
+            .with_context(|| format!("open vfs write staging directory {}", staging_dir.display()))?
+            .sync_all()
+            .with_context(|| {
+                format!("sync vfs write staging directory {}", staging_dir.display())
+            })?;
+    }
+    Ok(())
+}
+
+fn remove_staged_after_wal(shared: &Shared, writes: &[JournalWrite]) {
+    if writes.is_empty() {
+        return;
+    }
+    let mut removed = false;
+    for write in writes {
+        let staged = shared.staging_dir.join(write.staged_file.as_str());
+        match fs::remove_file(&staged) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                journal = %shared.journal_path.display(),
+                staged = %staged.display(),
+                error = %error,
+                "committed vfs staged write cleanup failed"
+            ),
+        }
+    }
+    if removed
+        && let Err(error) =
+            File::open(&shared.staging_dir).and_then(|directory| directory.sync_all())
+    {
+        tracing::warn!(
+            journal = %shared.journal_path.display(),
+            staging = %shared.staging_dir.display(),
+            error = %error,
+            "sync committed vfs staged write cleanup failed"
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn coalescing_keeps_first_precondition_and_latest_bytes() {
@@ -817,6 +1278,7 @@ mod tests {
                 force_flush: false,
                 flushing: false,
                 stop: false,
+                journal_needs_repair: false,
                 last_error: None,
                 dead_letter_error: None,
             }),
@@ -864,6 +1326,7 @@ mod tests {
                 force_flush: false,
                 flushing: false,
                 stop: false,
+                journal_needs_repair: false,
                 last_error: Some("rewrite failed".to_string()),
                 dead_letter_error: None,
             }),
@@ -908,6 +1371,81 @@ mod tests {
     }
 
     #[test]
+    fn matching_stat_requires_successful_exact_cas_repair_before_commit() {
+        let write = JournalWrite {
+            id: 1,
+            path: "src/main.rs".to_string(),
+            staged_file: "1.bin".to_string(),
+            size_bytes: b"desired".len() as u64,
+            base_content_hash: Some("old".to_string()),
+        };
+        let desired_hash = content_hash_for_bytes(b"desired");
+        let mut submitted_bases = Vec::new();
+        let outcome = resolve_rejected_write(
+            &write,
+            b"desired".to_vec(),
+            |remote| {
+                submitted_bases.push(remote.base_content_hash);
+                if submitted_bases.len() == 1 {
+                    Err(
+                        anyhow::Error::new(super::super::client::VfsRequestStatusError {
+                            status: StatusCode::CONFLICT,
+                        })
+                        .context("stale write precondition"),
+                    )
+                } else {
+                    Ok(())
+                }
+            },
+            || Ok(Some(desired_hash.clone())),
+        );
+
+        assert_eq!(
+            outcome,
+            RejectedWriteOutcome::Committed(desired_hash.clone())
+        );
+        assert_eq!(
+            submitted_bases,
+            vec![Some("old".to_string()), Some(desired_hash)],
+            "matching visible bytes must trigger a desired-hash CAS repair"
+        );
+    }
+
+    #[test]
+    fn failed_exact_cas_repair_retains_the_wal() {
+        let write = JournalWrite {
+            id: 1,
+            path: "src/main.rs".to_string(),
+            staged_file: "1.bin".to_string(),
+            size_bytes: b"desired".len() as u64,
+            base_content_hash: Some("old".to_string()),
+        };
+        let desired_hash = content_hash_for_bytes(b"desired");
+        let mut submissions = 0;
+        let outcome = resolve_rejected_write(
+            &write,
+            b"desired".to_vec(),
+            |_| {
+                submissions += 1;
+                if submissions == 1 {
+                    Err(
+                        anyhow::Error::new(super::super::client::VfsRequestStatusError {
+                            status: StatusCode::CONFLICT,
+                        })
+                        .context("stale write precondition"),
+                    )
+                } else {
+                    Err(anyhow!("repair response lost"))
+                }
+            },
+            || Ok(Some(desired_hash.clone())),
+        );
+
+        assert_eq!(outcome, RejectedWriteOutcome::Retained);
+        assert_eq!(submissions, 2);
+    }
+
+    #[test]
     fn batch_resolution_dead_letters_rejected_write_and_rebases_committed_chain() {
         let dir = tempfile::tempdir().expect("tempdir");
         let journal_path = dir.path().join("writes.jsonl");
@@ -920,7 +1458,12 @@ mod tests {
             id,
             path: path.to_string(),
             staged_file: format!("{id}.bin"),
-            size_bytes: 8,
+            size_bytes: match id {
+                1 => b"committed bytes".len() as u64,
+                2 => b"rejected bytes".len() as u64,
+                3 => b"follow-on bytes".len() as u64,
+                _ => unreachable!("test journal id"),
+            },
             base_content_hash: base.map(str::to_string),
         };
         let batch = vec![
@@ -939,6 +1482,7 @@ mod tests {
                 force_flush: false,
                 flushing: false,
                 stop: false,
+                journal_needs_repair: false,
                 last_error: Some("vfs request failed: 409".to_string()),
                 dead_letter_error: None,
             }),
@@ -967,7 +1511,10 @@ mod tests {
                 Some("committed-hash"),
                 "follow-on write for the committed path must rebase onto the committed hash"
             );
-            assert_eq!(state.last_error, None, "resolved batch must clear the error");
+            assert_eq!(
+                state.last_error, None,
+                "resolved batch must clear the error"
+            );
             assert!(
                 state
                     .dead_letter_error
@@ -1031,6 +1578,7 @@ mod tests {
                 force_flush: false,
                 flushing: false,
                 stop: false,
+                journal_needs_repair: false,
                 last_error: Some("vfs request failed: 409".to_string()),
                 dead_letter_error: None,
             }),
@@ -1082,6 +1630,7 @@ mod tests {
                 force_flush: false,
                 flushing: false,
                 stop: false,
+                journal_needs_repair: false,
                 last_error: Some("vfs request failed: 409".to_string()),
                 dead_letter_error: None,
             }),
@@ -1129,6 +1678,7 @@ mod tests {
                 force_flush: false,
                 flushing: false,
                 stop: false,
+                journal_needs_repair: false,
                 last_error: None,
                 dead_letter_error: None,
             }),
@@ -1152,5 +1702,528 @@ mod tests {
             .expect("journal state")
             .pending
             .clear();
+    }
+
+    #[test]
+    fn large_write_wal_streams_across_small_reader_buffers() {
+        const RECORDS: u64 = 12_000;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("writes.jsonl");
+        {
+            let mut writer = BufWriter::new(File::create(&journal_path).expect("journal"));
+            for id in 1..=RECORDS {
+                serde_json::to_writer(
+                    &mut writer,
+                    &JournalWrite {
+                        id,
+                        path: format!("src/generated/{id:05}/module.rs"),
+                        staged_file: format!("{id}.bin"),
+                        size_bytes: id,
+                        base_content_hash: Some(format!("base-{id}")),
+                    },
+                )
+                .expect("serialize");
+                writer.write_all(b"\n").expect("delimiter");
+            }
+            writer.flush().expect("flush");
+        }
+
+        let reader = BufReader::with_capacity(31, File::open(&journal_path).expect("open"));
+        let (pending, repair_tail) =
+            decode_journal(reader, &journal_path).expect("decode large WAL");
+        assert!(!repair_tail);
+        assert_eq!(pending.len(), RECORDS as usize);
+        assert_eq!(pending.front().expect("first").id, 1);
+        assert_eq!(pending.back().expect("last").id, RECORDS);
+    }
+
+    #[test]
+    fn oversized_write_wal_record_is_bounded_and_classified_by_termination() {
+        let path = Path::new("memory-write-journal.jsonl");
+        let mut oversized_tail =
+            BufReader::with_capacity(17, Cursor::new(vec![b'x'; MAX_JOURNAL_RECORD_BYTES + 4096]));
+        let mut retained = Vec::new();
+        let record = read_bounded_record(
+            &mut oversized_tail,
+            &mut retained,
+            path,
+            "read test write journal",
+        )
+        .expect("read")
+        .expect("record");
+        assert!(record.oversized);
+        assert!(!record.terminated);
+        assert_eq!(
+            retained.len(),
+            MAX_JOURNAL_RECORD_BYTES,
+            "corrupt tail retention is capped even while the reader drains to EOF"
+        );
+
+        let first = JournalWrite {
+            id: 1,
+            path: "first.txt".to_string(),
+            staged_file: "1.bin".to_string(),
+            size_bytes: 5,
+            base_content_hash: None,
+        };
+        let mut torn_bytes = serde_json::to_vec(&first).expect("serialize");
+        torn_bytes.push(b'\n');
+        torn_bytes.extend(std::iter::repeat(b'x').take(MAX_JOURNAL_RECORD_BYTES + 4096));
+        let (pending, repair_tail) =
+            decode_journal(BufReader::with_capacity(23, Cursor::new(torn_bytes)), path)
+                .expect("oversized unterminated final append is a torn tail");
+        assert_eq!(pending, VecDeque::from([first]));
+        assert!(repair_tail);
+
+        let mut complete_bytes = vec![b'x'; MAX_JOURNAL_RECORD_BYTES + 1];
+        complete_bytes.push(b'\n');
+        let error = decode_journal(
+            BufReader::with_capacity(29, Cursor::new(complete_bytes)),
+            path,
+        )
+        .expect_err("oversized terminated record is corrupt");
+        assert!(error.to_string().contains("exceeds the"));
+    }
+
+    #[test]
+    fn large_dead_letter_copy_is_exact_and_streamed() {
+        const LARGE_BYTES: u64 = 8 * 1024 * 1024;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("writes.jsonl");
+        let staging_dir = dir.path().join("writes");
+        fs::create_dir_all(&staging_dir).expect("staging");
+        let staged = staging_dir.join("1.bin");
+        {
+            let mut file = File::create(&staged).expect("create staged");
+            let mut chunk = [0u8; JOURNAL_READ_BUFFER_BYTES];
+            for (index, byte) in chunk.iter_mut().enumerate() {
+                *byte = (index % 251) as u8;
+            }
+            for _ in 0..(LARGE_BYTES / chunk.len() as u64) {
+                file.write_all(&chunk).expect("write staged");
+            }
+            file.sync_data().expect("sync staged");
+        }
+        let shared = Shared {
+            state: Mutex::new(JournalState {
+                pending: VecDeque::new(),
+                journal: open_append(&journal_path).expect("journal"),
+                next_id: 2,
+                force_flush: false,
+                flushing: false,
+                stop: false,
+                journal_needs_repair: false,
+                last_error: None,
+                dead_letter_error: None,
+            }),
+            changed: Condvar::new(),
+            journal_path: journal_path.clone(),
+            staging_dir: staging_dir.clone(),
+            on_dead_letter: None,
+        };
+        let write = JournalWrite {
+            id: 1,
+            path: "large.bin".to_string(),
+            staged_file: "1.bin".to_string(),
+            size_bytes: LARGE_BYTES,
+            base_content_hash: None,
+        };
+
+        dead_letter_write(&shared, &write, "rejected").expect("dead letter");
+        let records = fs::read_to_string(
+            journal_path
+                .with_extension("dead-letter")
+                .join("records.jsonl"),
+        )
+        .expect("records");
+        let record: serde_json::Value =
+            serde_json::from_str(records.lines().next().expect("record")).expect("json");
+        let preserved = journal_path
+            .with_extension("dead-letter")
+            .join(record["preserved_file"].as_str().expect("preserved name"));
+        assert_eq!(
+            fs::metadata(&preserved).expect("metadata").len(),
+            LARGE_BYTES
+        );
+        assert_eq!(
+            stream_exact_file(&staged, None, LARGE_BYTES).expect("source hash"),
+            stream_exact_file(&preserved, None, LARGE_BYTES).expect("preserved hash"),
+        );
+        assert!(staged.exists(), "WAL transition owns staged cleanup");
+    }
+
+    #[test]
+    fn dead_letter_copy_cleans_partial_files_and_reuses_ambiguous_publish() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("writes.jsonl");
+        let staging_dir = dir.path().join("writes");
+        let dead_letter_dir = journal_path.with_extension("dead-letter");
+        fs::create_dir_all(&staging_dir).expect("staging");
+        fs::create_dir_all(&dead_letter_dir).expect("dead letter");
+        let staged = staging_dir.join("1.bin");
+        fs::write(&staged, b"four").expect("stage");
+
+        for expected in [3, 5] {
+            preserve_staged_write(&staged, &dead_letter_dir, expected, expected)
+                .expect_err("short and long staged files are rejected");
+            assert!(
+                fs::read_dir(&dead_letter_dir).expect("list").all(|entry| {
+                    let name = entry.expect("entry").file_name();
+                    let name = name.to_string_lossy();
+                    !name.ends_with(".tmp") && !name.ends_with(".bin")
+                }),
+                "a failed bounded copy leaves no partial preserved file"
+            );
+        }
+
+        let write = JournalWrite {
+            id: 1,
+            path: "four.txt".to_string(),
+            staged_file: "1.bin".to_string(),
+            size_bytes: 4,
+            base_content_hash: None,
+        };
+        fs::create_dir(dead_letter_dir.join("records.jsonl")).expect("metadata blocker");
+        dead_letter_write(
+            &Shared {
+                state: Mutex::new(JournalState {
+                    pending: VecDeque::new(),
+                    journal: open_append(&journal_path).expect("journal"),
+                    next_id: 2,
+                    force_flush: false,
+                    flushing: false,
+                    stop: false,
+                    journal_needs_repair: false,
+                    last_error: None,
+                    dead_letter_error: None,
+                }),
+                changed: Condvar::new(),
+                journal_path: journal_path.clone(),
+                staging_dir: staging_dir.clone(),
+                on_dead_letter: None,
+            },
+            &write,
+            "rejected",
+        )
+        .expect_err("metadata append fails after bytes publish");
+        let preserved_before = fs::read_dir(&dead_letter_dir)
+            .expect("list")
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".bin")
+                    .then_some(entry.path())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(preserved_before.len(), 1);
+        assert!(fs::read_dir(&dead_letter_dir).expect("list").all(|entry| {
+            !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+
+        fs::remove_dir(dead_letter_dir.join("records.jsonl")).expect("remove blocker");
+        let shared = Shared {
+            state: Mutex::new(JournalState {
+                pending: VecDeque::new(),
+                journal: open_append(&journal_path).expect("journal"),
+                next_id: 2,
+                force_flush: false,
+                flushing: false,
+                stop: false,
+                journal_needs_repair: false,
+                last_error: None,
+                dead_letter_error: None,
+            }),
+            changed: Condvar::new(),
+            journal_path: journal_path.clone(),
+            staging_dir,
+            on_dead_letter: None,
+        };
+        dead_letter_write(&shared, &write, "rejected").expect("retry reuses exact bytes");
+        let preserved_after = fs::read_dir(&dead_letter_dir)
+            .expect("list")
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".bin")
+                    .then_some(entry.path())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(preserved_after, preserved_before);
+        assert!(dead_letter_dir.join("records.jsonl").is_file());
+    }
+
+    #[test]
+    fn reopen_truncates_only_a_torn_final_write_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("writes.jsonl");
+        let first = JournalWrite {
+            id: 1,
+            path: "first.txt".to_string(),
+            staged_file: "1.bin".to_string(),
+            size_bytes: 5,
+            base_content_hash: None,
+        };
+        let mut bytes = serde_json::to_vec(&first).expect("serialize");
+        bytes.extend_from_slice(b"\n{\"id\":2,\"path\":\"torn");
+        fs::write(&journal_path, bytes).expect("write torn journal");
+
+        assert_eq!(
+            read_journal(&journal_path)
+                .expect("torn tail is recoverable")
+                .iter()
+                .map(|write| write.id)
+                .collect::<Vec<_>>(),
+            [1],
+        );
+        let repaired = fs::read(&journal_path).expect("repaired journal");
+        assert!(repaired.ends_with(b"\n"));
+        assert!(!String::from_utf8_lossy(&repaired).contains("\"id\":2"));
+    }
+
+    #[test]
+    fn reopen_accepts_a_complete_unterminated_tail_and_canonicalizes_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("writes.jsonl");
+        let entry = JournalWrite {
+            id: 7,
+            path: "complete.txt".to_string(),
+            staged_file: "7.bin".to_string(),
+            size_bytes: 8,
+            base_content_hash: Some("base".to_string()),
+        };
+        fs::write(
+            &journal_path,
+            serde_json::to_vec(&entry).expect("serialize"),
+        )
+        .expect("write unterminated journal");
+
+        let reopened = read_journal(&journal_path).expect("complete tail is valid");
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened[0].id, 7);
+        assert!(
+            fs::read(&journal_path)
+                .expect("canonical journal")
+                .ends_with(b"\n")
+        );
+    }
+
+    #[test]
+    fn reopen_rejects_interior_write_journal_corruption() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("writes.jsonl");
+        fs::write(
+            &journal_path,
+            b"{\"id\":1,\"path\":\"a\",\"staged_file\":\"1.bin\",\"size_bytes\":1,\"base_content_hash\":null}\n{broken}\n",
+        )
+        .expect("write corrupt journal");
+
+        let error = read_journal(&journal_path).expect_err("interior corruption is fatal");
+        assert!(error.to_string().contains("record 2"));
+    }
+
+    #[test]
+    fn wal_rewrite_failure_retains_pending_entry_and_staged_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("writes.jsonl");
+        let staging_dir = journal_path.with_extension("writes");
+        fs::create_dir_all(&staging_dir).expect("staging");
+        let entry = JournalWrite {
+            id: 1,
+            path: "src/main.rs".to_string(),
+            staged_file: "1.bin".to_string(),
+            size_bytes: 15,
+            base_content_hash: Some("base".to_string()),
+        };
+        fs::write(staging_dir.join("1.bin"), b"committed bytes").expect("stage");
+        fs::write(
+            &journal_path,
+            format!("{}\n", serde_json::to_string(&entry).expect("serialize")),
+        )
+        .expect("journal");
+        // Occupying the atomic-rewrite temporary path with a directory is a
+        // deterministic crash-point stand-in for an I/O failure after the
+        // remote write completed but before the WAL transition committed.
+        fs::create_dir(journal_path.with_extension("jsonl.tmp")).expect("rewrite blocker");
+        let shared = Shared {
+            state: Mutex::new(JournalState {
+                pending: VecDeque::from([entry.clone()]),
+                journal: open_append(&journal_path).expect("open journal"),
+                next_id: 2,
+                force_flush: false,
+                flushing: false,
+                stop: false,
+                journal_needs_repair: false,
+                last_error: None,
+                dead_letter_error: None,
+            }),
+            changed: Condvar::new(),
+            journal_path: journal_path.clone(),
+            staging_dir: staging_dir.clone(),
+            on_dead_letter: None,
+        };
+        let mut state = shared.state.lock().expect("state");
+        apply_batch_resolution(
+            &shared,
+            &mut state,
+            std::slice::from_ref(&entry),
+            std::slice::from_ref(&entry),
+            BatchResolution {
+                committed: HashMap::from([(
+                    entry.path.clone(),
+                    content_hash_for_bytes(b"committed bytes"),
+                )]),
+                dead_lettered: Vec::new(),
+                retained: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            state.pending,
+            VecDeque::from([entry]),
+            "in-memory replay state must match the still-old durable WAL"
+        );
+        assert!(state.last_error.is_some());
+        drop(state);
+        assert_eq!(
+            fs::read(staging_dir.join("1.bin")).expect("staged bytes survive"),
+            b"committed bytes"
+        );
+        assert!(
+            fs::read_to_string(&journal_path)
+                .expect("old WAL survives")
+                .contains("src/main.rs")
+        );
+    }
+
+    #[test]
+    fn post_rename_rewrite_fault_must_repair_live_wal_before_later_enqueue() {
+        for fault in [
+            RewriteFault::ParentSyncAfterRename,
+            RewriteFault::ReopenAfterRewrite,
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let journal_path = dir.path().join("writes.jsonl");
+            let staging_dir = journal_path.with_extension("writes");
+            fs::create_dir_all(&staging_dir).expect("staging");
+            let first = JournalWrite {
+                id: 1,
+                path: "first.txt".to_string(),
+                staged_file: "1.bin".to_string(),
+                size_bytes: 5,
+                base_content_hash: None,
+            };
+            fs::write(staging_dir.join("1.bin"), b"first").expect("stage first");
+            fs::write(
+                &journal_path,
+                format!("{}\n", serde_json::to_string(&first).expect("serialize")),
+            )
+            .expect("journal");
+            let shared = Arc::new(Shared {
+                state: Mutex::new(JournalState {
+                    pending: VecDeque::from([first]),
+                    journal: open_append(&journal_path).expect("open journal"),
+                    next_id: 2,
+                    force_flush: false,
+                    flushing: false,
+                    stop: false,
+                    journal_needs_repair: false,
+                    last_error: None,
+                    dead_letter_error: None,
+                }),
+                changed: Condvar::new(),
+                journal_path: journal_path.clone(),
+                staging_dir,
+                on_dead_letter: None,
+            });
+            {
+                let mut state = shared.state.lock().expect("state");
+                arm_rewrite_fault(fault);
+                let error = rewrite_journal(&journal_path, &mut state)
+                    .expect_err("post-rename rewrite fault");
+                state.last_error = Some(error.to_string());
+                assert!(state.journal_needs_repair);
+            }
+            let journal = WriteJournal {
+                shared: Arc::clone(&shared),
+                worker: Mutex::new(None),
+            };
+
+            arm_rewrite_fault(fault);
+            journal
+                .enqueue("later.txt", b"later", None)
+                .expect_err("append cannot bypass a failed canonical repair");
+            {
+                let state = shared.state.lock().expect("state");
+                assert!(state.journal_needs_repair);
+                assert!(state.last_error.is_some(), "repair error stays latched");
+                assert_eq!(state.next_id, 2, "failed repair allocates no write id");
+            }
+
+            journal
+                .enqueue("later.txt", b"later", None)
+                .expect("next append repairs and reanchors the live WAL");
+            assert_eq!(
+                read_journal(&journal_path)
+                    .expect("reopen live WAL")
+                    .iter()
+                    .map(|write| (write.id, write.path.clone()))
+                    .collect::<Vec<_>>(),
+                [(1, "first.txt".to_string()), (2, "later.txt".to_string())],
+            );
+            {
+                let mut state = shared.state.lock().expect("state");
+                assert!(!state.journal_needs_repair);
+                assert_eq!(state.last_error, None);
+                state.pending.clear();
+            }
+            drop(journal);
+        }
+    }
+
+    #[test]
+    fn reopen_fails_loudly_when_wal_references_missing_staged_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = JournalWrite {
+            id: 1,
+            path: "missing.txt".to_string(),
+            staged_file: "1.bin".to_string(),
+            size_bytes: 7,
+            base_content_hash: None,
+        };
+        let error = validate_staged_writes(dir.path(), &VecDeque::from([entry]))
+            .expect_err("missing staged content is corruption, not an empty write");
+        assert!(error.to_string().contains("validate staged vfs write"));
+    }
+
+    #[test]
+    fn reopen_removes_only_unreferenced_staging_artifacts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = JournalWrite {
+            id: 1,
+            path: "kept.txt".to_string(),
+            staged_file: "1.bin".to_string(),
+            size_bytes: 4,
+            base_content_hash: None,
+        };
+        fs::write(dir.path().join("1.bin"), b"kept").expect("referenced");
+        fs::write(dir.path().join("2.bin"), b"orphan").expect("orphan");
+        fs::write(dir.path().join("3.tmp"), b"torn").expect("temporary");
+        fs::write(dir.path().join("notes.txt"), b"unrelated").expect("unrelated");
+
+        remove_orphaned_staged_writes(dir.path(), &VecDeque::from([entry]))
+            .expect("remove staging garbage");
+
+        assert!(dir.path().join("1.bin").exists());
+        assert!(!dir.path().join("2.bin").exists());
+        assert!(!dir.path().join("3.tmp").exists());
+        assert!(dir.path().join("notes.txt").exists());
     }
 }

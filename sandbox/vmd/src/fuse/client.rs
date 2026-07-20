@@ -6,6 +6,7 @@ use chevalier_sandbox::vfs::{
     CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, CHEVALIER_VFS_OPERATION_HEADER,
     CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER, CHEVALIER_VFS_RESOURCE_KEY_HEADER,
     CHEVALIER_VFS_SURFACE_KIND_HEADER, VFS_COMPONENT_VM_RUNTIME, VfsDirEntry as RemoteDirEntry,
+    VfsHardLinkAliasBody, VfsHardLinkAliasResponse, VfsHardLinkBody, VfsHardLinkMetadataResponse,
     VfsLeaseAcquireRequest, VfsLeaseGrant as LeaseGrant, VfsLeaseReleaseRequest,
     VfsMetadata as RemoteMetadata, VfsNamespaceMutation, VfsNamespaceMutationBatchBody,
     VfsWriteManyBody, VfsWriteManyItem, VfsWritePrecondition, scoped_vfs_path,
@@ -20,6 +21,8 @@ pub const RANGE_FINGERPRINT_HEADER: &str = "x-chevalier-vfs-range-fingerprint";
 const READ_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
 const METADATA_READ_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const FILE_READ_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
+const ADVISORY_LOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+const ADVISORY_LOCK_RENEWAL_BATCH_SIZE: usize = 4_096;
 const READ_RETRY_DELAY_MIN: Duration = Duration::from_millis(50);
 const READ_RETRY_DELAY_MAX: Duration = Duration::from_millis(500);
 
@@ -60,6 +63,13 @@ pub struct AdvisoryLockResponse {
     pub file_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AdvisoryLockRenewalIdentity {
+    pub lock_owner: String,
+    pub namespace: String,
+    pub file_id: String,
+}
+
 #[derive(Serialize)]
 struct AdvisoryLockRequest<'a> {
     action: &'a str,
@@ -71,6 +81,8 @@ struct AdvisoryLockRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     lock_owner: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    namespace: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     start: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     end: Option<String>,
@@ -78,6 +90,8 @@ struct AdvisoryLockRequest<'a> {
     kind: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identities: Option<&'a [AdvisoryLockRenewalIdentity]>,
 }
 
 impl RemoteVfsClient {
@@ -325,6 +339,56 @@ impl RemoteVfsClient {
         Ok(())
     }
 
+    pub async fn create_hard_link(
+        &self,
+        source_path: &str,
+        destination_path: &str,
+        lease: &LeaseGrant,
+        surface_kind: &str,
+    ) -> Result<VfsHardLinkMetadataResponse> {
+        self.request(
+            self.client
+                .post(self.url("/hard-link/v1"))
+                .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
+                .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
+                .header(CHEVALIER_VFS_OPERATION_HEADER, "vfs_hard_link")
+                .header(
+                    CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+                    lease.resource_key.as_str(),
+                )
+                .header(
+                    CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                    lease.owner_token.to_string(),
+                )
+                .json(&VfsHardLinkBody {
+                    source_path: self.path_arg(source_path),
+                    destination_path: self.path_arg(destination_path),
+                }),
+        )
+        .await?
+        .json()
+        .await
+        .context("decode vfs hard-link response")
+    }
+
+    pub async fn find_hard_link_alias(
+        &self,
+        file_id: &str,
+        excluding_path: &str,
+    ) -> Result<Option<String>> {
+        self.request(self.client.post(self.url("/hard-link-alias/v1")).json(
+            &VfsHardLinkAliasBody {
+                file_id: file_id.to_string(),
+                excluding_path: self.path_arg(excluding_path),
+            },
+        ))
+        .await?
+        .json::<VfsHardLinkAliasResponse>()
+        .await
+        .map(|response| response.path.map(|path| self.unscoped_path(path.as_str())))
+        .context("decode vfs hard-link alias response")
+    }
+
     pub async fn rmdir(
         &self,
         path: &str,
@@ -423,6 +487,7 @@ impl RemoteVfsClient {
         path: &str,
         mount_id: &str,
         lock_owner: &str,
+        namespace: &str,
         start: u64,
         end: u64,
         kind: &str,
@@ -431,16 +496,19 @@ impl RemoteVfsClient {
         self.request(
             self.client
                 .post(self.url("/posix-lock/v1"))
+                .timeout(ADVISORY_LOCK_ATTEMPT_TIMEOUT)
                 .json(&AdvisoryLockRequest {
                     action,
                     path: Some(self.path_arg(path)),
                     file_id: None,
                     mount_id,
                     lock_owner: Some(lock_owner),
+                    namespace: Some(namespace),
                     start: Some(start.to_string()),
                     end: Some(end.to_string()),
                     kind: Some(kind),
                     pid: Some(pid),
+                    identities: None,
                 }),
         )
         .await?
@@ -454,6 +522,7 @@ impl RemoteVfsClient {
         mount_id: &str,
         lock_owner: &str,
         file_id: &str,
+        namespace: &str,
     ) -> Result<()> {
         self.request(
             self.client
@@ -464,33 +533,43 @@ impl RemoteVfsClient {
                     file_id: Some(file_id),
                     mount_id,
                     lock_owner: Some(lock_owner),
+                    namespace: Some(namespace),
                     start: None,
                     end: None,
                     kind: None,
                     pid: None,
+                    identities: None,
                 }),
         )
         .await?;
         Ok(())
     }
 
-    pub async fn renew_advisory_locks(&self, mount_id: &str) -> Result<()> {
-        self.request(
-            self.client
-                .post(self.url("/posix-lock/v1"))
-                .json(&AdvisoryLockRequest {
-                    action: "renew_mount",
-                    path: None,
-                    file_id: None,
-                    mount_id,
-                    lock_owner: None,
-                    start: None,
-                    end: None,
-                    kind: None,
-                    pid: None,
-                }),
-        )
-        .await?;
+    pub async fn renew_advisory_locks(
+        &self,
+        mount_id: &str,
+        identities: &[AdvisoryLockRenewalIdentity],
+    ) -> Result<()> {
+        for identities in identities.chunks(ADVISORY_LOCK_RENEWAL_BATCH_SIZE) {
+            self.request(
+                self.client
+                    .post(self.url("/posix-lock/v1"))
+                    .json(&AdvisoryLockRequest {
+                        action: "renew_owners",
+                        path: None,
+                        file_id: None,
+                        mount_id,
+                        lock_owner: None,
+                        namespace: None,
+                        start: None,
+                        end: None,
+                        kind: None,
+                        pid: None,
+                        identities: Some(identities),
+                    }),
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -504,10 +583,12 @@ impl RemoteVfsClient {
                     file_id: None,
                     mount_id,
                     lock_owner: None,
+                    namespace: None,
                     start: None,
                     end: None,
                     kind: None,
                     pid: None,
+                    identities: None,
                 }),
         )
         .await?;
@@ -648,6 +729,19 @@ impl RemoteVfsClient {
 
     fn path_arg(&self, relative: &str) -> String {
         scoped_vfs_path(self.scope_path.as_str(), relative)
+    }
+
+    fn unscoped_path(&self, path: &str) -> String {
+        let path = path.trim_matches('/');
+        if self.scope_path.is_empty() {
+            return path.to_string();
+        }
+        if path == self.scope_path {
+            return String::new();
+        }
+        path.strip_prefix(&format!("{}/", self.scope_path))
+            .unwrap_or(path)
+            .to_string()
     }
 
     fn url(&self, suffix: &str) -> String {

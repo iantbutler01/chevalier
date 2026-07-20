@@ -17,10 +17,10 @@ use uuid::Uuid;
 
 use crate::{
     OptimizedVfsStorage, VfsStorageDeleteResult, VfsStorageDirListFilter, VfsStorageEntryKind,
-    VfsStorageError, VfsStorageMetadata, VfsStorageMetadataFields, VfsStoragePrefetchOptions,
-    VfsStoragePrefetchResult, VfsStorageReadIfChanged, VfsStorageReadIfChangedResult,
-    VfsStorageReadRange, VfsStorageRenameResult, VfsStorageResult, VfsStorageSubtreeOptions,
-    VfsStorageWrite, VfsStorageWritePrecondition, VfsStorageWriteResult,
+    VfsStorageError, VfsStorageHardLinkResult, VfsStorageMetadata, VfsStorageMetadataFields,
+    VfsStoragePrefetchOptions, VfsStoragePrefetchResult, VfsStorageReadIfChanged,
+    VfsStorageReadIfChangedResult, VfsStorageReadRange, VfsStorageRenameResult, VfsStorageResult,
+    VfsStorageSubtreeOptions, VfsStorageWrite, VfsStorageWritePrecondition, VfsStorageWriteResult,
     index::{
         VfsIndexEntryWithManifest, VfsIndexScope, VfsManifestIndex, VfsPackedCommit,
         VfsPackedFileCommit,
@@ -33,6 +33,8 @@ use crate::{
 
 const DEFAULT_PACK_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_SMALL_FILE_CACHE_MAX_BYTES: usize = 256 * 1024;
+const MAX_SMALL_FILE_CACHE_ENTRIES: usize = 4_096;
+const MAX_SMALL_FILE_CACHE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ObjectBackedVfsStorageConfig {
@@ -62,7 +64,21 @@ pub struct ObjectBackedVfsStorage {
 
 struct ObjectBackedVfsCache {
     pack_bytes: Arc<PackCache>,
-    file_bytes: Mutex<HashMap<String, Option<Bytes>>>,
+    file_bytes: Mutex<SmallFileCache>,
+}
+
+#[derive(Default)]
+struct SmallFileCache {
+    entries: HashMap<String, CachedObjectFile>,
+    sequence: u64,
+    total_bytes: usize,
+}
+
+#[derive(Clone)]
+struct CachedObjectFile {
+    content_hash: String,
+    bytes: Bytes,
+    last_touched: u64,
 }
 
 impl ObjectBackedVfsStorage {
@@ -92,7 +108,7 @@ impl ObjectBackedVfsStorage {
             index,
             cache: ObjectBackedVfsCache {
                 pack_bytes: pack_cache,
-                file_bytes: Mutex::new(HashMap::new()),
+                file_bytes: Mutex::new(SmallFileCache::default()),
             },
         }
     }
@@ -108,23 +124,43 @@ impl ObjectBackedVfsStorage {
         }
     }
 
-    fn cached_file_bytes(&self, path: &str) -> Option<Option<Bytes>> {
-        self.cache
-            .file_bytes
-            .lock()
-            .ok()
-            .and_then(|guard| guard.get(path).cloned())
+    fn cached_file_bytes(&self, path: &str, content_hash: &str) -> Option<Bytes> {
+        let mut cache = self.cache.file_bytes.lock().ok()?;
+        cache.sequence = cache.sequence.saturating_add(1);
+        let sequence = cache.sequence;
+        let entry = cache.entries.get_mut(path)?;
+        if entry.content_hash != content_hash {
+            return None;
+        }
+        entry.last_touched = sequence;
+        Some(entry.bytes.clone())
     }
 
-    fn put_file_bytes_cache(&self, path: String, bytes: Option<Bytes>) {
-        if let Ok(mut guard) = self.cache.file_bytes.lock() {
-            guard.insert(path, bytes);
+    fn put_file_bytes_cache(&self, path: String, content_hash: String, bytes: Bytes) {
+        if let Ok(mut cache) = self.cache.file_bytes.lock() {
+            cache.sequence = cache.sequence.saturating_add(1);
+            let sequence = cache.sequence;
+            if let Some(previous) = cache.entries.remove(&path) {
+                cache.total_bytes = cache.total_bytes.saturating_sub(previous.bytes.len());
+            }
+            cache.total_bytes = cache.total_bytes.saturating_add(bytes.len());
+            cache.entries.insert(
+                path,
+                CachedObjectFile {
+                    content_hash,
+                    bytes,
+                    last_touched: sequence,
+                },
+            );
+            prune_small_file_cache(&mut cache);
         }
     }
 
     fn invalidate_file_bytes(&self, path: &str) {
-        if let Ok(mut guard) = self.cache.file_bytes.lock() {
-            guard.remove(path);
+        if let Ok(mut cache) = self.cache.file_bytes.lock()
+            && let Some(previous) = cache.entries.remove(path)
+        {
+            cache.total_bytes = cache.total_bytes.saturating_sub(previous.bytes.len());
         }
     }
 
@@ -199,6 +235,44 @@ impl ObjectBackedVfsStorage {
         }
         Ok(())
     }
+
+    async fn create_parent_directories_for_writes(
+        &self,
+        writes: &[VfsStorageWrite],
+    ) -> VfsStorageResult<()> {
+        let mut directories = HashMap::<String, (String, String)>::new();
+        for write in writes {
+            let (parent, _) = Self::path_parts(&write.path);
+            let mut current = String::new();
+            for segment in parent
+                .trim_matches('/')
+                .split('/')
+                .filter(|part| !part.is_empty())
+            {
+                let ancestor = current.clone();
+                if !current.is_empty() {
+                    current.push('/');
+                }
+                current.push_str(segment);
+                directories
+                    .entry(current.clone())
+                    .or_insert_with(|| (ancestor, segment.to_string()));
+            }
+        }
+        let mut directories = directories.into_iter().collect::<Vec<_>>();
+        directories.sort_unstable_by(|(left, _), (right, _)| {
+            left.matches('/')
+                .count()
+                .cmp(&right.matches('/').count())
+                .then_with(|| left.cmp(right))
+        });
+        for (path, (parent, name)) in directories {
+            self.index
+                .create_directory(&self.cfg.scope, &path, &parent, &name)
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -258,44 +332,30 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
         options: VfsStorageSubtreeOptions,
     ) -> VfsStorageResult<Vec<VfsStorageMetadata>> {
         self.index
-            .list_current_file_manifests_in_subtree(&self.cfg.scope, prefix, options.limit)
+            .list_entries_with_manifest_in_subtree(&self.cfg.scope, prefix, options.limit)
             .await
-            .map(|manifests| {
-                manifests
+            .map(|entries| {
+                entries
                     .into_iter()
-                    .map(|manifest| VfsStorageMetadata {
-                        path: manifest.logical_path.clone(),
-                        kind: VfsStorageEntryKind::File,
-                        size_bytes: manifest.logical_size_bytes.max(0) as u64,
-                        file_id: None,
-                        link_count: 1,
-                        link_target: None,
-                        executable: false,
-                        content_hash: Some(manifest.content_hash.clone()),
-                        token_count: manifest.token_count,
-                        version: None,
-                        updated_at: None,
-                        object_state: Some(manifest.object_state()),
-                    })
+                    .map(VfsIndexEntryWithManifest::into_storage_metadata)
                     .collect()
             })
     }
 
     async fn read(&self, path: &str) -> VfsStorageResult<Bytes> {
-        if let Some(cached) = self.cached_file_bytes(path) {
-            return cached.ok_or_else(|| VfsStorageError::NotFound(path.to_string()));
-        }
         let Some(manifest) = self
             .index
             .get_current_file_manifest(&self.cfg.scope, path)
             .await?
         else {
-            self.put_file_bytes_cache(path.to_string(), None);
             return Err(VfsStorageError::NotFound(path.to_string()));
         };
+        if let Some(cached) = self.cached_file_bytes(path, &manifest.content_hash) {
+            return Ok(cached);
+        }
         let bytes = self.read_manifest_bytes(&manifest).await?;
         if bytes.len() <= self.cfg.small_file_cache_max_bytes {
-            self.put_file_bytes_cache(path.to_string(), Some(bytes.clone()));
+            self.put_file_bytes_cache(path.to_string(), manifest.content_hash, bytes.clone());
         }
         Ok(bytes)
     }
@@ -315,29 +375,20 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
             return Ok(Vec::new());
         }
         let mut results = Vec::new();
-        let mut unresolved = Vec::new();
-        for path in paths {
-            match self.cached_file_bytes(path) {
-                Some(Some(bytes)) => results.push((path.clone(), bytes)),
-                Some(None) => {}
-                None => unresolved.push(path.clone()),
-            }
-        }
-        if unresolved.is_empty() {
-            return Ok(results);
-        }
-
         let manifests = self
             .index
-            .list_current_file_manifests_by_paths(&self.cfg.scope, &unresolved)
+            .list_current_file_manifests_by_paths(&self.cfg.scope, paths)
             .await?;
         let mut manifest_by_path = manifests
             .into_iter()
             .map(|manifest| (manifest.logical_path.clone(), manifest))
             .collect::<HashMap<_, _>>();
-        for path in &unresolved {
-            if !manifest_by_path.contains_key(path) {
-                self.put_file_bytes_cache(path.clone(), None);
+        for path in paths {
+            if let Some(manifest) = manifest_by_path.get(path)
+                && let Some(bytes) = self.cached_file_bytes(path, &manifest.content_hash)
+            {
+                results.push((path.clone(), bytes));
+                manifest_by_path.remove(path);
             }
         }
         for path in manifest_by_path
@@ -347,15 +398,20 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
             })
             .collect::<Vec<_>>()
         {
-            self.put_file_bytes_cache(path.clone(), Some(Bytes::new()));
+            let content_hash = manifest_by_path
+                .get(&path)
+                .map(|manifest| manifest.content_hash.clone())
+                .unwrap_or_default();
+            self.put_file_bytes_cache(path.clone(), content_hash, Bytes::new());
             results.push((path.clone(), Bytes::new()));
             manifest_by_path.remove(&path);
         }
 
-        let mut packs: HashMap<String, Vec<(String, i64, i64)>> = HashMap::new();
+        let mut packs: HashMap<String, Vec<(String, String, i64, i64)>> = HashMap::new();
         for (path, manifest) in manifest_by_path {
             packs.entry(manifest.pack_slot.pack_key).or_default().push((
                 path,
+                manifest.content_hash,
                 manifest.pack_slot.pack_slot_offset,
                 manifest.pack_slot.pack_slot_length,
             ));
@@ -364,12 +420,12 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
             .map(|(pack_key, slots)| async move {
                 let range_start = slots
                     .iter()
-                    .map(|(_, offset, _)| *offset as u64)
+                    .map(|(_, _, offset, _)| *offset as u64)
                     .min()
                     .unwrap_or(0);
                 let range_end = slots
                     .iter()
-                    .map(|(_, offset, length)| (*offset + *length) as u64)
+                    .map(|(_, _, offset, length)| (*offset + *length) as u64)
                     .max()
                     .unwrap_or(0);
                 let range_length = range_end.saturating_sub(range_start);
@@ -388,13 +444,13 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
             .try_collect::<Vec<_>>()
             .await?;
         for (_pack_key, range_start, slots, bytes) in pack_results {
-            for (path, slot_offset, slot_length) in slots {
+            for (path, content_hash, slot_offset, slot_length) in slots {
                 let offset_within_range = slot_offset as u64 - range_start;
                 let extracted =
                     extract_slot(bytes.as_slice(), offset_within_range, slot_length as u64)?;
                 let bytes = Bytes::from(extracted.bytes);
                 if bytes.len() <= self.cfg.small_file_cache_max_bytes {
-                    self.put_file_bytes_cache(path.clone(), Some(bytes.clone()));
+                    self.put_file_bytes_cache(path.clone(), content_hash, bytes.clone());
                 }
                 results.push((path, bytes));
             }
@@ -470,9 +526,68 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
             return Ok(Vec::new());
         }
         assert_unique_write_paths(&writes)?;
-        for write in &writes {
-            let (parent_logical_path, _) = Self::path_parts(&write.path);
-            self.create_dir_all_metadata(&parent_logical_path).await?;
+        let requested_paths = writes
+            .iter()
+            .map(|write| write.path.clone())
+            .collect::<HashSet<_>>();
+        self.create_parent_directories_for_writes(&writes).await?;
+        let requested_previous = self
+            .index
+            .list_entries_with_manifest_by_paths(
+                &self.cfg.scope,
+                &writes
+                    .iter()
+                    .map(|write| write.path.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .await?
+            .into_iter()
+            .map(|entry| (entry.entry.logical_path.clone(), entry))
+            .collect::<HashMap<_, _>>();
+        let mut writes = writes;
+        let explicit_by_identity = requested_previous
+            .values()
+            .filter(|entry| entry.entry.link_count > 1)
+            .filter_map(|entry| {
+                entry
+                    .entry
+                    .file_id
+                    .as_ref()
+                    .map(|file_id| (file_id.clone(), entry.entry.logical_path.clone()))
+            })
+            .collect::<HashMap<_, _>>();
+        for (file_id, representative_path) in explicit_by_identity {
+            let representative = writes
+                .iter()
+                .find(|write| write.path == representative_path)
+                .cloned()
+                .ok_or_else(|| {
+                    VfsStorageError::Internal(format!(
+                        "missing write for hard-link identity {file_id}"
+                    ))
+                })?;
+            for alias in self
+                .index
+                .list_file_alias_paths(&self.cfg.scope, &file_id)
+                .await?
+            {
+                if requested_paths.contains(&alias) {
+                    let explicit = writes
+                        .iter()
+                        .find(|write| write.path == alias)
+                        .expect("requested write exists");
+                    if explicit.bytes != representative.bytes {
+                        return Err(VfsStorageError::Conflict(format!(
+                            "one atomic batch writes different content through hard-link aliases {representative_path} and {alias}"
+                        )));
+                    }
+                } else {
+                    let mut alias_write = representative.clone();
+                    alias_write.path = alias;
+                    alias_write.precondition = None;
+                    writes.push(alias_write);
+                }
+            }
         }
         let previous = self
             .index
@@ -488,7 +603,19 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
             .map(|entry| (entry.entry.logical_path.clone(), entry))
             .collect::<HashMap<_, _>>();
         let pack_key = self.build_pack_key();
-        let inputs = writes
+        let identity_key = |write: &VfsStorageWrite| {
+            previous
+                .get(&write.path)
+                .and_then(|entry| entry.entry.file_id.clone())
+                .map(|file_id| format!("inode:{file_id}"))
+                .unwrap_or_else(|| format!("path:{}", write.path))
+        };
+        let mut seen_content_identities = HashSet::new();
+        let unique_writes = writes
+            .iter()
+            .filter(|write| seen_content_identities.insert(identity_key(write)))
+            .collect::<Vec<_>>();
+        let inputs = unique_writes
             .iter()
             .map(|write| VfsPackInput {
                 logical_path: write.path.as_str(),
@@ -497,7 +624,30 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
                 token_count: write.token_count,
             })
             .collect::<Vec<_>>();
-        let built = build_pack_manifest(pack_key, &inputs)?;
+        let mut built = build_pack_manifest(pack_key, &inputs)?;
+        let manifest_by_identity = unique_writes
+            .iter()
+            .zip(built.file_manifests.iter())
+            .map(|(write, manifest)| (identity_key(write), manifest.clone()))
+            .collect::<HashMap<_, _>>();
+        let expanded_manifests = writes
+            .iter()
+            .map(|write| {
+                let mut manifest = manifest_by_identity
+                    .get(&identity_key(write))
+                    .cloned()
+                    .ok_or_else(|| {
+                        VfsStorageError::Internal(format!(
+                            "missing packed content for {}",
+                            write.path
+                        ))
+                    })?;
+                manifest.logical_path = write.path.clone();
+                Ok(manifest)
+            })
+            .collect::<VfsStorageResult<Vec<_>>>()?;
+        built.pack_record.reference_count = expanded_manifests.len() as i32;
+        built.file_manifests = expanded_manifests;
         self.store
             .put_object_async(
                 &built.pack_record.pack_key,
@@ -524,6 +674,9 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
                         parent_logical_path,
                         entry_name,
                         manifest: manifest.clone(),
+                        file_id: previous
+                            .get(&write.path)
+                            .and_then(|entry| entry.entry.file_id.clone()),
                         expected_current_version: write
                             .precondition
                             .as_ref()
@@ -554,6 +707,7 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
                     changed: true,
                 }
             })
+            .filter(|result| requested_paths.contains(&result.path))
             .collect();
         Ok(results)
     }
@@ -669,6 +823,38 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
         })
     }
 
+    async fn create_hard_link(
+        &self,
+        source: &str,
+        destination: &str,
+    ) -> VfsStorageResult<VfsStorageHardLinkResult> {
+        let (parent, name) = Self::path_parts(destination);
+        self.create_dir_all_metadata(&parent).await?;
+        let result = self
+            .index
+            .create_hard_link_entry(&self.cfg.scope, source, destination, &parent, &name)
+            .await?;
+        self.invalidate_file_bytes(source);
+        self.invalidate_file_bytes(destination);
+        Ok(VfsStorageHardLinkResult {
+            source: result.source.into_storage_metadata(),
+            destination: result.destination.into_storage_metadata(),
+        })
+    }
+
+    async fn find_hard_link_alias(
+        &self,
+        file_id: &str,
+        excluding_path: &str,
+    ) -> VfsStorageResult<Option<String>> {
+        Ok(self
+            .index
+            .list_file_alias_paths(&self.cfg.scope, file_id)
+            .await?
+            .into_iter()
+            .find(|path| path != excluding_path))
+    }
+
     async fn prefetch_subtree(
         &self,
         prefix: &str,
@@ -715,7 +901,11 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
                     manifest.pack_slot.pack_slot_length as u64,
                 )?;
                 let bytes = Bytes::from(extracted.bytes);
-                self.put_file_bytes_cache(manifest.logical_path.clone(), Some(bytes.clone()));
+                self.put_file_bytes_cache(
+                    manifest.logical_path.clone(),
+                    manifest.content_hash,
+                    bytes.clone(),
+                );
                 warmed_file_bytes.push((manifest.logical_path, bytes));
             }
         }
@@ -736,6 +926,30 @@ fn assert_unique_write_paths(writes: &[VfsStorageWrite]) -> VfsStorageResult<()>
     Ok(())
 }
 
+fn prune_small_file_cache(cache: &mut SmallFileCache) {
+    if cache.entries.len() <= MAX_SMALL_FILE_CACHE_ENTRIES
+        && cache.total_bytes <= MAX_SMALL_FILE_CACHE_TOTAL_BYTES
+    {
+        return;
+    }
+    let target_entries = MAX_SMALL_FILE_CACHE_ENTRIES.saturating_mul(3) / 4;
+    let target_bytes = MAX_SMALL_FILE_CACHE_TOTAL_BYTES.saturating_mul(3) / 4;
+    let mut oldest = cache
+        .entries
+        .iter()
+        .map(|(path, entry)| (path.clone(), entry.last_touched))
+        .collect::<Vec<_>>();
+    oldest.sort_unstable_by_key(|(_, last_touched)| *last_touched);
+    for (path, _) in oldest {
+        if cache.entries.len() <= target_entries && cache.total_bytes <= target_bytes {
+            break;
+        }
+        if let Some(removed) = cache.entries.remove(&path) {
+            cache.total_bytes = cache.total_bytes.saturating_sub(removed.bytes.len());
+        }
+    }
+}
+
 fn sanitize_scope_for_key(scope: &str) -> String {
     scope
         .chars()
@@ -753,6 +967,8 @@ fn sanitize_scope_for_key(scope: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
 
     use async_trait::async_trait;
     use chrono::Utc;
@@ -765,6 +981,11 @@ mod tests {
     #[derive(Default)]
     struct MemoryIndex {
         inner: Mutex<MemoryIndexInner>,
+        alias_list_calls: AtomicUsize,
+        create_directory_calls: AtomicUsize,
+        entries_by_paths_calls: AtomicUsize,
+        manifest_by_paths_calls: AtomicUsize,
+        packed_commit_calls: AtomicUsize,
     }
 
     #[derive(Default)]
@@ -838,6 +1059,7 @@ mod tests {
             _scope: &VfsIndexScope,
             logical_paths: &[String],
         ) -> VfsStorageResult<Vec<crate::manifest::VfsFileManifest>> {
+            self.manifest_by_paths_calls.fetch_add(1, Ordering::Relaxed);
             let guard = self.inner.lock().unwrap();
             Ok(logical_paths
                 .iter()
@@ -898,6 +1120,7 @@ mod tests {
             _scope: &VfsIndexScope,
             logical_paths: &[String],
         ) -> VfsStorageResult<Vec<VfsIndexEntryWithManifest>> {
+            self.entries_by_paths_calls.fetch_add(1, Ordering::Relaxed);
             let guard = self.inner.lock().unwrap();
             Ok(logical_paths
                 .iter()
@@ -969,6 +1192,7 @@ mod tests {
             _scope: &VfsIndexScope,
             commit: VfsPackedCommit,
         ) -> VfsStorageResult<VfsPackedCommitResult> {
+            self.packed_commit_calls.fetch_add(1, Ordering::Relaxed);
             let mut guard = self.inner.lock().unwrap();
             for file in &commit.files {
                 let actual = guard
@@ -986,6 +1210,16 @@ mod tests {
             for file in commit.files {
                 guard.version_counter += 1;
                 let version = format!("v{}", guard.version_counter);
+                // The in-memory test index already stores the link count on the
+                // existing namespace entry. Recounting every identity by scanning
+                // the complete map made this test double O(N²), masking the
+                // production batch implementation's actual scaling at 10k files.
+                let link_count = guard
+                    .entries
+                    .get(&file.logical_path)
+                    .map(|entry| entry.entry.link_count)
+                    .unwrap_or(1);
+                let file_id = file.file_id.or_else(|| Some(Uuid::new_v4().to_string()));
                 guard.entries.insert(
                     file.logical_path.clone(),
                     VfsIndexEntryWithManifest {
@@ -994,6 +1228,8 @@ mod tests {
                             parent_logical_path: file.parent_logical_path,
                             entry_name: file.entry_name,
                             kind: VfsStorageEntryKind::File,
+                            file_id,
+                            link_count,
                             size_bytes: file.manifest.logical_size_bytes,
                             content_hash: Some(file.manifest.content_hash.clone()),
                             current_version: Some(version),
@@ -1014,6 +1250,7 @@ mod tests {
             parent_logical_path: &str,
             entry_name: &str,
         ) -> VfsStorageResult<()> {
+            self.create_directory_calls.fetch_add(1, Ordering::Relaxed);
             let mut guard = self.inner.lock().unwrap();
             if matches!(
                 guard
@@ -1034,6 +1271,8 @@ mod tests {
                         parent_logical_path: parent_logical_path.to_string(),
                         entry_name: entry_name.to_string(),
                         kind: VfsStorageEntryKind::Directory,
+                        file_id: None,
+                        link_count: 1,
                         size_bytes: 0,
                         content_hash: None,
                         current_version: None,
@@ -1043,6 +1282,84 @@ mod tests {
                 },
             );
             Ok(())
+        }
+
+        async fn create_hard_link_entry(
+            &self,
+            _scope: &VfsIndexScope,
+            source_logical_path: &str,
+            destination_logical_path: &str,
+            destination_parent_logical_path: &str,
+            destination_entry_name: &str,
+        ) -> VfsStorageResult<crate::index::VfsIndexHardLinkResult> {
+            let mut guard = self.inner.lock().unwrap();
+            if guard.entries.contains_key(destination_logical_path) {
+                return Err(VfsStorageError::Conflict(format!(
+                    "vfs hard-link destination already exists: {destination_logical_path}"
+                )));
+            }
+            let mut source = guard
+                .entries
+                .get(source_logical_path)
+                .cloned()
+                .ok_or_else(|| VfsStorageError::NotFound(source_logical_path.to_string()))?;
+            if source.entry.kind != VfsStorageEntryKind::File {
+                return Err(VfsStorageError::BadRequest(format!(
+                    "vfs hard-link source {source_logical_path} is not a file"
+                )));
+            }
+            let file_id = source
+                .entry
+                .file_id
+                .clone()
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            let link_count = guard
+                .entries
+                .values()
+                .filter(|entry| entry.entry.file_id.as_deref() == Some(file_id.as_str()))
+                .count() as u64
+                + 1;
+            for entry in guard.entries.values_mut() {
+                if entry.entry.logical_path == source_logical_path
+                    || entry.entry.file_id.as_deref() == Some(file_id.as_str())
+                {
+                    entry.entry.file_id = Some(file_id.clone());
+                    entry.entry.link_count = link_count;
+                }
+            }
+            source = guard.entries[source_logical_path].clone();
+            let mut destination = source.clone();
+            destination.entry.logical_path = destination_logical_path.to_string();
+            destination.entry.parent_logical_path = destination_parent_logical_path.to_string();
+            destination.entry.entry_name = destination_entry_name.to_string();
+            destination.entry.link_count = link_count;
+            if let Some(manifest) = destination.manifest.as_mut() {
+                manifest.logical_path = destination_logical_path.to_string();
+            }
+            guard
+                .entries
+                .insert(destination_logical_path.to_string(), destination.clone());
+            Ok(crate::index::VfsIndexHardLinkResult {
+                source,
+                destination,
+            })
+        }
+
+        async fn list_file_alias_paths(
+            &self,
+            _scope: &VfsIndexScope,
+            file_id: &str,
+        ) -> VfsStorageResult<Vec<String>> {
+            self.alias_list_calls.fetch_add(1, Ordering::Relaxed);
+            let guard = self.inner.lock().unwrap();
+            let mut paths = guard
+                .entries
+                .values()
+                .filter(|entry| entry.entry.file_id.as_deref() == Some(file_id))
+                .map(|entry| entry.entry.logical_path.clone())
+                .collect::<Vec<_>>();
+            paths.sort();
+            Ok(paths)
         }
 
         async fn delete_file_entry(
@@ -1065,7 +1382,28 @@ mod tests {
                         "vfs write precondition failed for {logical_path}"
                     )))
                 }
-                Some(_) => Ok(guard.entries.remove(logical_path)),
+                Some(_) => {
+                    let removed = guard.entries.remove(logical_path);
+                    if let Some(file_id) = removed.as_ref().and_then(|entry| {
+                        (entry.entry.link_count > 1)
+                            .then(|| entry.entry.file_id.clone())
+                            .flatten()
+                    }) {
+                        let link_count = guard
+                            .entries
+                            .values()
+                            .filter(|entry| {
+                                entry.entry.file_id.as_deref() == Some(file_id.as_str())
+                            })
+                            .count() as u64;
+                        for entry in guard.entries.values_mut() {
+                            if entry.entry.file_id.as_deref() == Some(file_id.as_str()) {
+                                entry.entry.link_count = link_count;
+                            }
+                        }
+                    }
+                    Ok(removed)
+                }
             }
         }
 
@@ -1105,22 +1443,57 @@ mod tests {
             to_entry_name: &str,
         ) -> VfsStorageResult<(VfsIndexEntryWithManifest, VfsIndexEntryWithManifest)> {
             let mut guard = self.inner.lock().unwrap();
-            if guard.entries.contains_key(to_logical_path) {
-                return Err(VfsStorageError::Conflict(format!(
-                    "vfs destination already exists: {to_logical_path}"
-                )));
-            }
-            let Some(previous) = guard.entries.remove(from_logical_path) else {
-                return Err(VfsStorageError::NotFound(from_logical_path.to_string()));
-            };
-            if previous.entry.kind != VfsStorageEntryKind::File {
-                guard
+            if from_logical_path == to_logical_path {
+                let entry = guard
                     .entries
-                    .insert(from_logical_path.to_string(), previous.clone());
+                    .get(from_logical_path)
+                    .cloned()
+                    .ok_or_else(|| VfsStorageError::NotFound(from_logical_path.to_string()))?;
+                return Ok((entry.clone(), entry));
+            }
+            let previous = guard
+                .entries
+                .get(from_logical_path)
+                .cloned()
+                .ok_or_else(|| VfsStorageError::NotFound(from_logical_path.to_string()))?;
+            if previous.entry.kind != VfsStorageEntryKind::File {
                 return Err(VfsStorageError::BadRequest(format!(
                     "vfs path {from_logical_path} is not a file"
                 )));
             }
+            if let Some(destination) = guard.entries.get(to_logical_path).cloned() {
+                if destination.entry.kind != VfsStorageEntryKind::File {
+                    return Err(VfsStorageError::Conflict(format!(
+                        "vfs cannot replace non-file destination: {to_logical_path}"
+                    )));
+                }
+                // POSIX rename(2) is a successful no-op when both pathnames
+                // already name the same inode. Deleting the destination first
+                // would incorrectly collapse two hard links into one.
+                if previous.entry.file_id.is_some()
+                    && previous.entry.file_id == destination.entry.file_id
+                {
+                    return Ok((previous, destination));
+                }
+            }
+            let replaced_identity = guard.entries.remove(to_logical_path).and_then(|entry| {
+                (entry.entry.link_count > 1)
+                    .then_some(entry.entry.file_id)
+                    .flatten()
+            });
+            if let Some(file_id) = replaced_identity {
+                let count = guard
+                    .entries
+                    .values()
+                    .filter(|entry| entry.entry.file_id.as_deref() == Some(file_id.as_str()))
+                    .count() as u64;
+                for entry in guard.entries.values_mut() {
+                    if entry.entry.file_id.as_deref() == Some(file_id.as_str()) {
+                        entry.entry.link_count = count;
+                    }
+                }
+            }
+            guard.entries.remove(from_logical_path);
             let mut current = previous.clone();
             current.entry.logical_path = to_logical_path.to_string();
             current.entry.parent_logical_path = to_parent_logical_path.to_string();
@@ -1146,6 +1519,22 @@ mod tests {
             index,
         );
         (storage, dir)
+    }
+
+    fn object_storage_clients() -> (
+        ObjectBackedVfsStorage,
+        ObjectBackedVfsStorage,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(LocalObjectStoreClient::new(dir.path().to_path_buf()).unwrap());
+        let index = Arc::new(MemoryIndex::default());
+        let cfg = ObjectBackedVfsStorageConfig::new(VfsIndexScope::new("shared-test-scope"));
+        (
+            ObjectBackedVfsStorage::new(cfg.clone(), store.clone(), index.clone()),
+            ObjectBackedVfsStorage::new(cfg, store, index),
+            dir,
+        )
     }
 
     #[tokio::test]
@@ -1204,6 +1593,255 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git_metadata_batch_avoids_per_file_directory_and_alias_queries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(LocalObjectStoreClient::new(dir.path().to_path_buf()).unwrap());
+        let index = Arc::new(MemoryIndex::default());
+        let storage = ObjectBackedVfsStorage::new(
+            ObjectBackedVfsStorageConfig::new(VfsIndexScope::new("git-metadata-benchmark")),
+            store,
+            index.clone(),
+        );
+        let writes = (0..1_000)
+            .map(|index| VfsStorageWrite {
+                path: format!(".git/objects/ab/{index:04x}"),
+                bytes: Bytes::from(format!("object-{index:04}\n")),
+                token_count: None,
+                precondition: None,
+            })
+            .collect::<Vec<_>>();
+
+        let initial_started = Instant::now();
+        storage
+            .write_many_atomic(writes.clone())
+            .await
+            .expect("initial Git metadata batch");
+        let initial_elapsed = initial_started.elapsed();
+        assert_eq!(index.create_directory_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(index.alias_list_calls.load(Ordering::Relaxed), 0);
+
+        let rewrite_started = Instant::now();
+        storage
+            .write_many_atomic(writes)
+            .await
+            .expect("Git metadata rewrite batch");
+        let rewrite_elapsed = rewrite_started.elapsed();
+        assert_eq!(index.create_directory_calls.load(Ordering::Relaxed), 6);
+        assert_eq!(
+            index.alias_list_calls.load(Ordering::Relaxed),
+            0,
+            "ordinary files must not issue one hard-link alias query per entry",
+        );
+        eprintln!(
+            "git metadata object benchmark: initial={initial_elapsed:?} rewrite={rewrite_elapsed:?}"
+        );
+    }
+
+    fn git_perf_writes(count: usize, generation: usize) -> Vec<VfsStorageWrite> {
+        let mutation_count = (count / 100).max(1);
+        let object_count = count.saturating_sub(mutation_count.saturating_mul(2));
+        let mut writes = (0..mutation_count)
+            .map(|index| VfsStorageWrite {
+                path: format!(".git/refs/heads/perf-{index:05}.lock"),
+                bytes: Bytes::from(format!("ref-{generation}-{index:05}\n")),
+                token_count: None,
+                precondition: None,
+            })
+            .chain((0..mutation_count).map(|index| VfsStorageWrite {
+                path: format!("src/generated/perf-{index:05}.ts"),
+                bytes: Bytes::from(format!("export const value = {generation}_{index};\n")),
+                token_count: None,
+                precondition: None,
+            }))
+            .chain((0..object_count).map(|index| VfsStorageWrite {
+                path: format!(".git/objects/{:02x}/{:038x}", index % 256, index),
+                bytes: Bytes::from(format!("blob {generation} {index:08}\n")),
+                token_count: None,
+                precondition: None,
+            }))
+            .collect::<Vec<_>>();
+        writes.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        writes
+    }
+
+    /// Explicit object/index/cache performance torture. It uses the in-memory
+    /// index and filesystem object-store adapters so the exact operation counts,
+    /// cache ceilings, and cross-client invalidation remain deterministic.
+    #[tokio::test]
+    #[ignore = "explicit 1k/10k Git small-file performance suite"]
+    async fn object_git_small_file_perf_1k_10k() {
+        let mut scale_samples = Vec::new();
+        for count in [1_000_usize, 10_000] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let store = Arc::new(LocalObjectStoreClient::new(dir.path().to_path_buf()).unwrap());
+            let index = Arc::new(MemoryIndex::default());
+            let cfg =
+                ObjectBackedVfsStorageConfig::new(VfsIndexScope::new(format!("git-perf-{count}")));
+            let first = ObjectBackedVfsStorage::new(cfg.clone(), store.clone(), index.clone());
+            let second = ObjectBackedVfsStorage::new(cfg, store, index.clone());
+            let initial = git_perf_writes(count, 0);
+            let paths = initial
+                .iter()
+                .map(|write| write.path.clone())
+                .collect::<Vec<_>>();
+            let mutation_count = (count / 100).max(1);
+
+            let create_started = Instant::now();
+            first
+                .write_many_atomic(initial)
+                .await
+                .expect("create object-backed Git-shaped file set");
+            let create_elapsed = create_started.elapsed();
+
+            let status_started = Instant::now();
+            let status = first
+                .metadata_many(&paths, VfsStorageMetadataFields::default())
+                .await
+                .expect("object-backed status-like metadata batch");
+            let status_elapsed = status_started.elapsed();
+            assert_eq!(status.iter().filter(|entry| entry.is_some()).count(), count);
+
+            let warm_started = Instant::now();
+            let warmed = first
+                .read_many(&paths)
+                .await
+                .expect("warm object-backed small files");
+            let warm_elapsed = warm_started.elapsed();
+            assert_eq!(warmed.len(), count);
+
+            let targeted = git_perf_writes(count, 1)
+                .into_iter()
+                .filter(|write| {
+                    write.path.starts_with(".git/refs/") || write.path.starts_with("src/generated/")
+                })
+                .collect::<Vec<_>>();
+            let rewrite_started = Instant::now();
+            second
+                .write_many_atomic(targeted)
+                .await
+                .expect("targeted object-backed rewrite");
+            let rewrite_elapsed = rewrite_started.elapsed();
+
+            let namespace_started = Instant::now();
+            for index in 0..mutation_count {
+                second
+                    .rename_with_metadata(
+                        &format!(".git/refs/heads/perf-{index:05}.lock"),
+                        &format!(".git/refs/heads/perf-{index:05}"),
+                    )
+                    .await
+                    .expect("promote object-backed ref");
+                second
+                    .delete_file_with_metadata(&format!("src/generated/perf-{index:05}.ts"), None)
+                    .await
+                    .expect("delete object-backed worktree file");
+            }
+            let namespace_elapsed = namespace_started.elapsed();
+
+            let survivor_index = count.saturating_sub(mutation_count * 2 + 1);
+            let survivor = format!(
+                ".git/objects/{:02x}/{:038x}",
+                survivor_index % 256,
+                survivor_index
+            );
+            let _ = first
+                .read(&survivor)
+                .await
+                .expect("prime first-client cache");
+            let replacement = Bytes::from_static(b"cross-client replacement with distinct size\n");
+            second
+                .write(&survivor, replacement.clone(), None)
+                .await
+                .expect("second-client object replacement");
+            assert_eq!(
+                first
+                    .read(&survivor)
+                    .await
+                    .expect("first-client object refresh"),
+                replacement,
+                "manifest hash changes must invalidate a stale per-client byte entry",
+            );
+
+            for (name, storage) in [("first", &first), ("second", &second)] {
+                let cache = storage.cache.file_bytes.lock().unwrap();
+                assert!(
+                    cache.entries.len() <= MAX_SMALL_FILE_CACHE_ENTRIES,
+                    "{name} small-file cache exceeded its entry ceiling",
+                );
+                assert!(
+                    cache.total_bytes <= MAX_SMALL_FILE_CACHE_TOTAL_BYTES,
+                    "{name} small-file cache exceeded its byte ceiling",
+                );
+            }
+            assert_eq!(
+                index.alias_list_calls.load(Ordering::Relaxed),
+                0,
+                "ordinary Git files must not trigger hard-link alias scans",
+            );
+            assert!(
+                index.create_directory_calls.load(Ordering::Relaxed)
+                    <= 270 + mutation_count.saturating_mul(3),
+                "parent index work must scale with unique directories, not file count",
+            );
+            assert_eq!(
+                index.packed_commit_calls.load(Ordering::Relaxed),
+                3,
+                "initial, targeted, and cross-client writes should each be one packed commit",
+            );
+            assert_eq!(
+                index.manifest_by_paths_calls.load(Ordering::Relaxed),
+                1,
+                "one read-many call should issue one bulk manifest query",
+            );
+            assert!(
+                index.entries_by_paths_calls.load(Ordering::Relaxed) <= 7 + mutation_count,
+                "bulk metadata/write paths unexpectedly degraded toward per-file index queries",
+            );
+
+            let first_cache = first.cache.file_bytes.lock().unwrap();
+            let total = create_elapsed
+                + status_elapsed
+                + warm_elapsed
+                + rewrite_elapsed
+                + namespace_elapsed;
+            scale_samples.push((count, total));
+            eprintln!(
+                "git-small-file-perf backend=object files={count} create={create_elapsed:?} \
+                 status={status_elapsed:?} warm_reads={warm_elapsed:?} \
+                 rewrite_2pct={rewrite_elapsed:?} namespace_2pct={namespace_elapsed:?} \
+                 total={total:?} alias_queries={} parent_calls={} bulk_entry_queries={} \
+                 cache_entries={} cache_bytes={}",
+                index.alias_list_calls.load(Ordering::Relaxed),
+                index.create_directory_calls.load(Ordering::Relaxed),
+                index.entries_by_paths_calls.load(Ordering::Relaxed),
+                first_cache.entries.len(),
+                first_cache.total_bytes,
+            );
+        }
+        let one_k = scale_samples[0].1.as_secs_f64();
+        let ten_k = scale_samples[1].1.as_secs_f64();
+        assert!(
+            ten_k <= one_k * 35.0,
+            "10x object workload regressed toward quadratic scaling: 1k={one_k:.3}s 10k={ten_k:.3}s",
+        );
+    }
+
+    #[test]
+    fn object_small_file_cache_is_bounded() {
+        let (storage, _dir) = object_storage();
+        for index in 0..(MAX_SMALL_FILE_CACHE_ENTRIES + 1_000) {
+            storage.put_file_bytes_cache(
+                format!(".git/cache/{index}"),
+                format!("hash-{index}"),
+                Bytes::from_static(b"x"),
+            );
+        }
+        let cache = storage.cache.file_bytes.lock().unwrap();
+        assert!(cache.entries.len() <= MAX_SMALL_FILE_CACHE_ENTRIES);
+        assert!(cache.total_bytes <= MAX_SMALL_FILE_CACHE_TOTAL_BYTES);
+    }
+
+    #[tokio::test]
     async fn object_storage_changed_only_uses_manifest_hashes() {
         let (storage, _dir) = object_storage();
         storage
@@ -1233,6 +1871,181 @@ mod tests {
             .collect::<HashMap<_, _>>();
         assert!(!by_path["same.md"].changed);
         assert!(by_path["changed.md"].changed);
+    }
+
+    #[tokio::test]
+    async fn object_storage_hard_links_share_identity_and_alias_writes() {
+        let (storage, _dir) = object_storage();
+        storage
+            .write("source", Bytes::from_static(b"one"), None)
+            .await
+            .expect("source");
+        let linked = storage
+            .create_hard_link("source", "nested/alias")
+            .await
+            .expect("hard link");
+        assert_eq!(linked.source.file_id, linked.destination.file_id);
+        assert_eq!(linked.source.link_count, 2);
+        assert_eq!(linked.destination.link_count, 2);
+        assert_eq!(
+            linked.source.object_state.as_ref().unwrap().pack_key,
+            linked.destination.object_state.as_ref().unwrap().pack_key
+        );
+        assert_eq!(
+            linked
+                .source
+                .object_state
+                .as_ref()
+                .unwrap()
+                .pack_slot_offset,
+            linked
+                .destination
+                .object_state
+                .as_ref()
+                .unwrap()
+                .pack_slot_offset
+        );
+
+        storage
+            .write("nested/alias", Bytes::from_static(b"two"), None)
+            .await
+            .expect("write alias");
+        assert_eq!(storage.read("source").await.unwrap().as_ref(), b"two");
+        assert_eq!(storage.read("nested/alias").await.unwrap().as_ref(), b"two");
+        let source = storage.stat("source").await.unwrap().unwrap();
+        let alias = storage.stat("nested/alias").await.unwrap().unwrap();
+        assert_eq!(source.file_id, alias.file_id);
+        assert_eq!(source.content_hash, alias.content_hash);
+        assert_eq!(source.link_count, 2);
+
+        storage
+            .delete_file_with_metadata("source", None)
+            .await
+            .expect("unlink source");
+        let remaining = storage.stat("nested/alias").await.unwrap().unwrap();
+        assert_eq!(remaining.link_count, 1);
+        assert_eq!(
+            storage
+                .find_hard_link_alias(remaining.file_id.as_deref().unwrap(), "nested/alias")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn object_storage_independent_clients_observe_linked_inode_mutations() {
+        let (first, second, _dir) = object_storage_clients();
+        first
+            .write("source", Bytes::from_static(b"one"), None)
+            .await
+            .expect("initial write");
+        assert_eq!(first.read("source").await.unwrap().as_ref(), b"one");
+
+        let linked = second
+            .create_hard_link("source", "alias")
+            .await
+            .expect("second client hard link");
+        let file_id = linked.source.file_id.expect("stable identity");
+        second
+            .write("alias", Bytes::from_static(b"two"), None)
+            .await
+            .expect("second client alias write");
+
+        assert_eq!(first.read("source").await.unwrap().as_ref(), b"two");
+        assert_eq!(first.read("alias").await.unwrap().as_ref(), b"two");
+        let source = first.stat("source").await.unwrap().unwrap();
+        let alias = first.stat("alias").await.unwrap().unwrap();
+        assert_eq!(source.file_id.as_deref(), Some(file_id.as_str()));
+        assert_eq!(alias.file_id.as_deref(), Some(file_id.as_str()));
+        assert_eq!(source.link_count, 2);
+        assert_eq!(source.content_hash, alias.content_hash);
+
+        first
+            .delete_file_with_metadata("source", None)
+            .await
+            .expect("first client unlinks one alias");
+        assert!(second.stat("source").await.unwrap().is_none());
+        let remaining = second.stat("alias").await.unwrap().unwrap();
+        assert_eq!(remaining.file_id.as_deref(), Some(file_id.as_str()));
+        assert_eq!(remaining.link_count, 1);
+        assert_eq!(second.read("alias").await.unwrap().as_ref(), b"two");
+    }
+
+    #[tokio::test]
+    async fn object_storage_replacement_rename_is_immediately_visible() {
+        let (storage, _dir) = object_storage();
+        storage
+            .write("source", Bytes::from_static(b"new"), None)
+            .await
+            .unwrap();
+        storage
+            .write("destination", Bytes::from_static(b"old"), None)
+            .await
+            .unwrap();
+        let source_id = storage.stat("source").await.unwrap().unwrap().file_id;
+
+        storage
+            .rename_with_metadata("source", "destination")
+            .await
+            .expect("replacement rename");
+        assert!(storage.stat("source").await.unwrap().is_none());
+        let destination = storage.stat("destination").await.unwrap().unwrap();
+        assert_eq!(destination.file_id, source_id);
+        assert_eq!(storage.read("destination").await.unwrap().as_ref(), b"new");
+    }
+
+    #[tokio::test]
+    async fn object_storage_rename_between_aliases_of_one_inode_is_a_noop() {
+        let (storage, _dir) = object_storage();
+        storage
+            .write("source", Bytes::from_static(b"body"), None)
+            .await
+            .unwrap();
+        let linked = storage.create_hard_link("source", "alias").await.unwrap();
+        let file_id = linked.source.file_id.expect("stable file identity");
+
+        storage
+            .rename_with_metadata("source", "alias")
+            .await
+            .expect("same-inode rename");
+
+        for path in ["source", "alias"] {
+            let metadata = storage.stat(path).await.unwrap().expect(path);
+            assert_eq!(metadata.file_id.as_deref(), Some(file_id.as_str()));
+            assert_eq!(metadata.link_count, 2);
+            assert_eq!(storage.read(path).await.unwrap().as_ref(), b"body");
+        }
+    }
+
+    #[tokio::test]
+    async fn object_storage_rejects_conflicting_alias_writes_in_one_batch() {
+        let (storage, _dir) = object_storage();
+        storage
+            .write("source", Bytes::from_static(b"base"), None)
+            .await
+            .unwrap();
+        storage.create_hard_link("source", "alias").await.unwrap();
+        let error = storage
+            .write_many_atomic(vec![
+                VfsStorageWrite {
+                    path: "source".to_string(),
+                    bytes: Bytes::from_static(b"left"),
+                    token_count: None,
+                    precondition: None,
+                },
+                VfsStorageWrite {
+                    path: "alias".to_string(),
+                    bytes: Bytes::from_static(b"right"),
+                    token_count: None,
+                    precondition: None,
+                },
+            ])
+            .await
+            .expect_err("conflicting aliases rejected");
+        assert!(matches!(error, VfsStorageError::Conflict(_)));
+        assert_eq!(storage.read("source").await.unwrap().as_ref(), b"base");
+        assert_eq!(storage.read("alias").await.unwrap().as_ref(), b"base");
     }
 
     #[tokio::test]

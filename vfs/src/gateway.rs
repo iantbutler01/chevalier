@@ -14,11 +14,12 @@ use tokio_util::io::ReaderStream;
 
 use crate::{
     OptimizedVfsStorage, VfsStorageDeleteResult, VfsStorageDirListFilter, VfsStorageEntryKind,
-    VfsStorageError, VfsStorageMetadata, VfsStorageMetadataFields, VfsStorageNamespaceMutation,
-    VfsStorageObjectState, VfsStoragePrefetchOptions, VfsStoragePrefetchResult,
-    VfsStorageReadIfChanged, VfsStorageReadIfChangedResult, VfsStorageReadRange,
-    VfsStorageRenameResult, VfsStorageResult, VfsStorageSubtreeOptions, VfsStorageWrite,
-    VfsStorageWriteOptions, VfsStorageWritePrecondition, VfsStorageWriteResult, pack::hex_hash,
+    VfsStorageError, VfsStorageHardLinkResult, VfsStorageMetadata, VfsStorageMetadataFields,
+    VfsStorageNamespaceMutation, VfsStorageObjectState, VfsStoragePrefetchOptions,
+    VfsStoragePrefetchResult, VfsStorageReadIfChanged, VfsStorageReadIfChangedResult,
+    VfsStorageReadRange, VfsStorageRenameResult, VfsStorageResult, VfsStorageSubtreeOptions,
+    VfsStorageWrite, VfsStorageWriteOptions, VfsStorageWritePrecondition, VfsStorageWriteResult,
+    pack::hex_hash,
 };
 
 const COMPONENT_HEADER: &str = "x-chevalier-vfs-component";
@@ -41,6 +42,7 @@ const OP_UNLINK: &str = "vfs_unlink";
 const OP_RMDIR: &str = "vfs_rmdir";
 const OP_RENAME: &str = "vfs_rename";
 const OP_SYMLINK: &str = "vfs_symlink";
+const OP_HARD_LINK: &str = "vfs_hard_link";
 const OP_NAMESPACE_BATCH: &str = "vfs_namespace_batch";
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -866,6 +868,72 @@ impl OptimizedVfsStorage for GatewayVfsStorage {
         self.release_after(&lease, result).await
     }
 
+    async fn create_hard_link(
+        &self,
+        source: &str,
+        destination: &str,
+    ) -> VfsStorageResult<VfsStorageHardLinkResult> {
+        let lease_path = common_path_parent(source, destination);
+        let lease = self
+            .acquire_lease(&lease_path, 1, self.cfg.mutation_reason.as_str())
+            .await?;
+        let result = self
+            .send(
+                self.mutation_headers(
+                    self.client
+                        .post(self.url("/hard-link/v1"))
+                        .json(&HardLinkRequest {
+                            source_path: self.path_arg(source),
+                            destination_path: self.path_arg(destination),
+                        }),
+                    &lease,
+                    OP_HARD_LINK,
+                ),
+            )
+            .await;
+        let result = match result {
+            Ok(response) => response
+                .json::<HardLinkMetadataResponse>()
+                .await
+                .map_err(|error| {
+                    VfsStorageError::Internal(format!("decode gateway hard-link metadata: {error}"))
+                })
+                .and_then(|response| {
+                    Ok(VfsStorageHardLinkResult {
+                        source: response.source.into_storage_metadata(source.to_string())?,
+                        destination: response
+                            .destination
+                            .into_storage_metadata(destination.to_string())?,
+                    })
+                }),
+            Err(error) => Err(error),
+        };
+        self.release_after(&lease, result).await
+    }
+
+    async fn find_hard_link_alias(
+        &self,
+        file_id: &str,
+        excluding_path: &str,
+    ) -> VfsStorageResult<Option<String>> {
+        let response =
+            self.send(self.client.post(self.url("/hard-link-alias/v1")).json(
+                &HardLinkAliasRequest {
+                    file_id,
+                    excluding_path: self.path_arg(excluding_path),
+                },
+            ))
+            .await?
+            .json::<HardLinkAliasResponse>()
+            .await
+            .map_err(|error| {
+                VfsStorageError::Internal(format!(
+                    "decode gateway hard-link alias response: {error}"
+                ))
+            })?;
+        Ok(response.path.map(|path| self.unscoped_path(path)))
+    }
+
     async fn apply_namespace_batch(
         &self,
         mutations: Vec<VfsStorageNamespaceMutation>,
@@ -1017,6 +1085,17 @@ fn common_namespace_parent(mutations: &[VfsStorageNamespaceMutation]) -> String 
     common.join("/")
 }
 
+fn common_path_parent(left: &str, right: &str) -> String {
+    let left = left.trim_matches('/').split('/').collect::<Vec<_>>();
+    let right = right.trim_matches('/').split('/').collect::<Vec<_>>();
+    left.iter()
+        .zip(right.iter())
+        .take_while(|(left, right)| left == right)
+        .map(|(component, _)| *component)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn parent_path(path: &str) -> String {
     path.trim_matches('/')
         .rsplit_once('/')
@@ -1101,6 +1180,29 @@ struct RenameMetadataResponse {
     current: Option<RemoteMetadata>,
 }
 
+#[derive(Serialize)]
+struct HardLinkRequest {
+    source_path: String,
+    destination_path: String,
+}
+
+#[derive(Deserialize)]
+struct HardLinkMetadataResponse {
+    source: RemoteMetadata,
+    destination: RemoteMetadata,
+}
+
+#[derive(Serialize)]
+struct HardLinkAliasRequest<'a> {
+    file_id: &'a str,
+    excluding_path: String,
+}
+
+#[derive(Deserialize)]
+struct HardLinkAliasResponse {
+    path: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct ReadManyResponse {
     entries: Vec<Option<Vec<u8>>>,
@@ -1135,6 +1237,10 @@ struct RemoteSubtreeMetadataEntry {
     kind: String,
     size_bytes: u64,
     #[serde(default)]
+    file_id: Option<String>,
+    #[serde(default = "default_remote_link_count")]
+    link_count: u64,
+    #[serde(default)]
     executable: bool,
     #[serde(default)]
     link_target: Option<String>,
@@ -1155,6 +1261,8 @@ impl RemoteSubtreeMetadataEntry {
             parse_kind(&self.kind)?,
             self.size_bytes,
         );
+        metadata.file_id = self.file_id;
+        metadata.link_count = self.link_count;
         metadata.link_target = self.link_target;
         metadata.executable = self.executable;
         metadata.content_hash = self.content_hash;
@@ -1196,6 +1304,10 @@ struct RemoteMetadata {
     kind: String,
     size_bytes: u64,
     #[serde(default)]
+    file_id: Option<String>,
+    #[serde(default = "default_remote_link_count")]
+    link_count: u64,
+    #[serde(default)]
     executable: bool,
     #[serde(default)]
     link_target: Option<String>,
@@ -1206,6 +1318,8 @@ struct RemoteMetadata {
 impl RemoteMetadata {
     fn into_storage_metadata(self, path: String) -> VfsStorageResult<VfsStorageMetadata> {
         let mut metadata = VfsStorageMetadata::new(path, parse_kind(&self.kind)?, self.size_bytes);
+        metadata.file_id = self.file_id;
+        metadata.link_count = self.link_count;
         metadata.link_target = self.link_target;
         metadata.executable = self.executable;
         metadata.content_hash = self.content_hash;
@@ -1220,6 +1334,10 @@ struct RemoteDirEntry {
     kind: String,
     size_bytes: u64,
     #[serde(default)]
+    file_id: Option<String>,
+    #[serde(default = "default_remote_link_count")]
+    link_count: u64,
+    #[serde(default)]
     executable: bool,
     #[serde(default)]
     link_target: Option<String>,
@@ -1230,12 +1348,18 @@ struct RemoteDirEntry {
 impl RemoteDirEntry {
     fn into_storage_metadata(self, path: String) -> VfsStorageResult<VfsStorageMetadata> {
         let mut metadata = VfsStorageMetadata::new(path, parse_kind(&self.kind)?, self.size_bytes);
+        metadata.file_id = self.file_id;
+        metadata.link_count = self.link_count;
         metadata.link_target = self.link_target;
         metadata.executable = self.executable;
         metadata.content_hash = self.content_hash;
         metadata.updated_at = self.updated_at;
         Ok(metadata)
     }
+}
+
+const fn default_remote_link_count() -> u64 {
+    1
 }
 
 async fn storage_error_from_response(response: reqwest::Response) -> VfsStorageError {
@@ -1297,6 +1421,7 @@ mod tests {
         net::TcpListener,
         sync::mpsc,
         thread,
+        time::Instant,
     };
 
     #[tokio::test]
@@ -1457,6 +1582,265 @@ mod tests {
         );
         let release_request = requests.recv().expect("release request");
         assert_eq!(release_request.method, "DELETE");
+    }
+
+    #[tokio::test]
+    async fn gateway_git_metadata_batch_uses_constant_remote_round_trips() {
+        let results = (0..1_000)
+            .map(|index| {
+                serde_json::json!({
+                    "path": format!("scope/.git/objects/ab/{index:04x}"),
+                    "content_hash": format!("hash-{index}"),
+                    "previous_hash": null,
+                    "changed": true,
+                })
+            })
+            .collect::<Vec<_>>();
+        let (endpoint, requests) = serve_sequence(vec![
+            r#"{"resource_key":"rk","owner_token":"ot"}"#.to_string(),
+            serde_json::json!({ "results": results }).to_string(),
+            String::new(),
+        ]);
+        let storage =
+            GatewayVfsStorage::new(GatewayVfsStorageConfig::new(endpoint).with_scope_path("scope"));
+        let writes = (0..1_000)
+            .map(|index| VfsStorageWrite {
+                path: format!(".git/objects/ab/{index:04x}"),
+                bytes: Bytes::from(format!("object-{index:04}\n")),
+                token_count: None,
+                precondition: None,
+            })
+            .collect::<Vec<_>>();
+
+        let started = Instant::now();
+        let written = storage
+            .write_many_atomic(writes)
+            .await
+            .expect("gateway Git metadata batch");
+        let elapsed = started.elapsed();
+        assert_eq!(written.len(), 1_000);
+        let captured = (0..3)
+            .map(|_| requests.recv().expect("captured gateway request"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            captured
+                .iter()
+                .map(|request| request.target.as_str())
+                .collect::<Vec<_>>(),
+            ["/lease", "/write-many", "/lease"],
+        );
+        assert_eq!(
+            captured[1]
+                .body
+                .matches(r#""path":"scope/.git/objects/ab/"#)
+                .count(),
+            1_000,
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "one batch must not degrade into per-entry gateway calls",
+        );
+        eprintln!("git metadata gateway benchmark: elapsed={elapsed:?}");
+    }
+
+    fn git_perf_writes(count: usize, generation: usize) -> Vec<VfsStorageWrite> {
+        let mutation_count = (count / 100).max(1);
+        let object_count = count.saturating_sub(mutation_count.saturating_mul(2));
+        let mut writes = (0..mutation_count)
+            .map(|index| VfsStorageWrite {
+                path: format!(".git/refs/heads/perf-{index:05}.lock"),
+                bytes: Bytes::from(format!("ref-{generation}-{index:05}\n")),
+                token_count: None,
+                precondition: None,
+            })
+            .chain((0..mutation_count).map(|index| VfsStorageWrite {
+                path: format!("src/generated/perf-{index:05}.ts"),
+                bytes: Bytes::from(format!("export const value = {generation}_{index};\n")),
+                token_count: None,
+                precondition: None,
+            }))
+            .chain((0..object_count).map(|index| VfsStorageWrite {
+                path: format!(".git/objects/{:02x}/{:038x}", index % 256, index),
+                bytes: Bytes::from(format!("blob {generation} {index:08}\n")),
+                token_count: None,
+                precondition: None,
+            }))
+            .collect::<Vec<_>>();
+        writes.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        writes
+    }
+
+    fn gateway_write_many_response(writes: &[VfsStorageWrite]) -> String {
+        serde_json::json!({
+            "results": writes.iter().map(|write| {
+                serde_json::json!({
+                    "path": format!("scope/{}", write.path),
+                    "content_hash": hex_hash(&write.bytes),
+                    "previous_hash": null,
+                    "changed": true,
+                })
+            }).collect::<Vec<_>>(),
+        })
+        .to_string()
+    }
+
+    fn gateway_metadata_many_response(writes: &[VfsStorageWrite]) -> String {
+        serde_json::json!({
+            "entries": writes.iter().map(|write| {
+                Some(serde_json::json!({
+                    "kind": "file",
+                    "size_bytes": write.bytes.len(),
+                    "file_id": format!("inode:{}", write.path),
+                    "link_count": 1,
+                    "content_hash": hex_hash(&write.bytes),
+                    "updated_at": null,
+                }))
+            }).collect::<Vec<_>>(),
+        })
+        .to_string()
+    }
+
+    /// Explicit performance torture for request shape and serialization. The
+    /// server is deliberately a wire-level fake: backend semantics are covered
+    /// by the local/object tests while this test proves the gateway client keeps
+    /// 1k and 10k operations in constant request batches.
+    #[tokio::test]
+    #[ignore = "explicit 1k/10k Git small-file performance suite"]
+    async fn gateway_git_small_file_perf_1k_10k() {
+        let mut scale_samples = Vec::new();
+        for count in [1_000_usize, 10_000] {
+            let initial = git_perf_writes(count, 0);
+            let paths = initial
+                .iter()
+                .map(|write| write.path.clone())
+                .collect::<Vec<_>>();
+            let mutation_count = (count / 100).max(1);
+            let targeted = git_perf_writes(count, 1)
+                .into_iter()
+                .filter(|write| {
+                    write.path.starts_with(".git/refs/") || write.path.starts_with("src/generated/")
+                })
+                .collect::<Vec<_>>();
+            let responses = vec![
+                r#"{"resource_key":"create","owner_token":"owner"}"#.to_string(),
+                gateway_write_many_response(&initial),
+                String::new(),
+                gateway_metadata_many_response(&initial),
+                r#"{"resource_key":"rewrite","owner_token":"owner"}"#.to_string(),
+                gateway_write_many_response(&targeted),
+                String::new(),
+                r#"{"resource_key":"namespace","owner_token":"owner"}"#.to_string(),
+                String::new(),
+                String::new(),
+            ];
+            let (endpoint, requests) = serve_sequence(responses);
+            let storage = GatewayVfsStorage::new(
+                GatewayVfsStorageConfig::new(endpoint).with_scope_path("scope"),
+            );
+
+            let create_started = Instant::now();
+            storage
+                .write_many_atomic(initial)
+                .await
+                .expect("gateway Git-shaped create batch");
+            let create_elapsed = create_started.elapsed();
+
+            let status_started = Instant::now();
+            let status = storage
+                .metadata_many(&paths, VfsStorageMetadataFields::default())
+                .await
+                .expect("gateway status-like metadata batch");
+            let status_elapsed = status_started.elapsed();
+            assert_eq!(status.len(), count);
+
+            let rewrite_started = Instant::now();
+            storage
+                .write_many_atomic(targeted)
+                .await
+                .expect("gateway targeted rewrite batch");
+            let rewrite_elapsed = rewrite_started.elapsed();
+
+            let mutations = (0..mutation_count)
+                .map(|index| VfsStorageNamespaceMutation::Rename {
+                    from: format!(".git/refs/heads/perf-{index:05}.lock"),
+                    to: format!(".git/refs/heads/perf-{index:05}"),
+                })
+                .chain(
+                    (0..mutation_count).map(|index| VfsStorageNamespaceMutation::DeleteFile {
+                        path: format!("src/generated/perf-{index:05}.ts"),
+                        precondition: None,
+                    }),
+                )
+                .collect::<Vec<_>>();
+            let namespace_started = Instant::now();
+            storage
+                .apply_namespace_batch(mutations)
+                .await
+                .expect("gateway namespace batch");
+            let namespace_elapsed = namespace_started.elapsed();
+
+            let captured = (0..10)
+                .map(|_| requests.recv().expect("captured gateway request"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                captured
+                    .iter()
+                    .map(|request| request.target.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "/lease",
+                    "/write-many",
+                    "/lease",
+                    "/metadata-many",
+                    "/lease",
+                    "/write-many",
+                    "/lease",
+                    "/lease",
+                    "/namespace-many",
+                    "/lease",
+                ],
+                "gateway request count must remain constant as file count grows",
+            );
+            let create_body: serde_json::Value =
+                serde_json::from_str(&captured[1].body).expect("create request JSON");
+            let status_body: serde_json::Value =
+                serde_json::from_str(&captured[3].body).expect("status request JSON");
+            let rewrite_body: serde_json::Value =
+                serde_json::from_str(&captured[5].body).expect("rewrite request JSON");
+            let namespace_body: serde_json::Value =
+                serde_json::from_str(&captured[8].body).expect("namespace request JSON");
+            assert_eq!(create_body["writes"].as_array().unwrap().len(), count);
+            assert_eq!(status_body["paths"].as_array().unwrap().len(), count);
+            assert_eq!(
+                rewrite_body["writes"].as_array().unwrap().len(),
+                mutation_count * 2,
+            );
+            assert_eq!(
+                namespace_body["mutations"].as_array().unwrap().len(),
+                mutation_count * 2,
+            );
+            assert!(
+                requests.try_recv().is_err(),
+                "gateway workload emitted unexpected per-file calls",
+            );
+
+            let total = create_elapsed + status_elapsed + rewrite_elapsed + namespace_elapsed;
+            scale_samples.push((count, total));
+            eprintln!(
+                "git-small-file-perf backend=gateway files={count} create={create_elapsed:?} \
+                 status={status_elapsed:?} rewrite_2pct={rewrite_elapsed:?} \
+                 namespace_2pct={namespace_elapsed:?} total={total:?} requests={} \
+                 create_body_bytes={}",
+                captured.len(),
+                captured[1].body.len(),
+            );
+        }
+        let one_k = scale_samples[0].1.as_secs_f64();
+        let ten_k = scale_samples[1].1.as_secs_f64();
+        assert!(
+            ten_k <= one_k * 35.0,
+            "10x gateway serialization regressed toward quadratic scaling: 1k={one_k:.3}s 10k={ten_k:.3}s",
+        );
     }
 
     #[tokio::test]
@@ -1846,6 +2230,89 @@ mod tests {
         target: String,
         headers: String,
         body: String,
+    }
+
+    #[tokio::test]
+    async fn gateway_hard_link_uses_versioned_route_and_preserves_identity() {
+        let (endpoint, requests) = serve_sequence(vec![
+            r#"{"resource_key":"rk","owner_token":"00000000-0000-0000-0000-000000000001"}"#
+                .to_string(),
+            r#"{"source":{"kind":"file","size_bytes":4,"file_id":"inode-1","link_count":2,"content_hash":"hash","updated_at":null},"destination":{"kind":"file","size_bytes":4,"file_id":"inode-1","link_count":2,"content_hash":"hash","updated_at":null}}"#
+                .to_string(),
+            String::new(),
+        ]);
+        let storage =
+            GatewayVfsStorage::new(GatewayVfsStorageConfig::new(endpoint).with_scope_path("scope"));
+
+        let result = storage
+            .create_hard_link("source", "nested/alias")
+            .await
+            .expect("hard link");
+        assert_eq!(result.source.file_id.as_deref(), Some("inode-1"));
+        assert_eq!(result.destination.file_id.as_deref(), Some("inode-1"));
+        assert_eq!(result.source.link_count, 2);
+        assert_eq!(result.destination.link_count, 2);
+
+        let lease = requests.recv().expect("lease");
+        assert_eq!(lease.target, "/lease");
+        let link = requests.recv().expect("link");
+        assert_eq!(link.method, "POST");
+        assert_eq!(link.target, "/hard-link/v1");
+        assert!(link.body.contains(r#""source_path":"scope/source""#));
+        assert!(
+            link.body
+                .contains(r#""destination_path":"scope/nested/alias""#)
+        );
+        assert!(
+            link.headers
+                .contains("x-chevalier-vfs-operation: vfs_hard_link")
+        );
+        let release = requests.recv().expect("release");
+        assert_eq!(release.method, "DELETE");
+        assert_eq!(release.target, "/lease");
+    }
+
+    #[tokio::test]
+    async fn gateway_hard_link_alias_resolution_scopes_request_and_response() {
+        let (endpoint, requests) = serve_one(r#"{"path":"scope/nested/remaining"}"#);
+        let storage =
+            GatewayVfsStorage::new(GatewayVfsStorageConfig::new(endpoint).with_scope_path("scope"));
+
+        let alias = storage
+            .find_hard_link_alias("inode-1", "removed")
+            .await
+            .expect("resolve alias");
+        assert_eq!(alias.as_deref(), Some("nested/remaining"));
+        let request = requests.recv().expect("request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/hard-link-alias/v1");
+        assert!(request.body.contains(r#""file_id":"inode-1""#));
+        assert!(request.body.contains(r#""excluding_path":"scope/removed""#));
+    }
+
+    #[tokio::test]
+    async fn gateway_metadata_surfaces_preserve_defaulted_file_identity() {
+        let (endpoint, _requests) = serve_sequence(vec![
+            r#"{"kind":"file","size_bytes":1,"file_id":"inode-1","link_count":3,"content_hash":"h","updated_at":null}"#.to_string(),
+            r#"[{"name":"a","kind":"file","size_bytes":1,"file_id":"inode-1","link_count":3,"content_hash":"h","updated_at":null}]"#.to_string(),
+            r#"{"entries":[{"path":"scope/a","kind":"file","size_bytes":1,"file_id":"inode-1","link_count":3,"content_hash":"h","token_count":null,"version":null,"updated_at":null,"object_state":null}]}"#.to_string(),
+        ]);
+        let storage =
+            GatewayVfsStorage::new(GatewayVfsStorageConfig::new(endpoint).with_scope_path("scope"));
+
+        let stat = storage.stat("a").await.unwrap().unwrap();
+        let listed = storage
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .unwrap();
+        let subtree = storage
+            .list_subtree_file_metadata("", VfsStorageSubtreeOptions::default())
+            .await
+            .unwrap();
+        for metadata in [stat, listed[0].clone(), subtree[0].clone()] {
+            assert_eq!(metadata.file_id.as_deref(), Some("inode-1"));
+            assert_eq!(metadata.link_count, 3);
+        }
     }
 
     fn serve_one(response_body: &'static str) -> (String, mpsc::Receiver<RequestRecord>) {

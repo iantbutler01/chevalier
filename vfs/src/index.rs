@@ -29,10 +29,20 @@ pub struct VfsIndexEntry {
     pub parent_logical_path: String,
     pub entry_name: String,
     pub kind: VfsStorageEntryKind,
+    /// Stable regular-file identity shared by every hard-link alias.
+    #[serde(default)]
+    pub file_id: Option<String>,
+    /// Current number of namespace entries for `file_id`.
+    #[serde(default = "default_index_link_count")]
+    pub link_count: u64,
     pub size_bytes: i64,
     pub content_hash: Option<String>,
     pub current_version: Option<String>,
     pub updated_at: Option<DateTime<Utc>>,
+}
+
+const fn default_index_link_count() -> u64 {
+    1
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -47,6 +57,9 @@ pub struct VfsPackedFileCommit {
     pub parent_logical_path: String,
     pub entry_name: String,
     pub manifest: VfsFileManifest,
+    /// Preserve this identity when replacing content through any hard-link alias.
+    #[serde(default)]
+    pub file_id: Option<String>,
     pub expected_current_version: Option<String>,
 }
 
@@ -59,6 +72,12 @@ pub struct VfsPackedCommit {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct VfsPackedCommitResult {
     pub committed_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsIndexHardLinkResult {
+    pub source: VfsIndexEntryWithManifest,
+    pub destination: VfsIndexEntryWithManifest,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -117,6 +136,42 @@ pub trait VfsManifestIndex: Send + Sync {
         logical_paths: &[String],
     ) -> VfsStorageResult<Vec<VfsIndexEntryWithManifest>>;
 
+    async fn list_entries_with_manifest_in_subtree(
+        &self,
+        scope: &VfsIndexScope,
+        logical_path_prefix: &str,
+        limit: Option<i64>,
+    ) -> VfsStorageResult<Vec<VfsIndexEntryWithManifest>> {
+        let manifests = self
+            .list_current_file_manifests_in_subtree(scope, logical_path_prefix, limit)
+            .await?;
+        Ok(manifests
+            .into_iter()
+            .map(|manifest| {
+                let logical_path = manifest.logical_path.clone();
+                let (parent_logical_path, entry_name) = logical_path
+                    .rsplit_once('/')
+                    .map(|(parent, name)| (parent.to_string(), name.to_string()))
+                    .unwrap_or_else(|| (String::new(), logical_path.clone()));
+                VfsIndexEntryWithManifest {
+                    entry: VfsIndexEntry {
+                        logical_path,
+                        parent_logical_path,
+                        entry_name,
+                        kind: VfsStorageEntryKind::File,
+                        file_id: None,
+                        link_count: 1,
+                        size_bytes: manifest.logical_size_bytes,
+                        content_hash: Some(manifest.content_hash.clone()),
+                        current_version: None,
+                        updated_at: None,
+                    },
+                    manifest: Some(manifest),
+                }
+            })
+            .collect())
+    }
+
     async fn list_dir_with_manifest_attrs(
         &self,
         scope: &VfsIndexScope,
@@ -137,6 +192,31 @@ pub trait VfsManifestIndex: Send + Sync {
         parent_logical_path: &str,
         entry_name: &str,
     ) -> VfsStorageResult<()>;
+
+    /// Atomically add a pathname to the source's stable file identity.
+    async fn create_hard_link_entry(
+        &self,
+        _scope: &VfsIndexScope,
+        _source_logical_path: &str,
+        _destination_logical_path: &str,
+        _destination_parent_logical_path: &str,
+        _destination_entry_name: &str,
+    ) -> VfsStorageResult<VfsIndexHardLinkResult> {
+        Err(crate::VfsStorageError::BadRequest(
+            "hard links are not supported by this VFS manifest index".to_string(),
+        ))
+    }
+
+    /// Return every live pathname for one stable file identity.
+    async fn list_file_alias_paths(
+        &self,
+        _scope: &VfsIndexScope,
+        _file_id: &str,
+    ) -> VfsStorageResult<Vec<String>> {
+        Err(crate::VfsStorageError::BadRequest(
+            "hard-link alias lookup is not supported by this VFS manifest index".to_string(),
+        ))
+    }
 
     async fn delete_file_entry(
         &self,
@@ -232,8 +312,8 @@ impl VfsIndexEntryWithManifest {
             path: self.entry.logical_path,
             kind: self.entry.kind,
             size_bytes: self.entry.size_bytes.max(0) as u64,
-            file_id: None,
-            link_count: 1,
+            file_id: self.entry.file_id,
+            link_count: self.entry.link_count.max(1),
             link_target: None,
             executable: false,
             content_hash: self.entry.content_hash,
@@ -293,6 +373,8 @@ mod tests {
             parent_logical_path: "notes".to_string(),
             entry_name: "a.md".to_string(),
             kind: VfsStorageEntryKind::File,
+            file_id: Some("file-1".to_string()),
+            link_count: 1,
             size_bytes: 42,
             content_hash: Some("hash".to_string()),
             current_version: Some("v1".to_string()),

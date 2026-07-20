@@ -1,0 +1,1015 @@
+diff --git a/src/filesystem.rs b/src/filesystem.rs
+index dafe40a..bfe84dc 100644
+--- a/src/filesystem.rs
++++ b/src/filesystem.rs
+@@ -965,18 +965,35 @@ pub trait FileSystem {
+         Err(io::Error::from_raw_os_error(libc::ENOSYS))
+     }
+
+-    /// TODO: support this
+-    fn getlk(&self) -> io::Result<()> {
+-        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+-    }
+-
+-    /// TODO: support this
+-    fn setlk(&self) -> io::Result<()> {
++    /// Query a POSIX byte-range lock.
++    #[allow(clippy::too_many_arguments)]
++    fn getlk(
++        &self,
++        ctx: Context,
++        inode: Self::Inode,
++        handle: Self::Handle,
++        owner: u64,
++        lock: fuse::FileLock,
++        flags: u32,
++    ) -> io::Result<fuse::FileLock> {
+         Err(io::Error::from_raw_os_error(libc::ENOSYS))
+     }
+
+-    /// TODO: support this
+-    fn setlkw(&self) -> io::Result<()> {
++    /// Set or clear a POSIX byte-range lock or BSD flock lock.
++    ///
++    /// `sleep` distinguishes FUSE_SETLKW from FUSE_SETLK. `flags` carries
++    /// FUSE_LK_FLOCK when the guest operation originated from flock(2).
++    #[allow(clippy::too_many_arguments)]
++    fn setlk(
++        &self,
++        ctx: Context,
++        inode: Self::Inode,
++        handle: Self::Handle,
++        owner: u64,
++        lock: fuse::FileLock,
++        flags: u32,
++        sleep: bool,
++    ) -> io::Result<()> {
+         Err(io::Error::from_raw_os_error(libc::ENOSYS))
+     }
+
+diff --git a/src/passthrough/mod.rs b/src/passthrough/mod.rs
+index 8bf6a21..724c6ea 100644
+--- a/src/passthrough/mod.rs
++++ b/src/passthrough/mod.rs
+@@ -35,7 +35,7 @@ use mount_fd::{MPRError, MountFds};
+ use stat::{statx, StatExt};
+ use std::borrow::Cow;
+ use std::collections::{btree_map, BTreeMap};
+-use std::convert::TryInto;
++use std::convert::{TryFrom, TryInto};
+ use std::ffi::{CStr, CString};
+ use std::fs::File;
+ use std::io;
+@@ -439,6 +439,11 @@ pub struct PassthroughFs {
+     handles: RwLock<BTreeMap<Handle, Arc<HandleData>>>,
+     next_handle: AtomicU64,
+
++    // POSIX locks are process-associated, but one virtiofsd process serves every
++    // guest process. Give each guest lock owner a distinct host open-file
++    // description so F_OFD_* preserves guest ownership semantics.
++    posix_locks: Mutex<BTreeMap<(Inode, u64), Arc<File>>>,
++
+     // Maps mount IDs to an open FD on the respective ID for the purpose of open_by_handle_at().
+     // This is set when inode_file_handles is not never, since in the 'never' case,
+     // open_by_handle_at() is not called.
+@@ -535,6 +540,7 @@ impl PassthroughFs {
+             next_inode: AtomicU64::new(fuse::ROOT_ID + 1),
+             handles: RwLock::new(BTreeMap::new()),
+             next_handle: AtomicU64::new(0),
++            posix_locks: Mutex::new(BTreeMap::new()),
+             mount_fds,
+             proc_self_fd,
+             root_fd,
+@@ -598,6 +604,118 @@ impl PassthroughFs {
+             .ok_or_else(ebadf)
+     }
+
++    fn posix_lock_file(&self, inode: Inode, owner: u64, lock_type: u32) -> io::Result<Arc<File>> {
++        if let Some(file) = self.posix_locks.lock().unwrap().get(&(inode, owner)) {
++            return Ok(file.clone());
++        }
++
++        // Prefer O_RDWR so one owner context can carry both read and write locks.
++        // A read-only backing mount may reject O_RDWR even though a read lock is
++        // valid, so fall back to O_RDONLY for non-write requests.
++        let file = match self.open_inode(inode, libc::O_RDWR | libc::O_NONBLOCK) {
++            Ok(file) => file,
++            Err(err) if lock_type != libc::F_WRLCK as u32 => self
++                .open_inode(inode, libc::O_RDONLY | libc::O_NONBLOCK)
++                .map_err(|_| err)?,
++            Err(err) => return Err(err),
++        };
++        let file = Arc::new(file);
++
++        // Do not hold the map mutex across the potentially blocking open above.
++        // A racing request for the same owner wins the entry; dropping our fresh
++        // descriptor is harmless because it cannot own locks yet.
++        let mut locks = self.posix_locks.lock().unwrap();
++        Ok(locks
++            .entry((inode, owner))
++            .or_insert_with(|| file.clone())
++            .clone())
++    }
++
++    fn to_host_flock(lock: fuse::FileLock) -> io::Result<libc::flock> {
++        if lock.end != u64::MAX && lock.end < lock.start {
++            return Err(io::Error::from_raw_os_error(libc::EINVAL));
++        }
++
++        let l_type =
++            i16::try_from(lock.type_).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
++        if !matches!(
++            i32::from(l_type),
++            libc::F_RDLCK | libc::F_WRLCK | libc::F_UNLCK
++        ) {
++            return Err(io::Error::from_raw_os_error(libc::EINVAL));
++        }
++
++        let l_start =
++            i64::try_from(lock.start).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
++        let l_len = if lock.end == u64::MAX {
++            0
++        } else {
++            let length = lock
++                .end
++                .checked_sub(lock.start)
++                .and_then(|value| value.checked_add(1))
++                .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
++            i64::try_from(length).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?
++        };
++
++        Ok(libc::flock {
++            l_type,
++            l_whence: libc::SEEK_SET as i16,
++            l_start,
++            l_len,
++            l_pid: lock.pid as libc::pid_t,
++        })
++    }
++
++    fn from_host_flock(lock: libc::flock) -> io::Result<fuse::FileLock> {
++        let start = u64::try_from(lock.l_start)
++            .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
++        let end = if lock.l_len == 0 {
++            u64::MAX
++        } else {
++            let length = u64::try_from(lock.l_len)
++                .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
++            start
++                .checked_add(length - 1)
++                .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?
++        };
++
++        Ok(fuse::FileLock {
++            start,
++            end,
++            type_: u32::try_from(lock.l_type)
++                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?,
++            pid: u32::try_from(lock.l_pid).unwrap_or(u32::MAX),
++        })
++    }
++
++    fn set_flock(
++        &self,
++        inode: Inode,
++        handle: Handle,
++        lock: fuse::FileLock,
++        _sleep: bool,
++    ) -> io::Result<()> {
++        let data = self.find_handle(handle, inode)?;
++        let fd = data.file.get()?.read().unwrap().as_raw_fd();
++        let mut operation = match lock.type_ as libc::c_int {
++            libc::F_RDLCK => libc::LOCK_SH,
++            libc::F_WRLCK => libc::LOCK_EX,
++            libc::F_UNLCK => libc::LOCK_UN,
++            _ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
++        };
++        operation |= libc::LOCK_NB;
++
++        // The host mount negotiates FUSE_FLOCK_LOCKS, so this syscall crosses
++        // the second FUSE boundary instead of being isolated in this daemon.
++        let result = unsafe { libc::flock(fd, operation) };
++        if result == 0 {
++            Ok(())
++        } else {
++            Err(io::Error::last_os_error())
++        }
++    }
++
+     fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
+         let data = self.inodes.get(inode).ok_or_else(ebadf)?;
+
+@@ -1509,6 +1627,8 @@ impl FileSystem for PassthroughFs {
+         } else {
+             FsOptions::empty()
+         };
++        opts |= capable & (FsOptions::POSIX_LOCKS | FsOptions::FLOCK_LOCKS);
++
+         if self.cfg.writeback && capable.contains(FsOptions::WRITEBACK_CACHE) {
+             opts |= FsOptions::WRITEBACK_CACHE;
+             self.writeback.store(true, Ordering::Relaxed);
+@@ -1562,6 +1682,7 @@ impl FileSystem for PassthroughFs {
+
+     fn destroy(&self) {
+         self.handles.write().unwrap().clear();
++        self.posix_locks.lock().unwrap().clear();
+         self.inodes.clear();
+         self.writeback.store(false, Ordering::Relaxed);
+         self.announce_submounts.store(false, Ordering::Relaxed);
+@@ -1703,10 +1824,24 @@ impl FileSystem for PassthroughFs {
+         _flags: u32,
+         handle: Handle,
+         _flush: bool,
+-        _flock_release: bool,
++        flock_release: bool,
+         _lock_owner: Option<u64>,
+     ) -> io::Result<()> {
+-        self.do_release(inode, handle)
++        let unlock_result = if flock_release {
++            self.set_flock(
++                inode,
++                handle,
++                fuse::FileLock {
++                    type_: libc::F_UNLCK as u32,
++                    ..Default::default()
++                },
++                false,
++            )
++        } else {
++            Ok(())
++        };
++        let release_result = self.do_release(inode, handle);
++        unlock_result.and(release_result)
+     }
+
+     fn create(
+@@ -2217,9 +2352,13 @@ impl FileSystem for PassthroughFs {
+         _ctx: Context,
+         inode: Inode,
+         handle: Handle,
+-        _lock_owner: u64,
++        lock_owner: u64,
+     ) -> io::Result<()> {
+         let data = self.find_handle(handle, inode)?;
++        self.posix_locks
++            .lock()
++            .unwrap()
++            .remove(&(inode, lock_owner));
+
+         // Since this method is called whenever an fd is closed in the client, we can emulate that
+         // behavior by doing the same thing (dup-ing the fd and then immediately closing it). Safe
+@@ -2603,6 +2742,71 @@ impl FileSystem for PassthroughFs {
+         }
+     }
+
++    #[allow(clippy::too_many_arguments)]
++    fn getlk(
++        &self,
++        _ctx: Context,
++        inode: Inode,
++        _handle: Handle,
++        owner: u64,
++        lock: fuse::FileLock,
++        flags: u32,
++    ) -> io::Result<fuse::FileLock> {
++        if flags & fuse::LK_FLOCK != 0 {
++            return Err(io::Error::from_raw_os_error(libc::EINVAL));
++        }
++
++        let file = self.posix_lock_file(inode, owner, lock.type_)?;
++        let mut host_lock = Self::to_host_flock(lock)?;
++        let result = unsafe {
++            libc::fcntl(
++                file.as_raw_fd(),
++                libc::F_OFD_GETLK,
++                &mut host_lock as *mut libc::flock,
++            )
++        };
++        if result == 0 {
++            Self::from_host_flock(host_lock)
++        } else {
++            Err(io::Error::last_os_error())
++        }
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    fn setlk(
++        &self,
++        _ctx: Context,
++        inode: Inode,
++        handle: Handle,
++        owner: u64,
++        lock: fuse::FileLock,
++        flags: u32,
++        _sleep: bool,
++    ) -> io::Result<()> {
++        if flags & fuse::LK_FLOCK != 0 {
++            return self.set_flock(inode, handle, lock, false);
++        }
++
++        let file = self.posix_lock_file(inode, owner, lock.type_)?;
++        let mut host_lock = Self::to_host_flock(lock)?;
++        // OFD locks make the dedicated per-guest-owner file description the
++        // host lock identity. That prevents all guest processes in this daemon
++        // from collapsing into one process-scoped POSIX owner.
++        host_lock.l_pid = 0;
++        let result = unsafe {
++            libc::fcntl(
++                file.as_raw_fd(),
++                libc::F_OFD_SETLK,
++                &mut host_lock as *mut libc::flock,
++            )
++        };
++        if result == 0 {
++            Ok(())
++        } else {
++            Err(io::Error::last_os_error())
++        }
++    }
++
+     fn copyfilerange(
+         &self,
+         _ctx: Context,
+diff --git a/src/passthrough/read_only.rs b/src/passthrough/read_only.rs
+index e6c662a..69cc59f 100644
+--- a/src/passthrough/read_only.rs
++++ b/src/passthrough/read_only.rs
+@@ -221,6 +221,25 @@ impl FileSystem for PassthroughFsRo {
+             flock_release: bool,
+             lock_owner: Option<u64>,
+         ) -> io::Result<()>;
++        fn getlk(
++            &self,
++            ctx: Context,
++            inode: Self::Inode,
++            handle: Self::Handle,
++            owner: u64,
++            lock: fuse::FileLock,
++            flags: u32,
++        ) -> io::Result<fuse::FileLock>;
++        fn setlk(
++            &self,
++            ctx: Context,
++            inode: Self::Inode,
++            handle: Self::Handle,
++            owner: u64,
++            lock: fuse::FileLock,
++            flags: u32,
++            sleep: bool,
++        ) -> io::Result<()>;
+         fn statfs(&self, ctx: Context, inode: Self::Inode) -> io::Result<libc::statvfs64>;
+         fn getxattr(
+             &self,
+diff --git a/src/server.rs b/src/server.rs
+index 461461e..73265e9 100644
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -11,23 +11,83 @@ use crate::fuse::*;
+ use crate::passthrough::util::einval;
+ use crate::soft_idmap::GuestGid;
+ use crate::{oslib, Error, Result};
++use std::collections::{hash_map, HashMap};
+ use std::convert::{TryFrom, TryInto};
+ use std::ffi::{CStr, CString};
+ use std::fs::File;
+ use std::io::{self, Read, Write};
+ use std::mem::size_of;
+ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+-use std::sync::Arc;
++use std::sync::{Arc, Mutex};
++use std::thread;
+ use std::time::Duration;
+ use vm_memory::ByteValued;
+
+ const FUSE_BUFFER_HEADER_SIZE: u32 = 0x1000;
+ const MAX_BUFFER_SIZE: u32 = 1 << 20;
+ const DIRENT_PADDING: [u8; 8] = [0; 8];
++const LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+ const CURRENT_DIR_CSTR: &[u8] = b".";
+ const PARENT_DIR_CSTR: &[u8] = b"..";
+
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum PendingLockState {
++    Waiting,
++    Cancelled,
++    Acquired,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum PendingLockIdentity {
++    Posix { inode: u64, owner: u64 },
++    Flock { inode: u64, handle: u64 },
++}
++
++struct PendingLockRequest {
++    identity: PendingLockIdentity,
++    state: Mutex<PendingLockState>,
++}
++
++impl PendingLockRequest {
++    fn new(identity: PendingLockIdentity) -> Self {
++        Self {
++            identity,
++            state: Mutex::new(PendingLockState::Waiting),
++        }
++    }
++
++    fn cancel(&self) -> bool {
++        let mut state = self.state.lock().unwrap();
++        match *state {
++            PendingLockState::Waiting | PendingLockState::Cancelled => {
++                *state = PendingLockState::Cancelled;
++                true
++            }
++            PendingLockState::Acquired => false,
++        }
++    }
++}
++
++struct PendingLockRegistration<'a> {
++    unique: u64,
++    request: Arc<PendingLockRequest>,
++    requests: &'a Mutex<HashMap<u64, Arc<PendingLockRequest>>>,
++}
++
++impl Drop for PendingLockRegistration<'_> {
++    fn drop(&mut self) {
++        let mut requests = self.requests.lock().unwrap();
++        if requests
++            .get(&self.unique)
++            .map(|current| Arc::ptr_eq(current, &self.request))
++            .unwrap_or(false)
++        {
++            requests.remove(&self.unique);
++        }
++    }
++}
++
+ struct ZcReader<'a>(Reader<'a>);
+
+ impl ZeroCopyReader for ZcReader<'_> {
+@@ -83,6 +143,7 @@ impl ZeroCopyWriter for ZcWriter<'_> {
+ pub struct Server<F: FileSystem + Sync> {
+     fs: F,
+     options: AtomicU64,
++    pending_lock_requests: Mutex<HashMap<u64, Arc<PendingLockRequest>>>,
+ }
+
+ impl<F: FileSystem + Sync> Server<F> {
+@@ -90,6 +151,7 @@ impl<F: FileSystem + Sync> Server<F> {
+         Server {
+             fs,
+             options: AtomicU64::new(FsOptions::empty().bits()),
++            pending_lock_requests: Mutex::new(HashMap::new()),
+         }
+     }
+
+@@ -149,7 +211,7 @@ impl<F: FileSystem + Sync> Server<F> {
+                 Opcode::Setlkw => self.setlkw(in_header, r, w),
+                 Opcode::Access => self.access(in_header, r, w),
+                 Opcode::Create => self.create(in_header, r, w),
+-                Opcode::Interrupt => Ok(self.interrupt(in_header)),
++                Opcode::Interrupt => self.interrupt(in_header, r, w),
+                 Opcode::Bmap => self.bmap(in_header, r, w),
+                 Opcode::Destroy => Ok(self.destroy()),
+                 Opcode::Ioctl => self.ioctl(in_header, r, w),
+@@ -670,6 +732,14 @@ impl<F: FileSystem + Sync> Server<F> {
+             lock_owner,
+         } = r.read_obj().map_err(Error::DecodeMessage)?;
+
++        // Cancel any still-registered blocking flock request for this open
++        // handle before the filesystem performs the requested host unlock and
++        // release. This is a cleanup backstop for transports that can deliver
++        // RELEASE concurrently; stock Linux normally retains the file until
++        // its blocking flock request completes, so targeted INTERRUPT remains
++        // the prompt-cancellation path when the transport supports it.
++        self.cancel_pending_flock_lock_requests(in_header.nodeid, fh);
++
+         let flush = release_flags & RELEASE_FLUSH != 0;
+         let flock_release = release_flags & RELEASE_FLOCK_UNLOCK != 0;
+         let lock_owner = if flush || flock_release {
+@@ -861,6 +931,11 @@ impl<F: FileSystem + Sync> Server<F> {
+     fn flush(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+         let FlushIn { fh, lock_owner, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
+
++        // FLUSH is issued for close and carries the POSIX lock owner whose
++        // locks must be dropped. Cancel an outstanding blocking request before
++        // asking the filesystem to release that owner's acquired locks.
++        self.cancel_pending_posix_lock_requests(in_header.nodeid, lock_owner);
++
+         match self.fs.flush(
+             Context::from(in_header),
+             in_header.nodeid.into(),
+@@ -932,6 +1007,8 @@ impl<F: FileSystem + Sync> Server<F> {
+             | FsOptions::SUBMOUNTS
+             | FsOptions::INIT_EXT
+             | FsOptions::CREATE_SUPP_GROUP
++            | FsOptions::POSIX_LOCKS
++            | FsOptions::FLOCK_LOCKS
+             | FsOptions::ALLOW_IDMAP;
+
+         let flags_64 = ((flags2 as u64) << 32) | (flags as u64);
+@@ -1200,27 +1277,190 @@ impl<F: FileSystem + Sync> Server<F> {
+         }
+     }
+
+-    fn getlk(&self, in_header: InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+-        if let Err(e) = self.fs.getlk() {
+-            reply_error(e, in_header.unique, w)
++    fn getlk(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
++        let LkIn {
++            fh,
++            owner,
++            lk,
++            lk_flags,
++            ..
++        } = r.read_obj().map_err(Error::DecodeMessage)?;
++
++        match self.fs.getlk(
++            Context::from(in_header),
++            in_header.nodeid.into(),
++            fh.into(),
++            owner,
++            lk,
++            lk_flags,
++        ) {
++            Ok(lk) => reply_ok(Some(LkOut { lk }), None, in_header.unique, w),
++            Err(e) => reply_error(e, in_header.unique, w),
++        }
++    }
++
++    fn setlk(&self, in_header: InHeader, r: Reader, w: Writer) -> Result<usize> {
++        self.setlk_common(in_header, r, w, false)
++    }
++
++    fn setlkw(&self, in_header: InHeader, r: Reader, w: Writer) -> Result<usize> {
++        self.setlk_common(in_header, r, w, true)
++    }
++
++    fn register_pending_lock_request(
++        &self,
++        unique: u64,
++        identity: PendingLockIdentity,
++    ) -> io::Result<PendingLockRegistration<'_>> {
++        let request = Arc::new(PendingLockRequest::new(identity));
++        let mut requests = self.pending_lock_requests.lock().unwrap();
++        match requests.entry(unique) {
++            hash_map::Entry::Vacant(entry) => {
++                entry.insert(request.clone());
++            }
++            hash_map::Entry::Occupied(_) => {
++                return Err(io::Error::from_raw_os_error(libc::EIO));
++            }
++        }
++        drop(requests);
++        Ok(PendingLockRegistration {
++            unique,
++            request,
++            requests: &self.pending_lock_requests,
++        })
++    }
++
++    fn cancel_pending_lock_request(&self, unique: u64) -> bool {
++        let request = self
++            .pending_lock_requests
++            .lock()
++            .unwrap()
++            .get(&unique)
++            .cloned();
++        request.map(|request| request.cancel()).unwrap_or(false)
++    }
++
++    fn cancel_pending_lock_requests(&self, matches: impl Fn(PendingLockIdentity) -> bool) -> usize {
++        // Do not hold the registry mutex while taking individual request-state
++        // mutexes. Registration/drop and cancellation therefore have one lock
++        // order, and each request still linearizes cancellation vs acquisition
++        // through PendingLockRequest::state.
++        let requests: Vec<_> = self
++            .pending_lock_requests
++            .lock()
++            .unwrap()
++            .values()
++            .filter(|request| matches(request.identity))
++            .cloned()
++            .collect();
++        requests
++            .into_iter()
++            .filter(|request| request.cancel())
++            .count()
++    }
++
++    fn cancel_pending_posix_lock_requests(&self, inode: u64, owner: u64) -> usize {
++        self.cancel_pending_lock_requests(|identity| {
++            identity == PendingLockIdentity::Posix { inode, owner }
++        })
++    }
++
++    fn cancel_pending_flock_lock_requests(&self, inode: u64, handle: u64) -> usize {
++        self.cancel_pending_lock_requests(|identity| {
++            identity == PendingLockIdentity::Flock { inode, handle }
++        })
++    }
++
++    fn interrupt_pending_lock_request(&self, unique: u64) -> io::Result<()> {
++        if self.cancel_pending_lock_request(unique) {
++            Ok(())
+         } else {
+-            Ok(0)
++            Err(io::Error::from_raw_os_error(libc::EAGAIN))
+         }
+     }
+
+-    fn setlk(&self, in_header: InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+-        if let Err(e) = self.fs.setlk() {
+-            reply_error(e, in_header.unique, w)
++    #[allow(clippy::too_many_arguments)]
++    fn setlkw_cancellable(
++        &self,
++        unique: u64,
++        ctx: Context,
++        inode: u64,
++        handle: u64,
++        owner: u64,
++        lock: FileLock,
++        flags: u32,
++    ) -> io::Result<()> {
++        let identity = if flags & LK_FLOCK != 0 {
++            PendingLockIdentity::Flock { inode, handle }
+         } else {
+-            Ok(0)
++            PendingLockIdentity::Posix { inode, owner }
++        };
++        let registration = self.register_pending_lock_request(unique, identity)?;
++        loop {
++            // Keep this guard across the nonblocking acquisition and the
++            // transition to Acquired. An interrupt must win before the syscall
++            // starts or observe Acquired afterwards; it can never acknowledge
++            // cancellation while an untracked lock is being installed.
++            let mut state = registration.request.state.lock().unwrap();
++            if *state == PendingLockState::Cancelled {
++                return Err(io::Error::from_raw_os_error(libc::EINTR));
++            }
++
++            match self
++                .fs
++                .setlk(ctx, inode.into(), handle.into(), owner, lock, flags, false)
++            {
++                Ok(()) => {
++                    *state = PendingLockState::Acquired;
++                    return Ok(());
++                }
++                Err(error) if is_lock_contended(&error) => {}
++                Err(error) => return Err(error),
++            }
++            drop(state);
++            thread::sleep(LOCK_RETRY_DELAY);
+         }
+     }
+
+-    fn setlkw(&self, in_header: InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+-        if let Err(e) = self.fs.setlkw() {
+-            reply_error(e, in_header.unique, w)
++    fn setlk_common(
++        &self,
++        in_header: InHeader,
++        mut r: Reader,
++        w: Writer,
++        sleep: bool,
++    ) -> Result<usize> {
++        let LkIn {
++            fh,
++            owner,
++            lk,
++            lk_flags,
++            ..
++        } = r.read_obj().map_err(Error::DecodeMessage)?;
++
++        let result = if sleep {
++            self.setlkw_cancellable(
++                in_header.unique,
++                Context::from(in_header),
++                in_header.nodeid,
++                fh,
++                owner,
++                lk,
++                lk_flags,
++            )
+         } else {
+-            Ok(0)
++            self.fs.setlk(
++                Context::from(in_header),
++                in_header.nodeid.into(),
++                fh.into(),
++                owner,
++                lk,
++                lk_flags,
++                false,
++            )
++        };
++        match result {
++            Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
++            Err(e) => reply_error(e, in_header.unique, w),
+         }
+     }
+
+@@ -1292,8 +1532,21 @@ impl<F: FileSystem + Sync> Server<F> {
+         }
+     }
+
+-    fn interrupt(&self, _in_header: InHeader) -> usize {
+-        0
++    fn interrupt(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
++        let InterruptIn { unique } = r.read_obj().map_err(Error::DecodeMessage)?;
++        if self.interrupt_pending_lock_request(unique).is_ok() {
++            // The interrupted lock request owns the eventual EINTR reply.
++            Ok(0)
++        } else {
++            // The request may not have reached its worker yet, or it may have
++            // completed concurrently. EAGAIN asks the kernel to retry instead
++            // of silently losing an interrupt for an unknown request.
++            reply_error(
++                io::Error::from_raw_os_error(libc::EAGAIN),
++                in_header.unique,
++                w,
++            )
++        }
+     }
+
+     fn bmap(&self, in_header: InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+@@ -1484,6 +1737,275 @@ impl<F: FileSystem + SerializableFileSystem + Sync> SerializableFileSystem for S
+     }
+ }
+
++fn is_lock_contended(error: &io::Error) -> bool {
++    matches!(
++        error.raw_os_error(),
++        Some(code) if code == libc::EAGAIN || code == libc::EACCES
++    )
++}
++
++#[cfg(test)]
++mod lock_interrupt_tests {
++    use super::*;
++    use std::sync::atomic::AtomicUsize;
++    use std::sync::Condvar;
++    use std::time::Instant;
++
++    struct EmptyDirectory;
++
++    impl DirectoryIterator for EmptyDirectory {
++        fn next(&mut self) -> Option<DirEntry<'_>> {
++            None
++        }
++    }
++
++    #[derive(Default)]
++    struct RetryLockFs {
++        allow_acquire: AtomicBool,
++        attempts: AtomicUsize,
++        acquired_owners: Mutex<Vec<u64>>,
++    }
++
++    impl FileSystem for RetryLockFs {
++        type Inode = u64;
++        type Handle = u64;
++        type DirIter = EmptyDirectory;
++
++        fn setlk(
++            &self,
++            _ctx: Context,
++            _inode: Self::Inode,
++            _handle: Self::Handle,
++            owner: u64,
++            _lock: FileLock,
++            _flags: u32,
++            sleep: bool,
++        ) -> io::Result<()> {
++            assert!(!sleep, "server retries must use nonblocking host calls");
++            self.attempts.fetch_add(1, Ordering::SeqCst);
++            if !self.allow_acquire.load(Ordering::SeqCst) {
++                return Err(io::Error::from_raw_os_error(libc::EAGAIN));
++            }
++            self.acquired_owners.lock().unwrap().push(owner);
++            Ok(())
++        }
++    }
++
++    fn wait_for(predicate: impl Fn() -> bool) {
++        let deadline = Instant::now() + Duration::from_secs(2);
++        while !predicate() {
++            assert!(Instant::now() < deadline, "condition timed out");
++            thread::sleep(Duration::from_millis(1));
++        }
++    }
++
++    fn test_lock() -> FileLock {
++        FileLock {
++            start: 0,
++            end: u64::MAX,
++            type_: libc::F_WRLCK as u32,
++            pid: 1,
++        }
++    }
++
++    #[test]
++    fn interrupt_cancels_only_its_target_without_a_late_lock() {
++        let server = Arc::new(Server::new(RetryLockFs::default()));
++        let first = {
++            let server = server.clone();
++            thread::spawn(move || {
++                server.setlkw_cancellable(
++                    101,
++                    Context::from(InHeader::default()),
++                    1,
++                    1,
++                    11,
++                    test_lock(),
++                    0,
++                )
++            })
++        };
++        let second = {
++            let server = server.clone();
++            thread::spawn(move || {
++                server.setlkw_cancellable(
++                    202,
++                    Context::from(InHeader::default()),
++                    1,
++                    2,
++                    22,
++                    test_lock(),
++                    0,
++                )
++            })
++        };
++
++        wait_for(|| server.fs.attempts.load(Ordering::SeqCst) >= 2);
++        assert!(server.interrupt_pending_lock_request(101).is_ok());
++        server.fs.allow_acquire.store(true, Ordering::SeqCst);
++
++        let first_error = first.join().unwrap().unwrap_err();
++        assert_eq!(first_error.raw_os_error(), Some(libc::EINTR));
++        second.join().unwrap().unwrap();
++        assert_eq!(*server.fs.acquired_owners.lock().unwrap(), vec![22]);
++        assert!(server.pending_lock_requests.lock().unwrap().is_empty());
++    }
++
++    #[derive(Default)]
++    struct SuccessGate {
++        entered: bool,
++        release: bool,
++    }
++
++    #[derive(Default)]
++    struct SerializedSuccessFs {
++        gate: Mutex<SuccessGate>,
++        gate_changed: Condvar,
++        acquired: AtomicUsize,
++    }
++
++    impl FileSystem for SerializedSuccessFs {
++        type Inode = u64;
++        type Handle = u64;
++        type DirIter = EmptyDirectory;
++
++        fn setlk(
++            &self,
++            _ctx: Context,
++            _inode: Self::Inode,
++            _handle: Self::Handle,
++            _owner: u64,
++            _lock: FileLock,
++            _flags: u32,
++            sleep: bool,
++        ) -> io::Result<()> {
++            assert!(!sleep);
++            let mut gate = self.gate.lock().unwrap();
++            gate.entered = true;
++            self.gate_changed.notify_all();
++            while !gate.release {
++                gate = self.gate_changed.wait(gate).unwrap();
++            }
++            self.acquired.fetch_add(1, Ordering::SeqCst);
++            Ok(())
++        }
++    }
++
++    #[test]
++    fn successful_acquisition_is_serialized_against_cancellation() {
++        let server = Arc::new(Server::new(SerializedSuccessFs::default()));
++        let worker = {
++            let server = server.clone();
++            thread::spawn(move || {
++                server.setlkw_cancellable(
++                    303,
++                    Context::from(InHeader::default()),
++                    1,
++                    1,
++                    33,
++                    test_lock(),
++                    0,
++                )
++            })
++        };
++
++        {
++            let mut gate = server.fs.gate.lock().unwrap();
++            while !gate.entered {
++                gate = server.fs.gate_changed.wait(gate).unwrap();
++            }
++        }
++        let cancel_started = Arc::new(AtomicBool::new(false));
++        let cancel = {
++            let server = server.clone();
++            let cancel_started = cancel_started.clone();
++            thread::spawn(move || {
++                cancel_started.store(true, Ordering::SeqCst);
++                server.cancel_pending_lock_request(303)
++            })
++        };
++        wait_for(|| cancel_started.load(Ordering::SeqCst));
++        thread::sleep(Duration::from_millis(20));
++        {
++            let mut gate = server.fs.gate.lock().unwrap();
++            gate.release = true;
++            server.fs.gate_changed.notify_all();
++        }
++
++        worker.join().unwrap().unwrap();
++        assert!(!cancel.join().unwrap());
++        assert_eq!(server.fs.acquired.load(Ordering::SeqCst), 1);
++        assert!(server.pending_lock_requests.lock().unwrap().is_empty());
++    }
++
++    #[test]
++    fn unknown_interrupt_is_retryable() {
++        let server = Server::new(RetryLockFs::default());
++        let error = server.interrupt_pending_lock_request(404).unwrap_err();
++        assert_eq!(error.raw_os_error(), Some(libc::EAGAIN));
++    }
++
++    #[test]
++    fn flush_cancels_matching_posix_wait_without_a_late_lock() {
++        let server = Arc::new(Server::new(RetryLockFs::default()));
++        let worker = {
++            let server = server.clone();
++            thread::spawn(move || {
++                server.setlkw_cancellable(
++                    505,
++                    Context::from(InHeader::default()),
++                    7,
++                    8,
++                    55,
++                    test_lock(),
++                    0,
++                )
++            })
++        };
++
++        wait_for(|| server.fs.attempts.load(Ordering::SeqCst) > 0);
++        assert_eq!(server.cancel_pending_posix_lock_requests(7, 54), 0);
++        assert_eq!(server.cancel_pending_posix_lock_requests(6, 55), 0);
++        assert_eq!(server.cancel_pending_posix_lock_requests(7, 55), 1);
++        server.fs.allow_acquire.store(true, Ordering::SeqCst);
++
++        let error = worker.join().unwrap().unwrap_err();
++        assert_eq!(error.raw_os_error(), Some(libc::EINTR));
++        assert!(server.fs.acquired_owners.lock().unwrap().is_empty());
++        assert!(server.pending_lock_requests.lock().unwrap().is_empty());
++    }
++
++    #[test]
++    fn release_cancels_matching_flock_wait_without_a_late_lock() {
++        let server = Arc::new(Server::new(RetryLockFs::default()));
++        let worker = {
++            let server = server.clone();
++            thread::spawn(move || {
++                server.setlkw_cancellable(
++                    606,
++                    Context::from(InHeader::default()),
++                    9,
++                    10,
++                    66,
++                    test_lock(),
++                    LK_FLOCK,
++                )
++            })
++        };
++
++        wait_for(|| server.fs.attempts.load(Ordering::SeqCst) > 0);
++        assert_eq!(server.cancel_pending_flock_lock_requests(9, 11), 0);
++        assert_eq!(server.cancel_pending_flock_lock_requests(8, 10), 0);
++        assert_eq!(server.cancel_pending_flock_lock_requests(9, 10), 1);
++        server.fs.allow_acquire.store(true, Ordering::SeqCst);
++
++        let error = worker.join().unwrap().unwrap_err();
++        assert_eq!(error.raw_os_error(), Some(libc::EINTR));
++        assert!(server.fs.acquired_owners.lock().unwrap().is_empty());
++        assert!(server.pending_lock_requests.lock().unwrap().is_empty());
++    }
++}
++
+ fn reply_readdir(len: usize, unique: u64, mut w: Writer) -> Result<usize> {
+     let out = OutHeader {
+         len: (size_of::<OutHeader>() + len) as u32,

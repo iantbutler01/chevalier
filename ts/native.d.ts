@@ -138,6 +138,9 @@ export declare class VfsStorage {
   mkdir(path: string): Promise<void>
   /** Create a symbolic link. */
   createSymlink(path: string, target: string): Promise<void>
+  /** Create a second pathname for one shared regular-file identity. */
+  createHardLink(source: string, destination: string): Promise<VfsHardLinkResult>
+  findHardLinkAlias(fileId: string, excludingPath: string): Promise<string | null>
   /** Delete a file; returns the delete result (JSON). */
   remove(path: string, options?: { ifMatch?: string | null } | null): Promise<any>
   /** Remove an (empty) directory. */
@@ -311,6 +314,11 @@ export interface ToolSchemaJs {
 
 /** The chevalier-node binding version. */
 export declare function version(): string
+
+export interface VfsHardLinkResult {
+  source: VfsMetadata
+  destination: VfsMetadata
+}
 
 /**
  * File/dir metadata. `sizeBytes` is a `bigint` so it never loses precision at

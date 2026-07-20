@@ -20,6 +20,7 @@ WORKDIR /src
 COPY vmd ./vmd
 COPY crates ./crates
 COPY proto ./proto
+COPY patches/fuser-0.17.0 ./patches/fuser-0.17.0
 COPY portproxy/bin ./portproxy/bin
 
 WORKDIR /src/vmd
@@ -33,11 +34,17 @@ RUN cargo build --release --bin vmd
 FROM rust:1.90-bookworm AS vfsd-builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+    curl \
     libcap-ng-dev \
     libseccomp-dev \
+    patch \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
-RUN cargo install --locked --version 1.13.0 virtiofsd
+COPY patches/virtiofsd-1.13.0-lock-forwarding.patch /src/patches/virtiofsd-1.13.0-lock-forwarding.patch
+COPY scripts/build-patched-virtiofsd.sh /src/scripts/build-patched-virtiofsd.sh
+RUN VIRTIOFSD_INSTALL_ROOT=/usr/local \
+    VIRTIOFSD_SKIP_TESTS=1 \
+    /src/scripts/build-patched-virtiofsd.sh
 
 FROM ubuntu:26.04 AS threat-feed-builder
 ENV DEBIAN_FRONTEND=noninteractive
@@ -117,7 +124,7 @@ COPY --from=coredns-bin /coredns /usr/local/bin/coredns
 COPY --from=threat-feed-builder /tmp/threat-domains.hosts /opt/chevalier/network/threat-domains.hosts
 # Overwrite the Ubuntu-shipped virtiofsd 1.10 with our source-built 1.13.0 that
 # supports `--migration-mode` / VHOST_USER_PROTOCOL_F_LOG_SHMFD.
-COPY --from=vfsd-builder /usr/local/cargo/bin/virtiofsd /usr/libexec/virtiofsd
+COPY --from=vfsd-builder /usr/local/bin/virtiofsd /usr/libexec/virtiofsd
 COPY portproxy/bin/portproxy-linux-amd64 /opt/chevalier/portproxy/bin/portproxy-linux-amd64
 COPY portproxy/bin/portproxy-linux-arm64 /opt/chevalier/portproxy/bin/portproxy-linux-arm64
 

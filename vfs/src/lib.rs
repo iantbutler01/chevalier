@@ -221,6 +221,12 @@ pub struct VfsStorageRenameResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsStorageHardLinkResult {
+    pub source: VfsStorageMetadata,
+    pub destination: VfsStorageMetadata,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VfsStorageNamespaceMutation {
     CreateDirectory {
@@ -374,6 +380,36 @@ pub trait OptimizedVfsStorage: Send + Sync {
         let _ = (path, target);
         Err(VfsStorageError::BadRequest(
             "symlink creation not supported by this VFS backend".to_string(),
+        ))
+    }
+
+    /// Add a second namespace entry for the same regular-file identity.
+    ///
+    /// Implementations must not emulate this by copying bytes: reads and writes
+    /// through either pathname must continue to address one identity, and unlink
+    /// removes only the named alias until its link count reaches zero.
+    async fn create_hard_link(
+        &self,
+        source: &str,
+        destination: &str,
+    ) -> VfsStorageResult<VfsStorageHardLinkResult> {
+        let _ = (source, destination);
+        Err(VfsStorageError::BadRequest(
+            "hard-link creation not supported by this VFS backend".to_string(),
+        ))
+    }
+
+    /// Resolve one remaining pathname for an identity after a namespace entry
+    /// is removed. This is used to preserve open-but-unlinked handles without
+    /// recreating a deleted pathname.
+    async fn find_hard_link_alias(
+        &self,
+        file_id: &str,
+        excluding_path: &str,
+    ) -> VfsStorageResult<Option<String>> {
+        let _ = (file_id, excluding_path);
+        Err(VfsStorageError::BadRequest(
+            "hard-link alias resolution not supported by this VFS backend".to_string(),
         ))
     }
 

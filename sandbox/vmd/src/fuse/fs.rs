@@ -1,28 +1,29 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use chevalier_sandbox::vfs::{
-    VFS_OPERATION_LINK, VFS_OPERATION_SETATTR_MODE, VFS_OPERATION_SETATTR_SIZE,
-    VFS_OPERATION_WRITE_THROUGH, VFS_SURFACE_KIND_VM_SHARED, VFS_SURFACE_KIND_VM_WORKSPACE,
-    VfsDirEntry as RemoteDirEntry, VfsLeaseGrant as LeaseGrant, VfsMetadata as RemoteMetadata,
-    VfsNamespaceMutation, scoped_vfs_path,
+    VFS_OPERATION_SETATTR_MODE, VFS_OPERATION_SETATTR_SIZE, VFS_OPERATION_WRITE_THROUGH,
+    VFS_SURFACE_KIND_VM_SHARED, VFS_SURFACE_KIND_VM_WORKSPACE, VfsDirEntry as RemoteDirEntry,
+    VfsLeaseGrant as LeaseGrant, VfsMetadata as RemoteMetadata, VfsNamespaceMutation,
+    scoped_vfs_path,
 };
 use fuser::{
     BsdFileFlags, Errno, FileAttr, FileHandle, FileType, FopenFlags, Generation, INodeNo,
-    InitFlags, KernelConfig, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyWrite, TimeOrNow,
+    InitFlags, KernelConfig, LockNamespace, MountOption, OpenFlags, RenameFlags, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen,
+    ReplyWrite, TimeOrNow,
 };
 use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
 use uuid::Uuid;
 
 use super::cache::RemoteFuseCache;
-use super::client::{RangeRead, RemoteVfsClient, request_status};
+use super::client::{AdvisoryLockRenewalIdentity, RangeRead, RemoteVfsClient, request_status};
 use super::namespace::NamespaceJournal;
 use super::write::WriteJournal;
 
@@ -39,17 +40,157 @@ const ADVISORY_LOCK_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const ADVISORY_LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 type FuseResult<T> = std::result::Result<T, Errno>;
-type ActiveAdvisoryLocks = HashMap<String, HashMap<u64, String>>;
+type ActiveAdvisoryLocks = HashMap<(LockNamespace, String), HashMap<u64, String>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LockWaitState {
+    Pending,
+    Cancelled,
+    Completed,
+}
+
+pub(super) struct LockWaitCancellation {
+    state: Mutex<LockWaitState>,
+    wake: Condvar,
+}
+
+impl LockWaitCancellation {
+    pub(super) fn new() -> Self {
+        Self {
+            state: Mutex::new(LockWaitState::Pending),
+            wake: Condvar::new(),
+        }
+    }
+
+    pub(super) fn cancel(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *state != LockWaitState::Pending {
+            return false;
+        }
+        *state = LockWaitState::Cancelled;
+        self.wake.notify_all();
+        true
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            == LockWaitState::Cancelled
+    }
+
+    fn wait_cancelled(&self, timeout: Duration) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *state == LockWaitState::Cancelled {
+            return true;
+        }
+        let (state, _) = self
+            .wake
+            .wait_timeout_while(state, timeout, |state| *state == LockWaitState::Pending)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *state == LockWaitState::Cancelled
+    }
+
+    fn finish(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *state != LockWaitState::Pending {
+            return false;
+        }
+        *state = LockWaitState::Completed;
+        true
+    }
+}
+
+fn take_active_advisory_lock_file_id(
+    active: &mut ActiveAdvisoryLocks,
+    owner_key: &(LockNamespace, String),
+    ino: u64,
+) -> Option<String> {
+    let (file_id, owner_is_empty) = match active.get_mut(owner_key) {
+        Some(files) => {
+            let file_id = files.remove(&ino);
+            (file_id, files.is_empty())
+        }
+        None => (None, false),
+    };
+    if owner_is_empty {
+        active.remove(owner_key);
+    }
+    file_id
+}
+
+fn active_advisory_lock_identities(
+    active: &ActiveAdvisoryLocks,
+) -> Vec<AdvisoryLockRenewalIdentity> {
+    active
+        .iter()
+        .flat_map(|((namespace, lock_owner), files)| {
+            files.values().map(move |file_id| {
+                (
+                    lock_owner.clone(),
+                    match namespace {
+                        LockNamespace::Posix => "posix".to_string(),
+                        LockNamespace::Flock => "flock".to_string(),
+                    },
+                    file_id.clone(),
+                )
+            })
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(
+            |(lock_owner, namespace, file_id)| AdvisoryLockRenewalIdentity {
+                lock_owner,
+                namespace,
+                file_id,
+            },
+        )
+        .collect()
+}
+
+fn combine_flush_and_lock_cleanup(
+    operation: &'static str,
+    flush_result: FuseResult<()>,
+    cleanup_result: FuseResult<()>,
+) -> FuseResult<()> {
+    match (flush_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Err(cleanup)) => {
+            tracing::warn!(
+                operation,
+                ?primary,
+                ?cleanup,
+                "VFS close writeback and advisory-lock cleanup both failed"
+            );
+            Err(primary)
+        }
+    }
+}
 
 #[derive(Default)]
 struct InodeTable {
     next: u64,
     path_to_ino: BTreeMap<String, INodeNo>,
+    identity_to_ino: HashMap<String, INodeNo>,
     ino_to_path: HashMap<INodeNo, InodeRecord>,
 }
 
 struct InodeRecord {
     path: String,
+    paths: BTreeSet<String>,
+    identity: Option<String>,
     last_access: Instant,
     lookup_count: u64,
 }
@@ -59,6 +200,7 @@ impl InodeTable {
         let mut table = Self {
             next: ROOT_INO_RAW + 1,
             path_to_ino: BTreeMap::new(),
+            identity_to_ino: HashMap::new(),
             ino_to_path: HashMap::new(),
         };
         table.path_to_ino.insert(String::new(), ROOT_INO);
@@ -66,6 +208,8 @@ impl InodeTable {
             ROOT_INO,
             InodeRecord {
                 path: String::new(),
+                paths: BTreeSet::from([String::new()]),
+                identity: None,
                 last_access: Instant::now(),
                 lookup_count: u64::MAX,
             },
@@ -74,19 +218,54 @@ impl InodeTable {
     }
 
     fn ensure(&mut self, path: &str) -> INodeNo {
+        self.ensure_with_identity(path, None)
+    }
+
+    fn ensure_with_identity(&mut self, path: &str, identity: Option<&str>) -> INodeNo {
         if let Some(ino) = self.path_to_ino.get(path) {
+            if let Some(identity) = identity {
+                let mapped = self.identity_to_ino.get(identity).copied();
+                if mapped.is_some_and(|mapped| mapped != *ino) {
+                    self.detach_exact(path);
+                    return self.ensure_with_identity(path, Some(identity));
+                }
+            }
             if let Some(record) = self.ino_to_path.get_mut(ino) {
                 record.last_access = Instant::now();
+                if record.identity.is_none() {
+                    record.identity = identity.map(str::to_string);
+                    if let Some(identity) = identity {
+                        self.identity_to_ino.insert(identity.to_string(), *ino);
+                    }
+                }
             }
             return *ino;
+        }
+        if let Some(identity) = identity
+            && let Some(ino) = self.identity_to_ino.get(identity).copied()
+        {
+            self.path_to_ino.insert(path.to_string(), ino);
+            if let Some(record) = self.ino_to_path.get_mut(&ino) {
+                record.paths.insert(path.to_string());
+                if record.path.is_empty() {
+                    record.path = path.to_string();
+                }
+                record.last_access = Instant::now();
+            }
+            return ino;
         }
         let ino = INodeNo(self.next);
         self.next += 1;
         self.path_to_ino.insert(path.to_string(), ino);
+        if let Some(identity) = identity {
+            self.identity_to_ino.insert(identity.to_string(), ino);
+        }
         self.ino_to_path.insert(
             ino,
             InodeRecord {
                 path: path.to_string(),
+                paths: BTreeSet::from([path.to_string()]),
+                identity: identity.map(str::to_string),
                 last_access: Instant::now(),
                 lookup_count: 0,
             },
@@ -95,7 +274,11 @@ impl InodeTable {
     }
 
     pub(super) fn lookup(&mut self, path: &str) -> INodeNo {
-        let ino = self.ensure(path);
+        self.lookup_with_identity(path, None)
+    }
+
+    fn lookup_with_identity(&mut self, path: &str, identity: Option<&str>) -> INodeNo {
+        let ino = self.ensure_with_identity(path, identity);
         if let Some(record) = self.ino_to_path.get_mut(&ino) {
             record.lookup_count = record.lookup_count.saturating_add(1);
         }
@@ -117,10 +300,18 @@ impl InodeTable {
         };
         record.lookup_count = record.lookup_count.saturating_sub(nlookup);
         if record.lookup_count == 0 {
-            let path = record.path.clone();
+            let paths = record.paths.clone();
+            let identity = record.identity.clone();
             self.ino_to_path.remove(&ino);
-            if self.path_to_ino.get(path.as_str()) == Some(&ino) {
-                self.path_to_ino.remove(path.as_str());
+            for path in paths {
+                if self.path_to_ino.get(path.as_str()) == Some(&ino) {
+                    self.path_to_ino.remove(path.as_str());
+                }
+            }
+            if let Some(identity) = identity
+                && self.identity_to_ino.get(identity.as_str()) == Some(&ino)
+            {
+                self.identity_to_ino.remove(identity.as_str());
             }
         }
     }
@@ -129,7 +320,22 @@ impl InodeTable {
         let Some(ino) = self.path_to_ino.remove(path) else {
             return;
         };
-        self.ino_to_path.remove(&ino);
+        let mut remove_inode = false;
+        if let Some(record) = self.ino_to_path.get_mut(&ino) {
+            record.paths.remove(path);
+            if record.path == path {
+                record.path = record.paths.iter().next().cloned().unwrap_or_default();
+            }
+            remove_inode = record.paths.is_empty();
+        }
+        if remove_inode {
+            if let Some(record) = self.ino_to_path.remove(&ino)
+                && let Some(identity) = record.identity
+                && self.identity_to_ino.get(identity.as_str()) == Some(&ino)
+            {
+                self.identity_to_ino.remove(identity.as_str());
+            }
+        }
     }
 
     fn subtree_entries(&self, path: &str) -> Vec<(String, INodeNo)> {
@@ -149,9 +355,26 @@ impl InodeTable {
     }
 
     fn detach_subtree(&mut self, path: &str) {
+        let mut emptied = Vec::new();
         for (candidate, ino) in self.subtree_entries(path) {
             self.path_to_ino.remove(candidate.as_str());
-            self.ino_to_path.remove(&ino);
+            if let Some(record) = self.ino_to_path.get_mut(&ino) {
+                record.paths.remove(candidate.as_str());
+                if record.path == candidate {
+                    record.path = record.paths.iter().next().cloned().unwrap_or_default();
+                }
+                if record.paths.is_empty() {
+                    emptied.push(ino);
+                }
+            }
+        }
+        for ino in emptied {
+            if let Some(record) = self.ino_to_path.remove(&ino)
+                && let Some(identity) = record.identity
+                && self.identity_to_ino.get(identity.as_str()) == Some(&ino)
+            {
+                self.identity_to_ino.remove(identity.as_str());
+            }
         }
     }
 
@@ -163,10 +386,22 @@ impl InodeTable {
             self.path_to_ino.remove(old_path.as_str());
             self.path_to_ino.insert(new_path.clone(), ino);
             if let Some(record) = self.ino_to_path.get_mut(&ino) {
-                record.path = new_path;
+                record.paths.remove(old_path.as_str());
+                record.paths.insert(new_path.clone());
+                if record.path == old_path {
+                    record.path = new_path;
+                }
                 record.last_access = Instant::now();
             }
         }
+    }
+
+    fn aliases_for_path(&self, path: &str) -> Vec<String> {
+        self.path_to_ino
+            .get(path)
+            .and_then(|ino| self.ino_to_path.get(ino))
+            .map(|record| record.paths.iter().cloned().collect())
+            .unwrap_or_else(|| vec![path.to_string()])
     }
 }
 
@@ -187,8 +422,18 @@ impl Default for HandleTable {
 #[derive(Clone)]
 struct FileState {
     path: String,
+    file_id: Option<String>,
+    link_count: u64,
+    /// The pathname has been removed and no remaining alias can publish this
+    /// open inode. Its buffer remains usable until final release, but must
+    /// never be flushed back into the deleted namespace.
+    unlinked: bool,
     buffer: Vec<u8>,
     executable: bool,
+    /// Executable state last known to exist at the gateway. Byte-only writes
+    /// preserve this mode through the journal; a transition in either
+    /// direction must use the write-through endpoint that carries mode.
+    base_executable: bool,
     created: bool,
     dirty: bool,
     loaded: bool,
@@ -262,7 +507,9 @@ impl RemoteFuseFs {
                 // A dead-lettered write's content was installed into the read
                 // cache at flush time; drop it so readers converge on the
                 // gateway's authoritative content instead of the dropped bytes.
-                Some(Box::new(move |path: &str| dead_letter_cache.invalidate(path))),
+                Some(Box::new(move |path: &str| {
+                    dead_letter_cache.invalidate(path)
+                })),
             )?)
         };
         let (mount_id, active_lock_owners) = Self::start_lock_heartbeat(&client, &tokio);
@@ -300,15 +547,15 @@ impl RemoteFuseFs {
                 let Some(active) = weak.upgrade() else {
                     break;
                 };
-                let has_locks = active
+                let identities = active
                     .lock()
-                    .map(|owners| !owners.is_empty())
-                    .unwrap_or(false);
-                if !has_locks {
+                    .map(|owners| active_advisory_lock_identities(&owners))
+                    .unwrap_or_default();
+                if identities.is_empty() {
                     continue;
                 }
                 if let Err(error) = heartbeat_client
-                    .renew_advisory_locks(&heartbeat_mount_id)
+                    .renew_advisory_locks(&heartbeat_mount_id, &identities)
                     .await
                 {
                     tracing::warn!(
@@ -370,6 +617,23 @@ impl RemoteFuseFs {
         }
     }
 
+    fn invalidate_inode_aliases(&self, path: &str) {
+        if let Some(file_id) = self
+            .cache
+            .get_metadata(path)
+            .and_then(|metadata| metadata.file_id)
+        {
+            self.cache.invalidate_identity(&file_id);
+        }
+        let aliases = self
+            .lock_inodes()
+            .map(|inodes| inodes.aliases_for_path(path))
+            .unwrap_or_else(|_| vec![path.to_string()]);
+        for alias in aliases {
+            self.cache.invalidate(&alias);
+        }
+    }
+
     fn rename_inode_path(&self, from: &str, to: &str) {
         if let Ok(mut inodes) = self.lock_inodes() {
             inodes.rename_path(from, to);
@@ -386,11 +650,16 @@ impl RemoteFuseFs {
     }
 
     fn attr_for_path(&self, path: &str, metadata: &RemoteMetadata, lookup: bool) -> FileAttr {
-        let ino = if lookup {
-            self.lookup_ino(path)
-        } else {
-            self.ensure_ino(path)
-        };
+        let ino = self
+            .lock_inodes()
+            .map(|mut inodes| {
+                if lookup {
+                    inodes.lookup_with_identity(path, metadata.file_id.as_deref())
+                } else {
+                    inodes.ensure_with_identity(path, metadata.file_id.as_deref())
+                }
+            })
+            .unwrap_or(ROOT_INO);
         let kind = file_type_for_kind(&metadata.kind);
         let perm = match kind {
             FileType::Directory => {
@@ -469,13 +738,21 @@ impl RemoteFuseFs {
         if let Some(entries) = self.cache.get_dir(path) {
             return Ok(entries);
         }
-        let entries = self
-            .tokio
-            .block_on(self.client.list_dir(path))
-            .map_err(|_| Errno::EIO)?
-            .ok_or(Errno::ENOENT)?;
-        self.cache.put_dir(path, entries.clone());
-        Ok(entries)
+        for _ in 0..2 {
+            let generation = self.cache.directory_generation(path);
+            let entries = self
+                .tokio
+                .block_on(self.client.list_dir(path))
+                .map_err(|_| Errno::EIO)?
+                .ok_or(Errno::ENOENT)?;
+            if self
+                .cache
+                .put_dir_if_generation(path, generation, entries.clone())
+            {
+                return Ok(entries);
+            }
+        }
+        Err(Errno::EAGAIN)
     }
 
     fn stat_path(&self, path: &str) -> FuseResult<Option<RemoteMetadata>> {
@@ -542,8 +819,8 @@ impl RemoteFuseFs {
         Ok(Some(RemoteMetadata {
             kind: "file".to_string(),
             size_bytes: state.buffer.len() as u64,
-            file_id: None,
-            link_count: 1,
+            file_id: state.file_id.clone(),
+            link_count: state.link_count.max(1),
             link_target: None,
             content_hash: Some(content_hash_for_bytes(&state.buffer)),
             executable: state.executable,
@@ -595,8 +872,8 @@ impl RemoteFuseFs {
         Ok(Some(RemoteMetadata {
             kind: "file".to_string(),
             size_bytes: state.buffer.len() as u64,
-            file_id: None,
-            link_count: 1,
+            file_id: state.file_id.clone(),
+            link_count: state.link_count.max(1),
             link_target: None,
             content_hash: Some(content_hash_for_bytes(&state.buffer)),
             executable: state.executable,
@@ -692,7 +969,9 @@ impl RemoteFuseFs {
                     // The cached fingerprint can be up to ATTR_TTL stale, so
                     // budget enough attempts to converge under write churn.
                     std::thread::sleep(retry_delay);
-                    retry_delay = retry_delay.saturating_mul(2).min(Duration::from_millis(100));
+                    retry_delay = retry_delay
+                        .saturating_mul(2)
+                        .min(Duration::from_millis(100));
                     self.cache.invalidate(path);
                     let refreshed = self.stat_path_attributes(path)?.ok_or(Errno::ENOENT)?;
                     fingerprint = range_fingerprint(&refreshed);
@@ -710,6 +989,8 @@ impl RemoteFuseFs {
         base_content_hash: Option<String>,
         executable: bool,
         created: bool,
+        file_id: Option<String>,
+        link_count: u64,
     ) -> FuseResult<u64> {
         let mut handles = self.lock_handles()?;
         if handles.files.len() >= MAX_OPEN_HANDLES {
@@ -721,8 +1002,12 @@ impl RemoteFuseFs {
             fh,
             FileState {
                 path: path.to_string(),
+                file_id,
+                link_count,
+                unlinked: false,
                 buffer: initial,
                 executable,
+                base_executable: if created { false } else { executable },
                 created,
                 dirty: false,
                 loaded,
@@ -744,10 +1029,16 @@ impl RemoteFuseFs {
         if !state.dirty {
             return Ok(());
         }
+        if state.unlinked {
+            if let Some(handle) = self.lock_handles()?.files.get_mut(&fh) {
+                handle.dirty = false;
+            }
+            return Ok(());
+        }
 
         self.flush_namespace()?;
         let next_content_hash = content_hash_for_bytes(&state.buffer);
-        if state.executable {
+        if state.executable != state.base_executable {
             self.flush_writes()?;
             let lease = self
                 .tokio
@@ -761,7 +1052,7 @@ impl RemoteFuseFs {
             let result = self.tokio.block_on(self.client.write_file(
                 &state.path,
                 &state.buffer,
-                true,
+                state.executable,
                 &lease,
                 surface,
                 VFS_OPERATION_WRITE_THROUGH,
@@ -781,15 +1072,15 @@ impl RemoteFuseFs {
                 .map_err(|_| Errno::EIO)?;
         }
 
-        self.cache.invalidate(&state.path);
+        self.invalidate_inode_aliases(&state.path);
         self.cache.put_file(
             &state.path,
             state.buffer.clone(),
             Some(RemoteMetadata {
                 kind: "file".to_string(),
                 size_bytes: state.buffer.len() as u64,
-                file_id: None,
-                link_count: 1,
+                file_id: state.file_id.clone(),
+                link_count: state.link_count.max(1),
                 link_target: None,
                 content_hash: Some(next_content_hash.clone()),
                 executable: state.executable,
@@ -799,6 +1090,7 @@ impl RemoteFuseFs {
         if let Some(handle) = self.lock_handles()?.files.get_mut(&fh) {
             handle.loaded = true;
             handle.base_content_hash = Some(next_content_hash);
+            handle.base_executable = state.executable;
             if handle.revision == state.revision {
                 handle.dirty = false;
             }
@@ -878,8 +1170,8 @@ impl RemoteFuseFs {
                 let metadata = RemoteMetadata {
                     kind: "file".to_string(),
                     size_bytes: size,
-                    file_id: None,
-                    link_count: 1,
+                    file_id: state.file_id.clone(),
+                    link_count: state.link_count.max(1),
                     link_target: None,
                     content_hash: Some(content_hash_for_bytes(&state.buffer)),
                     executable: state.executable,
@@ -923,7 +1215,7 @@ impl RemoteFuseFs {
             let _ = self.tokio.block_on(self.client.release_lease(&lease));
             write_result.map_err(|_| Errno::EIO)?;
         }
-        self.cache.invalidate(path);
+        self.invalidate_inode_aliases(path);
         let metadata = RemoteMetadata {
             kind: "file".to_string(),
             size_bytes: size,
@@ -1166,6 +1458,20 @@ impl RemoteFuseFs {
         lock_owner.0.to_string()
     }
 
+    fn advisory_lock_namespace(namespace: LockNamespace) -> &'static str {
+        match namespace {
+            LockNamespace::Posix => "posix",
+            LockNamespace::Flock => "flock",
+        }
+    }
+
+    fn advisory_lock_range(namespace: LockNamespace, start: u64, end: u64) -> (u64, u64) {
+        match namespace {
+            LockNamespace::Posix => (start, end),
+            LockNamespace::Flock => (0, u64::MAX),
+        }
+    }
+
     fn advisory_lock_kind(typ: i32) -> FuseResult<&'static str> {
         match typ {
             value if value == i32::from(libc::F_RDLCK) => Ok("read"),
@@ -1189,34 +1495,38 @@ impl RemoteFuseFs {
         &self,
         ino: INodeNo,
         lock_owner: fuser::LockOwner,
+        namespace: LockNamespace,
     ) -> FuseResult<()> {
         let owner = self.advisory_lock_owner_key(lock_owner);
-        let file_id = self
-            .active_lock_owners
-            .lock()
-            .map(|owners| {
-                owners
-                    .get(&owner)
-                    .and_then(|files| files.get(&ino.0))
-                    .cloned()
-            })
-            .map_err(|_| Errno::EIO)?;
+        let owner_key = (namespace, owner.clone());
+        // Closing the local file description ends this process's ownership even
+        // when the gateway release RPC is temporarily unavailable. Remove the
+        // heartbeat source first so a failed close cannot renew an abandoned
+        // remote lock forever; the persisted lease then expires naturally.
+        let file_id = {
+            let mut active = self.active_lock_owners.lock().map_err(|_| Errno::EIO)?;
+            take_active_advisory_lock_file_id(&mut active, &owner_key, ino.0)
+        };
         let Some(file_id) = file_id else {
             return Ok(());
         };
+        self.release_remote_advisory_lock_identity(&owner, &file_id, namespace)
+    }
+
+    fn release_remote_advisory_lock_identity(
+        &self,
+        owner: &str,
+        file_id: &str,
+        namespace: LockNamespace,
+    ) -> FuseResult<()> {
         self.tokio
-            .block_on(
-                self.client
-                    .release_advisory_lock_owner(&self.mount_id, &owner, &file_id),
-            )
+            .block_on(self.client.release_advisory_lock_owner(
+                &self.mount_id,
+                owner,
+                file_id,
+                Self::advisory_lock_namespace(namespace),
+            ))
             .map_err(|error| Self::advisory_lock_error(&error))?;
-        let mut active = self.active_lock_owners.lock().map_err(|_| Errno::EIO)?;
-        if let Some(files) = active.get_mut(&owner) {
-            files.remove(&ino.0);
-            if files.is_empty() {
-                active.remove(&owner);
-            }
-        }
         Ok(())
     }
 
@@ -1224,17 +1534,23 @@ impl RemoteFuseFs {
         &self,
         ino: INodeNo,
         lock_owner: fuser::LockOwner,
+        namespace: LockNamespace,
         start: u64,
         end: u64,
         typ: i32,
         pid: u32,
         sleep: bool,
-    ) -> FuseResult<()> {
+        cancellation: Option<&LockWaitCancellation>,
+    ) -> FuseResult<Option<String>> {
         let path = self.path_for_ino(ino)?;
         let owner = self.advisory_lock_owner_key(lock_owner);
+        let (start, end) = Self::advisory_lock_range(namespace, start, end);
         let kind = Self::advisory_lock_kind(typ)?;
         let deadline = Instant::now() + ADVISORY_LOCK_BLOCK_TIMEOUT;
         loop {
+            if cancellation.is_some_and(LockWaitCancellation::is_cancelled) {
+                return Err(Errno::EINTR);
+            }
             let response = self
                 .tokio
                 .block_on(self.client.advisory_lock(
@@ -1242,6 +1558,7 @@ impl RemoteFuseFs {
                     &path,
                     &self.mount_id,
                     &owner,
+                    Self::advisory_lock_namespace(namespace),
                     start,
                     end,
                     kind,
@@ -1249,21 +1566,22 @@ impl RemoteFuseFs {
                 ))
                 .map_err(|error| Self::advisory_lock_error(&error))?;
             if response.acquired {
-                if kind != "unlock" {
-                    let file_id = response.file_id.ok_or(Errno::EIO)?;
-                    self.active_lock_owners
-                        .lock()
-                        .map_err(|_| Errno::EIO)?
-                        .entry(owner)
-                        .or_default()
-                        .insert(ino.0, file_id);
-                }
-                return Ok(());
+                return if kind == "unlock" {
+                    Ok(None)
+                } else {
+                    response.file_id.map(Some).ok_or(Errno::EIO)
+                };
             }
             if !sleep || Instant::now() >= deadline {
                 return Err(Errno::EAGAIN);
             }
-            std::thread::sleep(ADVISORY_LOCK_RETRY_DELAY);
+            if let Some(cancellation) = cancellation {
+                if cancellation.wait_cancelled(ADVISORY_LOCK_RETRY_DELAY) {
+                    return Err(Errno::EINTR);
+                }
+            } else {
+                std::thread::sleep(ADVISORY_LOCK_RETRY_DELAY);
+            }
         }
     }
 }
@@ -1337,14 +1655,17 @@ impl RemoteFuseFs {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
+    use std::time::Duration;
+
     use chevalier_sandbox::vfs::VfsMetadata as RemoteMetadata;
-    use fuser::InitFlags;
+    use fuser::{InitFlags, LockNamespace};
     use tokio::runtime::Builder;
 
     use super::super::client::RemoteVfsClient;
     use super::{
-        InodeTable, ROOT_INO, RemoteFuseFs, content_hash_conflicts, content_hash_for_bytes,
-        range_fingerprint,
+        ActiveAdvisoryLocks, InodeTable, LockWaitCancellation, ROOT_INO, RemoteFuseFs,
+        active_advisory_lock_identities, combine_flush_and_lock_cleanup, content_hash_conflicts,
+        content_hash_for_bytes, range_fingerprint, take_active_advisory_lock_file_id,
     };
 
     #[test]
@@ -1377,6 +1698,98 @@ mod tests {
             InitFlags::FUSE_AUTO_INVAL_DATA
                 | InitFlags::FUSE_POSIX_LOCKS
                 | InitFlags::FUSE_FLOCK_LOCKS
+        );
+    }
+
+    #[test]
+    fn failed_remote_release_cannot_leave_an_abandoned_lock_heartbeat_active() {
+        let mut active = ActiveAdvisoryLocks::new();
+        let owner_key = (LockNamespace::Posix, "42".to_string());
+        active
+            .entry(owner_key.clone())
+            .or_default()
+            .insert(77, "stable-file-77".to_string());
+        active
+            .entry((LockNamespace::Flock, "84".to_string()))
+            .or_default()
+            .insert(88, "stable-file-88".to_string());
+
+        assert_eq!(
+            take_active_advisory_lock_file_id(&mut active, &owner_key, 77).as_deref(),
+            Some("stable-file-77")
+        );
+        let identities = active_advisory_lock_identities(&active);
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].lock_owner, "84");
+        assert_eq!(identities[0].namespace, "flock");
+        assert_eq!(identities[0].file_id, "stable-file-88");
+    }
+
+    #[test]
+    fn close_cleanup_runs_without_masking_the_primary_flush_error() {
+        assert_eq!(
+            combine_flush_and_lock_cleanup(
+                "test",
+                Err(fuser::Errno::ENOSPC),
+                Err(fuser::Errno::EIO),
+            )
+            .unwrap_err()
+            .code(),
+            libc::ENOSPC
+        );
+        assert_eq!(
+            combine_flush_and_lock_cleanup("test", Ok(()), Err(fuser::Errno::EIO))
+                .unwrap_err()
+                .code(),
+            libc::EIO
+        );
+        assert_eq!(
+            combine_flush_and_lock_cleanup("test", Err(fuser::Errno::ENOSPC), Ok(()))
+                .unwrap_err()
+                .code(),
+            libc::ENOSPC
+        );
+    }
+
+    #[test]
+    fn lock_wait_cancellation_serializes_with_completion() {
+        let cancelled = LockWaitCancellation::new();
+        assert!(cancelled.cancel());
+        assert!(!cancelled.finish());
+        assert!(cancelled.wait_cancelled(Duration::ZERO));
+
+        let completed = LockWaitCancellation::new();
+        assert!(completed.finish());
+        assert!(!completed.cancel());
+        assert!(!completed.wait_cancelled(Duration::ZERO));
+    }
+
+    #[test]
+    fn open_handles_track_executable_mode_transitions_in_both_directions() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let client =
+            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
+        let fs = RemoteFuseFs::new(client, false, "test-scope", runtime.handle().clone());
+        let executable_existing = fs
+            .next_handle("existing", Vec::new(), true, None, true, false, None, 1)
+            .unwrap();
+        let executable_created = fs
+            .next_handle("created", Vec::new(), true, None, true, true, None, 1)
+            .unwrap();
+
+        let mut handles = fs.lock_handles().unwrap();
+        let existing = handles.files.get_mut(&executable_existing).unwrap();
+        assert_eq!(existing.executable, existing.base_executable);
+        existing.executable = false;
+        assert_ne!(
+            existing.executable, existing.base_executable,
+            "chmod -x must require a mode-carrying write-through"
+        );
+
+        let created = handles.files.get(&executable_created).unwrap();
+        assert_ne!(
+            created.executable, created.base_executable,
+            "a newly created executable has no executable gateway baseline"
         );
     }
 
@@ -1431,6 +1844,75 @@ mod tests {
     }
 
     #[test]
+    fn inode_table_uses_one_inode_for_all_paths_of_stable_identity() {
+        let mut table = InodeTable::new();
+        let source = table.lookup_with_identity("source", Some("inode-1"));
+        let alias = table.lookup_with_identity("nested/alias", Some("inode-1"));
+        assert_eq!(source, alias);
+        assert_eq!(
+            table.aliases_for_path("source"),
+            vec!["nested/alias".to_string(), "source".to_string()]
+        );
+
+        table.detach_exact("source");
+        assert_eq!(table.path(alias).as_deref(), Some("nested/alias"));
+        assert_eq!(table.ensure_with_identity("third", Some("inode-1")), alias);
+    }
+
+    #[test]
+    fn inode_table_late_identity_binding_keeps_created_source_and_link_alias_together() {
+        let mut table = InodeTable::new();
+        let source = table.lookup("source");
+
+        assert_eq!(
+            table.ensure_with_identity("source", Some("inode-after-publish")),
+            source
+        );
+        assert_eq!(
+            table.lookup_with_identity("alias", Some("inode-after-publish")),
+            source
+        );
+        assert_eq!(
+            table.aliases_for_path("source"),
+            vec!["alias".to_string(), "source".to_string()]
+        );
+    }
+
+    #[test]
+    fn dirty_open_unlinked_handle_is_never_published_by_deleted_path() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let client =
+            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
+        let fs = RemoteFuseFs::new(client, false, "test-scope", runtime.handle().clone());
+        let handle = fs
+            .next_handle(
+                "deleted",
+                b"private dirty bytes".to_vec(),
+                true,
+                Some(content_hash_for_bytes(b"committed")),
+                false,
+                false,
+                Some("inode-1".to_string()),
+                0,
+            )
+            .unwrap();
+        {
+            let mut handles = fs.lock_handles().unwrap();
+            let state = handles.files.get_mut(&handle).unwrap();
+            state.dirty = true;
+            state.unlinked = true;
+        }
+
+        fs.flush_handle(handle)
+            .expect("unlinked flush is a local lifetime barrier");
+        let handles = fs.lock_handles().unwrap();
+        let state = handles.files.get(&handle).unwrap();
+        assert!(!state.dirty);
+        assert_eq!(state.path, "deleted");
+        assert_eq!(state.buffer, b"private dirty bytes");
+    }
+
+    #[test]
     fn content_hash_conflict_requires_two_different_known_hashes() {
         assert!(content_hash_conflicts(Some("base"), Some("current")));
         assert!(!content_hash_conflicts(Some("same"), Some("same")));
@@ -1476,6 +1958,8 @@ mod tests {
                 committed_metadata.content_hash.clone(),
                 false,
                 false,
+                None,
+                1,
             )
             .unwrap();
         {
@@ -1545,6 +2029,8 @@ mod tests {
                 Some(content_hash_for_bytes(&content)),
                 false,
                 false,
+                None,
+                1,
             )
             .unwrap();
 
@@ -1568,7 +2054,7 @@ mod tests {
         let path = "new-file.txt";
         let bytes = b"new file contents".to_vec();
         let writer = fs
-            .next_handle(path, bytes.clone(), true, None, false, true)
+            .next_handle(path, bytes.clone(), true, None, false, true, None, 1)
             .unwrap();
         {
             let mut handles = fs.lock_handles().unwrap();
@@ -1598,7 +2084,7 @@ mod tests {
         let path = "git-meta/config.lock";
         let bytes = b"created contents".to_vec();
         let writer = fs
-            .next_handle(path, bytes.clone(), true, None, false, true)
+            .next_handle(path, bytes.clone(), true, None, false, true, None, 1)
             .unwrap();
         {
             let mut handles = fs.lock_handles().unwrap();
@@ -1761,8 +2247,8 @@ impl RemoteFuseFs {
                             &RemoteMetadata {
                                 kind: "file".to_string(),
                                 size_bytes: state.buffer.len() as u64,
-                                file_id: None,
-                                link_count: 1,
+                                file_id: state.file_id.clone(),
+                                link_count: state.link_count.max(1),
                                 link_target: None,
                                 content_hash: state.base_content_hash,
                                 executable: state.executable,
@@ -1911,7 +2397,14 @@ impl RemoteFuseFs {
                 // later); dot entries never do.
                 let mut attr = self.attr_for_path(&entry_path, &metadata, !dot_entry);
                 attr.ino = entry_ino;
-                if reply.add(entry_ino, (index + 1) as u64, name, &TTL, &attr, Generation(0)) {
+                if reply.add(
+                    entry_ino,
+                    (index + 1) as u64,
+                    name,
+                    &TTL,
+                    &attr,
+                    Generation(0),
+                ) {
                     break;
                 }
             }
@@ -1950,6 +2443,8 @@ impl RemoteFuseFs {
                 base_content_hash,
                 metadata.executable,
                 false,
+                metadata.file_id.clone(),
+                metadata.link_count,
             )?;
             if dirty {
                 let mut handles = self.lock_handles()?;
@@ -2042,10 +2537,10 @@ impl RemoteFuseFs {
         lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
-        match self
-            .flush_handle_immediate(fh.0)
-            .and_then(|()| self.release_advisory_lock_owner(ino, lock_owner))
-        {
+        let flush_result = self.flush_handle_immediate(fh.0);
+        let cleanup_result =
+            self.release_advisory_lock_owner(ino, lock_owner, LockNamespace::Posix);
+        match combine_flush_and_lock_cleanup("flush", flush_result, cleanup_result) {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(err),
         }
@@ -2067,16 +2562,17 @@ impl RemoteFuseFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let flush_result = self
-            .flush_handle_immediate(fh.0)
-            .and_then(|()| match lock_owner {
-                Some(lock_owner) => self.release_advisory_lock_owner(ino, lock_owner),
-                None => Ok(()),
-            });
+        let flush_result = self.flush_handle_immediate(fh.0);
+        let cleanup_result = match lock_owner {
+            Some(lock_owner) => {
+                self.release_advisory_lock_owner(ino, lock_owner, LockNamespace::Flock)
+            }
+            None => Ok(()),
+        };
         let _ = self
             .lock_handles()
             .map(|mut handles| handles.files.remove(&fh.0));
-        match flush_result {
+        match combine_flush_and_lock_cleanup("release", flush_result, cleanup_result) {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(err),
         }
@@ -2088,6 +2584,7 @@ impl RemoteFuseFs {
         ino: INodeNo,
         _fh: FileHandle,
         lock_owner: fuser::LockOwner,
+        namespace: LockNamespace,
         start: u64,
         end: u64,
         typ: i32,
@@ -2097,6 +2594,7 @@ impl RemoteFuseFs {
         let result = (|| {
             let path = self.path_for_ino(ino)?;
             let owner = self.advisory_lock_owner_key(lock_owner);
+            let (start, end) = Self::advisory_lock_range(namespace, start, end);
             let kind = Self::advisory_lock_kind(typ)?;
             if kind == "unlock" {
                 return Err(Errno::EINVAL);
@@ -2107,6 +2605,7 @@ impl RemoteFuseFs {
                     &path,
                     &self.mount_id,
                     &owner,
+                    Self::advisory_lock_namespace(namespace),
                     start,
                     end,
                     kind,
@@ -2148,15 +2647,59 @@ impl RemoteFuseFs {
         ino: INodeNo,
         _fh: FileHandle,
         lock_owner: fuser::LockOwner,
+        namespace: LockNamespace,
         start: u64,
         end: u64,
         typ: i32,
         pid: u32,
         sleep: bool,
+        cancellation: Option<&LockWaitCancellation>,
         reply: ReplyEmpty,
     ) {
-        match self.set_advisory_lock(ino, lock_owner, start, end, typ, pid, sleep) {
-            Ok(()) => reply.ok(),
+        let result = self.set_advisory_lock(
+            ino,
+            lock_owner,
+            namespace,
+            start,
+            end,
+            typ,
+            pid,
+            sleep,
+            cancellation,
+        );
+        if cancellation.is_some_and(|cancellation| !cancellation.finish()) {
+            if let Ok(Some(file_id)) = result {
+                let owner = self.advisory_lock_owner_key(lock_owner);
+                if let Err(error) =
+                    self.release_remote_advisory_lock_identity(&owner, &file_id, namespace)
+                {
+                    tracing::warn!(
+                        ?error,
+                        "failed to release advisory lock acquired by a cancelled waiter"
+                    );
+                }
+            }
+            reply.error(Errno::EINTR);
+            return;
+        }
+        match result {
+            Ok(file_id) => {
+                if let Some(file_id) = file_id {
+                    let owner_key = (namespace, self.advisory_lock_owner_key(lock_owner));
+                    let inserted =
+                        self.active_lock_owners
+                            .lock()
+                            .map_err(|_| Errno::EIO)
+                            .map(|mut active| {
+                                active.entry(owner_key).or_default().insert(ino.0, file_id);
+                            });
+                    if let Err(error) = inserted {
+                        reply.error(error);
+                        return;
+                    }
+                }
+                reply.ok();
+            }
             Err(error) => reply.error(error),
         }
     }
@@ -2233,11 +2776,50 @@ impl RemoteFuseFs {
         let result: FuseResult<()> = (|| {
             let parent_path = self.path_for_ino(parent)?;
             let path = Self::child_path(parent_path.as_str(), name)?;
+            // Publish pre-unlink dirty bytes while the pathname still exists.
+            // Later writes on the open handle can then target an authoritative
+            // surviving alias without resurrecting this name.
+            self.flush_handles_for_path(&path)?;
+            let metadata = self.stat_path_attributes(&path)?;
+            let local_alias = self
+                .lock_inodes()?
+                .aliases_for_path(&path)
+                .into_iter()
+                .find(|alias| alias != &path);
             self.commit_namespace(VfsNamespaceMutation::DeleteFile {
                 path: path.clone(),
                 precondition: None,
             })?;
+            let surviving_alias = match (
+                local_alias,
+                metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.file_id.as_deref()),
+                metadata.as_ref().map(|metadata| metadata.link_count),
+            ) {
+                (Some(alias), _, _) => Some(alias),
+                (None, Some(file_id), Some(link_count)) if link_count > 1 => self
+                    .tokio
+                    .block_on(self.client.find_hard_link_alias(file_id, &path))
+                    .map_err(|_| Errno::EIO)?,
+                _ => None,
+            };
             self.cache.invalidate(&path);
+            if let Ok(mut handles) = self.lock_handles() {
+                for state in handles
+                    .files
+                    .values_mut()
+                    .filter(|state| state.path == path)
+                {
+                    if let Some(alias) = surviving_alias.as_ref() {
+                        state.path = alias.clone();
+                        state.link_count = state.link_count.saturating_sub(1).max(1);
+                    } else {
+                        state.unlinked = true;
+                        state.link_count = 0;
+                    }
+                }
+            }
             self.detach_inode_path(&path);
             Ok(())
         })();
@@ -2276,11 +2858,46 @@ impl RemoteFuseFs {
             let newparent_path = self.path_for_ino(newparent)?;
             let from = Self::child_path(parent_path.as_str(), name)?;
             let to = Self::child_path(newparent_path.as_str(), newname)?;
+            if from == to {
+                return Ok(());
+            }
             self.flush_handles_for_subtree(&from)?;
+            self.flush_handles_for_subtree(&to)?;
+            let replaced_metadata = self.stat_path_attributes(&to)?;
+            let local_replaced_alias = self
+                .lock_inodes()?
+                .aliases_for_path(&to)
+                .into_iter()
+                .find(|alias| alias != &to);
             self.commit_namespace(VfsNamespaceMutation::Rename {
                 from: from.clone(),
                 to: to.clone(),
             })?;
+            let replaced_alias = match (
+                local_replaced_alias,
+                replaced_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.file_id.as_deref()),
+                replaced_metadata
+                    .as_ref()
+                    .map(|metadata| metadata.link_count),
+            ) {
+                (Some(alias), _, _) => Some(alias),
+                (None, Some(file_id), Some(link_count)) if link_count > 1 => self
+                    .tokio
+                    .block_on(self.client.find_hard_link_alias(file_id, &to))
+                    .map_err(|_| Errno::EIO)?,
+                _ => None,
+            };
+            if let Ok(mut handles) = self.lock_handles() {
+                for state in handles.files.values_mut().filter(|state| state.path == to) {
+                    if let Some(alias) = replaced_alias.as_ref() {
+                        state.path = alias.clone();
+                    } else {
+                        state.unlinked = true;
+                    }
+                }
+            }
             self.rename_inode_path(&from, &to);
             self.cache.invalidate(&from);
             self.cache.invalidate(&to);
@@ -2314,33 +2931,47 @@ impl RemoteFuseFs {
             if source_metadata.kind != "file" {
                 return Err(Errno::EPERM);
             }
-            let bytes = self
+            let surface = self.surface_kind_for_path(&destination);
+            let lease = self
                 .tokio
-                .block_on(self.client.read_file_raw(&source))
-                .map_err(|_| Errno::EIO)?
-                .ok_or(Errno::ENOENT)?;
-            self.mutate_namespace(&destination, |lease, surface| {
-                self.tokio.block_on(self.client.write_file(
-                    &destination,
-                    &bytes,
-                    source_metadata.executable,
-                    lease,
-                    surface,
-                    VFS_OPERATION_LINK,
-                    None,
-                ))
-            })?;
-            let metadata = self.stat_path(&destination)?.unwrap_or(RemoteMetadata {
-                kind: "file".to_string(),
-                size_bytes: bytes.len() as u64,
-                file_id: source_metadata.file_id,
-                link_count: source_metadata.link_count,
-                link_target: None,
-                content_hash: source_metadata.content_hash,
-                executable: source_metadata.executable,
-                updated_at: source_metadata.updated_at,
-            });
-            Ok(self.attr_for_path(&destination, &metadata, true))
+                .block_on(
+                    self.client
+                        .acquire_lease(&destination, 1, "create vfs hard link"),
+                )
+                .map_err(|_| Errno::EIO)?;
+            let response = self.tokio.block_on(self.client.create_hard_link(
+                &source,
+                &destination,
+                &lease,
+                surface,
+            ));
+            let _ = self.tokio.block_on(self.client.release_lease(&lease));
+            let response = response.map_err(|_| Errno::EIO)?;
+            if let Some(file_id) = response.source.file_id.as_deref() {
+                self.cache.invalidate_identity(file_id);
+                // A freshly created file first entered the inode table before
+                // the gateway assigned its stable identity. Bind that existing
+                // inode before allocating the destination attr so both names
+                // are returned to the kernel as one hard-linked inode.
+                self.lock_inodes()?
+                    .ensure_with_identity(&source, Some(file_id));
+            }
+            self.cache.invalidate(&source);
+            self.cache.invalidate(&destination);
+            self.cache.put_metadata(&source, response.source);
+            self.cache
+                .put_metadata(&destination, response.destination.clone());
+            if let Ok(mut handles) = self.lock_handles() {
+                for state in handles
+                    .files
+                    .values_mut()
+                    .filter(|state| state.path == source)
+                {
+                    state.file_id = response.destination.file_id.clone();
+                    state.link_count = response.destination.link_count;
+                }
+            }
+            Ok(self.attr_for_path(&destination, &response.destination, true))
         })();
         match result {
             Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
@@ -2371,7 +3002,16 @@ impl RemoteFuseFs {
                 updated_at: None,
             };
             let attr = self.attr_for_path(&path, &metadata, true);
-            let fh = self.next_handle(&path, Vec::new(), true, None, metadata.executable, true)?;
+            let fh = self.next_handle(
+                &path,
+                Vec::new(),
+                true,
+                None,
+                metadata.executable,
+                true,
+                metadata.file_id.clone(),
+                metadata.link_count,
+            )?;
             if let Ok(mut handles) = self.lock_handles()
                 && let Some(state) = handles.files.get_mut(&fh)
             {

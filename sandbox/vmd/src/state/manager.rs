@@ -1734,19 +1734,19 @@ impl Manager {
         };
         if !params.pci_device_ids.is_empty() {
             if matches!(&params.source.source_type, VmSourceType::Snapshot) {
-                let _ = fs::remove_dir_all(&vm_dir);
+                let _ = remove_vm_dir_if_detached(&id, &vm_dir);
                 return Err(ManagerError::Other(anyhow!(
                     "PCI devices cannot be assigned while creating from a snapshot"
                 )));
             }
             if let Err(error) = self.ensure_pci_compatible(&meta) {
-                let _ = fs::remove_dir_all(&vm_dir);
+                let _ = remove_vm_dir_if_detached(&id, &vm_dir);
                 return Err(error);
             }
             meta.pci_devices = match self.reserve_pci_devices(&id, &params.pci_device_ids).await {
                 Ok(assignments) => assignments,
                 Err(error) => {
-                    let _ = fs::remove_dir_all(&vm_dir);
+                    let _ = remove_vm_dir_if_detached(&id, &vm_dir);
                     return Err(error);
                 }
             };
@@ -1759,7 +1759,7 @@ impl Manager {
 
         if let Err(error) = save_metadata(&vm_dir, &mut meta) {
             self.release_pci_leases(&id, &meta.pci_devices).await;
-            let _ = fs::remove_dir_all(&vm_dir);
+            let _ = remove_vm_dir_if_detached(&id, &vm_dir);
             return Err(ManagerError::Other(error));
         }
 
@@ -1770,7 +1770,7 @@ impl Manager {
             .await
         {
             self.release_pci_leases(&id, &meta.pci_devices).await;
-            let _ = fs::remove_dir_all(&vm_dir);
+            let _ = remove_vm_dir_if_detached(&id, &vm_dir);
             return Err(error);
         }
         let mut vm_guard = vm.lock_owned().await;
@@ -1803,7 +1803,7 @@ impl Manager {
             Err(err) => {
                 self.vms.write().await.remove(&id);
                 self.release_pci_leases(&id, &meta.pci_devices).await;
-                let _ = fs::remove_dir_all(&vm_dir);
+                let _ = remove_vm_dir_if_detached(&id, &vm_dir);
                 return Err(err);
             }
         };
@@ -1812,7 +1812,7 @@ impl Manager {
         if let Err(err) = save_metadata(&vm.dir, &mut vm_guard.metadata) {
             self.vms.write().await.remove(&id);
             self.release_pci_leases(&id, &meta.pci_devices).await;
-            let _ = fs::remove_dir_all(&vm_dir);
+            let _ = remove_vm_dir_if_detached(&id, &vm_dir);
             return Err(ManagerError::Other(err));
         }
 
@@ -1905,6 +1905,15 @@ impl Manager {
                 return Err(ManagerError::InvalidState);
             }
         }
+        cleanup_runtime_mounts(&vm)
+            .await
+            .with_context(|| format!("clean runtime mounts before deleting VM {id}"))
+            .map_err(ManagerError::Other)?;
+        fuse::unmount_active_mountpoints_under(&vm.dir.join("fuse-mounts"))
+            .await
+            .with_context(|| format!("retry path-only FUSE cleanup before deleting VM {id}"))
+            .map_err(ManagerError::Other)?;
+        ensure_vm_fuse_mounts_detached(id, &vm.dir).map_err(ManagerError::Other)?;
         let (runtime_dir, assignments) = {
             let inner = vm.lock().await;
             (
@@ -1919,7 +1928,7 @@ impl Manager {
                 .map_err(ManagerError::Other)?;
         }
 
-        fs::remove_dir_all(&vm.dir)?;
+        remove_vm_dir_if_detached(id, &vm.dir).map_err(ManagerError::Other)?;
         let _ = fs::remove_dir_all(runtime_dir);
         self.vms.write().await.remove(id);
         if let Some(session_id) = session_id {
@@ -3178,6 +3187,10 @@ impl Manager {
             )
         };
         let mut meta_snapshot = meta_snapshot;
+        cleanup_runtime_mounts(&vm)
+            .await
+            .with_context(|| format!("clean stale runtime mounts before starting VM {id}"))
+            .map_err(ManagerError::Other)?;
         if cleanup_stale_sidecars {
             cleanup_stale_runtime_sidecars(id, vm_dir.as_path(), runtime_dir.as_path()).await;
         }
@@ -3269,9 +3282,7 @@ impl Manager {
                         if vm_proxy_upstream_addr.is_some() {
                             let _ = network::unregister_vm_proxy_policy(id).await;
                         }
-                        for previous in &fuse_handles {
-                            let _ = fuse::unmount_fuse(previous).await;
-                        }
+                        cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
                         mark_vm_state(&vm, VmState::Error).await;
                         return Err(ManagerError::Other(err));
                     }
@@ -3304,9 +3315,7 @@ impl Manager {
                         for previous in &virtiofsd_handles {
                             virt::terminate_virtiofsd(previous);
                         }
-                        for previous in &fuse_handles {
-                            let _ = fuse::unmount_fuse(previous).await;
-                        }
+                        cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
                         mark_vm_state(&vm, VmState::Error).await;
                         return Err(ManagerError::Other(err));
                     }
@@ -3337,9 +3346,7 @@ impl Manager {
                 for handle in &virtiofsd_handles {
                     virt::terminate_virtiofsd(handle);
                 }
-                for handle in &fuse_handles {
-                    let _ = fuse::unmount_fuse(handle).await;
-                }
+                cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
                 mark_vm_state(&vm, VmState::Error).await;
                 return Err(ManagerError::Other(err));
             }
@@ -3354,9 +3361,7 @@ impl Manager {
                     for handle in &virtiofsd_handles {
                         virt::terminate_virtiofsd(handle);
                     }
-                    for handle in &fuse_handles {
-                        let _ = fuse::unmount_fuse(handle).await;
-                    }
+                    cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
                     mark_vm_state(&vm, VmState::Error).await;
                     return Err(ManagerError::Other(err));
                 }
@@ -3388,9 +3393,7 @@ impl Manager {
                     for handle in &virtiofsd_handles {
                         virt::terminate_virtiofsd(handle);
                     }
-                    for handle in &fuse_handles {
-                        let _ = fuse::unmount_fuse(handle).await;
-                    }
+                    cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
                     mark_vm_state(&vm, VmState::Error).await;
                     return Err(ManagerError::Other(err));
                 }
@@ -3417,9 +3420,7 @@ impl Manager {
                 for handle in &virtiofsd_handles {
                     virt::terminate_virtiofsd(handle);
                 }
-                for handle in &fuse_handles {
-                    let _ = fuse::unmount_fuse(handle).await;
-                }
+                cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
                 mark_vm_state(&vm, VmState::Error).await;
                 return Err(ManagerError::Other(err));
             }
@@ -3455,9 +3456,7 @@ impl Manager {
             for handle in &virtiofsd_handles {
                 virt::terminate_virtiofsd(handle);
             }
-            for handle in &fuse_handles {
-                let _ = fuse::unmount_fuse(handle).await;
-            }
+            cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
             mark_vm_state(&vm, VmState::Error).await;
             return Err(ManagerError::Other(err));
         }
@@ -3482,9 +3481,7 @@ impl Manager {
                 for handle in &virtiofsd_handles {
                     virt::terminate_virtiofsd(handle);
                 }
-                for handle in &fuse_handles {
-                    let _ = fuse::unmount_fuse(handle).await;
-                }
+                cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
                 mark_vm_state(&vm, VmState::Error).await;
                 return Err(ManagerError::Other(err));
             }
@@ -3507,9 +3504,7 @@ impl Manager {
                 for handle in &virtiofsd_handles {
                     virt::terminate_virtiofsd(handle);
                 }
-                for handle in &fuse_handles {
-                    let _ = fuse::unmount_fuse(handle).await;
-                }
+                cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
                 mark_vm_state(&vm, VmState::Error).await;
                 return Err(ManagerError::Other(err));
             }
@@ -3535,9 +3530,7 @@ impl Manager {
                     for handle in &virtiofsd_handles {
                         virt::terminate_virtiofsd(handle);
                     }
-                    for handle in &fuse_handles {
-                        let _ = fuse::unmount_fuse(handle).await;
-                    }
+                    cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
                     mark_vm_state(&vm, VmState::Error).await;
                     return Err(ManagerError::Other(err));
                 }
@@ -3556,9 +3549,7 @@ impl Manager {
                     for handle in &virtiofsd_handles {
                         virt::terminate_virtiofsd(handle);
                     }
-                    for handle in &fuse_handles {
-                        let _ = fuse::unmount_fuse(handle).await;
-                    }
+                    cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
                     let err = abort_launch(vm.clone(), child, &log_path, err).await;
                     if let Some(cgroup) = qemu_cgroup.take() {
                         cgroup.cleanup();
@@ -3590,9 +3581,7 @@ impl Manager {
                 for handle in &virtiofsd_handles {
                     virt::terminate_virtiofsd(handle);
                 }
-                for handle in &fuse_handles {
-                    let _ = fuse::unmount_fuse(handle).await;
-                }
+                cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
                 let err = abort_launch(vm.clone(), child, &log_path, err).await;
                 if let Some(cgroup) = qemu_cgroup.take() {
                     cgroup.cleanup();
@@ -3625,9 +3614,7 @@ impl Manager {
             for handle in &virtiofsd_handles {
                 virt::terminate_virtiofsd(handle);
             }
-            for handle in &fuse_handles {
-                let _ = fuse::unmount_fuse(handle).await;
-            }
+            cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
             let err = abort_launch(vm.clone(), child, &log_path, err).await;
             if let Some(cgroup) = qemu_cgroup.take() {
                 cgroup.cleanup();
@@ -3636,7 +3623,6 @@ impl Manager {
         }
 
         let child_pid = child.id();
-        cleanup_runtime_mounts(&vm).await;
         {
             let mut inner = vm.lock().await;
             inner.runtime.monitor = Some(monitor.clone());
@@ -3687,7 +3673,13 @@ impl Manager {
                         if vm_proxy_upstream_addr.is_some() {
                             let _ = network::unregister_vm_proxy_policy(id).await;
                         }
-                        cleanup_runtime_mounts(&vm).await;
+                        if let Err(cleanup_error) = cleanup_runtime_mounts(&vm).await {
+                            warn!(
+                                vm_id = %id,
+                                error = %cleanup_error,
+                                "failed cleaning runtime mounts after network registration failure"
+                            );
+                        }
                         mark_vm_state(&vm, VmState::Error).await;
                         return Err(ManagerError::Other(
                             err.context("failed to register vm process for network guardrails"),
@@ -3708,7 +3700,13 @@ impl Manager {
                 if vm_proxy_upstream_addr.is_some() {
                     let _ = network::unregister_vm_proxy_policy(id).await;
                 }
-                cleanup_runtime_mounts(&vm).await;
+                if let Err(cleanup_error) = cleanup_runtime_mounts(&vm).await {
+                    warn!(
+                        vm_id = %id,
+                        error = %cleanup_error,
+                        "failed cleaning runtime mounts after missing qemu pid"
+                    );
+                }
                 mark_vm_state(&vm, VmState::Error).await;
                 return Err(ManagerError::Other(anyhow!(
                     "failed to register vm process for network guardrails: missing qemu pid"
@@ -3907,7 +3905,10 @@ impl Manager {
             };
             if reclaimed {
                 let _ = network::unregister_vm_proxy_policy(id).await;
-                cleanup_runtime_mounts(&vm).await;
+                cleanup_runtime_mounts(&vm)
+                    .await
+                    .with_context(|| format!("clean runtime mounts while force-stopping VM {id}"))
+                    .map_err(ManagerError::Other)?;
                 // @dive: Attach/failover paths can invoke force-stop without local runtime bookkeeping; persist stopped state after reclaim.
                 mark_vm_state(&vm, VmState::Stopped).await;
             }
@@ -3943,7 +3944,14 @@ impl Manager {
             );
         }
         let vm = self.vm_by_id(id).await?;
-        cleanup_runtime_mounts(&vm).await;
+        if let Err(error) = cleanup_runtime_mounts(&vm).await {
+            warn!(
+                vm_id = %id,
+                error = %error,
+                reason = %reason,
+                "failed cleaning runtime mounts while marking VM error"
+            );
+        }
         {
             let mut inner = vm.lock().await;
             inner.runtime.state = VmState::Error;
@@ -5119,7 +5127,75 @@ async fn mark_vm_state(vm: &Arc<Vm>, state: VmState) {
     }
 }
 
-async fn cleanup_runtime_mounts(vm: &Arc<Vm>) {
+fn ensure_vm_fuse_mounts_detached(vm_id: &str, vm_dir: &Path) -> Result<()> {
+    let fuse_root = vm_dir.join("fuse-mounts");
+    let active = fuse::active_mountpoints_under(&fuse_root)?;
+    if active.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "refusing to remove VM {vm_id} directory while mountpoints remain active beneath {}: {}",
+        fuse_root.display(),
+        active
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn remove_vm_dir_if_detached(vm_id: &str, vm_dir: &Path) -> Result<()> {
+    remove_vm_dir_with_mount_probe(vm_id, vm_dir, |fuse_root| {
+        fuse::active_mountpoints_under(fuse_root)
+    })
+}
+
+fn remove_vm_dir_with_mount_probe<F>(vm_id: &str, vm_dir: &Path, mount_probe: F) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<Vec<PathBuf>>,
+{
+    if !vm_dir.exists() {
+        return Ok(());
+    }
+    let fuse_root = vm_dir.join("fuse-mounts");
+    let active = mount_probe(&fuse_root)?;
+    if !active.is_empty() {
+        bail!(
+            "refusing to remove VM {vm_id} directory while mountpoints remain active beneath {}: {}",
+            fuse_root.display(),
+            active
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    fs::remove_dir_all(vm_dir)
+        .with_context(|| format!("remove detached VM {vm_id} directory {}", vm_dir.display()))
+}
+
+async fn cleanup_unpublished_fuse_handles(vm_id: &str, handles: &[fuse::FuseHandle]) {
+    for handle in handles {
+        if let Err(error) = fuse::unmount_fuse(handle).await {
+            warn!(
+                vm_id = %vm_id,
+                mountpoint = %handle.mountpoint().display(),
+                error = %error,
+                "initial FUSE cleanup failed before runtime publication; retrying by pathname"
+            );
+            if let Err(retry_error) = fuse::unmount_fuse(handle).await {
+                warn!(
+                    vm_id = %vm_id,
+                    mountpoint = %handle.mountpoint().display(),
+                    error = %retry_error,
+                    "path-based FUSE cleanup retry failed; VM-directory deletion remains fenced"
+                );
+            }
+        }
+    }
+}
+
+async fn cleanup_runtime_mounts(vm: &Arc<Vm>) -> Result<()> {
     let (virtiofsd_handles, fuse_handles, tap_network) = {
         let mut inner = vm.lock().await;
         (
@@ -5134,8 +5210,24 @@ async fn cleanup_runtime_mounts(vm: &Arc<Vm>) {
     for handle in &virtiofsd_handles {
         virt::terminate_virtiofsd(handle);
     }
-    for handle in &fuse_handles {
-        let _ = fuse::unmount_fuse(handle).await;
+    let mut failed_handles = Vec::new();
+    let mut failures = Vec::new();
+    for handle in fuse_handles {
+        if let Err(error) = fuse::unmount_fuse(&handle).await {
+            failures.push(format!("{}: {error:#}", handle.mountpoint().display()));
+            failed_handles.push(handle);
+        }
+    }
+    if !failed_handles.is_empty() {
+        vm.lock().await.runtime.fuse_handles.extend(failed_handles);
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "failed unmounting VM FUSE filesystems: {}",
+            failures.join("; ")
+        )
     }
 }
 
@@ -5263,7 +5355,7 @@ fn spawn_exit_task(
         let wait_result = child.wait().await;
         let tail = read_log_tail(&log_path, 8192);
 
-        let (new_state, log_message, mut exit_error) = match wait_result {
+        let (mut new_state, mut log_message, mut exit_error) = match wait_result {
             Ok(status) if status.success() => (VmState::Stopped, None, None),
             Ok(status) => {
                 let err = anyhow!("qemu exited with status {status}");
@@ -5306,8 +5398,24 @@ fn spawn_exit_task(
             virt::terminate_virtiofsd(handle);
         }
         let fuse_handles = std::mem::take(&mut inner.runtime.fuse_handles);
-        for handle in &fuse_handles {
-            let _ = fuse::unmount_fuse(handle).await;
+        let mut failed_fuse_handles = Vec::new();
+        let mut unmount_failures = Vec::new();
+        for handle in fuse_handles {
+            if let Err(error) = fuse::unmount_fuse(&handle).await {
+                unmount_failures.push(format!("{}: {error:#}", handle.mountpoint().display()));
+                failed_fuse_handles.push(handle);
+            }
+        }
+        if !failed_fuse_handles.is_empty() {
+            inner.runtime.fuse_handles.extend(failed_fuse_handles);
+            let detail = format!(
+                "failed unmounting VM FUSE filesystems after qemu exit: {}",
+                unmount_failures.join("; ")
+            );
+            warn!(vm_id = %vm_id, error = %detail, "VM runtime cleanup remains retryable");
+            new_state = VmState::Error;
+            log_message = Some(detail.clone());
+            exit_error = Some(anyhow!(detail));
         }
         if let Some(handle) = inner.runtime.tap_network.take() {
             if tokio::time::timeout(Duration::from_secs(10), handle.shutdown())
@@ -8002,6 +8110,7 @@ mod tests {
             source_path: PathBuf::from("/tmp/runtimefs"),
             tag: "runtimefs".to_string(),
             read_only: true,
+            terminate_tx: None,
         }];
 
         let args = build_qemu_args(
@@ -8218,6 +8327,49 @@ mod tests {
             !fake_docker.with_extension("log").exists(),
             "explicit architecture should not invoke docker manifest/pull probes"
         );
+    }
+
+    #[test]
+    fn vm_dir_removal_fails_closed_then_retries_after_mount_detaches() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let vm_dir = tmp.path().join("vm-id");
+        let fuse_mount = vm_dir.join("fuse-mounts").join("workspace");
+        let sentinel = vm_dir.join("metadata.json");
+        fs::create_dir_all(&fuse_mount).expect("create fake mount path");
+        fs::write(&sentinel, b"must survive a live mount fence").expect("write sentinel");
+
+        let error =
+            remove_vm_dir_with_mount_probe("vm-id", &vm_dir, |_| Ok(vec![fuse_mount.clone()]))
+                .expect_err("live mount must fence recursive VM deletion");
+        assert!(error.to_string().contains("mountpoints remain active"));
+        assert!(sentinel.exists(), "fenced deletion must preserve VM data");
+        assert!(
+            vm_dir.exists(),
+            "fenced deletion must preserve the VM record directory"
+        );
+
+        remove_vm_dir_with_mount_probe("vm-id", &vm_dir, |_| Ok(Vec::new()))
+            .expect("retry after mount detaches");
+        assert!(
+            !vm_dir.exists(),
+            "detached retry should remove the disposable VM directory"
+        );
+    }
+
+    #[test]
+    fn vm_dir_removal_preserves_data_when_mount_probe_fails() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let vm_dir = tmp.path().join("vm-id");
+        let sentinel = vm_dir.join("metadata.json");
+        fs::create_dir_all(&vm_dir).expect("create VM directory");
+        fs::write(&sentinel, b"preserve").expect("write sentinel");
+
+        let error = remove_vm_dir_with_mount_probe("vm-id", &vm_dir, |_| {
+            Err(anyhow!("mountinfo unavailable"))
+        })
+        .expect_err("unknown mount state must fail closed");
+        assert!(error.to_string().contains("mountinfo unavailable"));
+        assert!(sentinel.exists(), "probe failure must preserve VM data");
     }
 
     #[cfg(unix)]

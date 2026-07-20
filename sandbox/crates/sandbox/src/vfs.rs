@@ -37,7 +37,7 @@ pub const VFS_OPERATION_MKDIR: &str = "vfs_mkdir";
 pub const VFS_OPERATION_UNLINK: &str = "vfs_unlink";
 pub const VFS_OPERATION_RMDIR: &str = "vfs_rmdir";
 pub const VFS_OPERATION_RENAME: &str = "vfs_rename";
-pub const VFS_OPERATION_LINK: &str = "vfs_link";
+pub const VFS_OPERATION_LINK: &str = "vfs_hard_link";
 pub const VFS_OPERATION_SYMLINK: &str = "vfs_symlink";
 pub const VFS_OPERATION_NAMESPACE_BATCH: &str = "vfs_namespace_batch";
 
@@ -99,6 +99,29 @@ pub struct VfsDeleteMetadataResponse {
 pub struct VfsRenameMetadataResponse {
     pub previous: Option<VfsMetadata>,
     pub current: Option<VfsMetadata>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsHardLinkBody {
+    pub source_path: String,
+    pub destination_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsHardLinkMetadataResponse {
+    pub source: VfsMetadata,
+    pub destination: VfsMetadata,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsHardLinkAliasBody {
+    pub file_id: String,
+    pub excluding_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsHardLinkAliasResponse {
+    pub path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -182,6 +205,10 @@ pub struct VfsSubtreeMetadataEntry {
     pub path: String,
     pub kind: String,
     pub size_bytes: u64,
+    #[serde(default)]
+    pub file_id: Option<String>,
+    #[serde(default = "default_vfs_link_count")]
+    pub link_count: u64,
     #[serde(default)]
     pub link_target: Option<String>,
     pub content_hash: Option<String>,
@@ -368,6 +395,15 @@ pub struct VfsSymlinkRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VfsHardLinkRequest {
+    pub owner_id: String,
+    pub source_path: String,
+    pub destination_path: String,
+    pub headers: VfsWriteHeaders,
+    pub scope: VfsWriteScope,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VfsLeaseAcquire {
     pub owner_id: String,
     pub path: String,
@@ -487,9 +523,11 @@ mod server {
         CHEVALIER_VFS_PRECONDITION_SECONDARY_FINGERPRINT_HEADER, CHEVALIER_VFS_REASON_HEADER,
         CHEVALIER_VFS_RESOURCE_KEY_HEADER, CHEVALIER_VFS_ROUTE_PREFIX, CHEVALIER_VFS_RUN_ID_HEADER,
         CHEVALIER_VFS_SURFACE_KIND_HEADER, DEFAULT_VFS_BODY_LIMIT_BYTES, VFS_COMPONENT_VM_RUNTIME,
-        VFS_ENTRY_KIND_FILE, VFS_OPERATION_MKDIR, VFS_OPERATION_NAMESPACE_BATCH,
-        VFS_OPERATION_RENAME, VFS_OPERATION_RMDIR, VFS_OPERATION_SYMLINK, VFS_OPERATION_UNLINK,
-        VFS_OPERATION_WRITE_THROUGH, VfsDeleteMetadataResponse, VfsDirEntry, VfsGatewayError,
+        VFS_ENTRY_KIND_FILE, VFS_OPERATION_LINK, VFS_OPERATION_MKDIR,
+        VFS_OPERATION_NAMESPACE_BATCH, VFS_OPERATION_RENAME, VFS_OPERATION_RMDIR,
+        VFS_OPERATION_SYMLINK, VFS_OPERATION_UNLINK, VFS_OPERATION_WRITE_THROUGH,
+        VfsDeleteMetadataResponse, VfsDirEntry, VfsGatewayError, VfsHardLinkAliasBody,
+        VfsHardLinkAliasResponse, VfsHardLinkBody, VfsHardLinkMetadataResponse, VfsHardLinkRequest,
         VfsHeaderAliases, VfsLeaseAcquire, VfsLeaseAcquireRequest, VfsLeaseGrant,
         VfsLeaseReleaseRequest, VfsListDirOptions, VfsMetadata, VfsMetadataManyRequest,
         VfsMetadataManyResponse, VfsNamespaceMutation, VfsNamespaceMutationBatchBody,
@@ -601,6 +639,24 @@ mod server {
         async fn create_symlink(&self, _request: VfsSymlinkRequest) -> VfsResult<()> {
             Err(VfsGatewayError::BadRequest(
                 "gateway backend does not support symlink creation".to_string(),
+            ))
+        }
+        async fn create_hard_link(
+            &self,
+            _request: VfsHardLinkRequest,
+        ) -> VfsResult<VfsHardLinkMetadataResponse> {
+            Err(VfsGatewayError::BadRequest(
+                "gateway backend does not support hard-link creation".to_string(),
+            ))
+        }
+        async fn find_hard_link_alias(
+            &self,
+            _owner_id: &str,
+            _file_id: &str,
+            _excluding_path: &str,
+        ) -> VfsResult<Option<String>> {
+            Err(VfsGatewayError::BadRequest(
+                "gateway backend does not support hard-link alias resolution".to_string(),
             ))
         }
         async fn rmdir(&self, request: VfsNamespaceMutationRequest) -> VfsResult<()>;
@@ -745,6 +801,14 @@ mod server {
             .route(
                 &format!("{prefix}/{{owner_id}}/symlink"),
                 put(put_symlink::<S, B>),
+            )
+            .route(
+                &format!("{prefix}/{{owner_id}}/hard-link/v1"),
+                post(post_hard_link::<S, B>),
+            )
+            .route(
+                &format!("{prefix}/{{owner_id}}/hard-link-alias/v1"),
+                post(post_hard_link_alias::<S, B>),
             )
             .route(
                 &format!("{prefix}/{{owner_id}}/rename"),
@@ -1214,6 +1278,73 @@ mod server {
         .await?;
         backend.rmdir(request).await?;
         Ok(StatusCode::NO_CONTENT)
+    }
+
+    async fn post_hard_link<S, B>(
+        State(backend): State<B>,
+        Path(owner_id): Path<String>,
+        headers: HeaderMap,
+        Json(body): Json<VfsHardLinkBody>,
+    ) -> VfsResult<Json<VfsHardLinkMetadataResponse>>
+    where
+        B: VfsGatewayBackend + FromRef<S>,
+        S: Clone + Send + Sync + 'static,
+    {
+        let source_path = required_path(Some(body.source_path.as_str()))?;
+        let destination_path = required_path(Some(body.destination_path.as_str()))?;
+        let source_scope = backend
+            .derive_write_scope(owner_id.as_str(), source_path)
+            .await?;
+        let destination_scope = backend
+            .derive_write_scope(owner_id.as_str(), destination_path)
+            .await?;
+        if source_scope.resource_key != destination_scope.resource_key {
+            return Err(VfsGatewayError::Conflict(
+                backend.cross_scope_rename_message(),
+            ));
+        }
+        let aliases = backend.header_aliases();
+        let write_headers = parse_write_headers(
+            &headers,
+            &aliases,
+            source_scope.default_surface_kind.as_str(),
+            VFS_OPERATION_LINK,
+        )?;
+        validate_declared_resource_key(&headers, &aliases, source_scope.resource_key.as_str())?;
+        backend
+            .create_hard_link(VfsHardLinkRequest {
+                owner_id,
+                source_path: source_path.to_string(),
+                destination_path: destination_path.to_string(),
+                headers: write_headers,
+                scope: source_scope,
+            })
+            .await
+            .map(Json)
+    }
+
+    async fn post_hard_link_alias<S, B>(
+        State(backend): State<B>,
+        Path(owner_id): Path<String>,
+        Json(body): Json<VfsHardLinkAliasBody>,
+    ) -> VfsResult<Json<VfsHardLinkAliasResponse>>
+    where
+        B: VfsGatewayBackend + FromRef<S>,
+        S: Clone + Send + Sync + 'static,
+    {
+        if body.file_id.trim().is_empty() {
+            return Err(VfsGatewayError::BadRequest(
+                "hard-link alias resolution requires file_id".to_string(),
+            ));
+        }
+        let path = backend
+            .find_hard_link_alias(
+                owner_id.as_str(),
+                body.file_id.as_str(),
+                body.excluding_path.as_str(),
+            )
+            .await?;
+        Ok(Json(VfsHardLinkAliasResponse { path }))
     }
 
     async fn namespace_mutation_request<B>(

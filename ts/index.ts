@@ -79,6 +79,8 @@ if (!vfsStorageProto[VFS_ERROR_PATCHED]) {
     "listDir",
     "mkdir",
     "createSymlink",
+    "createHardLink",
+    "findHardLinkAlias",
     "remove",
     "rmdir",
     "rename",
@@ -108,6 +110,7 @@ export { createVfsGatewayServer } from "./vfs-gateway-server.js";
 export type {
   VfsAdvisoryLock,
   VfsAdvisoryLockKind,
+  VfsAdvisoryLockNamespace,
   VfsAdvisoryLockStateStore,
   VfsAdvisoryLockTransactionResult,
   VfsGatewayServerOptions,

@@ -1,9 +1,11 @@
 import type { VfsStorage } from "./native.js";
 export type VfsAdvisoryLockKind = "read" | "write";
+export type VfsAdvisoryLockNamespace = "posix" | "flock";
 export type VfsAdvisoryLock = {
     ownerId: string;
     mountId: string;
     lockOwner: string;
+    namespace: VfsAdvisoryLockNamespace;
     fileId: string;
     start: bigint;
     end: bigint;
@@ -33,6 +35,9 @@ export interface VfsGatewayServerOptions {
     /** Shared transactional state for POSIX advisory locks. Production gateways
      *  with more than one process must provide a cross-process implementation. */
     advisoryLockState?: VfsAdvisoryLockStateStore;
+    /** Per-owner product policy gate for replica-local `.git` metadata.
+     *  Defaults to false, preserving the historical exclusion. */
+    allowGitMetadata?: (ownerId: string) => boolean | Promise<boolean>;
 }
 /** Build a WHATWG `(Request) => Promise<Response>` handler that serves chevalier's
  *  VFS gateway protocol, delegating storage to `resolveStore(ownerId)`. */

@@ -210,6 +210,12 @@ pub struct VfsMetadata {
     pub object_state: Option<VfsObjectState>,
 }
 
+#[napi(object)]
+pub struct VfsHardLinkResult {
+    pub source: VfsMetadata,
+    pub destination: VfsMetadata,
+}
+
 impl From<VfsStorageMetadata> for VfsMetadata {
     fn from(m: VfsStorageMetadata) -> Self {
         Self {
@@ -446,6 +452,36 @@ impl VfsStorage {
     pub async fn create_symlink(&self, path: String, target: String) -> napi::Result<()> {
         self.inner
             .create_symlink(&path, &target)
+            .await
+            .map_err(vfs_err)
+    }
+
+    /// Create a second pathname for one shared regular-file identity.
+    #[napi]
+    pub async fn create_hard_link(
+        &self,
+        source: String,
+        destination: String,
+    ) -> napi::Result<VfsHardLinkResult> {
+        let result = self
+            .inner
+            .create_hard_link(&source, &destination)
+            .await
+            .map_err(vfs_err)?;
+        Ok(VfsHardLinkResult {
+            source: result.source.into(),
+            destination: result.destination.into(),
+        })
+    }
+
+    #[napi]
+    pub async fn find_hard_link_alias(
+        &self,
+        file_id: String,
+        excluding_path: String,
+    ) -> napi::Result<Option<String>> {
+        self.inner
+            .find_hard_link_alias(&file_id, &excluding_path)
             .await
             .map_err(vfs_err)
     }

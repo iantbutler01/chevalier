@@ -39,7 +39,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, open, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import type { VfsStorage, VfsMetadata } from "./native.js";
 
 const DEFAULT_ROUTE_PREFIX = "/internal/chevalier/vfs";
@@ -50,13 +50,16 @@ const EXPECTED_CONTENT_HASH_HEADER = "x-chevalier-vfs-expected-content-sha256";
 const STREAM_UPLOAD_HEADER = "x-chevalier-vfs-stream-upload";
 const RANGE_FINGERPRINT_HEADER = "x-chevalier-vfs-range-fingerprint";
 const ADVISORY_LOCK_LEASE_MS = 45_000;
+const MAX_BATCH_ITEMS = 4096;
 
 export type VfsAdvisoryLockKind = "read" | "write";
+export type VfsAdvisoryLockNamespace = "posix" | "flock";
 
 export type VfsAdvisoryLock = {
   ownerId: string;
   mountId: string;
   lockOwner: string;
+  namespace: VfsAdvisoryLockNamespace;
   fileId: string;
   start: bigint;
   end: bigint;
@@ -82,15 +85,23 @@ export interface VfsAdvisoryLockStateStore {
 }
 
 type AdvisoryLockRequest = {
-  action: "get" | "set" | "release_owner" | "renew_mount" | "release_mount";
+  action: "get" | "set" | "release_owner" | "renew_owners" | "renew_mount" | "release_mount";
   path?: string;
   file_id?: string;
   mount_id?: string;
   lock_owner?: string;
+  namespace?: VfsAdvisoryLockNamespace;
+  identities?: unknown;
   start?: string;
   end?: string;
   kind?: VfsAdvisoryLockKind | "unlock";
   pid?: number;
+};
+
+type AdvisoryLockRenewalIdentity = {
+  lockOwner: string;
+  namespace: VfsAdvisoryLockNamespace;
+  fileId: string;
 };
 
 /**
@@ -108,10 +119,31 @@ class AdvisoryLockCoordinator {
     if (mountId === null) return errorResponse(400, "posix lock requires mount_id");
 
     if (request.action === "renew_mount") {
+      return errorResponse(400, "renew_mount is unsupported; use renew_owners with exact identities");
+    }
+    if (request.action === "renew_owners") {
+      const identities = normalizeAdvisoryLockRenewalIdentities(request.identities);
+      if (identities instanceof Response) return identities;
+      const identityKeys = new Set(
+        identities.map(({ lockOwner, namespace, fileId }) =>
+          advisoryLockIdentityKey(lockOwner, namespace, fileId),
+        ),
+      );
       return this.state.transact(ownerId, (stored) => {
         const locks = liveLocks(stored, now);
         for (const lock of locks) {
-          if (lock.mountId === mountId) lock.expiresAt = now + ADVISORY_LOCK_LEASE_MS;
+          if (
+            lock.mountId === mountId &&
+            identityKeys.has(
+              advisoryLockIdentityKey(
+                lock.lockOwner,
+                lock.namespace ?? "posix",
+                lock.fileId,
+              ),
+            )
+          ) {
+            lock.expiresAt = now + ADVISORY_LOCK_LEASE_MS;
+          }
         }
         return {
           locks,
@@ -128,6 +160,10 @@ class AdvisoryLockCoordinator {
 
     const lockOwner = nonEmptyString(request.lock_owner);
     if (lockOwner === null) return errorResponse(400, "posix lock requires lock_owner");
+    const namespace = request.namespace ?? "posix";
+    if (namespace !== "posix" && namespace !== "flock") {
+      return errorResponse(400, "advisory lock namespace must be posix or flock");
+    }
     if (request.action === "release_owner") {
       const releasedFileId = nonEmptyString(request.file_id);
       if (releasedFileId === null) return errorResponse(400, "posix lock release requires file_id");
@@ -136,7 +172,8 @@ class AdvisoryLockCoordinator {
           (lock) =>
             lock.mountId !== mountId ||
             lock.lockOwner !== lockOwner ||
-            lock.fileId !== releasedFileId,
+            lock.fileId !== releasedFileId ||
+            (lock.namespace ?? "posix") !== namespace,
         ),
         result: json(200, { ok: true }),
       }));
@@ -153,7 +190,7 @@ class AdvisoryLockCoordinator {
       return errorResponse(400, "posix lock kind must be read, write, or unlock");
     }
     const pid = Number.isSafeInteger(request.pid) && (request.pid ?? -1) >= 0 ? request.pid! : 0;
-    const identity = { ownerId, mountId, lockOwner, fileId, start, end, kind, pid };
+    const identity = { ownerId, mountId, lockOwner, namespace, fileId, start, end, kind, pid };
 
     if (request.action === "get") {
       if (kind === "unlock") return errorResponse(400, "get posix lock cannot query unlock");
@@ -176,7 +213,10 @@ class AdvisoryLockCoordinator {
     return this.state.transact(ownerId, (stored) => {
       const locks = liveLocks(stored, now);
       const ownKey = (lock: VfsAdvisoryLock): boolean =>
-        lock.mountId === mountId && lock.lockOwner === lockOwner && lock.fileId === fileId;
+        lock.mountId === mountId &&
+        lock.lockOwner === lockOwner &&
+        (lock.namespace ?? "posix") === namespace &&
+        lock.fileId === fileId;
       const replacement = locks.flatMap((lock) => {
         if (!ownKey(lock) || !rangesOverlap(lock.start, lock.end, start, end)) return [lock];
         return subtractRange(lock, start, end);
@@ -196,7 +236,12 @@ class AdvisoryLockCoordinator {
       const conflict = firstConflict(replacement, { ...identity, kind });
       if (conflict !== undefined) {
         return {
-          locks: replacement,
+          // A failed F_SETLK conversion must leave every lock that the caller
+          // already held unchanged. `replacement` contains the proposed
+          // subtract/convert state; persisting it here would silently drop the
+          // caller's old range when (for example) a read-to-write upgrade is
+          // rejected by another reader.
+          locks,
           result: json(200, {
             acquired: false,
             conflict: lockResponse(conflict),
@@ -209,6 +254,7 @@ class AdvisoryLockCoordinator {
         ownerId,
         mountId,
         lockOwner,
+        namespace,
         fileId,
         start,
         end,
@@ -237,7 +283,11 @@ class InMemoryAdvisoryLockStateStore implements VfsAdvisoryLockStateStore {
     transaction: (locks: VfsAdvisoryLock[]) => VfsAdvisoryLockTransactionResult<T>,
   ): Promise<T> {
     const outcome = transaction([...(this.byOwner.get(ownerId) ?? [])]);
-    this.byOwner.set(ownerId, outcome.locks);
+    if (outcome.locks.length === 0) {
+      this.byOwner.delete(ownerId);
+    } else {
+      this.byOwner.set(ownerId, outcome.locks);
+    }
     return outcome.result;
   }
 }
@@ -252,6 +302,7 @@ function firstConflict(
     ownerId: string;
     mountId: string;
     lockOwner: string;
+    namespace: VfsAdvisoryLockNamespace;
     fileId: string;
     start: bigint;
     end: bigint;
@@ -261,10 +312,58 @@ function firstConflict(
   return locks.find(
     (lock) =>
       lock.fileId === request.fileId &&
+      (lock.namespace ?? "posix") === request.namespace &&
       !(lock.mountId === request.mountId && lock.lockOwner === request.lockOwner) &&
       rangesOverlap(lock.start, lock.end, request.start, request.end) &&
       (lock.kind === "write" || request.kind === "write"),
   );
+}
+
+function normalizeAdvisoryLockRenewalIdentities(
+  value: unknown,
+): AdvisoryLockRenewalIdentity[] | Response {
+  if (!Array.isArray(value) || value.length === 0) {
+    return errorResponse(400, "renew_owners requires a non-empty identities[]");
+  }
+  if (value.length > MAX_BATCH_ITEMS) {
+    return errorResponse(
+      400,
+      `renew_owners accepts at most ${MAX_BATCH_ITEMS} identities`,
+    );
+  }
+
+  const identities: AdvisoryLockRenewalIdentity[] = [];
+  for (const [index, item] of value.entries()) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      return errorResponse(400, `renew_owners identity ${index} must be an object`);
+    }
+    const identity = item as Record<string, unknown>;
+    const lockOwner = nonEmptyString(identity.lock_owner);
+    if (lockOwner === null) {
+      return errorResponse(400, `renew_owners identity ${index} requires lock_owner`);
+    }
+    const fileId = nonEmptyString(identity.file_id);
+    if (fileId === null) {
+      return errorResponse(400, `renew_owners identity ${index} requires file_id`);
+    }
+    const namespace = identity.namespace;
+    if (namespace !== "posix" && namespace !== "flock") {
+      return errorResponse(
+        400,
+        `renew_owners identity ${index} namespace must be posix or flock`,
+      );
+    }
+    identities.push({ lockOwner, namespace, fileId });
+  }
+  return identities;
+}
+
+function advisoryLockIdentityKey(
+  lockOwner: string,
+  namespace: VfsAdvisoryLockNamespace,
+  fileId: string,
+): string {
+  return JSON.stringify([lockOwner, namespace, fileId]);
 }
 
 function nonEmptyString(value: unknown): string | null {
@@ -337,6 +436,9 @@ export interface VfsGatewayServerOptions {
   /** Shared transactional state for POSIX advisory locks. Production gateways
    *  with more than one process must provide a cross-process implementation. */
   advisoryLockState?: VfsAdvisoryLockStateStore;
+  /** Per-owner product policy gate for replica-local `.git` metadata.
+   *  Defaults to false, preserving the historical exclusion. */
+  allowGitMetadata?: (ownerId: string) => boolean | Promise<boolean>;
 }
 
 /** Build a WHATWG `(Request) => Promise<Response>` handler that serves chevalier's
@@ -364,6 +466,9 @@ export function createVfsGatewayServer(
       const ownerId = segs.shift() ?? "";
       const op = segs.join("/");
       if (ownerId === "") return errorResponse(404, "missing owner_id segment");
+      const allowGitMetadata = (await opts.allowGitMetadata?.(ownerId)) ?? false;
+      const isExcludedPath = (path: string) =>
+        !allowGitMetadata && isGitExcludedPath(path);
 
       const store = await opts.resolveStore(ownerId);
       const q = url.searchParams;
@@ -375,11 +480,16 @@ export function createVfsGatewayServer(
         if (body === null || typeof body !== "object" || typeof body.action !== "string") {
           return errorResponse(400, "invalid posix lock request");
         }
-        if (body.action === "renew_mount" || body.action === "release_mount" || body.action === "release_owner") {
+        if (
+          body.action === "renew_owners" ||
+          body.action === "renew_mount" ||
+          body.action === "release_mount" ||
+          body.action === "release_owner"
+        ) {
           return await advisoryLocks.handle(ownerId, null, body);
         }
         const lockPath = normalizePath(body.path ?? null);
-        if (lockPath === "" || isGitExcludedPath(lockPath)) {
+        if (lockPath === "" || isExcludedPath(lockPath)) {
           return errorResponse(400, `invalid posix lock path: ${lockPath}`);
         }
         const metadata = await store.stat(lockPath);
@@ -389,7 +499,7 @@ export function createVfsGatewayServer(
 
       // ---- reads ----------------------------------------------------------
       if (method === "GET" && op === "stat") {
-        if (isGitExcludedPath(relPath)) return errorResponse(404, `not found: ${relPath}`);
+        if (isExcludedPath(relPath)) return errorResponse(404, `not found: ${relPath}`);
         const maxHashBytes = parseOptionalNonNegativeInteger(
           q.get("max_hash_bytes") ?? q.get("maxHashBytes"),
           "max_hash_bytes",
@@ -404,7 +514,7 @@ export function createVfsGatewayServer(
       }
 
       if (method === "GET" && op === "file/raw") {
-        if (isGitExcludedPath(relPath)) return errorResponse(404, `not found: ${relPath}`);
+        if (isExcludedPath(relPath)) return errorResponse(404, `not found: ${relPath}`);
         const requestedRange = req.headers.get("range");
         if (requestedRange !== null) {
           // Ranged reads are path-addressed across many requests, so they carry
@@ -472,7 +582,7 @@ export function createVfsGatewayServer(
       }
 
       if (method === "GET" && op === "tree") {
-        if (isGitExcludedPath(relPath)) return errorResponse(404, `not found: ${relPath}`);
+        if (isExcludedPath(relPath)) return errorResponse(404, `not found: ${relPath}`);
         const dir = relPath === "" ? "." : relPath;
         const maxHashBytes = parseOptionalNonNegativeInteger(
           q.get("max_hash_bytes") ?? q.get("maxHashBytes"),
@@ -492,7 +602,7 @@ export function createVfsGatewayServer(
         const nameLike = q.get("name_like");
         const nameNotLike = q.get("name_not_like");
         const out = entries
-          .filter((entry) => !isGitExcludedPath(entry.path))
+          .filter((entry) => !isExcludedPath(entry.path))
           .map(toRemoteDirEntry)
           .filter((e) => (nameLike === null || e.name.includes(nameLike)))
           .filter((e) => (nameNotLike === null || !e.name.includes(nameNotLike)));
@@ -503,6 +613,7 @@ export function createVfsGatewayServer(
       if (op === "lease" && method === "POST") {
         const body = (await req.json().catch(() => ({}))) as { path?: unknown };
         const leasePath = normalizePath(typeof body.path === "string" ? body.path : relPath);
+        if (isExcludedPath(leasePath)) return errorResponse(400, `excluded path: ${leasePath}`);
         return json(200, { resource_key: `rk:${ownerId}:${leasePath}`, owner_token: randomToken() });
       }
       if (op === "lease" && method === "DELETE") {
@@ -510,8 +621,9 @@ export function createVfsGatewayServer(
       }
 
       if (method === "POST" && op === "namespace-many") {
-        const body = (await req.json()) as { mutations?: unknown };
-        const mutations = normalizeNamespaceMutations(body.mutations);
+        const body = await requestJsonObject(req, "namespace-many");
+        if (body instanceof Response) return body;
+        const mutations = normalizeNamespaceMutations(body.mutations, isExcludedPath);
         if (mutations instanceof Response) return mutations;
         try {
           await store.applyNamespaceBatch(mutations);
@@ -525,7 +637,7 @@ export function createVfsGatewayServer(
 
       // ---- single-file mutations -----------------------------------------
       if (method === "PUT" && op === "file") {
-        if (isGitExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
+        if (isExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
         const precondition = requestPrecondition(req, q);
         const writeOptions = requestWriteOptions(req);
         const failed = await enforceFingerprintPrecondition(store, relPath, precondition);
@@ -624,7 +736,7 @@ export function createVfsGatewayServer(
       }
 
       if (method === "DELETE" && op === "file") {
-        if (isGitExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
+        if (isExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
         const precondition = requestPrecondition(req, q);
         const failed = await enforceFingerprintPrecondition(store, relPath, precondition);
         if (failed !== null) return failed;
@@ -644,14 +756,17 @@ export function createVfsGatewayServer(
       }
 
       if (method === "PUT" && op === "dir") {
-        if (isGitExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
+        if (isExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
         await store.mkdir(relPath);
         return new Response(null, { status: 204 });
       }
       if (method === "PUT" && op === "symlink") {
-        if (isGitExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
+        if (isExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
         const target = q.get("target");
         if (target === null || target === "") return errorResponse(400, "symlink requires target");
+        if (isExcludedPath(symlinkTargetPath(relPath, target))) {
+          return errorResponse(400, `excluded symlink target: ${target}`);
+        }
         try {
           await store.createSymlink(relPath, target);
         } catch (e) {
@@ -661,7 +776,7 @@ export function createVfsGatewayServer(
         return new Response(null, { status: 204 });
       }
       if (method === "DELETE" && op === "dir") {
-        if (isGitExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
+        if (isExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
         try {
           await store.rmdir(relPath);
         } catch (error) {
@@ -670,12 +785,64 @@ export function createVfsGatewayServer(
         return new Response(null, { status: 204 });
       }
 
+      if (method === "POST" && op === "hard-link/v1") {
+        const body = (await req.json()) as {
+          source_path?: unknown;
+          destination_path?: unknown;
+        };
+        const source = normalizePath(
+          typeof body.source_path === "string" ? body.source_path : "",
+        );
+        const destination = normalizePath(
+          typeof body.destination_path === "string" ? body.destination_path : "",
+        );
+        if (source === "" || destination === "") {
+          return errorResponse(400, "hard-link requires source_path + destination_path");
+        }
+        if (isExcludedPath(source) || isExcludedPath(destination)) {
+          return errorResponse(
+            400,
+            `excluded path: ${isExcludedPath(source) ? source : destination}`,
+          );
+        }
+        try {
+          const result = await store.createHardLink(source, destination);
+          return json(200, {
+            source: toRemoteMetadata(result.source),
+            destination: toRemoteMetadata(result.destination),
+          });
+        } catch (error) {
+          const conflict = conflictResponseFromStoreError(error, destination);
+          if (conflict !== null) return conflict;
+          if (isVfsBadRequestError(error)) {
+            return errorResponse(400, (error as Error).message);
+          }
+          throw error;
+        }
+      }
+
+      if (method === "POST" && op === "hard-link-alias/v1") {
+        const body = (await req.json()) as {
+          file_id?: unknown;
+          excluding_path?: unknown;
+        };
+        if (typeof body.file_id !== "string" || body.file_id.trim() === "") {
+          return errorResponse(400, "hard-link alias resolution requires file_id");
+        }
+        const excludingPath = normalizePath(
+          typeof body.excluding_path === "string" ? body.excluding_path : "",
+        );
+        if (isExcludedPath(excludingPath)) return errorResponse(400, `excluded path: ${excludingPath}`);
+        const path = await store.findHardLinkAlias(body.file_id, excludingPath);
+        return json(200, { path: path !== null && isExcludedPath(path) ? null : path });
+      }
+
       if (method === "POST" && op === "rename") {
         const from = normalizePath(q.get("from"));
         const to = normalizePath(q.get("to"));
         if (from === "" || to === "") return errorResponse(400, "rename requires from + to");
-        if (isGitExcludedPath(from) || isGitExcludedPath(to)) {
-          return errorResponse(400, `excluded path: ${isGitExcludedPath(from) ? from : to}`);
+        if (isExcludedPath(from) || isExcludedPath(to)) {
+          return errorResponse(400, `excluded path: ${isExcludedPath(from) ? from : to}`);
         }
         const previous = q.get("return_metadata") === "true" ? await store.stat(from) : null;
         await store.rename(from, to);
@@ -689,22 +856,26 @@ export function createVfsGatewayServer(
       // ---- batch ops: loop the per-path primitives (matches the Rust trait's
       //      default impls; the bound TS client only uses per-path ops today) ----
       if (method === "POST" && op === "metadata-many") {
-        const { paths } = (await req.json()) as { paths: string[] };
+        const body = await requestJsonObject(req, "metadata-many");
+        if (body instanceof Response) return body;
+        const paths = normalizePathBatch(body.paths, "metadata-many");
+        if (paths instanceof Response) return paths;
         const entries: (ReturnType<typeof toRemoteMetadata> | null)[] = [];
-        for (const p of paths) {
-          const path = normalizePath(p);
-          const md = isGitExcludedPath(path) ? null : await store.stat(path);
+        for (const path of paths) {
+          const md = isExcludedPath(path) ? null : await store.stat(path);
           entries.push(md === null ? null : toRemoteMetadata(md));
         }
         return json(200, { entries });
       }
 
       if (method === "POST" && op === "read-many") {
-        const { paths } = (await req.json()) as { paths: string[] };
+        const body = await requestJsonObject(req, "read-many");
+        if (body instanceof Response) return body;
+        const paths = normalizePathBatch(body.paths, "read-many");
+        if (paths instanceof Response) return paths;
         const entries: (number[] | null)[] = [];
-        for (const p of paths) {
-          const path = normalizePath(p);
-          if (isGitExcludedPath(path)) {
+        for (const path of paths) {
+          if (isExcludedPath(path)) {
             entries.push(null);
             continue;
           }
@@ -720,19 +891,16 @@ export function createVfsGatewayServer(
       }
 
       if (method === "POST" && op === "write-many") {
-        const body = (await req.json()) as {
-          writes: WriteManyRequestItem[];
-        };
+        const body = await requestJsonObject(req, "write-many");
+        if (body instanceof Response) return body;
+        const writes = normalizeWriteManyItems(body.writes, isExcludedPath);
+        if (writes instanceof Response) return writes;
         const streamingStore = store as StreamingVfsStorage;
         if (typeof streamingStore.writeMany === "function") {
-          const writes = body.writes.map((write) => {
-            const path = normalizePath(write.path);
-            if (isGitExcludedPath(path)) throw Object.assign(new Error(`excluded path: ${path}`), {
-              code: "VFS_BAD_REQUEST",
-            });
+          const normalizedWrites = writes.map((write) => {
             const precondition = writeItemPrecondition(write);
             return {
-              path,
+              path: write.path,
               body: write.body,
               ...(precondition.present
                 ? { precondition: { fingerprint: precondition.fingerprint } }
@@ -740,7 +908,7 @@ export function createVfsGatewayServer(
             };
           });
           try {
-            const results = await streamingStore.writeMany(writes);
+            const results = await streamingStore.writeMany(normalizedWrites);
             return json(200, {
               results: results.map((result: StreamingWriteManyResult) => ({
                 path: result.path,
@@ -756,18 +924,16 @@ export function createVfsGatewayServer(
           }
         }
         // Atomic-ish: check all preconditions first, then apply. Any mismatch -> 409.
-        for (const w of body.writes) {
-          const path = normalizePath(w.path);
-          if (isGitExcludedPath(path)) return errorResponse(400, `excluded path: ${path}`);
-          const failed = await enforceFingerprintPrecondition(store, path, writeItemPrecondition(w));
+        for (const write of writes) {
+          const failed = await enforceFingerprintPrecondition(store, write.path, writeItemPrecondition(write));
           if (failed !== null) return failed;
         }
         const results = [];
-        for (const w of body.writes) {
-          const p = normalizePath(w.path);
+        for (const write of writes) {
+          const p = write.path;
           const cur = await store.stat(p);
           const prev = cur?.contentHash ?? null;
-          const precondition = writeItemPrecondition(w);
+          const precondition = writeItemPrecondition(write);
           let res: {
             content_hash?: string;
             contentHash?: string;
@@ -778,7 +944,7 @@ export function createVfsGatewayServer(
           try {
             res = (await store.write(
               p,
-              Buffer.from(w.body),
+              Buffer.from(write.body),
               preconditionOptions(precondition),
             )) as {
               content_hash?: string;
@@ -829,12 +995,60 @@ function normalizePath(raw: string | null): string {
   return t === "." ? "" : t;
 }
 
+function asciiCaseFold(value: string): string {
+  return value.replace(/[A-Z]/g, (character) =>
+    String.fromCharCode(character.charCodeAt(0) + 32),
+  );
+}
+
+function isGitMetadataSegment(segment: string): boolean {
+  return asciiCaseFold(segment) === ".git";
+}
+
 function isGitExcludedPath(path: string): boolean {
   return path
     .replace(/\\/g, "/")
     .split("/")
     .filter((part) => part !== "" && part !== ".")
-    .some((part) => part === ".git");
+    .some(isGitMetadataSegment);
+}
+
+function symlinkTargetPath(path: string, target: string): string {
+  const normalizedPath = normalizePath(path).replace(/\\/g, "/");
+  const normalizedTarget = target.replace(/\\/g, "/");
+  if (posix.isAbsolute(normalizedTarget)) return normalizePath(normalizedTarget);
+  return posix.normalize(posix.join(posix.dirname(normalizedPath), normalizedTarget));
+}
+
+async function requestJsonObject(
+  request: Request,
+  operation: string,
+): Promise<Record<string, unknown> | Response> {
+  let value: unknown;
+  try {
+    value = await request.json();
+  } catch {
+    return errorResponse(400, `${operation} requires a JSON object`);
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return errorResponse(400, `${operation} requires a JSON object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function normalizePathBatch(value: unknown, operation: string): string[] | Response {
+  if (!Array.isArray(value)) return errorResponse(400, `${operation} requires paths[]`);
+  if (value.length > MAX_BATCH_ITEMS) {
+    return errorResponse(400, `${operation} accepts at most ${MAX_BATCH_ITEMS} paths`);
+  }
+  const paths: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string") {
+      return errorResponse(400, `${operation} paths must be strings`);
+    }
+    paths.push(normalizePath(item));
+  }
+  return paths;
 }
 
 function vfsErrorStatus(error: unknown): number | null {
@@ -925,6 +1139,50 @@ type WriteManyRequestItem = {
   };
 };
 
+function normalizeWriteManyItems(
+  value: unknown,
+  isExcludedPath: (path: string) => boolean,
+): WriteManyRequestItem[] | Response {
+  if (!Array.isArray(value)) return errorResponse(400, "write-many requires writes[]");
+  if (value.length > MAX_BATCH_ITEMS) {
+    return errorResponse(400, `write-many accepts at most ${MAX_BATCH_ITEMS} writes`);
+  }
+  const writes: WriteManyRequestItem[] = [];
+  for (const item of value) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      return errorResponse(400, "invalid write-many item");
+    }
+    const write = item as Record<string, unknown>;
+    if (typeof write.path !== "string") return errorResponse(400, "write-many path must be a string");
+    const path = normalizePath(write.path);
+    if (path === "" || isExcludedPath(path)) {
+      return errorResponse(400, `invalid write-many path: ${path}`);
+    }
+    if (
+      !Array.isArray(write.body) ||
+      !write.body.every((byte) => Number.isSafeInteger(byte) && byte >= 0 && byte <= 255)
+    ) {
+      return errorResponse(400, "write-many body must be an array of bytes");
+    }
+    const preconditionValue = ownValue(write, "precondition");
+    if (
+      preconditionValue !== undefined &&
+      preconditionValue !== null &&
+      (typeof preconditionValue !== "object" ||
+        Array.isArray(preconditionValue))
+    ) {
+      return errorResponse(400, "write-many precondition must be an object or null");
+    }
+    try {
+      writeItemPrecondition(write as WriteManyRequestItem);
+    } catch (error) {
+      return errorResponse(400, error instanceof Error ? error.message : String(error));
+    }
+    writes.push({ ...(write as WriteManyRequestItem), path, body: [...write.body] });
+  }
+  return writes;
+}
+
 type NamespaceMutation =
   | { kind: "create_directory"; path: string }
   | { kind: "create_symlink"; path: string; target: string }
@@ -936,9 +1194,14 @@ type NamespaceMutation =
   | { kind: "remove_directory"; path: string }
   | { kind: "rename"; from: string; to: string };
 
-function normalizeNamespaceMutations(value: unknown): NamespaceMutation[] | Response {
+function normalizeNamespaceMutations(
+  value: unknown,
+  isExcludedPath: (path: string) => boolean = isGitExcludedPath,
+): NamespaceMutation[] | Response {
   if (!Array.isArray(value)) return errorResponse(400, "namespace-many requires mutations[]");
-  if (value.length > 4096) return errorResponse(400, "namespace-many accepts at most 4096 mutations");
+  if (value.length > MAX_BATCH_ITEMS) {
+    return errorResponse(400, `namespace-many accepts at most ${MAX_BATCH_ITEMS} mutations`);
+  }
   const out: NamespaceMutation[] = [];
   for (const item of value) {
     if (typeof item !== "object" || item === null || typeof (item as { kind?: unknown }).kind !== "string") {
@@ -950,14 +1213,19 @@ function normalizeNamespaceMutations(value: unknown): NamespaceMutation[] | Resp
       const from = normalizePath(typeof mutation.from === "string" ? mutation.from : null);
       const to = normalizePath(typeof mutation.to === "string" ? mutation.to : null);
       if (from === "" || to === "") return errorResponse(400, "rename requires from + to");
-      if (isGitExcludedPath(from) || isGitExcludedPath(to)) return errorResponse(400, "excluded rename path");
+      if (isExcludedPath(from) || isExcludedPath(to)) return errorResponse(400, "excluded rename path");
       out.push({ kind, from, to });
       continue;
     }
     const path = normalizePath(typeof mutation.path === "string" ? mutation.path : null);
-    if (path === "" || isGitExcludedPath(path)) return errorResponse(400, `invalid namespace path: ${path}`);
+    if (path === "" || isExcludedPath(path)) return errorResponse(400, `invalid namespace path: ${path}`);
     if (kind === "delete_file") {
-      const precondition = writeItemPrecondition(mutation as WriteManyRequestItem);
+      let precondition: FingerprintPrecondition;
+      try {
+        precondition = writeItemPrecondition(mutation as WriteManyRequestItem);
+      } catch (error) {
+        return errorResponse(400, error instanceof Error ? error.message : String(error));
+      }
       out.push({
         kind,
         path,
@@ -974,6 +1242,9 @@ function normalizeNamespaceMutations(value: unknown): NamespaceMutation[] | Resp
     if (kind === "create_symlink") {
       if (typeof mutation.target !== "string" || mutation.target === "") {
         return errorResponse(400, "create_symlink requires target");
+      }
+      if (isExcludedPath(symlinkTargetPath(path, mutation.target))) {
+        return errorResponse(400, "excluded symlink target");
       }
       out.push({ kind, path, target: mutation.target });
       continue;

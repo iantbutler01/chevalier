@@ -1113,9 +1113,9 @@ fn clone_file_cow_sync(src: &Path, dst: &Path) -> Result<()> {
 /// `-chardev socket,...` + `-device vhost-user-fs-pci,...` device pair.
 ///
 /// virtiofsd exits automatically when qemu disconnects from the vhost-user socket, so
-/// normal VM-stop paths don't strictly need to kill it. This handle carries the PID so
-/// stop/force-stop code paths can best-effort reap the child and so crash-reclaim logic
-/// can surface orphans.
+/// normal VM-stop paths don't strictly need to kill it. This handle carries a
+/// termination channel whose background task owns and reaps the child; the PID remains
+/// observational so crash-reclaim and diagnostics can surface orphans.
 #[derive(Clone, Debug)]
 pub struct VirtiofsdHandle {
     pub pid: u32,
@@ -1123,6 +1123,7 @@ pub struct VirtiofsdHandle {
     pub source_path: PathBuf,
     pub tag: String,
     pub read_only: bool,
+    pub(crate) terminate_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 /// Configuration knobs for a single virtiofsd spawn. Separate from `SharedMountSpec`
@@ -1150,7 +1151,7 @@ pub struct VirtiofsdSpawn {
 ///
 /// Invocation:
 ///   `virtiofsd --socket-path=<sock> --shared-dir=<host> --cache=auto --sandbox=<mode>
-///    --log-level=warn [--readonly]`
+///    --thread-pool-size=64 --log-level=warn [--readonly]`
 ///
 /// The sandbox mode is selected at runtime. Root daemons use `chroot`; non-root
 /// daemons use `namespace`, which Rust virtiofsd supports through an unprivileged
@@ -1191,6 +1192,10 @@ pub async fn spawn_virtiofsd(
     cmd.arg("--cache=auto");
     let sandbox_mode = configured_virtiofsd_sandbox_mode();
     cmd.arg(format!("--sandbox={sandbox_mode}"));
+    // Blocking SETLKW/flock requests must not monopolize the sole vhost-user
+    // request loop. The patched daemon forwards them to the host FUSE mount,
+    // where RemoteFuseFs applies the bounded distributed-lock wait.
+    cmd.arg("--thread-pool-size=64");
     cmd.arg("--log-level=warn");
     // @dive: `--migration-mode=find-paths` is required for vhost-user migration
     //        cooperation. Without it, virtiofsd doesn't advertise the
@@ -1222,7 +1227,7 @@ pub async fn spawn_virtiofsd(
     cmd.stdout(std::process::Stdio::from(log_file));
     cmd.stderr(std::process::Stdio::from(stderr_clone));
 
-    let child = cmd.spawn().with_context(|| {
+    let mut child = cmd.spawn().with_context(|| {
         format!(
             "spawn virtiofsd {} for source {} -> socket {}",
             virtiofsd_bin,
@@ -1230,13 +1235,42 @@ pub async fn spawn_virtiofsd(
             spawn.socket_path.display()
         )
     })?;
-    let pid = child.id().unwrap_or(0);
+    let pid = child
+        .id()
+        .context("spawned virtiofsd did not expose a process id")?;
 
-    // We intentionally detach the Child here: virtiofsd's lifetime is tied to qemu's
-    // vhost-user connection, not to this Rust future. Once qemu drops the socket
-    // virtiofsd exits; and if vmd needs to forcibly reap it, the PID in VirtiofsdHandle
-    // is what we use.
-    std::mem::forget(child);
+    // Keep an asynchronous waiter for the complete child lifetime. Dropping or
+    // forgetting a Child lets the daemon continue, but leaves an exited virtiofsd
+    // as a zombie because vmd is PID 1 in the deployment container. The waiter
+    // reaps normal qemu-disconnect exits and explicit SIGTERM cleanup alike while
+    // a channel gives lifecycle shutdown paths the original Child handle instead
+    // of signaling a raw PID that the kernel could already have reused.
+    let (terminate_tx, mut terminate_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+    let wait_tag = spawn.tag.clone();
+    tokio::spawn(async move {
+        let status = tokio::select! {
+            status = child.wait() => status,
+            _ = terminate_rx.recv() => {
+                // An explicit message covers normal lifecycle cleanup. Channel
+                // closure covers cancellation before a handle is returned and
+                // defensive runtime-state drops; both must terminate the child.
+                if let Err(error) = child.start_kill() {
+                    warn!(pid, tag = %wait_tag, %error, "failed terminating virtiofsd child");
+                }
+                child.wait().await
+            }
+        };
+        match &status {
+            Ok(status) => {
+                debug!(pid, tag = %wait_tag, ?status, "virtiofsd exited and was reaped");
+            }
+            Err(error) => {
+                warn!(pid, tag = %wait_tag, %error, "failed waiting for virtiofsd child");
+            }
+        }
+        let _ = exit_tx.send(status);
+    });
 
     // Wait for the vhost-user socket to appear so the subsequent qemu launch can
     // connect to it immediately. virtiofsd creates the socket file as soon as it
@@ -1244,17 +1278,33 @@ pub async fn spawn_virtiofsd(
     let deadline = Instant::now() + Duration::from_secs(5);
     while !spawn.socket_path.exists() {
         if Instant::now() >= deadline {
-            // Try to reap the daemon if it died early so we don't leak a zombie.
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
-            }
+            let _ = terminate_tx.send(());
             bail!(
                 "virtiofsd socket {} did not appear within 5s (daemon probably failed to start; check {})",
                 spawn.socket_path.display(),
                 log_path.display()
             );
         }
-        sleep(Duration::from_millis(25)).await;
+        tokio::select! {
+            status = &mut exit_rx => {
+                match status {
+                    Ok(Ok(status)) => bail!(
+                        "virtiofsd exited with {status} before creating socket {} (check {})",
+                        spawn.socket_path.display(),
+                        log_path.display()
+                    ),
+                    Ok(Err(error)) => return Err(error).context(
+                        "wait for virtiofsd before its vhost-user socket became ready"
+                    ),
+                    Err(_) => bail!(
+                        "virtiofsd lifecycle waiter stopped before creating socket {} (check {})",
+                        spawn.socket_path.display(),
+                        log_path.display()
+                    ),
+                }
+            }
+            _ = sleep(Duration::from_millis(25)) => {}
+        }
     }
 
     debug!(
@@ -1273,6 +1323,7 @@ pub async fn spawn_virtiofsd(
         source_path: spawn.source_path.clone(),
         tag: spawn.tag.clone(),
         read_only: spawn.read_only,
+        terminate_tx: Some(terminate_tx),
     })
 }
 
@@ -1303,14 +1354,13 @@ fn running_as_root() -> bool {
     false
 }
 
-/// Terminate a running virtiofsd by PID. Best-effort; if the daemon already exited
-/// (normal case when qemu closes the socket), this is a no-op.
+/// Terminate a running virtiofsd through the child-lifetime task. Best-effort; if
+/// the daemon already exited (normal case when qemu closes the socket), this is a
+/// no-op. The task owns and reaps the original Child, avoiding both zombies and
+/// signaling a recycled process ID.
 pub fn terminate_virtiofsd(handle: &VirtiofsdHandle) {
-    if handle.pid == 0 {
-        return;
-    }
-    unsafe {
-        libc::kill(handle.pid as libc::pid_t, libc::SIGTERM);
+    if let Some(terminate_tx) = &handle.terminate_tx {
+        let _ = terminate_tx.send(());
     }
     // Best-effort unlink of the socket file (virtiofsd should have cleaned it up).
     let _ = std::fs::remove_file(&handle.socket_path);
@@ -1964,5 +2014,171 @@ exit 2
         assert!(msg.contains("example/missing:latest"));
         assert!(msg.contains("docker manifest inspect failed"));
         assert!(msg.contains("docker pull --platform probes found no supported"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn virtiofsd_lifecycle_waiter_reaps_terminated_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let source_path = tmp.path().join("source");
+        let socket_path = tmp.path().join("virtiofsd.sock");
+        let log_path = tmp.path().join("virtiofsd.log");
+        let script_path = tmp.path().join("fake-virtiofsd.sh");
+        fs::create_dir(&source_path).expect("create fake shared directory");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+set -eu
+socket=
+for arg in "$@"; do
+  case "$arg" in
+    --socket-path=*) socket=${arg#*=} ;;
+  esac
+done
+test -n "$socket"
+: >"$socket"
+trap 'rm -f "$socket"; exit 0' TERM INT
+while :; do sleep 0.05; done
+"#,
+        )
+        .expect("write fake virtiofsd");
+        let mut permissions = fs::metadata(&script_path)
+            .expect("read fake virtiofsd permissions")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("make fake virtiofsd executable");
+
+        let handle = spawn_virtiofsd(
+            script_path.to_str().expect("utf8 script path"),
+            &VirtiofsdSpawn {
+                source_path,
+                socket_path,
+                tag: "reap-test".to_string(),
+                read_only: false,
+            },
+            &log_path,
+        )
+        .await
+        .expect("spawn fake virtiofsd");
+        terminate_virtiofsd(&handle);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let alive = unsafe { libc::kill(handle.pid as libc::pid_t, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "terminated virtiofsd child was not reaped"
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+
+        let mut status = 0;
+        let waited =
+            unsafe { libc::waitpid(handle.pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        assert_eq!(
+            waited, -1,
+            "child remained waitable instead of being reaped"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_virtiofsd_spawn_terminates_and_reaps_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let source_path = tmp.path().join("source");
+        let socket_path = tmp.path().join("never-created.sock");
+        let log_path = tmp.path().join("virtiofsd.log");
+        let script_path = tmp.path().join("fake-virtiofsd-no-socket.sh");
+        fs::create_dir(&source_path).expect("create fake shared directory");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+set -eu
+source=
+for arg in "$@"; do
+  case "$arg" in
+    --shared-dir=*) source=${arg#*=} ;;
+  esac
+done
+test -n "$source"
+printf '%s\n' "$$" >"$source/pid"
+while :; do sleep 0.05; done
+"#,
+        )
+        .expect("write fake virtiofsd");
+        let mut permissions = fs::metadata(&script_path)
+            .expect("read fake virtiofsd permissions")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("make fake virtiofsd executable");
+
+        let pid_path = source_path.join("pid");
+        let spawn_task = tokio::spawn(async move {
+            spawn_virtiofsd(
+                script_path.to_str().expect("utf8 script path"),
+                &VirtiofsdSpawn {
+                    source_path,
+                    socket_path,
+                    tag: "cancel-reap-test".to_string(),
+                    read_only: false,
+                },
+                &log_path,
+            )
+            .await
+        });
+        let pid_deadline = Instant::now() + Duration::from_secs(2);
+        while !pid_path.exists() {
+            assert!(
+                Instant::now() < pid_deadline,
+                "fake virtiofsd did not publish its pid"
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+        let pid: u32 = fs::read_to_string(&pid_path)
+            .expect("fake virtiofsd wrote pid")
+            .trim()
+            .parse()
+            .expect("parse fake virtiofsd pid");
+        assert!(
+            !spawn_task.is_finished(),
+            "spawn should still be waiting for its socket"
+        );
+        spawn_task.abort();
+        let _ = spawn_task.await;
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancelled virtiofsd child was not reaped"
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        assert_eq!(
+            waited, -1,
+            "cancelled child remained waitable instead of being reaped"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 }

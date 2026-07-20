@@ -82,6 +82,8 @@ if (!vfsStorageProto[VFS_ERROR_PATCHED]) {
         "listDir",
         "mkdir",
         "createSymlink",
+        "createHardLink",
+        "findHardLinkAlias",
         "remove",
         "rmdir",
         "rename",

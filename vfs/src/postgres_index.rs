@@ -5,15 +5,16 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, QueryBuilder, Transaction};
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 use crate::{
     VfsStorageDirListFilter, VfsStorageDirListOrder, VfsStorageEntryKind, VfsStorageError,
     VfsStorageResult,
     index::{
-        VfsFileManifestRecord, VfsIndexEntry, VfsIndexEntryWithManifest, VfsIndexScope,
-        VfsManifestIndex, VfsManifestRepoint, VfsPackLifecycleIndex, VfsPackRecordWithScope,
-        VfsPackedCommit, VfsPackedCommitResult,
+        VfsFileManifestRecord, VfsIndexEntry, VfsIndexEntryWithManifest, VfsIndexHardLinkResult,
+        VfsIndexScope, VfsManifestIndex, VfsManifestRepoint, VfsPackLifecycleIndex,
+        VfsPackRecordWithScope, VfsPackedCommit, VfsPackedCommitResult, VfsPackedFileCommit,
     },
     manifest::{VfsFileManifest, VfsPackRecord, VfsPackSlotRef},
 };
@@ -68,6 +69,8 @@ struct EntryWithManifestRow {
     parent_logical_path: String,
     entry_name: String,
     entry_kind: String,
+    file_id: Option<String>,
+    link_count: i64,
     size_bytes: i64,
     content_hash: Option<String>,
     current_version_id: Option<String>,
@@ -124,6 +127,8 @@ impl TryFrom<EntryWithManifestRow> for VfsIndexEntryWithManifest {
                 parent_logical_path: row.parent_logical_path,
                 entry_name: row.entry_name,
                 kind,
+                file_id: row.file_id,
+                link_count: row.link_count.max(1) as u64,
                 size_bytes: row.size_bytes,
                 content_hash: row.content_hash,
                 current_version: row.current_version_id,
@@ -372,6 +377,33 @@ impl VfsManifestIndex for PostgresVfsManifestIndex {
             .collect()
     }
 
+    async fn list_entries_with_manifest_in_subtree(
+        &self,
+        scope: &VfsIndexScope,
+        logical_path_prefix: &str,
+        limit: Option<i64>,
+    ) -> VfsStorageResult<Vec<VfsIndexEntryWithManifest>> {
+        let paths = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT logical_path
+            FROM chevalier_vfs_entries
+            WHERE scope_key = $1
+              AND entry_kind = 'file'
+              AND ($2 = '' OR logical_path = $2 OR logical_path LIKE ($2 || '/%'))
+            ORDER BY logical_path
+            LIMIT $3
+            "#,
+        )
+        .bind(&scope.key)
+        .bind(logical_path_prefix)
+        .bind(limit.unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(internal)?;
+        self.list_entries_with_manifest_by_paths(scope, &paths)
+            .await
+    }
+
     async fn list_dir_with_manifest_attrs(
         &self,
         scope: &VfsIndexScope,
@@ -385,6 +417,14 @@ impl VfsManifestIndex for PostgresVfsManifestIndex {
                 e.parent_logical_path,
                 e.entry_name,
                 e.entry_kind,
+                e.file_id,
+                CASE WHEN e.file_id IS NULL THEN 1 ELSE (
+                    SELECT COUNT(*)::bigint
+                    FROM chevalier_vfs_entries aliases
+                    WHERE aliases.scope_key = e.scope_key
+                      AND aliases.file_id = e.file_id
+                      AND aliases.entry_kind = 'file'
+                ) END AS link_count,
                 e.size_bytes,
                 e.content_hash,
                 e.current_version_id,
@@ -456,12 +496,23 @@ impl VfsManifestIndex for PostgresVfsManifestIndex {
             });
         }
         let mut tx = self.pool.begin().await.map_err(internal)?;
+        acquire_file_identity_locks(
+            &mut tx,
+            scope,
+            commit.files.iter().filter_map(|file| file.file_id.clone()),
+        )
+        .await?;
+        validate_file_alias_snapshot(&mut tx, scope, &commit.files).await?;
         let now = Utc::now();
         let entry_rows = commit
             .files
             .iter()
             .map(|file| EntryBatchRow {
                 id: Uuid::new_v4().to_string(),
+                file_id: file
+                    .file_id
+                    .clone()
+                    .unwrap_or_else(|| Uuid::new_v4().to_string()),
                 logical_path: file.logical_path.clone(),
                 parent_logical_path: file.parent_logical_path.clone(),
                 entry_name: file.entry_name.clone(),
@@ -571,20 +622,237 @@ impl VfsManifestIndex for PostgresVfsManifestIndex {
         Ok(())
     }
 
+    async fn create_hard_link_entry(
+        &self,
+        scope: &VfsIndexScope,
+        source_logical_path: &str,
+        destination_logical_path: &str,
+        destination_parent_logical_path: &str,
+        destination_entry_name: &str,
+    ) -> VfsStorageResult<VfsIndexHardLinkResult> {
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let source_identity = sqlx::query_as::<_, (String, Option<String>, String)>(
+            r#"
+            SELECT e.id, e.file_id, e.entry_kind
+            FROM chevalier_vfs_entries e
+            WHERE e.scope_key = $1 AND e.logical_path = $2
+            "#,
+        )
+        .bind(&scope.key)
+        .bind(source_logical_path)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| VfsStorageError::NotFound(source_logical_path.to_string()))?;
+        if source_identity.2 != "file" {
+            return Err(VfsStorageError::BadRequest(format!(
+                "vfs hard-link source {source_logical_path} is not a file"
+            )));
+        }
+        let source_file_id = source_identity.1.unwrap_or(source_identity.0);
+        acquire_file_identity_locks(&mut tx, scope, [source_file_id.clone()]).await?;
+        let source = sqlx::query_as::<
+            _,
+            (
+                String,
+                Option<String>,
+                String,
+                i64,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
+            r#"
+            SELECT e.id, e.file_id, e.entry_kind, e.size_bytes, e.content_hash,
+                   e.current_version_id
+            FROM chevalier_vfs_entries e
+            WHERE e.scope_key = $1 AND e.logical_path = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(&scope.key)
+        .bind(source_logical_path)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| VfsStorageError::NotFound(source_logical_path.to_string()))?;
+        if source.2 != "file" {
+            return Err(VfsStorageError::BadRequest(format!(
+                "vfs hard-link source {source_logical_path} is not a file"
+            )));
+        }
+        let file_id = source.1.unwrap_or(source.0);
+        if file_id != source_file_id {
+            return Err(VfsStorageError::Conflict(format!(
+                "vfs hard-link source identity changed for {source_logical_path}"
+            )));
+        }
+        sqlx::query(
+            "UPDATE chevalier_vfs_entries SET file_id = $3 WHERE scope_key = $1 AND logical_path = $2 AND file_id IS NULL",
+        )
+        .bind(&scope.key)
+        .bind(source_logical_path)
+        .bind(&file_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+        let destination_id = Uuid::new_v4().to_string();
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO chevalier_vfs_entries (
+                id, scope_key, logical_path, parent_logical_path, entry_name,
+                entry_kind, file_id, size_bytes, content_hash, storage_backend,
+                current_version_id, materialization_generation, updated_at
+            )
+            SELECT $3, scope_key, $4, $5, $6, 'file', $7, size_bytes,
+                   content_hash, storage_backend, NULL, materialization_generation, now()
+            FROM chevalier_vfs_entries
+            WHERE scope_key = $1 AND logical_path = $2 AND entry_kind = 'file'
+            ON CONFLICT (scope_key, logical_path) DO NOTHING
+            "#,
+        )
+        .bind(&scope.key)
+        .bind(source_logical_path)
+        .bind(&destination_id)
+        .bind(destination_logical_path)
+        .bind(destination_parent_logical_path)
+        .bind(destination_entry_name)
+        .bind(&file_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+        if inserted.rows_affected() != 1 {
+            return Err(VfsStorageError::Conflict(format!(
+                "vfs hard-link destination already exists: {destination_logical_path}"
+            )));
+        }
+        let manifest_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            r#"
+            INSERT INTO chevalier_vfs_file_manifests (
+                id, scope_key, logical_path, content_hash, logical_size_bytes,
+                pack_key, pack_slot_offset, pack_slot_length,
+                pack_slot_compression, token_count
+            )
+            SELECT $3, m.scope_key, $4, m.content_hash, m.logical_size_bytes,
+                   m.pack_key, m.pack_slot_offset, m.pack_slot_length,
+                   m.pack_slot_compression, m.token_count
+            FROM chevalier_vfs_entries e
+            JOIN chevalier_vfs_file_versions v
+              ON v.scope_key = e.scope_key
+             AND v.logical_path = e.logical_path
+             AND v.version_id = e.current_version_id
+            JOIN chevalier_vfs_file_manifests m
+              ON m.scope_key = v.scope_key AND m.id = v.manifest_id
+            WHERE e.scope_key = $1 AND e.logical_path = $2
+            "#,
+        )
+        .bind(&scope.key)
+        .bind(source_logical_path)
+        .bind(&manifest_id)
+        .bind(destination_logical_path)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+        let destination_version = Uuid::new_v4().to_string();
+        sqlx::query(
+            r#"
+            INSERT INTO chevalier_vfs_file_versions (
+                scope_key, logical_path, version_id, version_no, manifest_id,
+                content_hash, logical_size_bytes
+            )
+            SELECT $1, $2, $3, 1, $4, content_hash, logical_size_bytes
+            FROM chevalier_vfs_file_manifests
+            WHERE scope_key = $1 AND id = $4
+            "#,
+        )
+        .bind(&scope.key)
+        .bind(destination_logical_path)
+        .bind(&destination_version)
+        .bind(&manifest_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+        sqlx::query(
+            "UPDATE chevalier_vfs_entries SET current_version_id = $3 WHERE scope_key = $1 AND logical_path = $2",
+        )
+        .bind(&scope.key)
+        .bind(destination_logical_path)
+        .bind(&destination_version)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+        let pack_key = sqlx::query_scalar::<_, String>(
+            "SELECT pack_key FROM chevalier_vfs_file_manifests WHERE scope_key = $1 AND id = $2",
+        )
+        .bind(&scope.key)
+        .bind(&manifest_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(internal)?;
+        update_pack_reference_count(&mut tx, scope, &pack_key).await?;
+        tx.commit().await.map_err(internal)?;
+        let source = self
+            .get_entry_with_manifest(scope, source_logical_path)
+            .await?
+            .ok_or_else(|| VfsStorageError::NotFound(source_logical_path.to_string()))?;
+        let destination = self
+            .get_entry_with_manifest(scope, destination_logical_path)
+            .await?
+            .ok_or_else(|| VfsStorageError::NotFound(destination_logical_path.to_string()))?;
+        Ok(VfsIndexHardLinkResult {
+            source,
+            destination,
+        })
+    }
+
+    async fn list_file_alias_paths(
+        &self,
+        scope: &VfsIndexScope,
+        file_id: &str,
+    ) -> VfsStorageResult<Vec<String>> {
+        sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT logical_path
+            FROM chevalier_vfs_entries
+            WHERE scope_key = $1 AND file_id = $2 AND entry_kind = 'file'
+            ORDER BY logical_path
+            "#,
+        )
+        .bind(&scope.key)
+        .bind(file_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(internal)
+    }
+
     async fn delete_file_entry(
         &self,
         scope: &VfsIndexScope,
         logical_path: &str,
         expected_current_version: Option<&str>,
     ) -> VfsStorageResult<Option<VfsIndexEntryWithManifest>> {
-        let Some(previous) = self.get_entry_with_manifest(scope, logical_path).await? else {
+        let Some(snapshot) = self.get_entry_with_manifest(scope, logical_path).await? else {
             return Ok(None);
         };
-        if previous.entry.kind != VfsStorageEntryKind::File {
+        if snapshot.entry.kind != VfsStorageEntryKind::File {
             return Err(VfsStorageError::BadRequest(format!(
                 "vfs path {logical_path} is not a file"
             )));
         };
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        acquire_file_identity_locks(&mut tx, scope, snapshot.entry.file_id.iter().cloned()).await?;
+        let Some(previous) =
+            get_entry_with_manifest_in_transaction(&mut tx, scope, logical_path).await?
+        else {
+            tx.commit().await.map_err(internal)?;
+            return Ok(None);
+        };
+        if previous.entry.file_id != snapshot.entry.file_id {
+            return Err(VfsStorageError::Conflict(format!(
+                "vfs identity changed before unlink for {logical_path}"
+            )));
+        }
         if let Some(expected_current_version) = expected_current_version
             && previous.entry.current_version.as_deref() != Some(expected_current_version)
         {
@@ -592,7 +860,6 @@ impl VfsManifestIndex for PostgresVfsManifestIndex {
                 "vfs write precondition failed for {logical_path}"
             )));
         }
-        let mut tx = self.pool.begin().await.map_err(internal)?;
         let pack_keys = sqlx::query_scalar::<_, String>(
             r#"
             SELECT DISTINCT pack_key
@@ -724,39 +991,89 @@ impl VfsManifestIndex for PostgresVfsManifestIndex {
         to_parent_logical_path: &str,
         to_entry_name: &str,
     ) -> VfsStorageResult<(VfsIndexEntryWithManifest, VfsIndexEntryWithManifest)> {
-        let previous = self
+        let source_snapshot = self
             .get_entry_with_manifest(scope, from_logical_path)
             .await?
             .ok_or_else(|| VfsStorageError::NotFound(from_logical_path.to_string()))?;
-        if previous.entry.kind != VfsStorageEntryKind::File {
+        if source_snapshot.entry.kind != VfsStorageEntryKind::File {
             return Err(VfsStorageError::BadRequest(format!(
                 "vfs path {from_logical_path} is not a file"
             )));
         }
+        if from_logical_path == to_logical_path {
+            return Ok((source_snapshot.clone(), source_snapshot));
+        }
+        let destination_snapshot = self.get_entry_with_manifest(scope, to_logical_path).await?;
         let mut tx = self.pool.begin().await.map_err(internal)?;
-        let destination_exists = sqlx::query_scalar::<_, bool>(
-            r#"
-            SELECT EXISTS (
-                SELECT 1 FROM chevalier_vfs_entries
-                WHERE scope_key = $1 AND logical_path = $2
-                UNION ALL
-                SELECT 1 FROM chevalier_vfs_file_versions
-                WHERE scope_key = $1 AND logical_path = $2
-                UNION ALL
-                SELECT 1 FROM chevalier_vfs_file_manifests
-                WHERE scope_key = $1 AND logical_path = $2
-            )
-            "#,
+        acquire_file_identity_locks(
+            &mut tx,
+            scope,
+            source_snapshot
+                .entry
+                .file_id
+                .iter()
+                .chain(
+                    destination_snapshot
+                        .as_ref()
+                        .and_then(|entry| entry.entry.file_id.as_ref()),
+                )
+                .cloned(),
+        )
+        .await?;
+        let previous = get_entry_with_manifest_in_transaction(&mut tx, scope, from_logical_path)
+            .await?
+            .ok_or_else(|| VfsStorageError::NotFound(from_logical_path.to_string()))?;
+        if previous.entry.file_id != source_snapshot.entry.file_id {
+            return Err(VfsStorageError::Conflict(format!(
+                "vfs source identity changed before rename for {from_logical_path}"
+            )));
+        }
+        let destination =
+            get_entry_with_manifest_in_transaction(&mut tx, scope, to_logical_path).await?;
+        if destination_snapshot.is_none() && destination.is_some()
+            || destination_snapshot
+                .as_ref()
+                .zip(destination.as_ref())
+                .is_some_and(|(snapshot, current)| snapshot.entry.file_id != current.entry.file_id)
+        {
+            return Err(VfsStorageError::Conflict(format!(
+                "vfs destination identity changed before rename for {to_logical_path}"
+            )));
+        }
+        if destination
+            .as_ref()
+            .is_some_and(|entry| entry.entry.kind != VfsStorageEntryKind::File)
+        {
+            return Err(VfsStorageError::Conflict(format!(
+                "vfs cannot replace non-file destination: {to_logical_path}"
+            )));
+        }
+        // POSIX rename(2) succeeds without changing the namespace when source
+        // and destination already name the same inode.
+        if previous.entry.file_id.is_some()
+            && destination
+                .as_ref()
+                .is_some_and(|entry| entry.entry.file_id == previous.entry.file_id)
+        {
+            tx.commit().await.map_err(internal)?;
+            let current = destination.expect("same identity destination exists");
+            return Ok((previous, current));
+        }
+        let replaced_pack_keys = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT pack_key FROM chevalier_vfs_file_manifests WHERE scope_key = $1 AND logical_path = $2",
         )
         .bind(&scope.key)
         .bind(to_logical_path)
-        .fetch_one(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
         .map_err(internal)?;
-        if destination_exists {
-            return Err(VfsStorageError::Conflict(format!(
-                "vfs destination already exists: {to_logical_path}"
-            )));
+        if destination.is_some() {
+            sqlx::query("DELETE FROM chevalier_vfs_file_versions WHERE scope_key = $1 AND logical_path = $2")
+                .bind(&scope.key).bind(to_logical_path).execute(&mut *tx).await.map_err(internal)?;
+            sqlx::query("DELETE FROM chevalier_vfs_file_manifests WHERE scope_key = $1 AND logical_path = $2")
+                .bind(&scope.key).bind(to_logical_path).execute(&mut *tx).await.map_err(internal)?;
+            sqlx::query("DELETE FROM chevalier_vfs_entries WHERE scope_key = $1 AND logical_path = $2 AND entry_kind = 'file'")
+                .bind(&scope.key).bind(to_logical_path).execute(&mut *tx).await.map_err(internal)?;
         }
         sqlx::query(
             r#"
@@ -808,6 +1125,9 @@ impl VfsManifestIndex for PostgresVfsManifestIndex {
         .execute(&mut *tx)
         .await
         .map_err(internal)?;
+        for pack_key in replaced_pack_keys {
+            update_pack_reference_count(&mut tx, scope, &pack_key).await?;
+        }
         tx.commit().await.map_err(internal)?;
         let current = self
             .get_entry_with_manifest(scope, to_logical_path)
@@ -1079,6 +1399,14 @@ SELECT
     e.parent_logical_path,
     e.entry_name,
     e.entry_kind,
+    e.file_id,
+    CASE WHEN e.file_id IS NULL THEN 1 ELSE (
+        SELECT COUNT(*)::bigint
+        FROM chevalier_vfs_entries aliases
+        WHERE aliases.scope_key = e.scope_key
+          AND aliases.file_id = e.file_id
+          AND aliases.entry_kind = 'file'
+    ) END AS link_count,
     e.size_bytes,
     e.content_hash,
     e.current_version_id,
@@ -1109,6 +1437,14 @@ SELECT
     e.parent_logical_path,
     e.entry_name,
     e.entry_kind,
+    e.file_id,
+    CASE WHEN e.file_id IS NULL THEN 1 ELSE (
+        SELECT COUNT(*)::bigint
+        FROM chevalier_vfs_entries aliases
+        WHERE aliases.scope_key = e.scope_key
+          AND aliases.file_id = e.file_id
+          AND aliases.entry_kind = 'file'
+    ) END AS link_count,
     e.size_bytes,
     e.content_hash,
     e.current_version_id,
@@ -1135,6 +1471,7 @@ WHERE e.scope_key = $1
 
 struct EntryBatchRow {
     id: String,
+    file_id: String,
     logical_path: String,
     parent_logical_path: String,
     entry_name: String,
@@ -1156,6 +1493,137 @@ struct PromoteManifestVersionItem<'a> {
     content_hash: &'a str,
     logical_size_bytes: i64,
     expected_current_version: Option<&'a str>,
+}
+
+const POSTGRES_BATCH_CHUNK_SIZE: usize = 4_000;
+const IDENTITY_LOCK_TIMEOUT: &str = "2000ms";
+const FILE_IDENTITY_LOCK_QUERY: &str = r#"
+    WITH ordered_locks AS MATERIALIZED (
+        SELECT lock_key
+        FROM unnest($1::text[]) AS requested(lock_key)
+        ORDER BY lock_key
+    )
+    SELECT pg_advisory_xact_lock(hashtextextended(lock_key, 0))
+    FROM ordered_locks
+    ORDER BY lock_key
+"#;
+
+fn file_identity_lock_keys(
+    scope: &VfsIndexScope,
+    file_ids: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut lock_keys = file_ids
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|file_id| {
+            format!(
+                "chevalier-vfs-identity:{}:{}:{}:{}",
+                scope.key.len(),
+                scope.key,
+                file_id.len(),
+                file_id
+            )
+        })
+        .collect::<Vec<_>>();
+    lock_keys.sort_unstable();
+    lock_keys
+}
+
+async fn acquire_file_identity_locks(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: &VfsIndexScope,
+    file_ids: impl IntoIterator<Item = String>,
+) -> VfsStorageResult<()> {
+    let lock_keys = file_identity_lock_keys(scope, file_ids);
+    if lock_keys.is_empty() {
+        return Ok(());
+    }
+    sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+        .bind(IDENTITY_LOCK_TIMEOUT)
+        .execute(&mut **tx)
+        .await
+        .map_err(internal)?;
+    sqlx::query(FILE_IDENTITY_LOCK_QUERY)
+        .bind(&lock_keys)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| identity_lock_error(error, "batch"))?;
+    Ok(())
+}
+
+fn identity_lock_error(error: sqlx::Error, file_id: &str) -> VfsStorageError {
+    if error
+        .as_database_error()
+        .and_then(|database_error| database_error.code())
+        .is_some_and(|code| code == "55P03")
+    {
+        VfsStorageError::Conflict(format!(
+            "timed out acquiring VFS file-identity lock for {file_id}"
+        ))
+    } else {
+        internal(error)
+    }
+}
+
+async fn validate_file_alias_snapshot(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: &VfsIndexScope,
+    files: &[VfsPackedFileCommit],
+) -> VfsStorageResult<()> {
+    let mut expected = BTreeMap::<String, BTreeSet<String>>::new();
+    for file in files {
+        if let Some(file_id) = file.file_id.as_ref() {
+            expected
+                .entry(file_id.clone())
+                .or_default()
+                .insert(file.logical_path.clone());
+        }
+    }
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let file_ids = expected.keys().cloned().collect::<Vec<_>>();
+    let rows = sqlx::query_as::<_, (String, String)>(
+        r#"
+        SELECT file_id, logical_path
+        FROM chevalier_vfs_entries
+        WHERE scope_key = $1
+          AND file_id = ANY($2::text[])
+          AND entry_kind = 'file'
+        ORDER BY file_id, logical_path
+        "#,
+    )
+    .bind(&scope.key)
+    .bind(&file_ids)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(internal)?;
+    let mut actual = BTreeMap::<String, BTreeSet<String>>::new();
+    for (file_id, logical_path) in rows {
+        actual.entry(file_id).or_default().insert(logical_path);
+    }
+    if actual != expected {
+        return Err(VfsStorageError::Conflict(
+            "VFS hard-link alias set changed during write".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn get_entry_with_manifest_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: &VfsIndexScope,
+    logical_path: &str,
+) -> VfsStorageResult<Option<VfsIndexEntryWithManifest>> {
+    sqlx::query_as::<_, EntryWithManifestRow>(ENTRY_WITH_MANIFEST_SQL)
+        .bind(&scope.key)
+        .bind(logical_path)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(internal)?
+        .map(TryInto::try_into)
+        .transpose()
 }
 
 async fn insert_pack_record(
@@ -1336,52 +1804,57 @@ async fn upsert_entries_batch(
     if rows.is_empty() {
         return Ok(());
     }
-    let mut qb = QueryBuilder::<Postgres>::new(
-        r#"
-        INSERT INTO chevalier_vfs_entries (
-            id,
-            scope_key,
-            logical_path,
-            parent_logical_path,
-            entry_name,
-            entry_kind,
-            size_bytes,
-            content_hash,
-            storage_backend,
-            current_version_id,
-            materialization_generation,
-            updated_at
-        )
-        "#,
-    );
-    qb.push_values(rows, |mut row, req| {
-        row.push_bind(req.id.as_str())
-            .push_bind(scope.key.as_str())
-            .push_bind(req.logical_path.as_str())
-            .push_bind(req.parent_logical_path.as_str())
-            .push_bind(req.entry_name.as_str())
-            .push_bind("file")
-            .push_bind(req.size_bytes)
-            .push_bind(req.content_hash.as_deref())
-            .push_bind(req.storage_backend.as_str())
-            .push_bind(Option::<&str>::None)
-            .push_bind(0_i64)
-            .push_bind(req.updated_at);
-    });
-    qb.push(
-        r#"
-        ON CONFLICT (scope_key, logical_path) DO UPDATE
-        SET
-            parent_logical_path = EXCLUDED.parent_logical_path,
-            entry_name = EXCLUDED.entry_name,
-            entry_kind = EXCLUDED.entry_kind,
-            size_bytes = EXCLUDED.size_bytes,
-            content_hash = EXCLUDED.content_hash,
-            storage_backend = EXCLUDED.storage_backend,
-            updated_at = EXCLUDED.updated_at
-        "#,
-    );
-    qb.build().execute(&mut **tx).await.map_err(internal)?;
+    for rows in rows.chunks(POSTGRES_BATCH_CHUNK_SIZE) {
+        let mut qb = QueryBuilder::<Postgres>::new(
+            r#"
+            INSERT INTO chevalier_vfs_entries (
+                id,
+                scope_key,
+                logical_path,
+                parent_logical_path,
+                entry_name,
+                entry_kind,
+                file_id,
+                size_bytes,
+                content_hash,
+                storage_backend,
+                current_version_id,
+                materialization_generation,
+                updated_at
+            )
+            "#,
+        );
+        qb.push_values(rows, |mut row, req| {
+            row.push_bind(req.id.as_str())
+                .push_bind(scope.key.as_str())
+                .push_bind(req.logical_path.as_str())
+                .push_bind(req.parent_logical_path.as_str())
+                .push_bind(req.entry_name.as_str())
+                .push_bind("file")
+                .push_bind(req.file_id.as_str())
+                .push_bind(req.size_bytes)
+                .push_bind(req.content_hash.as_deref())
+                .push_bind(req.storage_backend.as_str())
+                .push_bind(Option::<&str>::None)
+                .push_bind(0_i64)
+                .push_bind(req.updated_at);
+        });
+        qb.push(
+            r#"
+            ON CONFLICT (scope_key, logical_path) DO UPDATE
+            SET
+                parent_logical_path = EXCLUDED.parent_logical_path,
+                entry_name = EXCLUDED.entry_name,
+                entry_kind = EXCLUDED.entry_kind,
+                file_id = COALESCE(chevalier_vfs_entries.file_id, EXCLUDED.file_id),
+                size_bytes = EXCLUDED.size_bytes,
+                content_hash = EXCLUDED.content_hash,
+                storage_backend = EXCLUDED.storage_backend,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        );
+        qb.build().execute(&mut **tx).await.map_err(internal)?;
+    }
     Ok(())
 }
 
@@ -1393,35 +1866,37 @@ async fn insert_manifests_batch(
     if rows.is_empty() {
         return Ok(());
     }
-    let mut qb = QueryBuilder::<Postgres>::new(
-        r#"
-        INSERT INTO chevalier_vfs_file_manifests (
-            id,
-            scope_key,
-            logical_path,
-            content_hash,
-            logical_size_bytes,
-            pack_key,
-            pack_slot_offset,
-            pack_slot_length,
-            pack_slot_compression,
-            token_count
-        )
-        "#,
-    );
-    qb.push_values(rows, |mut row, req| {
-        row.push_bind(req.id.as_str())
-            .push_bind(scope.key.as_str())
-            .push_bind(req.manifest.logical_path.as_str())
-            .push_bind(req.manifest.content_hash.as_str())
-            .push_bind(req.manifest.logical_size_bytes)
-            .push_bind(req.manifest.pack_slot.pack_key.as_str())
-            .push_bind(req.manifest.pack_slot.pack_slot_offset)
-            .push_bind(req.manifest.pack_slot.pack_slot_length)
-            .push_bind(req.manifest.pack_slot.pack_slot_compression)
-            .push_bind(req.manifest.token_count);
-    });
-    qb.build().execute(&mut **tx).await.map_err(internal)?;
+    for rows in rows.chunks(POSTGRES_BATCH_CHUNK_SIZE) {
+        let mut qb = QueryBuilder::<Postgres>::new(
+            r#"
+            INSERT INTO chevalier_vfs_file_manifests (
+                id,
+                scope_key,
+                logical_path,
+                content_hash,
+                logical_size_bytes,
+                pack_key,
+                pack_slot_offset,
+                pack_slot_length,
+                pack_slot_compression,
+                token_count
+            )
+            "#,
+        );
+        qb.push_values(rows, |mut row, req| {
+            row.push_bind(req.id.as_str())
+                .push_bind(scope.key.as_str())
+                .push_bind(req.manifest.logical_path.as_str())
+                .push_bind(req.manifest.content_hash.as_str())
+                .push_bind(req.manifest.logical_size_bytes)
+                .push_bind(req.manifest.pack_slot.pack_key.as_str())
+                .push_bind(req.manifest.pack_slot.pack_slot_offset)
+                .push_bind(req.manifest.pack_slot.pack_slot_length)
+                .push_bind(req.manifest.pack_slot.pack_slot_compression)
+                .push_bind(req.manifest.token_count);
+        });
+        qb.build().execute(&mut **tx).await.map_err(internal)?;
+    }
     Ok(())
 }
 
@@ -1433,13 +1908,17 @@ async fn batch_promote_manifest_versions(
     if items.is_empty() {
         return Ok(Vec::new());
     }
-    let mut qb = build_batch_promote_manifest_versions_query(scope, items);
-    let rows: Vec<(String,)> = qb
-        .build_query_as()
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(internal)?;
-    Ok(rows.into_iter().map(|(path,)| path).collect())
+    let mut committed = Vec::with_capacity(items.len());
+    for items in items.chunks(POSTGRES_BATCH_CHUNK_SIZE) {
+        let mut qb = build_batch_promote_manifest_versions_query(scope, items);
+        let rows: Vec<(String,)> = qb
+            .build_query_as()
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(internal)?;
+        committed.extend(rows.into_iter().map(|(path,)| path));
+    }
+    Ok(committed)
 }
 
 fn build_batch_promote_manifest_versions_query<'a>(
@@ -1594,5 +2073,36 @@ mod tests {
             "{sql}"
         );
         assert!(!sql.contains("FOR UPDATE"), "{sql}");
+    }
+
+    #[test]
+    fn multi_identity_lock_plan_uses_one_sorted_server_statement() {
+        let scope = VfsIndexScope::new("owner:scope");
+        let file_ids = (0..10_000)
+            .rev()
+            .map(|index| format!("inode-{index:05}"))
+            .collect::<Vec<_>>();
+        let keys = file_identity_lock_keys(&scope, file_ids);
+
+        assert_eq!(keys.len(), 10_000);
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            FILE_IDENTITY_LOCK_QUERY
+                .matches("pg_advisory_xact_lock")
+                .count(),
+            1,
+            "one multi-identity commit must issue one advisory-lock query",
+        );
+        assert!(FILE_IDENTITY_LOCK_QUERY.contains("unnest($1::text[])"));
+        assert!(FILE_IDENTITY_LOCK_QUERY.contains("ORDER BY lock_key"));
+        assert!(FILE_IDENTITY_LOCK_QUERY.contains("MATERIALIZED"));
+    }
+
+    #[test]
+    fn postgres_batch_chunk_size_stays_below_bind_limit() {
+        assert!(POSTGRES_BATCH_CHUNK_SIZE * 13 < 65_535);
+        assert_eq!(3_999_usize.div_ceil(POSTGRES_BATCH_CHUNK_SIZE), 1);
+        assert_eq!(4_001_usize.div_ceil(POSTGRES_BATCH_CHUNK_SIZE), 2);
+        assert_eq!(10_000_usize.div_ceil(POSTGRES_BATCH_CHUNK_SIZE), 3);
     }
 }
