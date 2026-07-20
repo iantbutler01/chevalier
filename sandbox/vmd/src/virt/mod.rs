@@ -1150,7 +1150,7 @@ pub struct VirtiofsdSpawn {
 /// FUSE-style CLI (`-o source=`, `-o cache=`, etc.) which is NOT what we invoke here.
 ///
 /// Invocation:
-///   `virtiofsd --socket-path=<sock> --shared-dir=<host> --cache=auto --sandbox=<mode>
+///   `virtiofsd --socket-path=<sock> --shared-dir=<host> --cache=never --sandbox=<mode>
 ///    --thread-pool-size=64 --log-level=warn [--readonly]`
 ///
 /// The sandbox mode is selected at runtime. Root daemons use `chroot`; non-root
@@ -1189,7 +1189,10 @@ pub async fn spawn_virtiofsd(
         "--shared-dir={}",
         spawn.source_path.to_string_lossy()
     ));
-    cmd.arg("--cache=auto");
+    // The host source is itself a remote FUSE mount. Another VM can publish
+    // through a separate FUSE/virtiofsd pair, so virtiofsd cannot safely retain
+    // entry or attribute metadata without a cross-daemon invalidation channel.
+    cmd.arg("--cache=never");
     let sandbox_mode = configured_virtiofsd_sandbox_mode();
     cmd.arg(format!("--sandbox={sandbox_mode}"));
     // Blocking SETLKW/flock requests must not monopolize the sole vhost-user
@@ -2033,6 +2036,7 @@ exit 2
 set -eu
 socket=
 for arg in "$@"; do
+  printf '%s\n' "$arg"
   case "$arg" in
     --socket-path=*) socket=${arg#*=} ;;
   esac
@@ -2087,6 +2091,11 @@ while :; do sleep 0.05; done
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ECHILD)
+        );
+        let log = fs::read_to_string(&log_path).expect("read fake virtiofsd arguments");
+        assert!(
+            log.lines().any(|line| line == "--cache=never"),
+            "virtiofsd must not retain metadata across independently mounted VMs: {log}"
         );
     }
 

@@ -27,7 +27,10 @@ use super::client::{AdvisoryLockRenewalIdentity, RangeRead, RemoteVfsClient, req
 use super::namespace::NamespaceJournal;
 use super::write::WriteJournal;
 
-const TTL: Duration = Duration::from_secs(1);
+/// Kernel metadata and entry caching must stay disabled. Distinct VMs can
+/// mount the same VFS scope through independent FUSE sessions, so there is no
+/// kernel-to-kernel invalidation path that could make a positive TTL coherent.
+const TTL: Duration = Duration::ZERO;
 const ROOT_INO_RAW: u64 = 1;
 const ROOT_INO: INodeNo = INodeNo(ROOT_INO_RAW);
 const LARGE_FILE_BYTES: u64 = 10 * 1024 * 1024;
@@ -760,6 +763,9 @@ impl RemoteFuseFs {
         if let Some(metadata) = self.open_handle_metadata(path)? {
             return Ok(Some(metadata));
         }
+        if let Some(metadata) = self.dirty_handle_committed_metadata(path)? {
+            return Ok(Some(metadata));
+        }
         if let Some(metadata) = self.cache.get_metadata(path) {
             if metadata.kind != "file" || metadata.content_hash.is_some() {
                 return Ok(Some(metadata));
@@ -787,6 +793,9 @@ impl RemoteFuseFs {
         if let Some(metadata) = self.open_handle_metadata(path)? {
             return Ok(Some(metadata));
         }
+        if let Some(metadata) = self.dirty_handle_committed_metadata(path)? {
+            return Ok(Some(metadata));
+        }
         if let Some(metadata) = self.cache.get_metadata(path) {
             return Ok(Some(metadata));
         }
@@ -805,6 +814,23 @@ impl RemoteFuseFs {
             self.cache.put_metadata(path, metadata.clone());
         }
         Ok(metadata)
+    }
+
+    /// Same-mount readers must continue seeing the last committed bytes while
+    /// an existing file has a dirty private handle. This is the only path that
+    /// may consume metadata embedded in the content cache without a new remote
+    /// stat; other mounts have no such handle and always revalidate.
+    fn dirty_handle_committed_metadata(&self, path: &str) -> FuseResult<Option<RemoteMetadata>> {
+        let preserve_committed = self
+            .lock_handles()?
+            .files
+            .values()
+            .any(|state| state.path == path && !state.created && state.dirty);
+        if preserve_committed {
+            Ok(self.cache.get_committed_file_metadata(path))
+        } else {
+            Ok(None)
+        }
     }
 
     fn open_handle_metadata(&self, path: &str) -> FuseResult<Option<RemoteMetadata>> {
@@ -1663,10 +1689,15 @@ mod tests {
 
     use super::super::client::RemoteVfsClient;
     use super::{
-        ActiveAdvisoryLocks, InodeTable, LockWaitCancellation, ROOT_INO, RemoteFuseFs,
+        ActiveAdvisoryLocks, InodeTable, LockWaitCancellation, ROOT_INO, RemoteFuseFs, TTL,
         active_advisory_lock_identities, combine_flush_and_lock_cleanup, content_hash_conflicts,
         content_hash_for_bytes, range_fingerprint, take_active_advisory_lock_file_id,
     };
+
+    #[test]
+    fn kernel_metadata_cache_is_disabled_for_cross_mount_coherence() {
+        assert_eq!(TTL, Duration::ZERO);
+    }
 
     #[test]
     fn surface_kind_uses_scoped_path_not_mount_relative_path() {

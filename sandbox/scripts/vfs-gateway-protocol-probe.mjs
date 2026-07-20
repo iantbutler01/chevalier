@@ -267,7 +267,28 @@ export async function runVfsGatewayProtocolProbe({
     namespace: "flock",
   });
   assert(flockB.acquired === true, "flock namespace incorrectly conflicted with POSIX");
-  await lock({ action: "renew_mount", mount_id: mountA });
+  await lock({
+    action: "renew_owners",
+    mount_id: mountA,
+    identities: [
+      {
+        lock_owner: sharedOwner,
+        namespace: "posix",
+        file_id: acquiredA.file_id,
+      },
+    ],
+  });
+  await lock({
+    action: "renew_owners",
+    mount_id: mountB,
+    identities: [
+      {
+        lock_owner: sharedOwner,
+        namespace: "flock",
+        file_id: flockB.file_id,
+      },
+    ],
+  });
   const unlockedA = await lock({
     ...baseLock,
     action: "set",
@@ -317,7 +338,7 @@ export async function runVfsGatewayProtocolProbe({
       independentMountIdentities: true,
       posixConflict: true,
       flockNamespaceIndependent: true,
-      renewMount: true,
+      renewOwners: true,
       unlock: true,
       releaseOwner: true,
       releaseMount: true,

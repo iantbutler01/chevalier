@@ -25,7 +25,7 @@ listener from the vmd container or host.
 
 Before creating a VM, the harness drives an authenticated wire-level probe
 through that public URL. It covers the complete `posix-lock/v1` action set,
-independent mount identities, POSIX/flock namespace separation, scoped
+exact-identity owner renewal, independent mount identities, POSIX/flock namespace separation, scoped
 hard-link creation/alias lookup/mutation/unlink, and the lease-wrapped mutation
 shape used by `RemoteFuseFs`. Each VM must then increase the in-process
 gateway's request count and write a unique readiness challenge that the backing

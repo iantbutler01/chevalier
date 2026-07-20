@@ -360,6 +360,62 @@ index e6c662a..69cc59f 100644
          fn statfs(&self, ctx: Context, inode: Self::Inode) -> io::Result<libc::statvfs64>;
          fn getxattr(
              &self,
+diff --git a/src/seccomp.rs b/src/seccomp.rs
+index ce31412..b5b6efd 100644
+--- a/src/seccomp.rs
++++ b/src/seccomp.rs
+@@ -69,6 +69,7 @@ pub fn enable_seccomp(action: SeccompAction, allow_remote_logging: bool) -> Resu
+     allow_syscall!(ctx, libc::SYS_capget); // For CAP_FSETID
+     allow_syscall!(ctx, libc::SYS_capset);
+     allow_syscall!(ctx, libc::SYS_clock_gettime);
++    allow_syscall!(ctx, libc::SYS_clock_nanosleep);
+     allow_syscall!(ctx, libc::SYS_clone);
+     allow_syscall!(ctx, libc::SYS_clone3);
+     allow_syscall!(ctx, libc::SYS_close);
+@@ -213,3 +214,43 @@ pub fn enable_seccomp(action: SeccompAction, allow_remote_logging: bool) -> Resu
+
+     Ok(())
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::{enable_seccomp, SeccompAction};
++
++    #[test]
++    fn clock_nanosleep_is_allowed_by_production_filter() {
++        let child = unsafe { libc::fork() };
++        assert!(child >= 0, "fork failed");
++
++        if child == 0 {
++            if enable_seccomp(SeccompAction::Kill, false).is_err() {
++                unsafe { libc::_exit(2) };
++            }
++            let request = libc::timespec {
++                tv_sec: 0,
++                tv_nsec: 1_000_000,
++            };
++            let result = unsafe {
++                libc::syscall(
++                    libc::SYS_clock_nanosleep,
++                    libc::CLOCK_MONOTONIC,
++                    0,
++                    &request,
++                    std::ptr::null_mut::<libc::timespec>(),
++                )
++            };
++            unsafe { libc::_exit(if result == 0 { 0 } else { 3 }) };
++        }
++
++        let mut status = 0;
++        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
++        assert!(
++            libc::WIFEXITED(status),
++            "child was killed by seccomp: {}",
++            status
++        );
++        assert_eq!(libc::WEXITSTATUS(status), 0);
++    }
++}
 diff --git a/src/server.rs b/src/server.rs
 index 461461e..73265e9 100644
 --- a/src/server.rs
