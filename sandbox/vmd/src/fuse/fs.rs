@@ -41,7 +41,14 @@ const ADVISORY_LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const POSIX_MODE_MASK: u32 = 0o7777;
 
 type FuseResult<T> = std::result::Result<T, Errno>;
-type ActiveAdvisoryLocks = HashMap<(LockNamespace, String), HashMap<u64, String>>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActiveAdvisoryLockFile {
+    file_id: String,
+    fh: u64,
+}
+
+type ActiveAdvisoryLocks = HashMap<(LockNamespace, String), HashMap<u64, ActiveAdvisoryLockFile>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LockWaitState {
@@ -119,7 +126,7 @@ fn take_active_advisory_lock_file_id(
 ) -> Option<String> {
     let (file_id, owner_is_empty) = match active.get_mut(owner_key) {
         Some(files) => {
-            let file_id = files.remove(&ino);
+            let file_id = files.remove(&ino).map(|file| file.file_id);
             (file_id, files.is_empty())
         }
         None => (None, false),
@@ -130,20 +137,43 @@ fn take_active_advisory_lock_file_id(
     file_id
 }
 
+fn take_active_posix_handle_locks(
+    active: &mut ActiveAdvisoryLocks,
+    fh: u64,
+    ino: u64,
+) -> Vec<(String, String)> {
+    let owners = active
+        .iter()
+        .filter_map(|((namespace, owner), files)| {
+            (*namespace == LockNamespace::Posix
+                && files.get(&ino).is_some_and(|file| file.fh == fh))
+            .then(|| owner.clone())
+        })
+        .collect::<Vec<_>>();
+    owners
+        .into_iter()
+        .filter_map(|owner| {
+            let owner_key = (LockNamespace::Posix, owner.clone());
+            take_active_advisory_lock_file_id(active, &owner_key, ino)
+                .map(|file_id| (owner, file_id))
+        })
+        .collect()
+}
+
 fn active_advisory_lock_identities(
     active: &ActiveAdvisoryLocks,
 ) -> Vec<AdvisoryLockRenewalIdentity> {
     active
         .iter()
         .flat_map(|((namespace, lock_owner), files)| {
-            files.values().map(move |file_id| {
+            files.values().map(move |file| {
                 (
                     lock_owner.clone(),
                     match namespace {
                         LockNamespace::Posix => "posix".to_string(),
                         LockNamespace::Flock => "flock".to_string(),
                     },
-                    file_id.clone(),
+                    file.file_id.clone(),
                 )
             })
         })
@@ -2342,6 +2372,7 @@ impl RemoteFuseFs {
         ino: INodeNo,
         lock_owner: fuser::LockOwner,
         namespace: LockNamespace,
+        posix_fh: Option<u64>,
     ) -> FuseResult<()> {
         let owner = self.advisory_lock_owner_key(lock_owner);
         let owner_key = (namespace, owner.clone());
@@ -2349,14 +2380,34 @@ impl RemoteFuseFs {
         // when the gateway release RPC is temporarily unavailable. Remove the
         // heartbeat source first so a failed close cannot renew an abandoned
         // remote lock forever; the persisted lease then expires naturally.
-        let file_id = {
+        let releases = {
             let mut active = self.active_lock_owners.lock().map_err(|_| Errno::EIO)?;
-            take_active_advisory_lock_file_id(&mut active, &owner_key, ino.0)
+            let mut releases = if namespace == LockNamespace::Posix {
+                posix_fh
+                    .map(|fh| take_active_posix_handle_locks(&mut active, fh, ino.0))
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if let Some(file_id) = take_active_advisory_lock_file_id(&mut active, &owner_key, ino.0)
+                && !releases.iter().any(|(candidate_owner, candidate_file)| {
+                    candidate_owner == &owner && candidate_file == &file_id
+                })
+            {
+                releases.push((owner, file_id));
+            }
+            releases
         };
-        let Some(file_id) = file_id else {
-            return Ok(());
-        };
-        self.release_remote_advisory_lock_identity(&owner, &file_id, namespace)
+        let mut first_error = None;
+        for (owner, file_id) in releases {
+            if let Err(error) =
+                self.release_remote_advisory_lock_identity(&owner, &file_id, namespace)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn release_remote_advisory_lock_identity(
@@ -2545,10 +2596,10 @@ mod tests {
 
     use super::super::client::RemoteVfsClient;
     use super::{
-        ActiveAdvisoryLocks, InodeTable, LockWaitCancellation, ROOT_INO, RemoteFuseFs, TTL,
-        active_advisory_lock_identities, combine_flush_and_lock_cleanup, content_hash_conflicts,
-        content_hash_for_bytes, creation_mode, range_fingerprint,
-        take_active_advisory_lock_file_id,
+        ActiveAdvisoryLockFile, ActiveAdvisoryLocks, InodeTable, LockWaitCancellation, ROOT_INO,
+        RemoteFuseFs, TTL, active_advisory_lock_identities, combine_flush_and_lock_cleanup,
+        content_hash_conflicts, content_hash_for_bytes, creation_mode, range_fingerprint,
+        take_active_advisory_lock_file_id, take_active_posix_handle_locks,
     };
 
     #[derive(Default)]
@@ -2663,14 +2714,23 @@ mod tests {
     fn failed_remote_release_cannot_leave_an_abandoned_lock_heartbeat_active() {
         let mut active = ActiveAdvisoryLocks::new();
         let owner_key = (LockNamespace::Posix, "42".to_string());
-        active
-            .entry(owner_key.clone())
-            .or_default()
-            .insert(77, "stable-file-77".to_string());
+        active.entry(owner_key.clone()).or_default().insert(
+            77,
+            ActiveAdvisoryLockFile {
+                file_id: "stable-file-77".to_string(),
+                fh: 7,
+            },
+        );
         active
             .entry((LockNamespace::Flock, "84".to_string()))
             .or_default()
-            .insert(88, "stable-file-88".to_string());
+            .insert(
+                88,
+                ActiveAdvisoryLockFile {
+                    file_id: "stable-file-88".to_string(),
+                    fh: 8,
+                },
+            );
 
         assert_eq!(
             take_active_advisory_lock_file_id(&mut active, &owner_key, 77).as_deref(),
@@ -2681,6 +2741,50 @@ mod tests {
         assert_eq!(identities[0].lock_owner, "84");
         assert_eq!(identities[0].namespace, "flock");
         assert_eq!(identities[0].file_id, "stable-file-88");
+    }
+
+    #[test]
+    fn posix_close_releases_setlk_owners_by_open_file_description() {
+        let mut active = ActiveAdvisoryLocks::new();
+        for (owner, ino, fh) in [
+            ("same-handle-a", 77, 700),
+            ("same-handle-b", 77, 700),
+            ("other-handle", 77, 701),
+            ("other-inode", 78, 700),
+        ] {
+            active
+                .entry((LockNamespace::Posix, owner.to_string()))
+                .or_default()
+                .insert(
+                    ino,
+                    ActiveAdvisoryLockFile {
+                        file_id: format!("file-{ino}"),
+                        fh,
+                    },
+                );
+        }
+
+        let mut releases = take_active_posix_handle_locks(&mut active, 700, 77);
+        releases.sort();
+        assert_eq!(
+            releases,
+            vec![
+                ("same-handle-a".to_string(), "file-77".to_string()),
+                ("same-handle-b".to_string(), "file-77".to_string()),
+            ]
+        );
+        let identities = active_advisory_lock_identities(&active);
+        assert_eq!(identities.len(), 2);
+        assert!(
+            identities
+                .iter()
+                .any(|identity| identity.lock_owner == "other-handle")
+        );
+        assert!(
+            identities
+                .iter()
+                .any(|identity| identity.lock_owner == "other-inode")
+        );
     }
 
     #[test]
@@ -3874,7 +3978,7 @@ impl RemoteFuseFs {
     ) {
         let flush_result = self.flush_handle_immediate(fh.0);
         let cleanup_result =
-            self.release_advisory_lock_owner(ino, lock_owner, LockNamespace::Posix);
+            self.release_advisory_lock_owner(ino, lock_owner, LockNamespace::Posix, Some(fh.0));
         match combine_flush_and_lock_cleanup("flush", flush_result, cleanup_result) {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(err),
@@ -3918,7 +4022,7 @@ impl RemoteFuseFs {
         };
         let cleanup_result = match lock_owner {
             Some(lock_owner) => {
-                self.release_advisory_lock_owner(ino, lock_owner, LockNamespace::Flock)
+                self.release_advisory_lock_owner(ino, lock_owner, LockNamespace::Flock, None)
             }
             None => Ok(()),
         };
@@ -4052,7 +4156,10 @@ impl RemoteFuseFs {
                             .lock()
                             .map_err(|_| Errno::EIO)
                             .map(|mut active| {
-                                active.entry(owner_key).or_default().insert(ino.0, file_id);
+                                active
+                                    .entry(owner_key)
+                                    .or_default()
+                                    .insert(ino.0, ActiveAdvisoryLockFile { file_id, fh: fh.0 });
                             });
                     if let Err(error) = inserted {
                         reply.error(error);
