@@ -145,6 +145,21 @@ impl PathLockTable {
     /// removal excludes every descendant mutation. Keys are acquired in global
     /// lexical order so overlapping multi-path operations cannot deadlock.
     async fn lock(&self, paths: impl IntoIterator<Item = String>) -> PathLocks {
+        self.lock_with_target_mode(paths, PathLockMode::Write).await
+    }
+
+    /// Point reads share their target lock. They still exclude an exact-path
+    /// mutation, but a directory stat/list or subtree scan no longer takes an
+    /// exclusive ancestor lock that stalls every descendant operation.
+    async fn lock_read(&self, paths: impl IntoIterator<Item = String>) -> PathLocks {
+        self.lock_with_target_mode(paths, PathLockMode::Read).await
+    }
+
+    async fn lock_with_target_mode(
+        &self,
+        paths: impl IntoIterator<Item = String>,
+        target_mode: PathLockMode,
+    ) -> PathLocks {
         let mut modes = HashMap::new();
         for path in paths {
             let path = path.trim_matches('/');
@@ -155,7 +170,7 @@ impl PathLockTable {
                 .filter(|component| !component.is_empty())
                 .collect::<Vec<_>>();
             if components.is_empty() {
-                modes.insert(current, PathLockMode::Write);
+                modes.insert(current, target_mode);
                 continue;
             }
             for (index, component) in components.iter().enumerate() {
@@ -164,7 +179,7 @@ impl PathLockTable {
                 }
                 current.push_str(component);
                 let mode = if index + 1 == components.len() {
-                    PathLockMode::Write
+                    target_mode
                 } else {
                     PathLockMode::Read
                 };
@@ -624,6 +639,18 @@ impl LocalVfsStorage {
     }
 
     async fn lock_write_paths(&self, paths: impl IntoIterator<Item = String>) -> PathLocks {
+        self.lock_paths(paths, PathLockMode::Write).await
+    }
+
+    async fn lock_read_paths(&self, paths: impl IntoIterator<Item = String>) -> PathLocks {
+        self.lock_paths(paths, PathLockMode::Read).await
+    }
+
+    async fn lock_paths(
+        &self,
+        paths: impl IntoIterator<Item = String>,
+        target_mode: PathLockMode,
+    ) -> PathLocks {
         let mut keys = Vec::new();
         for path in paths {
             if let Ok(abs_path) = self.abs_path(&path) {
@@ -648,7 +675,10 @@ impl LocalVfsStorage {
             }
             keys.push(path);
         }
-        self.path_locks.lock(keys).await
+        match target_mode {
+            PathLockMode::Read => self.path_locks.lock_read(keys).await,
+            PathLockMode::Write => self.path_locks.lock(keys).await,
+        }
     }
 
     fn hash_file_for_metadata(
@@ -785,7 +815,7 @@ impl OptimizedVfsStorage for LocalVfsStorage {
 
     async fn stat(&self, path: &str) -> VfsStorageResult<Option<VfsStorageMetadata>> {
         let path = path.to_string();
-        let _locks = self.lock_write_paths([path.clone()]).await;
+        let _locks = self.lock_read_paths([path.clone()]).await;
         self.run_blocking(move |storage| storage.metadata_for_path(&path))
             .await
     }
@@ -796,7 +826,7 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         fields: VfsStorageMetadataFields,
     ) -> VfsStorageResult<Option<VfsStorageMetadata>> {
         let path = path.to_string();
-        let _locks = self.lock_write_paths([path.clone()]).await;
+        let _locks = self.lock_read_paths([path.clone()]).await;
         self.run_blocking(move |storage| {
             let abs_path = storage.abs_path(&path)?;
             storage.metadata_for_abs_with_hash_limit(&abs_path, fields.max_hash_bytes)
@@ -810,7 +840,7 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         fields: VfsStorageMetadataFields,
     ) -> VfsStorageResult<Vec<Option<VfsStorageMetadata>>> {
         let paths = paths.to_vec();
-        let _locks = self.lock_write_paths(paths.clone()).await;
+        let _locks = self.lock_read_paths(paths.clone()).await;
         self.run_blocking(move |storage| {
             paths
                 .iter()
@@ -829,7 +859,7 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         filter: VfsStorageDirListFilter,
     ) -> VfsStorageResult<Vec<VfsStorageMetadata>> {
         let path = path.to_string();
-        let _locks = self.lock_write_paths([path.clone()]).await;
+        let _locks = self.lock_read_paths([path.clone()]).await;
         self.run_blocking(move |storage| {
             let abs_path = storage.abs_path(&path)?;
             storage.assert_no_symlink_ancestor(&abs_path)?;
@@ -894,7 +924,7 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         options: VfsStorageSubtreeOptions,
     ) -> VfsStorageResult<Vec<VfsStorageMetadata>> {
         let prefix = prefix.to_string();
-        let _locks = self.lock_write_paths([prefix.clone()]).await;
+        let _locks = self.lock_read_paths([prefix.clone()]).await;
         self.run_blocking(move |storage| {
             let root = storage.abs_path(&prefix)?;
             storage.assert_no_symlink_ancestor(&root)?;
@@ -957,7 +987,7 @@ impl OptimizedVfsStorage for LocalVfsStorage {
 
     async fn read(&self, path: &str) -> VfsStorageResult<Bytes> {
         let path = path.to_string();
-        let _locks = self.lock_write_paths([path.clone()]).await;
+        let _locks = self.lock_read_paths([path.clone()]).await;
         self.run_blocking(move |storage| {
             let abs_path = storage.abs_path(&path)?;
             storage.assert_no_symlink_ancestor(&abs_path)?;
@@ -968,7 +998,7 @@ impl OptimizedVfsStorage for LocalVfsStorage {
 
     async fn read_range(&self, path: &str, range: VfsStorageReadRange) -> VfsStorageResult<Bytes> {
         let path = path.to_string();
-        let _locks = self.lock_write_paths([path.clone()]).await;
+        let _locks = self.lock_read_paths([path.clone()]).await;
         self.run_blocking(move |storage| {
             let abs_path = storage.abs_path(&path)?;
             storage.assert_no_symlink_ancestor(&abs_path)?;
@@ -986,7 +1016,7 @@ impl OptimizedVfsStorage for LocalVfsStorage {
 
     async fn read_many(&self, paths: &[String]) -> VfsStorageResult<Vec<(String, Bytes)>> {
         let paths = paths.to_vec();
-        let _locks = self.lock_write_paths(paths.clone()).await;
+        let _locks = self.lock_read_paths(paths.clone()).await;
         self.run_blocking(move |storage| {
             let mut out = Vec::with_capacity(paths.len());
             for path in paths {
@@ -1009,7 +1039,7 @@ impl OptimizedVfsStorage for LocalVfsStorage {
     ) -> VfsStorageResult<Vec<VfsStorageReadIfChangedResult>> {
         let requests = requests.to_vec();
         let _locks = self
-            .lock_write_paths(requests.iter().map(|request| request.path.clone()))
+            .lock_read_paths(requests.iter().map(|request| request.path.clone()))
             .await;
         self.run_blocking(move |storage| {
             let mut out = Vec::with_capacity(requests.len());
@@ -4391,6 +4421,33 @@ mod tests {
         assert!(
             tree_lock.try_write_owned().is_ok(),
             "ancestor mutation should proceed after descendants release",
+        );
+    }
+
+    #[tokio::test]
+    async fn path_locks_point_reads_exclude_exact_mutations_without_stalling_descendants() {
+        let table = PathLockTable::default();
+        let directory_read = table.lock_read(["tree".to_string()]).await;
+        let tree_lock = table
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get("tree")
+            .expect("tree point-read lock")
+            .clone();
+        assert!(
+            tree_lock.clone().try_write_owned().is_err(),
+            "an exact directory mutation must wait for its point read",
+        );
+        let descendant_intent = tree_lock
+            .clone()
+            .try_read_owned()
+            .expect("a directory point read must allow descendant intent reads");
+        drop(descendant_intent);
+        drop(directory_read);
+        assert!(
+            tree_lock.try_write_owned().is_ok(),
+            "the exact directory mutation should proceed after its read releases",
         );
     }
 
