@@ -19,11 +19,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 #[cfg(feature = "host")]
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, OnceCell, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 use tonic::metadata::{Ascii, MetadataValue};
-use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use uuid::Uuid;
 
 #[cfg(feature = "distributed-control")]
@@ -934,6 +934,7 @@ struct SandboxInner {
     #[cfg(feature = "host")]
     managed_daemon: Mutex<Option<ManagedDaemon>>,
     ready_vm_rpc: Mutex<HashMap<String, GuestRpcAccess>>,
+    portproxy_channels: Mutex<HashMap<String, Arc<PortproxyChannelEntry>>>,
     node_multiplexers: Mutex<HashMap<String, Arc<NodePortMultiplexer>>>,
     warm_pool_ready: Mutex<HashSet<String>>,
     opencomputer_session_aliases: Mutex<HashMap<String, String>>,
@@ -964,8 +965,13 @@ struct GuestRpcAccess {
 }
 
 struct PortproxyClientAccess {
-    client: PortProxyClient<tonic::transport::Channel>,
+    client: PortProxyClient<Channel>,
     auth_header: Option<MetadataValue<Ascii>>,
+}
+
+struct PortproxyChannelEntry {
+    endpoint: String,
+    channel: OnceCell<Channel>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1139,6 +1145,18 @@ impl Session {
         self.update_route_state(&current_endpoint, &resolved_endpoint, next_fence)
             .await;
         Ok(access)
+    }
+
+    async fn portproxy_client_access(&self) -> Result<PortproxyClientAccess> {
+        // @dive: File RPCs share exec's cached session-access fast path. Calling
+        // resolve_session_endpoint first would force vmd.GetVm (including its
+        // runtime network snapshot) into every read/list/write hot path even
+        // when this VM route is already proven ready.
+        let access = self.ensure_session_rpc_access().await?;
+        let endpoint = self.current_node_endpoint().await;
+        self.sandbox
+            .portproxy_client_for_access(&self.vm_id, &endpoint, access)
+            .await
     }
 
     async fn invalidate_exec_transport_path(&self, endpoint: &str) {
@@ -2124,11 +2142,7 @@ impl Session {
             return control.read_file(&self.vm_id, path).await;
         }
 
-        let endpoint = self.resolve_session_endpoint().await?;
-        let mut access = self
-            .sandbox
-            .portproxy_client_for_vm(&self.vm_id, &endpoint)
-            .await?;
+        let mut access = self.portproxy_client_access().await?;
         let response = access
             .client
             .read_file(request_with_optional_auth_timeout(
@@ -2148,11 +2162,7 @@ impl Session {
             return control.write_file(&self.vm_id, path, data).await;
         }
 
-        let endpoint = self.resolve_session_endpoint().await?;
-        let mut access = self
-            .sandbox
-            .portproxy_client_for_vm(&self.vm_id, &endpoint)
-            .await?;
+        let mut access = self.portproxy_client_access().await?;
         access
             .client
             .write_file(request_with_optional_auth_timeout(
@@ -2176,11 +2186,7 @@ impl Session {
             return control.list_dir(&self.vm_id, path).await;
         }
 
-        let endpoint = self.resolve_session_endpoint().await?;
-        let mut access = self
-            .sandbox
-            .portproxy_client_for_vm(&self.vm_id, &endpoint)
-            .await?;
+        let mut access = self.portproxy_client_access().await?;
         let response = access
             .client
             .list_directory(request_with_optional_auth_timeout(
@@ -2200,11 +2206,7 @@ impl Session {
             return control.delete_path(&self.vm_id, path).await;
         }
 
-        let endpoint = self.resolve_session_endpoint().await?;
-        let mut access = self
-            .sandbox
-            .portproxy_client_for_vm(&self.vm_id, &endpoint)
-            .await?;
+        let mut access = self.portproxy_client_access().await?;
         access
             .client
             .delete_path(request_with_optional_auth_timeout(
@@ -2759,6 +2761,7 @@ impl Sandbox {
                 #[cfg(feature = "host")]
                 managed_daemon: Mutex::new(None),
                 ready_vm_rpc: Mutex::new(HashMap::new()),
+                portproxy_channels: Mutex::new(HashMap::new()),
                 node_multiplexers: Mutex::new(HashMap::new()),
                 warm_pool_ready: Mutex::new(HashSet::new()),
                 opencomputer_session_aliases: Mutex::new(HashMap::new()),
@@ -4397,9 +4400,7 @@ impl Sandbox {
             #[cfg(not(feature = "distributed-control"))]
             let _ = &running_vm;
 
-            let mut ready = self.inner.ready_vm_rpc.lock().await;
-            ready.remove(&ready_key(from_endpoint, vm_id));
-            drop(ready);
+            self.invalidate_ready_vm_rpc(vm_id, from_endpoint).await;
 
             #[cfg(feature = "distributed-control")]
             if let ControlBackend::Distributed(control) = &self.inner.control_backend {
@@ -4632,9 +4633,7 @@ impl Sandbox {
 
         let is_running = vm.state == proto::vmd::v1::VmState::Running as i32;
         if !is_running {
-            let mut ready = self.inner.ready_vm_rpc.lock().await;
-            ready.remove(&ready_key(endpoint, vm_id));
-            drop(ready);
+            self.invalidate_ready_vm_rpc(vm_id, endpoint).await;
             let action_request = self.request_with_auth(VmActionRequest {
                 vm_id: vm_id.to_string(),
             });
@@ -4649,8 +4648,12 @@ impl Sandbox {
     }
 
     async fn invalidate_ready_vm_rpc(&self, vm_id: &str, endpoint: &str) {
+        let cache_key = ready_key(endpoint, vm_id);
         let mut ready = self.inner.ready_vm_rpc.lock().await;
-        ready.remove(&ready_key(endpoint, vm_id));
+        ready.remove(&cache_key);
+        drop(ready);
+        let mut channels = self.inner.portproxy_channels.lock().await;
+        channels.remove(&cache_key);
     }
 
     async fn restart_vm_on_endpoint(&self, vm_id: &str, endpoint: &str) -> Result<()> {
@@ -4783,16 +4786,56 @@ impl Sandbox {
         )))
     }
 
-    async fn portproxy_client_for_vm(
+    async fn portproxy_client_for_access(
         &self,
         vm_id: &str,
         endpoint: &str,
+        access: GuestRpcAccess,
     ) -> Result<PortproxyClientAccess> {
-        let access = self.ensure_vm_and_get_rpc_access(vm_id, endpoint).await?;
+        let channel_entry = self
+            .portproxy_channel_entry(vm_id, endpoint, &access.endpoint)
+            .await;
+        let connect_timeout = self.inner.cfg.connect_timeout;
+        let channel = channel_entry
+            .channel
+            .get_or_try_init(|| async {
+                Endpoint::from_shared(access.endpoint.clone())
+                    .map_err(|err| SandboxError::InvalidConfig(err.to_string()))?
+                    .connect_timeout(connect_timeout)
+                    .connect()
+                    .await
+                    .map_err(SandboxError::Transport)
+            })
+            .await?
+            .clone();
         Ok(PortproxyClientAccess {
-            client: PortProxyClient::connect(access.endpoint).await?,
+            client: PortProxyClient::new(channel),
             auth_header: access.auth_header,
         })
+    }
+
+    async fn portproxy_channel_entry(
+        &self,
+        vm_id: &str,
+        endpoint: &str,
+        rpc_endpoint: &str,
+    ) -> Arc<PortproxyChannelEntry> {
+        // @dive: tonic Channel clones multiplex RPCs over one reconnecting
+        // HTTP/2 transport. The OnceCell prevents a cold parallel traversal
+        // from opening one TCP connection per file before the first connects.
+        let cache_key = ready_key(endpoint, vm_id);
+        let mut channels = self.inner.portproxy_channels.lock().await;
+        if let Some(entry) = channels.get(&cache_key) {
+            if entry.endpoint == rpc_endpoint {
+                return Arc::clone(entry);
+            }
+        }
+        let entry = Arc::new(PortproxyChannelEntry {
+            endpoint: rpc_endpoint.to_string(),
+            channel: OnceCell::new(),
+        });
+        channels.insert(cache_key, Arc::clone(&entry));
+        entry
     }
 
     async fn discard_vm(
@@ -4827,9 +4870,7 @@ impl Sandbox {
                 purge_snapshots: true,
             }))
             .await?;
-        let mut ready = self.inner.ready_vm_rpc.lock().await;
-        ready.remove(&ready_key(endpoint, vm_id));
-        drop(ready);
+        self.invalidate_ready_vm_rpc(vm_id, endpoint).await;
         self.clear_session_route(session_id, vm_id, expected_fence)
             .await?;
         Ok(())
@@ -5538,6 +5579,7 @@ mod tests {
                 #[cfg(feature = "host")]
                 managed_daemon: Mutex::new(None),
                 ready_vm_rpc: Mutex::new(HashMap::new()),
+                portproxy_channels: Mutex::new(HashMap::new()),
                 node_multiplexers: Mutex::new(HashMap::new()),
                 warm_pool_ready: Mutex::new(HashSet::new()),
                 opencomputer_session_aliases: Mutex::new(HashMap::new()),
@@ -5563,5 +5605,38 @@ mod tests {
                 .await,
             "requested-session"
         );
+    }
+
+    #[tokio::test]
+    async fn portproxy_channels_are_single_flight_per_vm_route_and_invalidated() {
+        let sandbox = Sandbox {
+            inner: Arc::new(SandboxInner {
+                cfg: SandboxConfig::default(),
+                control_backend: ControlBackend::Direct,
+                auth_header: None,
+                pci_auth_header: None,
+                #[cfg(feature = "host")]
+                managed_daemon: Mutex::new(None),
+                ready_vm_rpc: Mutex::new(HashMap::new()),
+                portproxy_channels: Mutex::new(HashMap::new()),
+                node_multiplexers: Mutex::new(HashMap::new()),
+                warm_pool_ready: Mutex::new(HashSet::new()),
+                opencomputer_session_aliases: Mutex::new(HashMap::new()),
+            }),
+        };
+
+        let (first, concurrent) = tokio::join!(
+            sandbox.portproxy_channel_entry("vm-1", "node-1", "http://127.0.0.1:3001"),
+            sandbox.portproxy_channel_entry("vm-1", "node-1", "http://127.0.0.1:3001"),
+        );
+        assert!(Arc::ptr_eq(&first, &concurrent));
+
+        let rebound = sandbox
+            .portproxy_channel_entry("vm-1", "node-1", "http://127.0.0.1:3002")
+            .await;
+        assert!(!Arc::ptr_eq(&first, &rebound));
+
+        sandbox.invalidate_ready_vm_rpc("vm-1", "node-1").await;
+        assert!(sandbox.inner.portproxy_channels.lock().await.is_empty());
     }
 }

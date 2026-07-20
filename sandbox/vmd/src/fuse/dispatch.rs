@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -155,28 +156,47 @@ impl SpawnedFuseFs {
         &self.inner
     }
 
-    fn spawn(&self, op: impl FnOnce(&RemoteFuseFs) + Send + 'static) {
-        self.spawn_with_semaphore(Arc::clone(&self.ops), op);
+    fn spawn(
+        &self,
+        operation: &'static str,
+        request_id: RequestId,
+        op: impl FnOnce(&RemoteFuseFs) + Send + 'static,
+    ) {
+        self.spawn_with_semaphore(Arc::clone(&self.ops), operation, request_id, op);
     }
 
-    fn spawn_blocking_lock(&self, op: impl FnOnce(&RemoteFuseFs) + Send + 'static) {
-        self.spawn_with_semaphore(Arc::clone(&self.blocking_lock_ops), op);
+    fn spawn_blocking_lock(
+        &self,
+        operation: &'static str,
+        request_id: RequestId,
+        op: impl FnOnce(&RemoteFuseFs) + Send + 'static,
+    ) {
+        self.spawn_with_semaphore(
+            Arc::clone(&self.blocking_lock_ops),
+            operation,
+            request_id,
+            op,
+        );
     }
 
     fn spawn_with_semaphore(
         &self,
         ops: Arc<Semaphore>,
+        operation: &'static str,
+        request_id: RequestId,
         op: impl FnOnce(&RemoteFuseFs) + Send + 'static,
     ) {
         let inner = Arc::clone(&self.inner);
         let tokio = inner.tokio_handle();
-        spawn_bounded_blocking(&tokio, ops, move || op(&inner));
+        spawn_bounded_blocking(&tokio, ops, operation, request_id, move || op(&inner));
     }
 }
 
 fn spawn_bounded_blocking(
     tokio: &tokio::runtime::Handle,
     ops: Arc<Semaphore>,
+    operation: &'static str,
+    request_id: RequestId,
     op: impl FnOnce() + Send + 'static,
 ) {
     let queued_at = Instant::now();
@@ -191,17 +211,34 @@ fn spawn_bounded_blocking(
         let queue_wait = queued_at.elapsed();
         if queue_wait >= Duration::from_secs(1) {
             tracing::warn!(
+                operation,
+                request_id = request_id.0,
                 queue_wait_ms = queue_wait.as_millis(),
                 "vfs fuse operation waited for dispatch admission"
             );
         }
+        let completed = Arc::new(AtomicBool::new(false));
+        let watchdog_completed = Arc::clone(&completed);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if !watchdog_completed.load(Ordering::Acquire) {
+                tracing::warn!(
+                    operation,
+                    request_id = request_id.0,
+                    "vfs fuse operation remains in flight"
+                );
+            }
+        });
         let _ = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let started_at = Instant::now();
             op();
+            completed.store(true, Ordering::Release);
             let operation_time = started_at.elapsed();
             if operation_time >= Duration::from_secs(1) {
                 tracing::warn!(
+                    operation,
+                    request_id = request_id.0,
                     operation_time_ms = operation_time.as_millis(),
                     "vfs fuse operation occupied a dispatch worker"
                 );
@@ -237,23 +274,27 @@ impl Filesystem for SpawnedFuseFs {
         }
     }
 
-    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name: OsString = name.to_owned();
-        self.spawn(move |fs| fs.lookup(parent, &name, reply));
+        self.spawn("lookup", req.unique(), move |fs| {
+            fs.lookup(parent, &name, reply)
+        });
     }
 
-    fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
-        self.spawn(move |fs| fs.getattr(ino, fh, reply));
+    fn getattr(&self, req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
+        self.spawn("getattr", req.unique(), move |fs| {
+            fs.getattr(ino, fh, reply)
+        });
     }
 
-    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
-        self.spawn(move |fs| fs.readlink(ino, reply));
+    fn readlink(&self, req: &Request, ino: INodeNo, reply: ReplyData) {
+        self.spawn("readlink", req.unique(), move |fs| fs.readlink(ino, reply));
     }
 
     #[allow(clippy::too_many_arguments)]
     fn setattr(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -269,7 +310,7 @@ impl Filesystem for SpawnedFuseFs {
         flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        self.spawn(move |fs| {
+        self.spawn("setattr", req.unique(), move |fs| {
             fs.setattr(
                 ino, mode, uid, gid, size, atime, mtime, ctime, fh, crtime, chgtime, bkuptime,
                 flags, reply,
@@ -284,33 +325,37 @@ impl Filesystem for SpawnedFuseFs {
 
     fn readdir(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         reply: ReplyDirectory,
     ) {
-        self.spawn(move |fs| fs.readdir(ino, fh, offset, reply));
+        self.spawn("readdir", req.unique(), move |fs| {
+            fs.readdir(ino, fh, offset, reply)
+        });
     }
 
     fn readdirplus(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         reply: ReplyDirectoryPlus,
     ) {
-        self.spawn(move |fs| fs.readdirplus(ino, fh, offset, reply));
+        self.spawn("readdirplus", req.unique(), move |fs| {
+            fs.readdirplus(ino, fh, offset, reply)
+        });
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        self.spawn(move |fs| fs.open(ino, flags, reply));
+    fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        self.spawn("open", req.unique(), move |fs| fs.open(ino, flags, reply));
     }
 
     fn read(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         fh: FileHandle,
         offset: u64,
@@ -319,13 +364,15 @@ impl Filesystem for SpawnedFuseFs {
         lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        self.spawn(move |fs| fs.read(ino, fh, offset, size, flags, lock_owner, reply));
+        self.spawn("read", req.unique(), move |fs| {
+            fs.read(ino, fh, offset, size, flags, lock_owner, reply)
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
     fn write(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         fh: FileHandle,
         offset: u64,
@@ -336,7 +383,7 @@ impl Filesystem for SpawnedFuseFs {
         reply: ReplyWrite,
     ) {
         let data = data.to_vec();
-        self.spawn(move |fs| {
+        self.spawn("write", req.unique(), move |fs| {
             fs.write(
                 ino,
                 fh,
@@ -352,7 +399,7 @@ impl Filesystem for SpawnedFuseFs {
 
     fn flush(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         fh: FileHandle,
         lock_owner: LockOwner,
@@ -360,23 +407,27 @@ impl Filesystem for SpawnedFuseFs {
     ) {
         self.lock_waits
             .cancel_owner(ino, lock_owner, LockNamespace::Posix);
-        self.spawn(move |fs| fs.flush(ino, fh, lock_owner, reply));
+        self.spawn("flush", req.unique(), move |fs| {
+            fs.flush(ino, fh, lock_owner, reply)
+        });
     }
 
     fn fsync(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         fh: FileHandle,
         datasync: bool,
         reply: ReplyEmpty,
     ) {
-        self.spawn(move |fs| fs.fsync(ino, fh, datasync, reply));
+        self.spawn("fsync", req.unique(), move |fs| {
+            fs.fsync(ino, fh, datasync, reply)
+        });
     }
 
     fn release(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         fh: FileHandle,
         flags: OpenFlags,
@@ -388,12 +439,14 @@ impl Filesystem for SpawnedFuseFs {
             self.lock_waits
                 .cancel_owner(ino, lock_owner, LockNamespace::Flock);
         }
-        self.spawn(move |fs| fs.release(ino, fh, flags, lock_owner, flush, reply));
+        self.spawn("release", req.unique(), move |fs| {
+            fs.release(ino, fh, flags, lock_owner, flush, reply)
+        });
     }
 
     fn getlk(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         fh: FileHandle,
         lock_owner: LockOwner,
@@ -404,7 +457,7 @@ impl Filesystem for SpawnedFuseFs {
         pid: u32,
         reply: ReplyLock,
     ) {
-        self.spawn(move |fs| {
+        self.spawn("getlk", req.unique(), move |fs| {
             fs.getlk(
                 ino,
                 fh,
@@ -453,15 +506,15 @@ impl Filesystem for SpawnedFuseFs {
             );
         };
         if sleep {
-            self.spawn_blocking_lock(op);
+            self.spawn_blocking_lock("setlk", req.unique(), op);
         } else {
-            self.spawn(op);
+            self.spawn("setlk", req.unique(), op);
         }
     }
 
     fn mkdir(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -469,12 +522,14 @@ impl Filesystem for SpawnedFuseFs {
         reply: ReplyEntry,
     ) {
         let name: OsString = name.to_owned();
-        self.spawn(move |fs| fs.mkdir(parent, &name, mode, umask, reply));
+        self.spawn("mkdir", req.unique(), move |fs| {
+            fs.mkdir(parent, &name, mode, umask, reply)
+        });
     }
 
     fn symlink(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         link_name: &OsStr,
         target: &Path,
@@ -482,22 +537,28 @@ impl Filesystem for SpawnedFuseFs {
     ) {
         let link_name: OsString = link_name.to_owned();
         let target = target.to_path_buf();
-        self.spawn(move |fs| fs.symlink(parent, &link_name, &target, reply));
+        self.spawn("symlink", req.unique(), move |fs| {
+            fs.symlink(parent, &link_name, &target, reply)
+        });
     }
 
-    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let name: OsString = name.to_owned();
-        self.spawn(move |fs| fs.unlink(parent, &name, reply));
+        self.spawn("unlink", req.unique(), move |fs| {
+            fs.unlink(parent, &name, reply)
+        });
     }
 
-    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let name: OsString = name.to_owned();
-        self.spawn(move |fs| fs.rmdir(parent, &name, reply));
+        self.spawn("rmdir", req.unique(), move |fs| {
+            fs.rmdir(parent, &name, reply)
+        });
     }
 
     fn rename(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         newparent: INodeNo,
@@ -507,24 +568,28 @@ impl Filesystem for SpawnedFuseFs {
     ) {
         let name: OsString = name.to_owned();
         let newname: OsString = newname.to_owned();
-        self.spawn(move |fs| fs.rename(parent, &name, newparent, &newname, flags, reply));
+        self.spawn("rename", req.unique(), move |fs| {
+            fs.rename(parent, &name, newparent, &newname, flags, reply)
+        });
     }
 
     fn link(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         newparent: INodeNo,
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
         let newname: OsString = newname.to_owned();
-        self.spawn(move |fs| fs.link(ino, newparent, &newname, reply));
+        self.spawn("link", req.unique(), move |fs| {
+            fs.link(ino, newparent, &newname, reply)
+        });
     }
 
     fn create(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -533,7 +598,9 @@ impl Filesystem for SpawnedFuseFs {
         reply: ReplyCreate,
     ) {
         let name: OsString = name.to_owned();
-        self.spawn(move |fs| fs.create(parent, &name, mode, umask, flags, reply));
+        self.spawn("create", req.unique(), move |fs| {
+            fs.create(parent, &name, mode, umask, flags, reply)
+        });
     }
 }
 
@@ -559,16 +626,28 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
 
-        spawn_bounded_blocking(&runtime.handle(), Arc::clone(&semaphore), move || {
-            started_tx.send(()).expect("report admitted operation");
-            release_rx.recv().expect("release admitted operation");
-        });
+        spawn_bounded_blocking(
+            &runtime.handle(),
+            Arc::clone(&semaphore),
+            "test",
+            RequestId(1),
+            move || {
+                started_tx.send(()).expect("report admitted operation");
+                release_rx.recv().expect("release admitted operation");
+            },
+        );
         started_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("first operation starts");
 
         for _ in 0..8 {
-            spawn_bounded_blocking(&runtime.handle(), Arc::clone(&semaphore), || {});
+            spawn_bounded_blocking(
+                &runtime.handle(),
+                Arc::clone(&semaphore),
+                "test",
+                RequestId(2),
+                || {},
+            );
         }
 
         let (probe_tx, probe_rx) = mpsc::channel();
