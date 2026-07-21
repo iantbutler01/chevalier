@@ -3187,11 +3187,32 @@ impl Manager {
             )
         };
         let mut meta_snapshot = meta_snapshot;
-        cleanup_runtime_mounts(&vm)
-            .await
-            .with_context(|| format!("clean stale runtime mounts before starting VM {id}"))
-            .map_err(ManagerError::Other)?;
-        if cleanup_stale_sidecars {
+        let mut stale_sidecars_cleaned = false;
+        if let Err(initial_error) = cleanup_runtime_mounts(&vm).await {
+            if !cleanup_stale_sidecars {
+                return Err(ManagerError::Other(
+                    initial_error.context(format!("clean runtime mounts before starting VM {id}")),
+                ));
+            }
+            warn!(
+                vm_id = %id,
+                error = %initial_error,
+                "normal FUSE cleanup failed after reclaiming stale runtime; retrying by pathname"
+            );
+            cleanup_stale_runtime_sidecars(id, vm_dir.as_path(), runtime_dir.as_path()).await;
+            stale_sidecars_cleaned = true;
+            fuse::unmount_active_mountpoints_under(&vm_dir.join("fuse-mounts"))
+                .await
+                .with_context(|| format!("retry stale FUSE cleanup before starting VM {id}"))
+                .map_err(ManagerError::Other)?;
+            cleanup_runtime_mounts(&vm)
+                .await
+                .with_context(|| {
+                    format!("verify stale runtime mounts are detached before starting VM {id}")
+                })
+                .map_err(ManagerError::Other)?;
+        }
+        if cleanup_stale_sidecars && !stale_sidecars_cleaned {
             cleanup_stale_runtime_sidecars(id, vm_dir.as_path(), runtime_dir.as_path()).await;
         }
 
