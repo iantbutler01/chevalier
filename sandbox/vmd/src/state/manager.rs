@@ -824,9 +824,6 @@ impl Manager {
         let mut registry = HashMap::new();
         for vm in vms {
             let inner = vm.lock().await;
-            if matches!(inner.metadata.state, VmState::Error) {
-                continue;
-            }
             let Some(session_id) = inner.metadata.metadata.get(META_SESSION_ID) else {
                 continue;
             };
@@ -960,31 +957,30 @@ impl Manager {
                     }
 
                     self.vms.write().await.insert(meta.id.clone(), vm);
-                    if !matches!(meta.state, VmState::Error) {
-                        if let Some(session_id) = meta
-                            .metadata
-                            .get(META_SESSION_ID)
-                            .filter(|value| !value.trim().is_empty())
-                        {
-                            let replaced = self
-                                .session_registry
-                                .write()
-                                .await
-                                .insert(session_id.clone(), meta.id.clone());
-                            if let Some(previous) = replaced {
-                                warn!(
-                                    session_id = %session_id,
-                                    previous_vm_id = %previous,
-                                    vm_id = %meta.id,
-                                    "duplicate session mapping replaced during discovery"
-                                );
-                            }
-                            info!(
+                    if let Some(session_id) = meta
+                        .metadata
+                        .get(META_SESSION_ID)
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        let replaced = self
+                            .session_registry
+                            .write()
+                            .await
+                            .insert(session_id.clone(), meta.id.clone());
+                        if let Some(previous) = replaced {
+                            warn!(
                                 session_id = %session_id,
+                                previous_vm_id = %previous,
                                 vm_id = %meta.id,
-                                "rehydrated persisted session mapping"
+                                "duplicate session mapping replaced during discovery"
                             );
                         }
+                        info!(
+                            session_id = %session_id,
+                            vm_id = %meta.id,
+                            state = ?meta.state,
+                            "rehydrated persisted session mapping"
+                        );
                     }
                 }
                 Err(err) => {
@@ -6956,12 +6952,20 @@ mod tests {
                 .id,
             vm_id
         );
+        let discovered_vm = manager
+            .vms
+            .read()
+            .await
+            .get(&vm_id)
+            .cloned()
+            .expect("discovered VM");
+        discovered_vm.lock().await.metadata.state = VmState::Error;
         manager.session_registry.write().await.clear();
         assert_eq!(
             manager
                 .get_by_session_id("persisted-session")
                 .await
-                .expect("one lookup-time registry rebuild")
+                .expect("error-state session remains recoverable after registry rebuild")
                 .id,
             vm_id
         );
