@@ -1048,21 +1048,15 @@ impl RemoteFuseFs {
         if let Some(entries) = self.cache.get_dir(path) {
             return Ok(entries);
         }
-        for _ in 0..2 {
-            let generation = self.cache.directory_generation(path);
-            let entries = self
-                .tokio
-                .block_on(self.client.list_dir(path))
-                .map_err(|_| Errno::EIO)?
-                .ok_or(Errno::ENOENT)?;
-            if self
-                .cache
-                .put_dir_if_generation(path, generation, entries.clone())
-            {
-                return Ok(entries);
-            }
-        }
-        Err(Errno::EAGAIN)
+        // list_dir returns one coherent authoritative snapshot. Concurrent
+        // namespace changes may make that snapshot immediately old, which is
+        // normal readdir behavior; they must not turn a successful listing
+        // into EAGAIN. Directory responses are deliberately not cached, so the
+        // next call will observe the newer namespace without a stale entry.
+        self.tokio
+            .block_on(self.client.list_dir(path))
+            .map_err(|_| Errno::EIO)?
+            .ok_or(Errno::ENOENT)
     }
 
     fn stat_path(&self, path: &str) -> FuseResult<Option<RemoteMetadata>> {
