@@ -102,12 +102,60 @@ pub(super) trait KernelInvalidator: Send + Sync {
     /// learned — the watch 200 carries only a revision. Same return contract as
     /// [`KernelInvalidator::invalidate`].
     fn invalidate_all(&self) -> bool;
+
+    /// Whether this mount holds kernel state that `invalidation` supersedes AND
+    /// that it is not itself the source of — the exact and only condition under
+    /// which a publication must wait for this mount before it may be reported
+    /// coherent.
+    ///
+    /// Must be cheap and side-effect free: it resolves the target set from the
+    /// mount's own tables and never calls a notifier. Two mounts answer `false`:
+    /// one that never handed the kernel the affected path or its parent (it
+    /// cannot serve anything stale for this publication), and one whose only
+    /// targets are paths it is publishing itself (its own projection is the
+    /// newest, and its parked op holds the very dentry lock the revocation
+    /// needs — see [`KernelInvalidator::invalidate_for_ack`]).
+    ///
+    /// The default is the conservative answer, so a mount that does not
+    /// distinguish the cases keeps today's behaviour exactly.
+    fn has_ack_blocking_targets(&self, invalidation: &PublicationInvalidation) -> bool {
+        !invalidation.is_empty()
+    }
+
+    /// Revoke everything this mount must drop before it may be reported
+    /// coherent for `invalidation` — which is everything except the paths it is
+    /// itself publishing.
+    ///
+    /// A mount publishing path `P` has an op parked on that publication while
+    /// the guest kernel holds `P`'s parent inode lock for the whole op, and
+    /// `fuse_reverse_inval_entry` takes that same lock. Revoking `P` here
+    /// therefore cannot complete until the publication returns, and the
+    /// publication cannot return until this ack lands: a lock-order inversion
+    /// that resolves only when the gateway's ack cap fires. Measured at 27.6 ms
+    /// per publication (200/200 capped) against 0.40 ms uncontended.
+    ///
+    /// Skipping is sound, not a dropped revocation: the mount's own projection
+    /// answers reads of the paths it just published (read-your-writes), and its
+    /// commit hook enqueues the real revocation for exactly those paths the
+    /// moment the publication returns.
+    ///
+    /// Default: the full revocation, unchanged.
+    fn invalidate_for_ack(&self, invalidation: &PublicationInvalidation) -> bool {
+        self.invalidate(invalidation)
+    }
 }
 
 /// One queued kernel revocation's target set.
 enum RevocationRequest {
     /// Revoke exactly the entries one publication superseded.
-    Targeted(PublicationInvalidation),
+    Targeted {
+        invalidation: PublicationInvalidation,
+        /// This revocation gates a publication's ack, so each mount applies the
+        /// ack-critical subset only ([`KernelInvalidator::invalidate_for_ack`]).
+        /// A mount's own in-flight publication is excluded there; its commit
+        /// hook enqueues that part as an ordinary untracked revocation.
+        for_ack: bool,
+    },
     /// Revoke every entry each mount handed its kernel, for a cross-process
     /// publication whose exact path set this process never learned.
     Full,
@@ -278,6 +326,29 @@ impl InvalidatorRegistry {
         clean
     }
 
+    /// As [`InvalidatorRegistry::invalidate`], but each mount applies only the
+    /// part of the revocation that must precede a publication's ack.
+    fn invalidate_for_ack(&self, invalidation: &PublicationInvalidation) -> bool {
+        if invalidation.is_empty() {
+            return true;
+        }
+        let mut clean = true;
+        for invalidator in self.live() {
+            clean &= invalidator.invalidate_for_ack(invalidation);
+        }
+        clean
+    }
+
+    /// Whether ANY live mount holds kernel state this publication supersedes
+    /// and is not itself the source of. `false` means no mount of this registry
+    /// can serve a superseded attr or dentry for it, so nothing has to be
+    /// revoked before the publisher may be told it is coherent.
+    fn has_ack_blocking_targets(&self, invalidation: &PublicationInvalidation) -> bool {
+        self.live()
+            .iter()
+            .any(|invalidator| invalidator.has_ack_blocking_targets(invalidation))
+    }
+
     /// Returns whether every mount's revocation landed.
     fn invalidate_all(&self) -> bool {
         let mut clean = true;
@@ -323,7 +394,14 @@ fn run_revocation_worker(queue: Arc<RevocationQueue>, registry: Arc<InvalidatorR
         }
         for item in batch {
             let landed = match &item.request {
-                RevocationRequest::Targeted(invalidation) => registry.invalidate(invalidation),
+                RevocationRequest::Targeted {
+                    invalidation,
+                    for_ack: false,
+                } => registry.invalidate(invalidation),
+                RevocationRequest::Targeted {
+                    invalidation,
+                    for_ack: true,
+                } => registry.invalidate_for_ack(invalidation),
                 RevocationRequest::Full => registry.invalidate_all(),
             };
             if let Some(completion) = item.completion {
@@ -404,12 +482,26 @@ impl MountInvalidators {
         if invalidation.is_empty() {
             return;
         }
-        self.queue
-            .push(RevocationRequest::Targeted(invalidation.clone()), None);
+        self.queue.push(
+            RevocationRequest::Targeted {
+                invalidation: invalidation.clone(),
+                for_ack: false,
+            },
+            None,
+        );
     }
 
     /// Queue a revocation whose completion the caller will await before it
     /// reports itself coherent (the revision watch's ack ordering).
+    ///
+    /// A publication only has to wait for a mount that could actually serve
+    /// something it superseded. When no live mount of this registry holds
+    /// kernel state for the affected set — or the only state any of them holds
+    /// is for paths that mount is publishing itself — there is nothing to
+    /// revoke before the ack, so the ticket resolves immediately and the writer
+    /// never pays the queue, the worker hop, or (when the revocation would have
+    /// contended with the publishing op's own inode lock) the gateway's whole
+    /// ack cap.
     pub(super) fn enqueue_revocation_tracked(
         &self,
         invalidation: &PublicationInvalidation,
@@ -417,9 +509,15 @@ impl MountInvalidators {
         if invalidation.is_empty() {
             return RevocationTicket::resolved(true);
         }
+        if !self.registry.has_ack_blocking_targets(invalidation) {
+            return RevocationTicket::resolved(true);
+        }
         let (sender, receiver) = oneshot::channel();
         if self.queue.push(
-            RevocationRequest::Targeted(invalidation.clone()),
+            RevocationRequest::Targeted {
+                invalidation: invalidation.clone(),
+                for_ack: true,
+            },
             Some(sender),
         ) {
             RevocationTicket::pending(receiver)

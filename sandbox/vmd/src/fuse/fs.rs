@@ -26,8 +26,8 @@ use super::cache::{
     KernelInvalidator, MountInvalidators, PublicationInvalidation, RemoteFuseCache,
 };
 use super::client::{
-    AdvisoryLockRenewalIdentity, OPEN_STAT_MAX_HASH_BYTES, RangeRead, RemoteVfsClient, Versioned,
-    request_status,
+    AdvisoryLockRenewalIdentity, InFlightPublications, OPEN_STAT_MAX_HASH_BYTES, RangeRead,
+    RemoteVfsClient, Versioned, request_status,
 };
 use super::namespace::{NamespaceJournal, NamespaceProjection};
 use super::write::{WriteBarrierGuard, WriteJournal};
@@ -788,6 +788,82 @@ struct KernelInvalTarget {
     name: OsString,
 }
 
+/// Resolve one publication's invalidation into the exact attr/dentry targets a
+/// mount handed its kernel.
+///
+/// `skip_publishing` is `Some` only when the result gates a publication's ack.
+/// Paths that mount is itself publishing are then dropped: the op parked on that
+/// publication holds the path's parent inode lock for its whole duration and
+/// `fuse_reverse_inval_entry` takes the same lock, so the revocation cannot land
+/// until the publication returns — while the publication cannot return until
+/// this ack does. Nothing is lost: the mount's own projection answers reads of
+/// the paths it just published, and its commit hook enqueues the identical
+/// revocation as soon as the publication returns.
+fn resolve_invalidation_targets(
+    table: &InodeTable,
+    invalidation: &PublicationInvalidation,
+    skip_publishing: Option<&InFlightPublications>,
+) -> Vec<KernelInvalTarget> {
+    let is_own = own_publication_filter(skip_publishing);
+    let mut targets = Vec::new();
+    for path in &invalidation.paths {
+        if is_own(path.as_str()) {
+            continue;
+        }
+        if let Some(target) = table.invalidation_target(path) {
+            targets.push(target);
+        }
+    }
+    for prefix in &invalidation.subtrees {
+        if is_own(prefix.as_str()) {
+            continue;
+        }
+        targets.extend(table.subtree_invalidation_targets(prefix));
+    }
+    // Identities are reached through a stable file id, never a pathname, and a
+    // remote publication's answer never carries any (see
+    // `PublicationInvalidation::for_affected`), so there is nothing to filter.
+    for identity in &invalidation.identities {
+        targets.extend(table.identity_invalidation_targets(identity));
+    }
+    targets
+}
+
+/// Whether [`resolve_invalidation_targets`] would return anything, decided
+/// without building the vector and short-circuiting on the first hit.
+///
+/// This runs on the revision-watch task for every publication, so it must stay
+/// proportional to the answer rather than to the affected set: a `false` here is
+/// what lets the publication ack without touching the revocation queue at all.
+fn has_invalidation_targets(
+    table: &InodeTable,
+    invalidation: &PublicationInvalidation,
+    skip_publishing: Option<&InFlightPublications>,
+) -> bool {
+    let is_own = own_publication_filter(skip_publishing);
+    invalidation
+        .paths
+        .iter()
+        .any(|path| !is_own(path.as_str()) && table.invalidation_target(path).is_some())
+        || invalidation.subtrees.iter().any(|prefix| {
+            !is_own(prefix.as_str()) && !table.subtree_invalidation_targets(prefix).is_empty()
+        })
+        || invalidation
+            .identities
+            .iter()
+            .any(|identity| !table.identity_invalidation_targets(identity).is_empty())
+}
+
+/// Predicate for "this mount is publishing that path itself", pre-resolved so
+/// the common case (nothing in flight) costs one atomic-free map check rather
+/// than one per affected path.
+fn own_publication_filter(
+    skip_publishing: Option<&InFlightPublications>,
+) -> impl Fn(&str) -> bool + '_ {
+    let publishing = skip_publishing.filter(|publications| !publications.is_idle());
+    move |path: &str| publishing.is_some_and(|publications| publications.contains(path))
+}
+
 /// Split a scope-relative VFS path into its parent directory and leaf name.
 /// Returns `None` for the scope root (which has no parent dentry). A top-level
 /// name yields `("", name)` — the empty parent is the scope root inode.
@@ -811,12 +887,42 @@ fn split_parent_and_leaf(path: &str) -> Option<(&str, &str)> {
 pub(super) struct MountKernelInvalidator {
     notifier: fuser::Notifier,
     inodes: Weak<Mutex<InodeTable>>,
+    /// Paths this mount is publishing to the gateway right now. A revocation
+    /// for one of them cannot land while the op that is publishing it holds the
+    /// dentry's parent inode lock, so it is excluded from the revocation that
+    /// gates that publication's ack — never from the mount's own commit-hook
+    /// revocation, which runs once the publication has returned.
+    publications: Arc<InFlightPublications>,
     /// Edge-detects notify failures so an operator-facing WARN fires once per
     /// failing transition, not once per path.
     warned: AtomicBool,
 }
 
 impl MountKernelInvalidator {
+    /// Resolve one publication's invalidation into this mount's kernel targets.
+    ///
+    /// With `for_ack`, paths this mount is itself publishing are skipped: their
+    /// revocation is a catch-up its own commit hook performs, and putting it on
+    /// the ack path inverts the lock order against the op that is parked on the
+    /// publication being acked.
+    fn resolve_targets(
+        &self,
+        invalidation: &PublicationInvalidation,
+        for_ack: bool,
+    ) -> Vec<KernelInvalTarget> {
+        let Some(inodes) = self.inodes.upgrade() else {
+            return Vec::new();
+        };
+        let table = inodes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        resolve_invalidation_targets(
+            &table,
+            invalidation,
+            for_ack.then_some(self.publications.as_ref()),
+        )
+    }
+
     /// Fire the notifier for each target, resolving the inode-table lock first
     /// and dropping it before any `writev` into `/dev/fuse`.
     fn apply(&self, targets: &[KernelInvalTarget]) -> bool {
@@ -864,27 +970,22 @@ impl MountKernelInvalidator {
 
 impl KernelInvalidator for MountKernelInvalidator {
     fn invalidate(&self, invalidation: &PublicationInvalidation) -> bool {
+        self.apply(&self.resolve_targets(invalidation, false))
+    }
+
+    fn invalidate_for_ack(&self, invalidation: &PublicationInvalidation) -> bool {
+        self.apply(&self.resolve_targets(invalidation, true))
+    }
+
+    fn has_ack_blocking_targets(&self, invalidation: &PublicationInvalidation) -> bool {
+        // Inode-table lookups only — no notifier call, nothing that can block.
         let Some(inodes) = self.inodes.upgrade() else {
-            // The mount is gone; it holds no kernel state to revoke.
-            return true;
+            return false;
         };
-        let targets = {
-            let table = inodes.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut targets = Vec::new();
-            for path in &invalidation.paths {
-                if let Some(target) = table.invalidation_target(path) {
-                    targets.push(target);
-                }
-            }
-            for prefix in &invalidation.subtrees {
-                targets.extend(table.subtree_invalidation_targets(prefix));
-            }
-            for identity in &invalidation.identities {
-                targets.extend(table.identity_invalidation_targets(identity));
-            }
-            targets
-        };
-        self.apply(&targets)
+        let table = inodes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        has_invalidation_targets(&table, invalidation, Some(self.publications.as_ref()))
     }
 
     fn invalidate_all(&self) -> bool {
@@ -923,6 +1024,7 @@ impl KernelInvalidator for MountKernelInvalidator {
 pub(super) struct KernelInvalidationRegistrar {
     invalidators: Arc<MountInvalidators>,
     inodes: Arc<Mutex<InodeTable>>,
+    publications: Arc<InFlightPublications>,
 }
 
 impl KernelInvalidationRegistrar {
@@ -930,6 +1032,7 @@ impl KernelInvalidationRegistrar {
         let invalidator = Arc::new(MountKernelInvalidator {
             notifier,
             inodes: Arc::downgrade(&self.inodes),
+            publications: self.publications,
             warned: AtomicBool::new(false),
         });
         let handle: Arc<dyn KernelInvalidator> = invalidator.clone();
@@ -1580,6 +1683,7 @@ impl RemoteFuseFs {
         KernelInvalidationRegistrar {
             invalidators: Arc::clone(&self.invalidators),
             inodes: Arc::clone(&self.inodes),
+            publications: self.client.in_flight_publications(),
         }
     }
 
@@ -3974,14 +4078,17 @@ mod tests {
         KernelInvalidator, MountInvalidators, PublicationInvalidation, RemoteFuseCache,
         SUBTREE_LOAD_REVISION_QUIET_PERIOD,
     };
-    use super::super::client::{BULK_METADATA_MAX_HASH_BYTES, RemoteVfsClient};
+    use super::super::client::{
+        BULK_METADATA_MAX_HASH_BYTES, InFlightPublications, RemoteVfsClient,
+    };
     use super::super::namespace::NamespaceProjection;
     use super::{
         ATTR_ENTRY_LEASE_TTL, ActiveAdvisoryLockFile, ActiveAdvisoryLocks, FlushBarrier,
-        FullStatHash, HandlePublication, InodeTable, LARGE_FILE_BYTES, LockWaitCancellation,
-        ROOT_INO, RemoteFuseFs, active_advisory_lock_identities, combine_flush_and_lock_cleanup,
-        content_hash_conflicts, content_hash_for_bytes, creation_mode, lease_ttl_for,
-        publish_authoritative_projection, range_fingerprint, remote_file_open_flags,
+        FullStatHash, HandlePublication, InodeTable, KernelInvalTarget, LARGE_FILE_BYTES,
+        LockWaitCancellation, ROOT_INO, RemoteFuseFs, active_advisory_lock_identities,
+        combine_flush_and_lock_cleanup, content_hash_conflicts, content_hash_for_bytes,
+        creation_mode, has_invalidation_targets, lease_ttl_for, publish_authoritative_projection,
+        range_fingerprint, remote_file_open_flags, resolve_invalidation_targets,
         take_active_advisory_lock_file_id, take_active_posix_handle_locks,
     };
 
@@ -6058,6 +6165,113 @@ mod tests {
         assert!(
             fs.lock_handles().unwrap().files.get(&handle).unwrap().dirty,
             "an existing stable identity must not force unrelated dirty bytes to flush"
+        );
+    }
+
+    /// A mount that never handed its kernel the affected path OR its parent has
+    /// nothing it could serve stale for the publication, so it resolves no
+    /// targets — which is what lets a publication skip the revocation queue and
+    /// ack immediately instead of paying a worker hop it cannot need.
+    #[test]
+    fn ack_targets_are_empty_for_a_mount_that_never_cached_the_affected_paths() {
+        let mut table = InodeTable::new();
+        table.lookup("unrelated/file");
+        let publications = Arc::new(InFlightPublications::default());
+        // A publication's affected set names the changed path and its parent
+        // directory. Both are nested here: the scope ROOT is always in the
+        // table, so a top-level path always resolves a target (the mount may
+        // hold a negative dentry for it under the root) and could never
+        // demonstrate the empty case.
+        let invalidation = PublicationInvalidation {
+            paths: vec!["work/many/file-0000".to_string(), "work/many".to_string()],
+            subtrees: Vec::new(),
+            identities: Vec::new(),
+        };
+
+        assert!(
+            resolve_invalidation_targets(&table, &invalidation, Some(publications.as_ref()))
+                .is_empty(),
+            "a mount holding neither the changed path nor its parent has nothing to revoke"
+        );
+        assert!(
+            !has_invalidation_targets(&table, &invalidation, Some(publications.as_ref())),
+            "the short-circuit the watch task uses must agree with the full resolution"
+        );
+
+        // The same mount once it HAS looked the parent up: now it holds a
+        // dentry the publication supersedes, and the revocation is ack-critical.
+        table.lookup("work/many");
+        assert!(
+            !resolve_invalidation_targets(&table, &invalidation, Some(publications.as_ref()))
+                .is_empty(),
+            "a mount that cached the affected parent must still gate the ack"
+        );
+        assert!(
+            has_invalidation_targets(&table, &invalidation, Some(publications.as_ref())),
+            "the short-circuit the watch task uses must agree with the full resolution"
+        );
+    }
+
+    /// A path this mount is publishing itself is off the ack path: the op parked
+    /// on that publication holds the path's parent inode lock for its whole
+    /// duration, and `fuse_reverse_inval_entry` takes the same lock, so the
+    /// revocation cannot land until the publication returns — which it cannot do
+    /// until the ack does. The mount's own commit hook revokes it afterwards, so
+    /// the FULL revocation must still contain it.
+    #[test]
+    fn ack_targets_exclude_the_paths_the_mount_is_publishing_itself() {
+        let mut table = InodeTable::new();
+        let parent = table.lookup("many");
+        table.lookup("many/file-0000");
+        let publications = Arc::new(InFlightPublications::default());
+        let invalidation = PublicationInvalidation {
+            paths: vec!["many/file-0000".to_string(), "many".to_string()],
+            subtrees: Vec::new(),
+            identities: Vec::new(),
+        };
+
+        let dentries_under_parent = |targets: &[KernelInvalTarget]| {
+            targets
+                .iter()
+                .filter(|target| target.parent == Some(parent))
+                .count()
+        };
+
+        // Nothing in flight: the ack-scoped resolution is the full one.
+        assert_eq!(
+            resolve_invalidation_targets(&table, &invalidation, Some(publications.as_ref())).len(),
+            resolve_invalidation_targets(&table, &invalidation, None).len(),
+            "with nothing in flight the ack-scoped revocation must not be narrower"
+        );
+
+        let in_flight = publications.begin(vec!["many/file-0000".to_string()]);
+        let ack = resolve_invalidation_targets(&table, &invalidation, Some(publications.as_ref()));
+        assert_eq!(
+            dentries_under_parent(&ack),
+            0,
+            "the dentry whose parent lock the publishing op holds must not gate its own ack"
+        );
+        assert!(
+            !ack.is_empty(),
+            "the published directory's own dentry hangs off the root and stays ack-critical"
+        );
+        assert!(
+            has_invalidation_targets(&table, &invalidation, Some(publications.as_ref())),
+            "the short-circuit the watch task uses must agree with the full resolution"
+        );
+        let full = resolve_invalidation_targets(&table, &invalidation, None);
+        assert_eq!(
+            dentries_under_parent(&full),
+            1,
+            "the full revocation — the one this mount's commit hook enqueues once the \
+             publication returns — must still drop that dentry"
+        );
+
+        drop(in_flight);
+        assert_eq!(
+            resolve_invalidation_targets(&table, &invalidation, Some(publications.as_ref())).len(),
+            full.len(),
+            "the exclusion must last exactly as long as the publication is in flight"
         );
     }
 

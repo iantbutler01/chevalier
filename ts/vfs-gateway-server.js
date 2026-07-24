@@ -922,7 +922,14 @@ function createVfsGatewayServer(opts) {
                 const mutations = normalizeNamespaceMutations(body.mutations, isExcludedPath);
                 if (mutations instanceof Response)
                     return mutations;
-                if (operationIds.length !== mutations.length) {
+                //  Supplied ids must still line up one-to-one; absent ids are minted here
+                //  so the batch is applied with the same shape either way.
+                if (operationIds.length === 0) {
+                    for (let index = 0; index < mutations.length; index += 1) {
+                        operationIds.push(`srv-${(0, node_crypto_1.randomUUID)()}`);
+                    }
+                }
+                else if (operationIds.length !== mutations.length) {
                     return errorResponse(400, "namespace-many requires one operation_id per mutation");
                 }
                 try {
@@ -1751,8 +1758,17 @@ function mutationSupersededSubtrees(mutations) {
     return prefixes;
 }
 function normalizeNamespaceOperationIds(value) {
+    //  `operation_ids` is OPTIONAL. It exists so a client that retries a batch can
+    //  have the retry recognized as the same operation; a client that does not
+    //  supply them simply does not get that idempotency, which is exactly how this
+    //  endpoint behaved before the field existed. Rejecting a writer for omitting
+    //  it would break every client that predates the field — including the sync
+    //  rail — for a property only the caller can benefit from.
+    if (value === undefined || value === null) {
+        return [];
+    }
     if (!Array.isArray(value)) {
-        return errorResponse(400, "namespace-many requires operation_ids[]");
+        return errorResponse(400, "namespace-many operation_ids must be an array");
     }
     if (value.length > MAX_BATCH_ITEMS) {
         return errorResponse(400, `namespace-many accepts at most ${MAX_BATCH_ITEMS} operation_ids`);

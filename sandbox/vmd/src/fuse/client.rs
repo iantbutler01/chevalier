@@ -117,6 +117,107 @@ pub struct RemoteVfsClient {
     auth_token: String,
     scope_path: String,
     revisions: Arc<SharedRevisionState>,
+    /// Paths this mount currently has a publication in flight for. Shared by
+    /// every clone of one mount's client (the journals hold clones) and by
+    /// nothing else — see [`InFlightPublications`].
+    publications: Arc<InFlightPublications>,
+}
+
+/// The mount-relative paths one mount is publishing to the gateway right now.
+///
+/// This exists for exactly one decision: whether a kernel revocation may be put
+/// on a publication's ack path. `notify_inval_entry` blocks in the guest kernel
+/// on the affected dentry's PARENT inode lock, and the op that is publishing
+/// holds that lock for its whole duration — so a revocation for a path this
+/// mount is itself publishing cannot land until that publication returns, and
+/// the publication cannot return until the watcher acks. That is a lock-order
+/// inversion, not a coherence requirement: measured at 27.6 ms per publication
+/// (200/200 hitting the 25 ms ack cap) against 0.40 ms when the same revocation
+/// does not contend.
+///
+/// Refcounted rather than a set: two batches may have the same path in flight
+/// (a content write behind a namespace mutation), and the first to finish must
+/// not un-register the second.
+#[derive(Debug, Default)]
+pub(super) struct InFlightPublications {
+    inner: Mutex<HashMap<String, usize>>,
+}
+
+impl InFlightPublications {
+    /// Register `paths` for the life of the returned guard.
+    pub(super) fn begin(self: &Arc<Self>, paths: Vec<String>) -> InFlightPublicationGuard {
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for path in &paths {
+                *inner.entry(path.clone()).or_insert(0) += 1;
+            }
+        }
+        InFlightPublicationGuard {
+            publications: Arc::clone(self),
+            paths,
+        }
+    }
+
+    /// Whether this mount is currently publishing `path` itself.
+    pub(super) fn contains(&self, path: &str) -> bool {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.is_empty() {
+            return false;
+        }
+        inner.contains_key(path.trim_matches('/'))
+    }
+
+    /// Fast negative for the common case (nothing in flight), so the revocation
+    /// path never pays a per-target lookup it cannot need.
+    pub(super) fn is_idle(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+    }
+}
+
+/// Drops one publication's registration, including on the error path — a
+/// publication that fails still stops being in flight.
+pub(super) struct InFlightPublicationGuard {
+    publications: Arc<InFlightPublications>,
+    paths: Vec<String>,
+}
+
+impl Drop for InFlightPublicationGuard {
+    fn drop(&mut self) {
+        let mut inner = self
+            .publications
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for path in &self.paths {
+            if let Some(count) = inner.get_mut(path) {
+                *count -= 1;
+                if *count == 0 {
+                    inner.remove(path);
+                }
+            }
+        }
+    }
+}
+
+/// Every mount-relative path a batch of namespace mutations publishes. Both
+/// endpoints of a rename and both ends of a hard link are in flight together:
+/// the op holds each one's parent inode lock for the whole publication.
+fn in_flight_namespace_paths(mutations: &[VfsNamespaceMutation]) -> Vec<String> {
+    mutations
+        .iter()
+        .flat_map(|mutation| mutation.paths())
+        .map(|path| path.trim_matches('/').to_string())
+        .filter(|path| !path.is_empty())
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -264,7 +365,15 @@ impl RemoteVfsClient {
             auth_token: auth_token.to_string(),
             scope_path,
             revisions,
+            publications: Arc::new(InFlightPublications::default()),
         })
+    }
+
+    /// This mount's in-flight publication set, handed to its kernel-invalidation
+    /// hook so a revocation for a path the mount is itself publishing never gates
+    /// that publication's ack.
+    pub(super) fn in_flight_publications(&self) -> Arc<InFlightPublications> {
+        Arc::clone(&self.publications)
     }
 
     pub fn observed_namespace_revision(&self) -> u64 {
@@ -1043,6 +1152,13 @@ impl RemoteVfsClient {
             .iter()
             .map(|mutation| self.scope_namespace_mutation(mutation))
             .collect::<Vec<_>>();
+        // Mark these paths in flight for the life of the request. The gateway
+        // holds the response until its watchers ack, and this mount's watcher
+        // must not be made to revoke a dentry whose parent inode lock the op
+        // parked on this very request is holding.
+        let _in_flight = self
+            .publications
+            .begin(in_flight_namespace_paths(mutations));
         let result = async {
             let response = self
                 .request_mutation(
@@ -1117,6 +1233,15 @@ impl RemoteVfsClient {
                 "flush vfs fuse write batch",
             )
             .await?;
+        // Same in-flight window as the namespace batch above: a content
+        // publication's own paths must never gate its own ack.
+        let _in_flight = self.publications.begin(
+            writes
+                .iter()
+                .map(|write| write.path.trim_matches('/').to_string())
+                .filter(|path| !path.is_empty())
+                .collect(),
+        );
         let body = VfsWriteManyBody {
             writes: writes
                 .into_iter()
@@ -3061,5 +3186,584 @@ mod tests {
             "the watch must remain live after the retry recovers the blip"
         );
         server.abort();
+    }
+
+    // ---------------------------------------------------------------------
+    // Revocation-acked publications: what a publisher must and must not wait for
+    // ---------------------------------------------------------------------
+
+    /// Stand-in for the gateway's publication coordinator
+    /// (`chevalier_sandbox::vfs`'s `OwnerState`), reproduced here because vmd
+    /// links the sandbox crate without its `vfs-server` feature: a monotonic
+    /// revision, a long-poll `/watch` that answers the union of paths published
+    /// since the caller's fence AND treats the poll's `since` as that watcher's
+    /// ack, and a `/namespace-many` that publishes then holds its response until
+    /// every registered watcher acks the new revision or the ack cap elapses.
+    struct AckGateway {
+        revision: Mutex<u64>,
+        revision_tx: tokio::sync::watch::Sender<u64>,
+        history: Mutex<Vec<(u64, Vec<String>)>>,
+        acks: Mutex<HashMap<String, u64>>,
+        ack_tx: tokio::sync::watch::Sender<u64>,
+        ack_cap: Duration,
+        capped: std::sync::atomic::AtomicUsize,
+    }
+
+    /// Ack cap the probe gateway runs with — the production default
+    /// (`CHEVALIER_VFS_PUBLICATION_ACK_TIMEOUT_MS`).
+    const PROBE_ACK_CAP: Duration = Duration::from_millis(25);
+
+    impl AckGateway {
+        fn new() -> Arc<Self> {
+            let (revision_tx, _) = tokio::sync::watch::channel(0u64);
+            let (ack_tx, _) = tokio::sync::watch::channel(0u64);
+            Arc::new(Self {
+                revision: Mutex::new(0),
+                revision_tx,
+                history: Mutex::new(Vec::new()),
+                acks: Mutex::new(HashMap::new()),
+                ack_tx,
+                ack_cap: PROBE_ACK_CAP,
+                capped: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn lock<T>(guard: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+            guard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn unacked(&self, revision: u64) -> usize {
+            Self::lock(&self.acks)
+                .values()
+                .filter(|acked| **acked < revision)
+                .count()
+        }
+
+        /// Bump, announce, then hold until every watcher acks or the cap fires —
+        /// the gateway's `commit_and_await_acks_for`.
+        async fn publish(&self, paths: Vec<String>) -> u64 {
+            let published = {
+                let mut revision = Self::lock(&self.revision);
+                *revision += 1;
+                *revision
+            };
+            Self::lock(&self.history).push((published, paths));
+            self.revision_tx.send_replace(published);
+            let mut progress = self.ack_tx.subscribe();
+            let deadline = tokio::time::Instant::now() + self.ack_cap;
+            loop {
+                if self.unacked(published) == 0 {
+                    return published;
+                }
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero()
+                    || tokio::time::timeout(remaining, progress.changed())
+                        .await
+                        .is_err()
+                {
+                    self.capped
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return published;
+                }
+            }
+        }
+
+        fn record_ack(&self, watcher_id: &str, since: u64) {
+            if watcher_id.is_empty() {
+                return;
+            }
+            {
+                let mut acks = Self::lock(&self.acks);
+                let entry = acks.entry(watcher_id.to_string()).or_insert(since);
+                *entry = (*entry).max(since);
+            }
+            self.ack_tx.send_modify(|counter| *counter += 1);
+        }
+
+        fn affected_since(&self, since: u64) -> Vec<String> {
+            Self::lock(&self.history)
+                .iter()
+                .filter(|(revision, _)| *revision > since)
+                .flat_map(|(_, paths)| paths.iter().cloned())
+                .collect()
+        }
+
+        fn cap_hits(&self) -> usize {
+            self.capped.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    /// Bring the probe gateway up on a loopback port. Serves the three routes a
+    /// namespace publication touches: `/lease` (answered in implicit mode, so
+    /// only the first batch pays for it), `/namespace-many`, and `/watch`.
+    fn spawn_ack_gateway(
+        runtime: &tokio::runtime::Runtime,
+        gateway: Arc<AckGateway>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let watch_gateway = Arc::clone(&gateway);
+        let publish_gateway = Arc::clone(&gateway);
+        let server = runtime.spawn(async move {
+            let app = axum::Router::new()
+                .route(
+                    "/lease",
+                    axum::routing::post(|| async {
+                        (
+                            [(
+                                chevalier_sandbox::vfs::CHEVALIER_VFS_LEASE_MODE_HEADER,
+                                chevalier_sandbox::vfs::CHEVALIER_VFS_LEASE_MODE_IMPLICIT,
+                            )],
+                            axum::Json(serde_json::json!({
+                                "resource_key": "probe",
+                                "owner_token": uuid::Uuid::nil(),
+                                "task_id": serde_json::Value::Null,
+                            })),
+                        )
+                            .into_response()
+                    }),
+                )
+                .route(
+                    "/namespace-many",
+                    axum::routing::post(
+                        move |axum::Json(body): axum::Json<VfsNamespaceMutationBatchBody>| {
+                            let gateway = Arc::clone(&publish_gateway);
+                            async move {
+                                // The affected set a real publication reports:
+                                // every changed path AND its parent directory.
+                                let mut paths = Vec::new();
+                                for mutation in &body.mutations {
+                                    for path in mutation.paths() {
+                                        if path.is_empty() {
+                                            continue;
+                                        }
+                                        paths.push(path.to_string());
+                                        paths.push(
+                                            path.rsplit_once('/')
+                                                .map(|(parent, _)| parent.to_string())
+                                                .unwrap_or_default(),
+                                        );
+                                    }
+                                }
+                                let revision = gateway.publish(paths).await;
+                                (
+                                    [(
+                                        CHEVALIER_VFS_NAMESPACE_REVISION_HEADER,
+                                        revision.to_string(),
+                                    )],
+                                    axum::Json(serde_json::json!({ "entries": [] })),
+                                )
+                                    .into_response()
+                            }
+                        },
+                    ),
+                )
+                .route(
+                    "/watch",
+                    axum::routing::get(
+                        move |axum::extract::Query(params): axum::extract::Query<
+                            HashMap<String, String>,
+                        >| {
+                            let gateway = Arc::clone(&watch_gateway);
+                            async move {
+                                let since = params
+                                    .get("since")
+                                    .and_then(|value| value.parse::<u64>().ok())
+                                    .unwrap_or(0);
+                                let watcher_id =
+                                    params.get("watcher_id").cloned().unwrap_or_default();
+                                let timeout_ms = params
+                                    .get("timeout_ms")
+                                    .and_then(|value| value.parse::<u64>().ok())
+                                    .unwrap_or(1_000);
+                                gateway.record_ack(watcher_id.as_str(), since);
+                                let mut revisions = gateway.revision_tx.subscribe();
+                                let deadline =
+                                    tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+                                loop {
+                                    let current = *AckGateway::lock(&gateway.revision);
+                                    if current > since {
+                                        return axum::Json(serde_json::json!({
+                                            "revision": current,
+                                            "paths": gateway.affected_since(since),
+                                            "subtrees": Vec::<String>::new(),
+                                        }))
+                                        .into_response();
+                                    }
+                                    let remaining = deadline
+                                        .saturating_duration_since(tokio::time::Instant::now());
+                                    if remaining.is_zero()
+                                        || tokio::time::timeout(remaining, revisions.changed())
+                                            .await
+                                            .is_err()
+                                    {
+                                        return axum::http::StatusCode::NO_CONTENT.into_response();
+                                    }
+                                }
+                            }
+                        },
+                    ),
+                );
+            axum::serve(listener, app).await.unwrap();
+        });
+        (endpoint, server)
+    }
+
+    /// One mount's kernel-invalidation hook, standing in for
+    /// `fs::MountKernelInvalidator` (whose real notifier needs a live
+    /// `/dev/fuse` session). `cached` plays the mount's inode table — the paths
+    /// it handed its kernel — and `publications` is the REAL in-flight set the
+    /// client registers around every publication, so the ack-critical rule under
+    /// test is the production one and not a restatement of it.
+    ///
+    /// `drain` models what a notify call costs. A target whose PARENT directory
+    /// is the one the publishing op holds locked blocks on `parent_lock` — that
+    /// is `notify_inval_entry` waiting in `fuse_reverse_inval_entry` for the
+    /// parent inode lock. A target elsewhere (the published directory's own
+    /// dentry, which hangs off the root) does not.
+    struct MountDouble {
+        cached: std::collections::HashSet<String>,
+        publications: Arc<InFlightPublications>,
+        parent_lock: Arc<Mutex<()>>,
+        /// Directory whose inode lock the driver's op holds while publishing.
+        locked_dir: String,
+        /// `false` reproduces the invalidator as ce855e3 deployed it, which put
+        /// a mount's own in-flight paths on the ack path.
+        exclude_own_publications: bool,
+        drain: Duration,
+        applied: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MountDouble {
+        /// Mirror of `fs::resolve_invalidation_targets`: an affected path
+        /// resolves a target when this mount handed its kernel either that
+        /// path's inode or its parent's dentry, minus whatever it is publishing
+        /// itself (the `for_ack` filter).
+        fn targets(&self, invalidation: &PublicationInvalidation, for_ack: bool) -> Vec<String> {
+            invalidation
+                .paths
+                .iter()
+                .chain(invalidation.subtrees.iter())
+                .filter(|path| {
+                    self.cached.contains(path.as_str())
+                        || path
+                            .rsplit_once('/')
+                            .is_some_and(|(parent, _)| self.cached.contains(parent))
+                })
+                .filter(|path| {
+                    !(for_ack
+                        && self.exclude_own_publications
+                        && self.publications.contains(path.as_str()))
+                })
+                .cloned()
+                .collect()
+        }
+
+        fn apply(&self, targets: &[String]) -> bool {
+            if targets.is_empty() {
+                return true;
+            }
+            self.applied
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let contends = targets.iter().any(|path| {
+                path.rsplit_once('/')
+                    .is_some_and(|(parent, _)| parent == self.locked_dir)
+            });
+            if contends {
+                let _held = self
+                    .parent_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            if !self.drain.is_zero() {
+                std::thread::sleep(self.drain);
+            }
+            true
+        }
+    }
+
+    impl super::super::cache::KernelInvalidator for MountDouble {
+        fn invalidate(&self, invalidation: &PublicationInvalidation) -> bool {
+            self.apply(&self.targets(invalidation, false))
+        }
+
+        fn invalidate_all(&self) -> bool {
+            self.apply(&self.cached.iter().cloned().collect::<Vec<_>>())
+        }
+
+        fn has_ack_blocking_targets(&self, invalidation: &PublicationInvalidation) -> bool {
+            !self.targets(invalidation, true).is_empty()
+        }
+
+        fn invalidate_for_ack(&self, invalidation: &PublicationInvalidation) -> bool {
+            self.apply(&self.targets(invalidation, true))
+        }
+    }
+
+    struct AckProbeArm {
+        /// Per-publication latency the writer paid, in issue order.
+        samples: Vec<Duration>,
+        cap_hits: usize,
+        /// How many times the mount double's notifier ran.
+        applied: usize,
+    }
+
+    impl AckProbeArm {
+        fn mean(&self) -> Duration {
+            self.samples.iter().sum::<Duration>() / self.samples.len() as u32
+        }
+
+        fn max(&self) -> Duration {
+            self.samples.iter().copied().max().unwrap_or_default()
+        }
+    }
+
+    /// Drive `publications` real namespace publications through the real client,
+    /// the real revision watch, and the real kernel-revocation registry against
+    /// the probe gateway, with one mount double configured by the caller.
+    ///
+    /// `hold_parent_lock` reproduces the guest kernel's behaviour on a mutating
+    /// op: the parent directory's inode lock is held for the whole op, and the
+    /// op is parked on the publication.
+    fn run_ack_probe(
+        publications: usize,
+        cached: &[&str],
+        drain: Duration,
+        hold_parent_lock: bool,
+        exclude_own_publications: bool,
+    ) -> AckProbeArm {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        let gateway = AckGateway::new();
+        let (endpoint, server) = spawn_ack_gateway(&runtime, Arc::clone(&gateway));
+
+        let cache = Arc::new(RemoteFuseCache::default());
+        let invalidators = Arc::new(MountInvalidators::default());
+        let client = RemoteVfsClient::new(&endpoint, "token", "").unwrap();
+        let parent_lock = Arc::new(Mutex::new(()));
+        let double = Arc::new(MountDouble {
+            cached: cached.iter().map(|path| path.to_string()).collect(),
+            publications: client.in_flight_publications(),
+            parent_lock: Arc::clone(&parent_lock),
+            locked_dir: "many".to_string(),
+            exclude_own_publications,
+            drain,
+            applied: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let registered: Arc<dyn super::super::cache::KernelInvalidator> = double.clone();
+        invalidators.register(Arc::downgrade(&registered));
+        client.ensure_revision_watch(runtime.handle(), &cache, &invalidators);
+        // Let the watch establish its first long poll before measuring.
+        std::thread::sleep(Duration::from_millis(150));
+
+        let handle = runtime.handle().clone();
+        let driver_client = client.clone();
+        let driver = std::thread::spawn(move || {
+            let mut samples = Vec::with_capacity(publications);
+            for index in 0..publications {
+                let mutation = VfsNamespaceMutation::CreateFile {
+                    path: format!("many/file-{index:04}"),
+                    mode: Some(0o644),
+                };
+                let held = hold_parent_lock.then(|| {
+                    parent_lock
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                });
+                let started = Instant::now();
+                handle
+                    .block_on(driver_client.apply_namespace_batch(
+                        std::slice::from_ref(&format!("op-{index}")),
+                        std::slice::from_ref(&mutation),
+                        "vm_workspace",
+                    ))
+                    .expect("probe publication");
+                samples.push(started.elapsed());
+                drop(held);
+            }
+            samples
+        });
+        let samples = driver.join().unwrap();
+        server.abort();
+        AckProbeArm {
+            cap_hits: gateway.cap_hits(),
+            applied: double.applied.load(std::sync::atomic::Ordering::Relaxed),
+            samples,
+        }
+    }
+
+    /// The paths one publication of `many/file-NNNN` names: the changed path
+    /// and its parent directory, which is what a real affected set carries.
+    fn published_paths(count: usize) -> Vec<String> {
+        let mut paths = vec!["many".to_string()];
+        paths.extend((0..count).map(|index| format!("many/file-{index:04}")));
+        paths
+    }
+
+    /// A watcher whose mount holds nothing the publication supersedes cannot
+    /// serve stale data for it, so it must not cost the writer anything — not
+    /// the queue, not the worker hop, and above all not the gateway's ack cap.
+    #[test]
+    fn a_publication_is_not_delayed_by_a_watcher_with_nothing_cached() {
+        // The mount holds `unrelated` and nothing under `many/`, which is where
+        // every publication lands. The publishing op holds `many`'s inode lock
+        // throughout, so any revocation that DID reach this mount for a child of
+        // `many` would block on it and ride the ack cap out.
+        let arm = run_ack_probe(20, &["unrelated"], Duration::ZERO, true, true);
+        assert_eq!(
+            arm.cap_hits,
+            0,
+            "no publication may hit the ack cap when no mount holds affected state \
+             (mean {:?}, max {:?})",
+            arm.mean(),
+            arm.max()
+        );
+        assert_eq!(
+            arm.applied, 0,
+            "a mount with nothing to revoke must not be handed a revocation at all"
+        );
+        assert!(
+            arm.max() < PROBE_ACK_CAP,
+            "every publication must return well inside the ack cap; max was {:?}",
+            arm.max()
+        );
+    }
+
+    /// The other half of the same contract: a watcher that DOES hold kernel
+    /// state for an affected path it is not itself publishing must still delay
+    /// the publisher until that state is revoked. This is the guarantee the fast
+    /// path above must never weaken.
+    #[test]
+    fn a_publication_is_still_delayed_by_a_watcher_that_holds_affected_state() {
+        const DRAIN: Duration = Duration::from_millis(8);
+        // `many` — the parent every publication's affected set names — is held
+        // by a mount that is publishing nothing, so its revocation is
+        // ack-critical. Its dentry hangs off the root, whose lock nothing holds,
+        // so the revocation CAN land: the point here is that the publisher waits
+        // for it, not that it deadlocks against it.
+        let arm = run_ack_probe(10, &["many"], DRAIN, false, true);
+        assert_eq!(
+            arm.applied, 10,
+            "every publication must revoke the observer mount's state"
+        );
+        assert!(
+            arm.samples.iter().all(|sample| *sample >= DRAIN),
+            "no publication may return before the observer's revocation landed; \
+             samples: {:?}",
+            arm.samples
+        );
+        assert_eq!(
+            arm.cap_hits, 0,
+            "a revocation that can land must land inside the cap, not fail open"
+        );
+    }
+
+    /// The measured ce855e3 regression, and the fix for it.
+    ///
+    /// The publishing mount holds kernel state for exactly the path it is
+    /// publishing, and the guest kernel holds that path's parent inode lock for
+    /// the whole op — so revoking it cannot complete until the publication
+    /// returns, while the publication cannot return until this ack does. Every
+    /// publication then rode the full ack cap out.
+    ///
+    /// The publisher is not an observer of its own write: its projection already
+    /// answers reads of the paths it just published, and its commit hook
+    /// enqueues the identical revocation the moment the publication returns.
+    #[test]
+    fn a_publication_is_not_delayed_by_the_publishing_mounts_own_in_flight_paths() {
+        const N: usize = 20;
+        let cached = published_paths(N);
+        let cached = cached.iter().map(String::as_str).collect::<Vec<_>>();
+
+        // Control: the same mount, the same lock, with a mount's own in-flight
+        // paths still on the ack path — ce855e3 as deployed. Every publication
+        // must wait the cap out, or this test is proving nothing.
+        let regressed = run_ack_probe(N, &cached, Duration::ZERO, true, false);
+        assert_eq!(
+            regressed.cap_hits,
+            N,
+            "control: with its own in-flight paths on the ack path every \
+             publication must ride the cap out (mean {:?})",
+            regressed.mean()
+        );
+
+        let fixed = run_ack_probe(N, &cached, Duration::ZERO, true, true);
+        assert_eq!(
+            fixed.cap_hits,
+            0,
+            "a publication must never wait out the ack cap for a revocation of \
+             the path it is itself publishing (mean {:?}, max {:?})",
+            fixed.mean(),
+            fixed.max()
+        );
+        assert!(
+            fixed.max() < PROBE_ACK_CAP,
+            "every publication must return well inside the ack cap; max was {:?}",
+            fixed.max()
+        );
+        // `many` itself is never in flight, so its revocation stays ack-critical
+        // and still runs — only the entry whose parent lock the publishing op
+        // holds came off the ack path.
+        assert!(
+            fixed.applied > 0,
+            "the parent directory's revocation must still gate the ack"
+        );
+    }
+
+    /// Standing measurement of the regression and its fix. Not an assertion —
+    /// run it with `--ignored --nocapture` for the per-arm table.
+    #[test]
+    #[ignore = "measurement probe; run with --ignored --nocapture"]
+    fn probe_publication_ack_latency() {
+        const N: usize = 100;
+        let cached = published_paths(N);
+        let cached = cached.iter().map(String::as_str).collect::<Vec<_>>();
+        let arms: [(&str, AckProbeArm); 4] = [
+            // Pre-ce855e3: the watch answer stayed in the owner namespace, so
+            // every resolved target set came back empty and the revocation was
+            // a no-op.
+            (
+                "pre-ce855e3 (no targets)",
+                run_ack_probe(N, &[], Duration::ZERO, true, true),
+            ),
+            // Targets resolve, nothing contends: the pure cost of the watch
+            // cycle plus the queue/worker hop.
+            (
+                "targets, uncontended",
+                run_ack_probe(N, &["many"], Duration::ZERO, false, true),
+            ),
+            // ce855e3 as deployed: the publishing mount's own paths resolve AND
+            // their revocation contends with the parked op's parent inode lock.
+            (
+                "ce855e3 (own paths on ack)",
+                run_ack_probe(N, &cached, Duration::ZERO, true, false),
+            ),
+            // Fixed: the publishing mount's in-flight paths are off the ack path.
+            (
+                "fixed (own paths excluded)",
+                run_ack_probe(N, &cached, Duration::ZERO, true, true),
+            ),
+        ];
+        for (name, arm) in arms.iter() {
+            let mut sorted = arm.samples.clone();
+            sorted.sort();
+            eprintln!(
+                "PROBE {name:<28} n={n} mean={mean:>9.3?} p50={p50:>9.3?} \
+                 p95={p95:>9.3?} max={max:>9.3?} cap_hits={cap}/{n}",
+                n = arm.samples.len(),
+                mean = arm.mean(),
+                p50 = sorted[sorted.len() / 2],
+                p95 = sorted[sorted.len() * 95 / 100],
+                max = arm.max(),
+                cap = arm.cap_hits,
+            );
+        }
     }
 }
