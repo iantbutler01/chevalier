@@ -1500,6 +1500,74 @@ impl RemoteFuseFs {
         self.authoritative_file_route_with_metadata(path, file_id, RouteMetadata::Full)
     }
 
+    /// The stable route for `file_id` at `path`, proven from this mount's own
+    /// fence rather than re-read over the wire — or `None`, which means the
+    /// caller must resolve it authoritatively.
+    ///
+    /// An open handle's route resolution asks one question: does `path` still
+    /// hold the inode this handle was opened on, and what is its current
+    /// metadata? A cached entry answers it when it carries the same proof
+    /// `stat_path` already serves on, plus one condition stricter:
+    ///
+    ///  * the revision watch is live, so this mount's coherence fence is
+    ///    continuously confirmed (watch down -> `None`, fail closed);
+    ///  * the entry is tagged at exactly that fence, so no publication has
+    ///    landed against it — a remote one evicts the entry (or, unclassified,
+    ///    clears the cache) strictly before its writer is told it is coherent;
+    ///  * no queued namespace mutation of this mount's own could retarget the
+    ///    path, and no unflushed write of its own could supersede the metadata;
+    ///  * the entry is COMPLETE (`full_stat_metadata_is_complete`), because the
+    ///    caller matches loaded bytes against its content hash and chains a CAS
+    ///    base from it, exactly as a full stat's caller does;
+    ///  * and the entry's `file_id` IS this handle's identity. That is the
+    ///    condition a plain full stat does not carry, and it is what makes this
+    ///    serve answer the identity question rather than only the metadata one.
+    ///    Any other answer — a different identity, or no entry at all — means
+    ///    the path may have been retargeted, and only the wire (plus the
+    ///    hard-link alias lookup behind it) can say where the inode went.
+    ///
+    /// Without this, every `open(2)`+`read(2)` cost an unconditional, unbounded
+    /// point `/stat`: `ensure_handle_loaded_locked` resolves the handle's route
+    /// before it may use the buffer, and that route was the one read path with
+    /// no cache serve at all. Measured at 30 point stats per warm `git status`
+    /// phase over 9 `.git` internals — exactly one per open — and invisible to
+    /// every fix aimed at the metadata cache, because this route never consulted
+    /// it.
+    fn cached_stable_file_route(&self, path: &str, file_id: &str) -> Option<LinkedFileRoute> {
+        if !self.client.revision_watch_live() {
+            return None;
+        }
+        if self
+            .namespace
+            .as_ref()
+            .map(|namespace| namespace.has_projection_for_path(path, false))
+            .transpose()
+            .ok()?
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        if self
+            .writes
+            .as_ref()
+            .is_some_and(|writes| writes.has_pending_path(path))
+        {
+            return None;
+        }
+        let revision = self.client.coherence_revision();
+        let metadata = self.cache.get_metadata(path, revision)?;
+        if !full_stat_metadata_is_complete(&metadata)
+            || metadata.file_id.as_deref() != Some(file_id)
+        {
+            return None;
+        }
+        Some(LinkedFileRoute {
+            path: path.to_string(),
+            metadata,
+            revision,
+        })
+    }
+
     fn authoritative_file_route_with_metadata(
         &self,
         path: &str,
@@ -3557,7 +3625,10 @@ impl RemoteFuseFs {
                 revision: 0,
             }));
         };
-        let route = self.authoritative_file_route(&state.path, file_id)?;
+        let route = match self.cached_stable_file_route(&state.path, file_id) {
+            Some(route) => StableFileRoute::Linked(route),
+            None => self.authoritative_file_route(&state.path, file_id)?,
+        };
         let mut handles = self.lock_handles()?;
         let handle = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
         if handle.path != state.path || handle.file_id != state.file_id {
@@ -6526,6 +6597,189 @@ mod tests {
     /// Without this, every open(2) cost a point `/stat` even over a tree nothing
     /// had touched: 47 of them per measured `git status` phase.
     ///
+    /// An open handle's stable route — "does my path still hold my inode, and
+    /// what is its metadata now" — is answered from this mount's own confirmed
+    /// fence when, and only when, that fence proves it.
+    ///
+    /// This route (`resolve_handle_route_locked`, which every first `read(2)`
+    /// and every `getattr` on an open handle goes through) was the last read
+    /// path with NO cache serve at all: an unconditional, unbounded point
+    /// `/stat` per open. It cost a warm `git status` 30 of them over 9 `.git`
+    /// internals — one per open(2) — and was invisible to every fix aimed at
+    /// the metadata cache, because it never consulted the cache.
+    ///
+    /// The serve carries one condition a full stat does not: the entry's
+    /// `file_id` must BE the handle's identity. That is what makes it answer
+    /// the identity question rather than only the metadata one. Every other
+    /// answer wires, and so does a fence this mount cannot prove.
+    #[test]
+    fn handle_route_serves_a_fence_matched_identity_and_wires_when_it_cannot() {
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let oversized = vec![b'x'; BULK_METADATA_MAX_HASH_BYTES as usize + 1];
+        let gateway = Arc::new(Mutex::new(RoundTripGateway {
+            scope: "test-scope".to_string(),
+            files: std::collections::BTreeMap::from([
+                ("test-scope/seed/file".to_string(), b"content".to_vec()),
+                ("test-scope/seed/oversized".to_string(), oversized),
+            ]),
+            revision: 17,
+            publications: Vec::new(),
+            acked: 0,
+            hashed_bytes: AtomicU64::new(0),
+            watch_serves: true,
+            counts: RouteCounts::default(),
+        }));
+        let server_gateway = Arc::clone(&gateway);
+        let server = runtime.spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/{*path}", any(round_trip_gateway))
+                    .with_state(server_gateway),
+            )
+            .await
+            .unwrap();
+        });
+        let client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
+        let fs = RemoteFuseFs::new(client.clone(), false, "test-scope", runtime.handle().clone());
+        await_watch_live(&client);
+
+        let metadata = fs
+            .stat_path("seed/file")
+            .unwrap()
+            .expect("the seeded file exists");
+        let identity = metadata.file_id.clone().expect("the gateway supplies one");
+
+        // The entry a batched read installed is complete and fence-matched, and
+        // it carries this identity: the route is proven locally.
+        let route = fs
+            .cached_stable_file_route("seed/file", identity.as_str())
+            .expect("a complete fence-matched entry with this identity");
+        assert_eq!(route.path, "seed/file");
+        assert_eq!(route.metadata, metadata);
+        assert_eq!(
+            route.revision,
+            client.coherence_revision(),
+            "the served route must carry the fence it was proven at, so a \
+             following whole-file read can skip its verifying stat"
+        );
+
+        // A different identity is the retarget case: the path may no longer
+        // hold this inode, and only the wire (and the hard-link alias lookup
+        // behind it) can say where it went.
+        assert!(
+            fs.cached_stable_file_route("seed/file", "identity:somewhere-else")
+                .is_none(),
+            "a cached entry for another inode must not be served as this handle's route"
+        );
+
+        // An entry with no content hash is not serveable here for the same
+        // reason it is not serveable to a full stat: the caller matches loaded
+        // bytes against that hash and chains a CAS base from it.
+        let oversized = fs
+            .stat_path_attributes("seed/oversized")
+            .unwrap()
+            .expect("the oversized file exists");
+        assert!(oversized.content_hash.is_none());
+        assert!(
+            fs.cached_stable_file_route(
+                "seed/oversized",
+                oversized.file_id.as_deref().expect("identity"),
+            )
+            .is_none(),
+            "an incomplete entry must not stand in for the handle's route"
+        );
+
+        // A path this mount holds nothing for wires, rather than guessing.
+        assert!(
+            fs.cached_stable_file_route("seed/never-seen", identity.as_str())
+                .is_none()
+        );
+
+        drop(fs);
+        server.abort();
+    }
+
+    /// The same serve, fail-closed: with the revision watch down this mount
+    /// cannot prove its fence is current, so the handle route wires even when
+    /// the cache holds a complete, identity-matching entry for the path.
+    #[test]
+    fn handle_route_wires_when_the_revision_watch_is_down() {
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let gateway = Arc::new(Mutex::new(RoundTripGateway {
+            scope: "test-scope".to_string(),
+            files: std::collections::BTreeMap::from([(
+                "test-scope/seed/file".to_string(),
+                b"content".to_vec(),
+            )]),
+            revision: 17,
+            publications: Vec::new(),
+            acked: 0,
+            hashed_bytes: AtomicU64::new(0),
+            // The watch never confirms this mount's fence.
+            watch_serves: false,
+            counts: RouteCounts::default(),
+        }));
+        let server_gateway = Arc::clone(&gateway);
+        let server = runtime.spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/{*path}", any(round_trip_gateway))
+                    .with_state(server_gateway),
+            )
+            .await
+            .unwrap();
+        });
+        let client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
+        let fs = RemoteFuseFs::new(client.clone(), false, "test-scope", runtime.handle().clone());
+
+        // Warm the cache by hand at the exact fence the serve would check, so
+        // the only thing standing between it and a hit is watch liveness.
+        let metadata = fs
+            .stat_path("seed/file")
+            .unwrap()
+            .expect("the seeded file exists");
+        let identity = metadata.file_id.clone().expect("the gateway supplies one");
+        let revision = client.coherence_revision();
+        assert!(revision != 0);
+        fs.cache
+            .put_metadata("seed/file", metadata.clone(), revision);
+        assert_eq!(
+            fs.cache.get_metadata("seed/file", revision),
+            Some(metadata),
+            "the entry the serve would read is present and fence-matched"
+        );
+        assert!(
+            !client.revision_watch_live(),
+            "this arm is only meaningful with the watch down"
+        );
+        assert!(
+            fs.cached_stable_file_route("seed/file", identity.as_str())
+                .is_none(),
+            "an unconfirmed fence must not back a handle's route"
+        );
+
+        drop(fs);
+        server.abort();
+    }
+
     /// Completeness is the content hash, and the bulk routes now ask the gateway
     /// for one up to `BULK_METADATA_MAX_HASH_BYTES` — so a batched attribute
     /// read already installs an entry an open can be served from, which is what
@@ -6555,6 +6809,7 @@ mod tests {
             publications: Vec::new(),
             acked: 0,
             hashed_bytes: AtomicU64::new(0),
+            watch_serves: true,
             counts: RouteCounts::default(),
         }));
         let server_gateway = Arc::clone(&gateway);
@@ -6677,6 +6932,7 @@ mod tests {
             publications: Vec::new(),
             acked: 0,
             hashed_bytes: AtomicU64::new(0),
+            watch_serves: true,
             counts: RouteCounts::default(),
         }));
         let server_gateway = Arc::clone(&gateway);
@@ -7808,6 +8064,9 @@ mod tests {
         /// read 5 GiB. Round trips alone cannot see that cost, so it is counted
         /// separately.
         hashed_bytes: AtomicU64,
+        /// When false the /watch route errors, so the revision watch stays down
+        /// and every serve must fail closed to a wire read.
+        watch_serves: bool,
         counts: RouteCounts,
     }
 
@@ -8512,6 +8771,9 @@ mod tests {
             // publication imposes on the mount that observes it, which is
             // precisely what this benchmark exists to measure.
             (Method::GET, "/watch") => {
+                if !state.lock().unwrap().watch_serves {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
                 round_trip_watch(state, round_trip_query_since(&request)).await
             }
             _ => StatusCode::NOT_FOUND.into_response(),
@@ -8529,9 +8791,8 @@ mod tests {
     /// guarantee so a regression fails the build instead of silently costing
     /// every operation another RTT.
     ///
-    /// Not covered: handle-based reads (`next_handle` + `ensure_handle_loaded`)
-    /// and content flushes, whose plumbing needs a handle table set up by
-    /// `open`/`create` dispatch rather than an fs-level entry point.
+    /// Not covered: content flushes, whose plumbing needs a handle table set up
+    /// by `create` dispatch rather than an fs-level entry point.
     #[test]
     fn op_class_round_trips() {
         const CREATE_OPS: usize = 50;
@@ -8552,6 +8813,16 @@ mod tests {
             "gitdir/objects/12/3456",
             "gitdir/packed-refs",
         ];
+        /// How many times a warm `git status` phase OPENS each of those paths,
+        /// as counted per path on the mounted repo: 9 for `config`, 4 each for
+        /// `HEAD` and `info/exclude`, 3 for the branch ref and for each loose
+        /// object, 2 for `index`, 1 each for `refs/stash` and `packed-refs`.
+        /// They sum to 30, which is exactly the number of point `/stat` calls
+        /// the phase issued — one per open(2), which is what identified the
+        /// route that was paying for them (see `status_open_warm`).
+        const GIT_INTERNAL_OPENS: [usize; 9] = [9, 4, 4, 3, 1, 2, 3, 3, 1];
+        const GIT_INTERNAL_TOTAL_OPENS: usize = 30;
+        const _: () = assert!(GIT_INTERNAL_OPENS.len() == GIT_INTERNALS.len());
         /// A file past both the bulk hashing budget AND the mount's whole-file
         /// content cache — the shape of an ML dataset in a sandbox, only smaller
         /// so the stub can hold it. Its open must cost neither a point stat nor a
@@ -8594,6 +8865,7 @@ mod tests {
             publications: Vec::new(),
             acked: 0,
             hashed_bytes: AtomicU64::new(0),
+            watch_serves: true,
             counts: RouteCounts::default(),
         }));
         let server_gateway = Arc::clone(&gateway);
@@ -9001,6 +9273,90 @@ mod tests {
         // listing. Its siblings' metadata is untouched and must stay serveable.
         rows.push(("publish_siblings", GIT_INTERNALS.len(), 0, publish_siblings));
 
+        // status_open_cold / status_open_warm: the rest of what a `git status`
+        // does to those same `.git` internals — the full open(2)/read(2)/
+        // close(2) cycle, at the per-path multiplicity a real status showed,
+        // rather than only the metadata resolution the classes above measure.
+        //
+        // This is where the last 30 point `/stat` calls per warm status phase
+        // lived, and neither of the two cache fixes above could reach them:
+        // `open(2)` resolves its path through `stat_path` (served from cache),
+        // but the first `read(2)` then makes the handle resolve its STABLE
+        // ROUTE — "does my path still hold my inode, and what is its metadata
+        // now" — and that route went straight to an unconditional, unbounded
+        // point `/stat` with no cache serve at all. One per open(2), which is
+        // exactly the 30 measured over these 9 paths, and exactly why the count
+        // did not move when the metadata cache got warmer.
+        //
+        // The `.git` internals' bytes are already in the content cache from the
+        // cold pass, so the warm pass owes nothing on any route.
+        let open_read_close = |path: &str, ino: fuser::INodeNo| {
+            let route = fs.resolve_inode_file_route_deferred_hash(ino).unwrap();
+            assert_eq!(route.path, path);
+            let metadata = route.metadata;
+            let (initial, loaded) = fs
+                .cache
+                .get_file_matching(&route.path, &metadata)
+                .map(|bytes| (bytes, true))
+                .unwrap_or_else(|| (Vec::new(), false));
+            let fh = fs
+                .next_handle(
+                    &route.path,
+                    initial,
+                    loaded,
+                    metadata.content_hash.clone(),
+                    super::metadata_mode(&metadata),
+                    false,
+                    metadata.file_id.clone(),
+                    metadata.link_count,
+                )
+                .unwrap();
+            {
+                let gate = fs.publication_gate_for_handle(fh).unwrap();
+                let _guard = gate.lock().unwrap();
+                fs.ensure_handle_loaded_locked(fh).unwrap();
+            }
+            // close(2): FLUSH then RELEASE, neither an fsync.
+            fs.flush_handle_immediate(fh, FlushBarrier::Close).unwrap();
+            fs.lock_handles().unwrap().files.remove(&fh);
+        };
+        // LOOKUP once per path, as the guest kernel does before it leases the
+        // dentry, so the inode carries the identity the handle route checks.
+        let git_internal_inodes = GIT_INTERNALS.map(|name| {
+            let metadata = fs.stat_path_attributes(name).unwrap().expect("exists");
+            fs.attr_for_path(name, &metadata, true).ino
+        });
+        let base = sample();
+        for (index, name) in GIT_INTERNALS.iter().enumerate() {
+            for _ in 0..GIT_INTERNAL_OPENS[index] {
+                open_read_close(name, git_internal_inodes[index]);
+            }
+        }
+        let status_open_cold = sample().since(&base);
+        // Budget: one whole-file read per path the content cache has never held.
+        rows.push((
+            "status_open_cold",
+            GIT_INTERNAL_TOTAL_OPENS,
+            GIT_INTERNALS.len(),
+            status_open_cold,
+        ));
+
+        let base = sample();
+        for (index, name) in GIT_INTERNALS.iter().enumerate() {
+            for _ in 0..GIT_INTERNAL_OPENS[index] {
+                open_read_close(name, git_internal_inodes[index]);
+            }
+        }
+        let status_open_warm = sample().since(&base);
+        // Budget 0: every open(2)/read(2)/close(2) of a path this mount already
+        // holds, at a fence a live watch keeps confirmed, is answered locally.
+        rows.push((
+            "status_open_warm",
+            GIT_INTERNAL_TOTAL_OPENS,
+            0,
+            status_open_warm,
+        ));
+
         // open_large_cold / open_large: opening a file past the bulk hashing
         // budget. The bulk routes answer hashless past 1 MiB, so such an entry
         // cannot stand in for a full stat and the open falls through to a point
@@ -9200,6 +9556,24 @@ mod tests {
             GIT_INTERNALS.len(),
             publish_siblings.breakdown()
         );
+        // Mechanism: an open handle's route resolution answers "does my path
+        // still hold my inode" from a fence-matched, complete cache entry whose
+        // file_id IS that inode, instead of re-reading it over the wire. This
+        // was the last unconditional point `/stat` on a read path: 30 per warm
+        // status phase, one per open(2), unmoved by every cache fix because the
+        // route never consulted the cache.
+        assert_eq!(
+            status_open_warm.charged(),
+            0,
+            "warm open/read/close of {GIT_INTERNAL_TOTAL_OPENS} already-held opens cost {}",
+            status_open_warm.breakdown()
+        );
+        assert_eq!(
+            status_open_cold.stat,
+            0,
+            "opening files a batched read already described must not point-stat them: {}",
+            status_open_cold.breakdown()
+        );
         // Mechanism: a file past the whole-file content cache has no use for a
         // content hash at open, so the open serves the hashless entry and bounds
         // the hashing budget of the point stat it falls through to. The gateway
@@ -9255,6 +9629,7 @@ mod tests {
         drop(fs);
         server.abort();
     }
+
 }
 
 /// FUSE operation bodies. Dispatched concurrently by `SpawnedFuseFs`
