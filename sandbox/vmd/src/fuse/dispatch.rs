@@ -425,6 +425,23 @@ impl Filesystem for SpawnedFuseFs {
         });
     }
 
+    fn fsyncdir(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        // Without this the op falls through to fuser's ENOSYS default, so a
+        // guest asking for its directory entries to be durable silently got
+        // nothing — and since close stopped draining the namespace journal,
+        // this is the only barrier that publishes them on demand.
+        self.spawn("fsyncdir", req.unique(), move |fs| {
+            fs.fsyncdir(ino, fh, datasync, reply)
+        });
+    }
+
     fn release(
         &self,
         req: &Request,

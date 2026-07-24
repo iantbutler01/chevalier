@@ -111,6 +111,18 @@ fn metadata_from_dir_entry(entry: &RemoteDirEntry) -> RemoteMetadata {
     }
 }
 
+/// Whether a cached entry carries everything a FULL stat (`/stat`) promises its
+/// callers, as opposed to an attributes-only entry installed by
+/// `/metadata-many`.
+///
+/// The difference is the content hash: `read_bytes` matches cached file bytes
+/// against it and a write chains its CAS base from it, so a file entry without
+/// one must not be served in place of a full stat. Directories and symlinks
+/// carry no content hash at all, so for them the entry is already complete.
+fn full_stat_metadata_is_complete(metadata: &RemoteMetadata) -> bool {
+    metadata.kind != "file" || metadata.content_hash.is_some()
+}
+
 /// A namespace projection is mount-local read-your-writes state. Only an
 /// unprojected server response may be published into the cache shared by
 /// sibling mounts, and callers must tag that publication with the exact
@@ -928,6 +940,26 @@ struct HandlePublication {
     mode: u32,
 }
 
+/// What a handle flush owes its caller once it returns.
+///
+/// The two are genuinely different operations and the guest kernel tells us
+/// which one it is asking for. Collapsing them made every close a mount-wide
+/// publication barrier, which is why nothing ever batched.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlushBarrier {
+    /// close(2): the FUSE FLUSH and RELEASE pair. The handle's bytes must reach
+    /// the write journal's durable WAL, ordered behind any queued namespace
+    /// mutation for its own pathname, and an already-terminal publication
+    /// failure must be reported. Nothing else is owed — in particular, no
+    /// unrelated namespace mutation is forced onto the wire.
+    Close,
+    /// fsync(2)/fdatasync(2), and every internal path that goes on to report
+    /// authoritative post-publication state (fchmod's exact-mode publication,
+    /// advisory locking's stable identity). Both ordered journals must be
+    /// remotely acknowledged before this returns.
+    Durable,
+}
+
 #[derive(Clone)]
 struct LinkedFileRoute {
     path: String,
@@ -1702,6 +1734,13 @@ impl RemoteFuseFs {
         if let Some(metadata) = self.dirty_handle_committed_metadata(path)? {
             return Ok(Some(metadata));
         }
+        let has_projection = self
+            .namespace
+            .as_ref()
+            .map(|namespace| namespace.has_projection_for_path(path, false))
+            .transpose()
+            .map_err(|_| Errno::EIO)?
+            .unwrap_or(false);
         // A get_metadata or is_known_missing hit may not be returned on its
         // own: this mount's revision fence only advances on a wire call, so an
         // idle observer's fenced cache (or fenced negative entry) can be stale
@@ -1715,6 +1754,30 @@ impl RemoteFuseFs {
             .is_some_and(|writes| writes.has_pending_path(path))
         {
             self.flush_writes()?;
+        }
+        // A live revision watch keeps this mount's coherence fence continuously
+        // confirmed, which is exactly the condition under which
+        // `stat_path_attributes` serves without a wire call. The full stat had
+        // no such serve at all, so every open(2) cost a point `/stat` even over
+        // a tree nothing had touched — 47 of them per `git status` phase.
+        //
+        // The one extra condition a full stat carries is completeness: it
+        // promises the content hash its callers use to match cached bytes and to
+        // chain a CAS write, and an attributes-only response (`/metadata-many`)
+        // installs an entry without one. Serve only a complete entry; anything
+        // less falls through to the wire, where it belongs.
+        if !has_projection && self.client.revision_watch_live() {
+            let revision = self.client.coherence_revision();
+            if let Some(metadata) = self
+                .cache
+                .get_metadata(path, revision)
+                .filter(full_stat_metadata_is_complete)
+            {
+                return Ok(Some(metadata));
+            }
+            if self.cache.is_known_missing(path, revision) {
+                return Ok(None);
+            }
         }
         let response = self
             .tokio
@@ -2556,8 +2619,27 @@ impl RemoteFuseFs {
                 return Ok(());
             }
         }
-        self.flush_namespace()?;
         self.acknowledge_pending_publication_locked(fh)?;
+        // A queued namespace mutation for this exact pathname — in practice its
+        // own journaled creation — must reach the gateway before this handle's
+        // content does: `write-many` carries a CAS base the gateway can only
+        // evaluate against an entry that exists, so a content publication that
+        // overtook its creation would be rejected and dead-lettered.
+        //
+        // This is an ORDERING fence, not a durability barrier, so it is taken
+        // only when this pathname actually has queued namespace work, and only
+        // when there is content to publish. Closing a file whose namespace state
+        // is already published costs nothing even while unrelated creations sit
+        // in the journal — which is the difference between a close and an fsync
+        // (see `flush_handle_immediate_locked`).
+        let ordering_fence_required = {
+            let handles = self.lock_handles()?;
+            let state = handles.files.get(&fh).ok_or(Errno::ENOENT)?;
+            state.dirty && !state.unlinked && self.namespace_publication_pending_for(&state.path)?
+        };
+        if ordering_fence_required {
+            self.flush_namespace()?;
+        }
         let state = self
             .lock_handles()?
             .files
@@ -2726,7 +2808,7 @@ impl RemoteFuseFs {
         self.flush_handle_locked(fh)
     }
 
-    fn flush_handle_immediate_locked(&self, fh: u64) -> FuseResult<()> {
+    fn flush_handle_immediate_locked(&self, fh: u64, barrier: FlushBarrier) -> FuseResult<()> {
         let had_dirty_data = self
             .lock_handles()?
             .files
@@ -2736,19 +2818,41 @@ impl RemoteFuseFs {
         if !had_dirty_data {
             return Ok(());
         }
-        // A file can be renamed between its data flush and the final
-        // close/fsync. Do not report a barrier until both ordered journals are
-        // remotely acknowledged.
+        if barrier == FlushBarrier::Close {
+            // POSIX does not make close(2) a durability point, and the FUSE
+            // FLUSH/RELEASE pair the kernel sends on every close is not a
+            // request for one. This handle's bytes are already durably in the
+            // write journal's WAL (staged file fsynced, journal line appended
+            // and fsynced by `WriteJournal::enqueue`) and its pathname's queued
+            // namespace work was ordered ahead of them by the fence in
+            // `flush_handle_locked`; publishing the rest of the namespace
+            // journal is not this close's business.
+            //
+            // Making it this close's business is what kept the journal from
+            // ever accumulating a batch: with a full drain on every close, each
+            // creation published alone, so 1,000 creates cost 1,000
+            // publications instead of the handful the batch window is for.
+            //
+            // What is still owed to the caller is a *terminal* failure that has
+            // already happened — a dead-lettered publication must not be
+            // silently swallowed just because this close does not wait. That is
+            // surfaced without a wire call.
+            return self.assert_namespace_journal_healthy();
+        }
+        // fsync(2) IS a durability point. A file can be renamed between its data
+        // flush and the fsync, so the barrier is not complete until BOTH ordered
+        // journals are remotely acknowledged: the content above, and every
+        // namespace mutation that could have retargeted it.
         self.flush_namespace()
     }
 
-    fn flush_handle_immediate(&self, fh: u64) -> FuseResult<()> {
+    fn flush_handle_immediate(&self, fh: u64, barrier: FlushBarrier) -> FuseResult<()> {
         if self.read_only {
             return Ok(());
         }
         let gate = self.publication_gate_for_handle(fh)?;
         let _guard = gate.lock().map_err(|_| Errno::EIO)?;
-        self.flush_handle_immediate_locked(fh)
+        self.flush_handle_immediate_locked(fh, barrier)
     }
 
     fn advisory_lock_target(&self, fh: u64) -> FuseResult<AdvisoryLockTarget> {
@@ -2766,7 +2870,7 @@ impl RemoteFuseFs {
         // create(2) is intentionally handle-local until a publication point.
         // POSIX/OFD/flock operations need the gateway's stable identity, so
         // publish the exact handle bytes and mode before asking for a lock.
-        self.flush_handle_immediate(fh)?;
+        self.flush_handle_immediate(fh, FlushBarrier::Durable)?;
         for _ in 0..4 {
             let state = {
                 let handles = self.lock_handles()?;
@@ -3165,6 +3269,25 @@ impl RemoteFuseFs {
             .lock()
             .map_err(|_| Errno::EIO)?;
         self.flush_namespace_locked()
+    }
+
+    /// Whether this mount has a namespace mutation queued for `path` (or for an
+    /// ancestor of it) that the gateway has not published yet.
+    ///
+    /// This is the exact condition under which a content publication for `path`
+    /// must be ordered behind a namespace drain; it is deliberately not
+    /// "anything at all is queued", so one file's close never waits out another
+    /// file's creation. Direct children are excluded: a queued mutation of a
+    /// sibling entry inside `path`'s parent cannot change whether `path` exists
+    /// at the gateway.
+    fn namespace_publication_pending_for(&self, path: &str) -> FuseResult<bool> {
+        let Some(namespace) = self.namespace.as_ref() else {
+            return Ok(false);
+        };
+        namespace.has_pending_for_path(path, false).map_err(|error| {
+            tracing::warn!(error = %error, "vfs namespace journal state unavailable");
+            Errno::EIO
+        })
     }
 
     /// Read-side barrier for one namespace location. Namespace mutations remain
@@ -3741,8 +3864,9 @@ mod tests {
     use axum::routing::any;
     use axum::{Json, Router};
     use chevalier_sandbox::vfs::{
-        VfsMetadata as RemoteMetadata, VfsMetadataManyRequest, VfsMetadataManyResponse,
-        VfsNamespaceMutation, VfsSubtreeMetadataEntry, VfsSubtreeMetadataResponse,
+        VfsCasPredicate, VfsMetadata as RemoteMetadata, VfsMetadataManyRequest,
+        VfsMetadataManyResponse, VfsNamespaceMutation, VfsSubtreeMetadataEntry,
+        VfsSubtreeMetadataResponse,
     };
     use fuser::{FopenFlags, InitFlags, LockNamespace};
     use tokio::runtime::Builder;
@@ -3755,8 +3879,9 @@ mod tests {
     use super::super::client::RemoteVfsClient;
     use super::super::namespace::NamespaceProjection;
     use super::{
-        ATTR_ENTRY_LEASE_TTL, ActiveAdvisoryLockFile, ActiveAdvisoryLocks, HandlePublication,
-        InodeTable, LockWaitCancellation, ROOT_INO, RemoteFuseFs, active_advisory_lock_identities,
+        ATTR_ENTRY_LEASE_TTL, ActiveAdvisoryLockFile, ActiveAdvisoryLocks, FlushBarrier,
+        HandlePublication, InodeTable, LockWaitCancellation, ROOT_INO, RemoteFuseFs,
+        active_advisory_lock_identities,
         combine_flush_and_lock_cleanup, content_hash_conflicts, content_hash_for_bytes,
         creation_mode, lease_ttl_for, publish_authoritative_projection, range_fingerprint,
         remote_file_open_flags, take_active_advisory_lock_file_id, take_active_posix_handle_locks,
@@ -6076,6 +6201,297 @@ mod tests {
         }
     }
 
+    /// A full stat (`stat_path`, the route open(2) resolves through) must serve
+    /// from the same fence-matched cache the attribute stat does — but only from
+    /// an entry complete enough to keep the promise a full stat makes.
+    ///
+    /// Without this, every open(2) cost a point `/stat` even over a tree nothing
+    /// had touched: 47 of them per measured `git status` phase.
+    #[test]
+    fn full_stat_serves_a_complete_fence_matched_entry_and_wires_for_an_incomplete_one() {
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let gateway = Arc::new(Mutex::new(RoundTripGateway {
+            scope: "test-scope".to_string(),
+            files: std::collections::BTreeMap::from([(
+                "test-scope/seed/file".to_string(),
+                b"content".to_vec(),
+            )]),
+            revision: 17,
+            publications: Vec::new(),
+            acked: 0,
+            counts: RouteCounts::default(),
+        }));
+        let server_gateway = Arc::clone(&gateway);
+        let server = runtime.spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/{*path}", any(round_trip_gateway))
+                    .with_state(server_gateway),
+            )
+            .await
+            .unwrap();
+        });
+        let client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
+        let fs = RemoteFuseFs::new(client.clone(), false, "test-scope", runtime.handle().clone());
+        await_watch_live(&client);
+
+        // The first full stat wires — every bulk route asks the gateway not to
+        // hash, so nothing else can supply the content hash a full stat owes —
+        // and installs a complete entry.
+        let complete = fs.stat_path("seed/file").unwrap().expect("file exists");
+        assert_eq!(
+            complete.content_hash,
+            Some(content_hash_for_bytes(b"content"))
+        );
+        assert_eq!(gateway.lock().unwrap().counts.stat, 1);
+
+        // Every later open of the same file at the same fence is served from it.
+        for _ in 0..8 {
+            assert_eq!(fs.stat_path("seed/file").unwrap(), Some(complete.clone()));
+        }
+        assert_eq!(
+            gateway.lock().unwrap().counts.stat,
+            1,
+            "a complete fence-matched entry must be served without a point stat"
+        );
+
+        // An attributes-only entry (what /metadata-many installs) carries no
+        // content hash, so it cannot stand in for a full stat: callers match
+        // cached bytes and chain CAS writes off that hash. It must wire.
+        fs.cache.invalidate("seed/file");
+        assert!(
+            fs.stat_path_attributes("seed/file")
+                .unwrap()
+                .is_some_and(|metadata| metadata.content_hash.is_none()),
+            "the attribute route installs an entry without a content hash"
+        );
+        let stats_before = gateway.lock().unwrap().counts.stat;
+        assert!(fs.stat_path("seed/file").unwrap().is_some());
+        assert_eq!(
+            gateway.lock().unwrap().counts.stat,
+            stats_before + 1,
+            "an incomplete entry must fall through to the wire"
+        );
+
+        drop(fs);
+        server.abort();
+    }
+
+    /// Gateway for `close_is_not_a_namespace_barrier_but_fsync_is`: content
+    /// publishes freely while namespace publications park until released, so a
+    /// flush's dependence on the namespace journal is directly observable.
+    struct HeldNamespaceGateway {
+        release_namespace: Arc<Notify>,
+        namespace_requests: Mutex<usize>,
+    }
+
+    async fn held_namespace_gateway(
+        State(state): State<Arc<HeldNamespaceGateway>>,
+        request: Request<Body>,
+    ) -> Response {
+        let method = request.method().clone();
+        let route = request.uri().path().to_string();
+        let revision = |mut response: Response| -> Response {
+            response.headers_mut().insert(
+                HeaderName::from_static("x-chevalier-vfs-namespace-revision"),
+                HeaderValue::from_static("1"),
+            );
+            response
+        };
+        match (method, route.as_str()) {
+            (Method::POST, "/lease") => Json(serde_json::json!({
+                "resource_key": "held-namespace-test",
+                "owner_token": "00000000-0000-0000-0000-000000000001",
+                "task_id": null
+            }))
+            .into_response(),
+            (Method::DELETE, "/lease") => StatusCode::NO_CONTENT.into_response(),
+            (Method::POST, "/namespace-many") => {
+                *state.namespace_requests.lock().unwrap() += 1;
+                state.release_namespace.notified().await;
+                revision(
+                    Json(chevalier_sandbox::vfs::VfsNamespaceMutationBatchResponse::default())
+                        .into_response(),
+                )
+            }
+            (Method::POST, "/write-many") => {
+                revision(Json(serde_json::json!({"results": [], "entries": []})).into_response())
+            }
+            // Every handle this test flushes carries the same payload, so one
+            // authoritative answer verifies each publication.
+            (Method::GET, "/stat") => {
+                let scoped = round_trip_query_path(&request);
+                let path = scoped
+                    .strip_prefix("test-scope/")
+                    .unwrap_or(scoped.as_str());
+                revision(
+                    Json(RemoteMetadata {
+                        kind: "file".to_string(),
+                        size_bytes: b"payload".len() as u64,
+                        file_id: Some(format!("identity:{path}")),
+                        link_count: 1,
+                        link_target: None,
+                        content_hash: Some(content_hash_for_bytes(b"payload")),
+                        executable: false,
+                        mode: Some(0o644),
+                        updated_at: None,
+                    })
+                    .into_response(),
+                )
+            }
+            _ => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    /// close(2) must not be a namespace publication barrier; fsync(2) must be.
+    ///
+    /// The handle here is dirty on a pathname with no queued namespace work of
+    /// its own, while an unrelated creation sits unpublished in the journal.
+    /// A close owes that creation nothing — its own bytes are already in the
+    /// write journal's durable WAL — so it must complete while the namespace
+    /// publication is still parked at the gateway. An fsync owes it everything:
+    /// a rename can land between the data flush and the fsync, so the barrier is
+    /// not met until both ordered journals are remotely acknowledged.
+    ///
+    /// This is the difference that lets creations batch at all: when every close
+    /// drained the journal, each queued creation published alone.
+    #[test]
+    fn close_is_not_a_namespace_barrier_but_fsync_is() {
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let gateway = Arc::new(HeldNamespaceGateway {
+            release_namespace: Arc::new(Notify::new()),
+            namespace_requests: Mutex::new(0),
+        });
+        let server_gateway = Arc::clone(&gateway);
+        let server = runtime.spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/{*path}", any(held_namespace_gateway))
+                    .with_state(server_gateway),
+            )
+            .await
+            .unwrap();
+        });
+        let journal_dir = tempfile::tempdir().unwrap();
+        let client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
+        let fs = Arc::new(
+            RemoteFuseFs::new_with_namespace_journal(
+                client,
+                false,
+                "test-scope",
+                &journal_dir.path().join("namespace.jsonl"),
+                runtime.handle().clone(),
+            )
+            .unwrap(),
+        );
+
+        // An unrelated creation, journaled and unpublished: the worker picks it
+        // up and parks in the gateway.
+        fs.enqueue_namespace_creation(
+            VfsNamespaceMutation::CreateFile {
+                path: "unrelated/new".to_string(),
+                mode: Some(0o644),
+            },
+            None,
+        )
+        .unwrap();
+        for _ in 0..200 {
+            if *gateway.namespace_requests.lock().unwrap() > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            *gateway.namespace_requests.lock().unwrap(),
+            1,
+            "the journal worker must have the unrelated creation in flight"
+        );
+
+        let dirty_handle = |path: &str| {
+            let fh = fs
+                .next_handle(
+                    path,
+                    Vec::new(),
+                    true,
+                    Some(content_hash_for_bytes(b"base")),
+                    0o644,
+                    false,
+                    Some(format!("identity:{path}")),
+                    1,
+                )
+                .unwrap();
+            let mut handles = fs.lock_handles().unwrap();
+            let state = handles.files.get_mut(&fh).unwrap();
+            state.buffer = b"payload".to_vec();
+            state.dirty = true;
+            state.revision = state.revision.saturating_add(1);
+            RemoteFuseFs::mirror_handle_state_locked(&mut handles, fh).unwrap();
+            fh
+        };
+
+        // close: must complete with the namespace publication still parked.
+        let closing = dirty_handle("published/file");
+        let (done, closed) = mpsc::channel();
+        let close_fs = Arc::clone(&fs);
+        let closer = std::thread::spawn(move || {
+            let result = close_fs.flush_handle_immediate(closing, FlushBarrier::Close);
+            let _ = done.send(result.is_ok());
+        });
+        assert_eq!(
+            closed.recv_timeout(Duration::from_secs(10)),
+            Ok(true),
+            "an ordinary close must not wait on an unrelated namespace publication"
+        );
+        closer.join().unwrap();
+        assert_eq!(
+            *gateway.namespace_requests.lock().unwrap(),
+            1,
+            "a close must not force a namespace publication of its own"
+        );
+
+        // fsync: must NOT complete while that publication is parked.
+        let syncing = dirty_handle("published/other");
+        let (done, synced) = mpsc::channel();
+        let fsync_fs = Arc::clone(&fs);
+        let syncer = std::thread::spawn(move || {
+            let result = fsync_fs.flush_handle_immediate(syncing, FlushBarrier::Durable);
+            let _ = done.send(result.is_ok());
+        });
+        assert_eq!(
+            synced.recv_timeout(Duration::from_millis(750)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "fsync must hold until both ordered journals are remotely acknowledged"
+        );
+        gateway.release_namespace.notify_waiters();
+        assert_eq!(
+            synced.recv_timeout(Duration::from_secs(10)),
+            Ok(true),
+            "fsync must complete once the namespace journal drains"
+        );
+        syncer.join().unwrap();
+
+        drop(fs);
+        server.abort();
+    }
+
     #[test]
     fn descendant_write_barrier_blocks_only_the_deleted_subtree_until_rmdir_resolves() {
         let runtime = Builder::new_multi_thread()
@@ -6893,38 +7309,164 @@ mod tests {
     /// namespace revision header.
     struct RoundTripGateway {
         scope: String,
-        /// Scoped path -> file size. Directories are implied by their entries.
-        files: std::collections::BTreeMap<String, u64>,
+        /// Scoped path -> file content. Directories are implied by their
+        /// entries, exactly as the production gateway's namespace is.
+        files: std::collections::BTreeMap<String, Vec<u8>>,
         revision: u64,
+        /// Recent publications as (revision, affected paths), newest last —
+        /// the history the production gateway retains so a watcher is told
+        /// exactly what to revoke instead of "something changed". Without it
+        /// the benchmark cannot measure what a publication actually costs the
+        /// mount that observes it.
+        publications: Vec<(u64, Vec<String>)>,
+        /// Highest revision the watcher has acked. A poll's `since` IS the ack
+        /// of that revision, exactly as the production gateway treats it.
+        acked: u64,
         counts: RouteCounts,
     }
 
-    /// Every file the stub serves is empty, which is exactly the shape a
-    /// freshly reserved file has: `published_file_matches` verifies size, hash,
-    /// mode and identity against this.
-    fn round_trip_file_metadata(path: &str) -> RemoteMetadata {
+    impl RoundTripGateway {
+        /// Record one publication's affected set against the revision it
+        /// produced, and return that revision.
+        fn publish(&mut self, paths: Vec<String>) -> u64 {
+            self.revision += 1;
+            let revision = self.revision;
+            self.publications.push((revision, paths));
+            revision
+        }
+
+        /// The union of paths published in `(since, revision]`, or `None` when
+        /// the watcher is behind the retained history and the answer cannot be
+        /// claimed exhaustive. Mirrors `#pathsPublishedSince` in
+        /// ts/vfs-gateway-server.ts, truncation semantics included.
+        fn published_since(&self, since: u64) -> Option<Vec<String>> {
+            // The history must account for the revision being reported. A
+            // revision the stub advanced without recording an affected set
+            // models exactly what the production gateway reports as truncated:
+            // "something changed and I cannot tell you what".
+            if self.publications.last().map(|entry| entry.0) != Some(self.revision) {
+                return None;
+            }
+            let oldest = self.publications.first()?;
+            if since < oldest.0 {
+                return None;
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            let mut union = Vec::new();
+            for (revision, paths) in &self.publications {
+                if *revision <= since {
+                    continue;
+                }
+                for path in paths {
+                    if seen.insert(path.clone()) {
+                        union.push(path.clone());
+                    }
+                }
+            }
+            Some(union)
+        }
+    }
+
+    /// A file's authoritative metadata, derived from its stored bytes:
+    /// `published_file_matches` verifies size, hash, mode and identity against
+    /// this, so a flush that publishes content must see the content back.
+    ///
+    /// `max_hash_bytes` is the gateway's hashing budget, and the mount asks for
+    /// zero on every bulk/attribute route (`/tree`, `/metadata-many`,
+    /// `/subtree-metadata`, and the attribute `/stat`). Those answers therefore
+    /// carry NO content hash, which is what makes an attributes-only cache entry
+    /// unable to stand in for a full stat. A stub that hashed unconditionally
+    /// would report a cache that is warmer than the real one ever is.
+    fn round_trip_file_metadata(
+        path: &str,
+        bytes: &[u8],
+        max_hash_bytes: Option<u64>,
+    ) -> RemoteMetadata {
+        let hashed = max_hash_bytes.is_none_or(|budget| bytes.len() as u64 <= budget);
         RemoteMetadata {
             kind: "file".to_string(),
-            size_bytes: 0,
+            size_bytes: bytes.len() as u64,
             file_id: Some(format!("identity:{path}")),
             link_count: 1,
             link_target: None,
-            content_hash: Some(content_hash_for_bytes(&[])),
+            content_hash: hashed.then(|| content_hash_for_bytes(bytes)),
             executable: false,
             mode: Some(0o644),
             updated_at: None,
         }
     }
 
+    /// Directory metadata for an implied directory. The production gateway
+    /// answers `/stat` and `/metadata-many` for directories the same way it
+    /// answers for files, which is what makes a publication snapshot's parent
+    /// entry usable as cached metadata.
+    fn round_trip_directory_metadata() -> RemoteMetadata {
+        RemoteMetadata {
+            kind: "directory".to_string(),
+            size_bytes: 0,
+            file_id: None,
+            link_count: 1,
+            link_target: None,
+            content_hash: None,
+            executable: false,
+            mode: Some(0o755),
+            updated_at: None,
+        }
+    }
+
+    /// Authoritative metadata for any path the stub's namespace holds: a stored
+    /// file, an implied directory (the scope root, or any prefix of a stored
+    /// path), or absent.
+    fn round_trip_metadata(
+        state: &RoundTripGateway,
+        path: &str,
+        max_hash_bytes: Option<u64>,
+    ) -> Option<RemoteMetadata> {
+        if let Some(bytes) = state.files.get(path) {
+            return Some(round_trip_file_metadata(path, bytes, max_hash_bytes));
+        }
+        if path == state.scope {
+            return Some(round_trip_directory_metadata());
+        }
+        let prefix = format!("{path}/");
+        state
+            .files
+            .keys()
+            .any(|stored| stored.starts_with(prefix.as_str()))
+            .then(round_trip_directory_metadata)
+    }
+
+    /// The gateway's `namespace_snapshot_paths`: every mutated path plus its
+    /// immediate parent, so the publishing mount learns the resulting state of
+    /// both without a follow-up read.
+    fn round_trip_snapshot_paths(paths: &[String]) -> Vec<String> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut ordered = Vec::new();
+        for path in paths {
+            let parent = path
+                .trim_matches('/')
+                .rsplit_once('/')
+                .map(|(parent, _)| parent.to_string())
+                .unwrap_or_default();
+            for candidate in [path.clone(), parent] {
+                if seen.insert(candidate.clone()) {
+                    ordered.push(candidate);
+                }
+            }
+        }
+        ordered
+    }
+
     /// Direct children of `dir`, or `None` when the directory does not exist.
     fn round_trip_children(
         state: &RoundTripGateway,
         dir: &str,
+        max_hash_bytes: Option<u64>,
     ) -> Option<Vec<chevalier_sandbox::vfs::VfsDirEntry>> {
         let prefix = format!("{dir}/");
         let mut files = Vec::new();
         let mut directories = std::collections::BTreeSet::new();
-        for path in state.files.keys() {
+        for (path, bytes) in &state.files {
             let Some(rest) = path.strip_prefix(prefix.as_str()) else {
                 continue;
             };
@@ -6932,18 +7474,21 @@ mod tests {
                 Some((name, _)) => {
                     directories.insert(name.to_string());
                 }
-                None => files.push(chevalier_sandbox::vfs::VfsDirEntry {
-                    name: rest.to_string(),
-                    kind: "file".to_string(),
-                    size_bytes: 0,
-                    file_id: Some(format!("identity:{path}")),
-                    link_count: 1,
-                    link_target: None,
-                    content_hash: Some(content_hash_for_bytes(&[])),
-                    executable: false,
-                    mode: Some(0o644),
-                    updated_at: None,
-                }),
+                None => {
+                    let metadata = round_trip_file_metadata(path, bytes, max_hash_bytes);
+                    files.push(chevalier_sandbox::vfs::VfsDirEntry {
+                        name: rest.to_string(),
+                        kind: metadata.kind,
+                        size_bytes: metadata.size_bytes,
+                        file_id: metadata.file_id,
+                        link_count: metadata.link_count,
+                        link_target: metadata.link_target,
+                        content_hash: metadata.content_hash,
+                        executable: metadata.executable,
+                        mode: metadata.mode,
+                        updated_at: metadata.updated_at,
+                    })
+                }
             }
         }
         if files.is_empty() && directories.is_empty() && dir != state.scope {
@@ -6995,31 +7540,116 @@ mod tests {
         decoded
     }
 
-    fn round_trip_query_path(request: &Request<Body>) -> String {
+    fn round_trip_query_value(request: &Request<Body>, name: &str) -> String {
         request
             .uri()
             .query()
             .unwrap_or_default()
             .split('&')
             .filter_map(|pair| pair.split_once('='))
-            .find(|(name, _)| *name == "path")
+            .find(|(key, _)| *key == name)
             .map(|(_, value)| decode_query_value(value))
             .unwrap_or_default()
     }
 
+    fn round_trip_query_path(request: &Request<Body>) -> String {
+        round_trip_query_value(request, "path")
+    }
+
+    fn round_trip_query_max_hash_bytes(request: &Request<Body>) -> Option<u64> {
+        let raw = round_trip_query_value(request, "max_hash_bytes");
+        (!raw.is_empty()).then(|| raw.parse().unwrap_or_default())
+    }
+
+    fn round_trip_query_since(request: &Request<Body>) -> u64 {
+        round_trip_query_value(request, "since")
+            .parse()
+            .unwrap_or_default()
+    }
+
+    /// The watch answer shape the production gateway sends: the revision plus
+    /// the affected set, or `truncated` when the set cannot be claimed
+    /// exhaustive (which sends the watcher down its conservative fallback).
+    fn round_trip_watch_response(revision: u64, published: Option<Vec<String>>) -> Response {
+        let body = match published {
+            Some(paths) => serde_json::json!({ "revision": revision, "paths": paths }),
+            None => {
+                serde_json::json!({ "revision": revision, "paths": [], "truncated": true })
+            }
+        };
+        with_revision_header(Json(body).into_response(), revision)
+    }
+
+    /// Hold a publication until the revision watch has acked it, which is the
+    /// gateway's `commit_and_await_acks_for`.
+    ///
+    /// This ordering is the whole reason a mount observes its OWN publications
+    /// on its own watch: the answer (and the cache/kernel work it triggers)
+    /// lands strictly before the publishing request's response does. A stub that
+    /// returned immediately would let the publisher's response-header revision
+    /// beat the watch, the watch would then see nothing to report, and the
+    /// benchmark would measure a coherence protocol nobody runs. Fails open on
+    /// timeout, as the gateway does, so a test without a live watcher still
+    /// makes progress.
+    async fn await_watch_ack(state: &Arc<Mutex<RoundTripGateway>>, revision: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if state.lock().unwrap().acked >= revision {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// A real long poll against the recorded publication history: park until the
+    /// revision passes `since`, then answer with the exact affected union (or
+    /// report truncation when the watcher is behind the history). Parking on a
+    /// fixed sleep instead — which is what the other stubs in this file do —
+    /// would hide the cost every publication imposes on the mount that observes
+    /// it, which is precisely what this benchmark exists to measure.
+    async fn round_trip_watch(state: &Arc<Mutex<RoundTripGateway>>, since: u64) -> Response {
+        {
+            // This poll's `since` IS the watcher's ack of that revision.
+            let mut state = state.lock().unwrap();
+            state.counts.watch += 1;
+            state.acked = state.acked.max(since);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let answer = {
+                let state = state.lock().unwrap();
+                (state.revision > since).then(|| (state.revision, state.published_since(since)))
+            };
+            if let Some((revision, published)) = answer {
+                return round_trip_watch_response(revision, published);
+            }
+            if std::time::Instant::now() >= deadline {
+                return StatusCode::NO_CONTENT.into_response();
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
     async fn round_trip_gateway(
-        State(state): State<Arc<Mutex<RoundTripGateway>>>,
+        State(state_handle): State<Arc<Mutex<RoundTripGateway>>>,
         request: Request<Body>,
     ) -> Response {
+        let state = &state_handle;
         let method = request.method().clone();
         let route = request.uri().path().to_string();
         let path = round_trip_query_path(&request);
+        // Absent means "hash whatever it costs"; present (always 0 from this
+        // mount) means "do not hash".
+        let max_hash_bytes = round_trip_query_max_hash_bytes(&request);
         match (method, route.as_str()) {
             (Method::GET, "/tree") => {
                 let mut state = state.lock().unwrap();
                 state.counts.tree += 1;
                 let revision = state.revision;
-                match round_trip_children(&state, path.as_str()) {
+                match round_trip_children(&state, path.as_str(), max_hash_bytes) {
                     Some(entries) => with_revision_header(Json(entries).into_response(), revision),
                     None => with_revision_header(StatusCode::NOT_FOUND.into_response(), revision),
                 }
@@ -7028,11 +7658,10 @@ mod tests {
                 let mut state = state.lock().unwrap();
                 state.counts.stat += 1;
                 let revision = state.revision;
-                match state.files.get(path.as_str()) {
-                    Some(_) => with_revision_header(
-                        Json(round_trip_file_metadata(path.as_str())).into_response(),
-                        revision,
-                    ),
+                match round_trip_metadata(&state, path.as_str(), max_hash_bytes) {
+                    Some(metadata) => {
+                        with_revision_header(Json(metadata).into_response(), revision)
+                    }
                     None => with_revision_header(StatusCode::NOT_FOUND.into_response(), revision),
                 }
             }
@@ -7048,12 +7677,7 @@ mod tests {
                 let entries = payload
                     .paths
                     .iter()
-                    .map(|path| {
-                        state
-                            .files
-                            .contains_key(path.as_str())
-                            .then(|| round_trip_file_metadata(path))
-                    })
+                    .map(|path| round_trip_metadata(&state, path.as_str(), max_hash_bytes))
                     .collect();
                 with_revision_header(
                     Json(VfsMetadataManyResponse { entries }).into_response(),
@@ -7076,22 +7700,26 @@ mod tests {
                 let revision = state.revision;
                 let entries = state
                     .files
-                    .keys()
-                    .filter(|path| path.starts_with(prefix.as_str()))
-                    .map(|path| VfsSubtreeMetadataEntry {
-                        path: path.clone(),
-                        kind: "file".to_string(),
-                        size_bytes: 0,
-                        file_id: Some(format!("identity:{path}")),
-                        link_count: 1,
-                        link_target: None,
-                        content_hash: Some(content_hash_for_bytes(&[])),
-                        executable: false,
-                        mode: Some(0o644),
-                        token_count: None,
-                        version: None,
-                        updated_at: None,
-                        object_state: None,
+                    .iter()
+                    .filter(|(path, _)| path.starts_with(prefix.as_str()))
+                    .map(|(path, bytes)| {
+                        let metadata =
+                            round_trip_file_metadata(path, bytes, payload.max_hash_bytes);
+                        VfsSubtreeMetadataEntry {
+                            path: path.clone(),
+                            kind: metadata.kind,
+                            size_bytes: metadata.size_bytes,
+                            file_id: metadata.file_id,
+                            link_count: metadata.link_count,
+                            link_target: metadata.link_target,
+                            content_hash: metadata.content_hash,
+                            executable: metadata.executable,
+                            mode: metadata.mode,
+                            token_count: None,
+                            version: None,
+                            updated_at: None,
+                            object_state: None,
+                        }
                     })
                     .collect();
                 with_revision_header(
@@ -7120,32 +7748,43 @@ mod tests {
                     .expect("read namespace-many request");
                 let payload: chevalier_sandbox::vfs::VfsNamespaceMutationBatchBody =
                     serde_json::from_slice(&body).expect("decode namespace-many request");
-                let mut state = state.lock().unwrap();
-                state.counts.namespace_many += 1;
-                let mut entries = Vec::new();
-                for mutation in &payload.mutations {
-                    match mutation {
-                        VfsNamespaceMutation::CreateFile { path, .. } => {
-                            state.files.insert(path.clone(), 0);
-                            entries.push(chevalier_sandbox::vfs::VfsPublicationSnapshotEntry {
-                                path: path.clone(),
-                                metadata: Some(round_trip_file_metadata(path)),
-                            });
+                let (entries, revision) = {
+                    let mut state = state.lock().unwrap();
+                    state.counts.namespace_many += 1;
+                    let mut mutated = Vec::new();
+                    for mutation in &payload.mutations {
+                        match mutation {
+                            VfsNamespaceMutation::CreateFile { path, .. } => {
+                                state.files.insert(path.clone(), Vec::new());
+                                mutated.push(path.clone());
+                            }
+                            VfsNamespaceMutation::DeleteFile { path, .. } => {
+                                state.files.remove(path.as_str());
+                                mutated.push(path.clone());
+                            }
+                            _ => {}
                         }
-                        VfsNamespaceMutation::DeleteFile { path, .. } => {
-                            state.files.remove(path.as_str());
-                            entries.push(chevalier_sandbox::vfs::VfsPublicationSnapshotEntry {
-                                path: path.clone(),
-                                metadata: None,
-                            });
-                        }
-                        _ => {}
                     }
-                }
-                // Every publication advances the namespace revision, exactly as
-                // the gateway's publication sequencer does.
-                state.revision += 1;
-                let revision = state.revision;
+                    // The gateway answers a namespace publication with a
+                    // snapshot of every mutated path AND its immediate parent
+                    // (see `namespace_snapshot_paths` in
+                    // crates/sandbox/src/vfs.rs), so the publishing mount never
+                    // has to re-read what it just changed.
+                    let snapshot_paths = round_trip_snapshot_paths(&mutated);
+                    let entries = snapshot_paths
+                        .iter()
+                        .map(|path| chevalier_sandbox::vfs::VfsPublicationSnapshotEntry {
+                            metadata: round_trip_metadata(&state, path.as_str(), None),
+                            path: path.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    // Every publication advances the namespace revision and
+                    // records its affected set, exactly as the gateway's
+                    // publication sequencer does.
+                    let revision = state.publish(snapshot_paths);
+                    (entries, revision)
+                };
+                await_watch_ack(state, revision).await;
                 with_revision_header(
                     Json(chevalier_sandbox::vfs::VfsNamespaceMutationBatchResponse { entries })
                         .into_response(),
@@ -7153,30 +7792,125 @@ mod tests {
                 )
             }
             (Method::POST, "/write-many") => {
-                let mut state = state.lock().unwrap();
-                state.counts.write_many += 1;
-                state.revision += 1;
-                let revision = state.revision;
-                with_revision_header(
-                    Json(serde_json::json!({"results": [], "entries": []})).into_response(),
-                    revision,
-                )
+                let body = to_bytes(request.into_body(), 4 * 1024 * 1024)
+                    .await
+                    .expect("read write-many request");
+                let payload: chevalier_sandbox::vfs::VfsWriteManyBody =
+                    serde_json::from_slice(&body).expect("decode write-many request");
+                let published = {
+                    let mut state = state.lock().unwrap();
+                    state.counts.write_many += 1;
+                    // Content preconditions are the gateway's, not a
+                    // convenience: a write whose CAS base does not match
+                    // (including a write that reached the gateway before the
+                    // creation it depends on) is rejected atomically for the
+                    // whole batch.
+                    let rejected = payload
+                        .writes
+                        .iter()
+                        .find(|write| {
+                            let Some(predicate) = write
+                                .precondition
+                                .as_ref()
+                                .and_then(|precondition| precondition.predicate.as_ref())
+                            else {
+                                return false;
+                            };
+                            match predicate {
+                                VfsCasPredicate::Absent => {
+                                    state.files.contains_key(write.path.as_str())
+                                }
+                                VfsCasPredicate::ContentFingerprint { fingerprint } => state
+                                    .files
+                                    .get(write.path.as_str())
+                                    .is_none_or(|bytes| {
+                                        content_hash_for_bytes(bytes) != *fingerprint
+                                    }),
+                            }
+                        })
+                        .map(|write| write.path.clone());
+                    match rejected {
+                        Some(rejected) => Err((state.revision, rejected)),
+                        None => {
+                            let mut results = Vec::new();
+                            let mut written = Vec::new();
+                            for write in payload.writes {
+                                let previous_hash = state
+                                    .files
+                                    .get(write.path.as_str())
+                                    .map(|bytes| content_hash_for_bytes(bytes));
+                                let content_hash = content_hash_for_bytes(write.body.as_slice());
+                                state.files.insert(write.path.clone(), write.body);
+                                results.push(chevalier_sandbox::vfs::VfsWriteManyResult {
+                                    changed: previous_hash.as_deref()
+                                        != Some(content_hash.as_str()),
+                                    previous_hash,
+                                    content_hash,
+                                    path: write.path.clone(),
+                                });
+                                written.push(write.path);
+                            }
+                            // A content publication's snapshot names only the
+                            // written paths (see `post_write_many` in
+                            // crates/sandbox/src/vfs.rs) — no parent entry,
+                            // which is exactly why a write must not evict its
+                            // parent directory's cached metadata.
+                            let entries = written
+                                .iter()
+                                .map(|path| chevalier_sandbox::vfs::VfsPublicationSnapshotEntry {
+                                    metadata: round_trip_metadata(&state, path.as_str(), None),
+                                    path: path.clone(),
+                                })
+                                .collect::<Vec<_>>();
+                            let revision = state.publish(written);
+                            Ok((results, entries, revision))
+                        }
+                    }
+                };
+                match published {
+                    Err((revision, rejected)) => with_revision_header(
+                        (
+                            StatusCode::CONFLICT,
+                            format!("write precondition failed for {rejected}"),
+                        )
+                            .into_response(),
+                        revision,
+                    ),
+                    Ok((results, entries, revision)) => {
+                        await_watch_ack(state, revision).await;
+                        with_revision_header(
+                            Json(chevalier_sandbox::vfs::VfsWriteManyPublicationResponse {
+                                results,
+                                entries,
+                            })
+                            .into_response(),
+                            revision,
+                        )
+                    }
+                }
             }
             (Method::GET, "/file/raw") => {
                 let mut state = state.lock().unwrap();
                 state.counts.file += 1;
                 let revision = state.revision;
                 match state.files.get(path.as_str()) {
-                    Some(_) => with_revision_header(Vec::new().into_response(), revision),
+                    Some(bytes) => {
+                        with_revision_header(bytes.clone().into_response(), revision)
+                    }
                     None => with_revision_header(StatusCode::NOT_FOUND.into_response(), revision),
                 }
             }
             (Method::PUT, "/file") => {
-                let mut state = state.lock().unwrap();
-                state.counts.file += 1;
-                state.files.insert(path.clone(), 0);
-                state.revision += 1;
-                let revision = state.revision;
+                let body = to_bytes(request.into_body(), 4 * 1024 * 1024)
+                    .await
+                    .expect("read file body");
+                let revision = {
+                    let mut state = state.lock().unwrap();
+                    state.counts.file += 1;
+                    state.files.insert(path.clone(), body.to_vec());
+                    state.publish(vec![path.clone()])
+                };
+                await_watch_ack(state, revision).await;
                 with_revision_header(StatusCode::NO_CONTENT.into_response(), revision)
             }
             (Method::POST, "/lease") => {
@@ -7199,13 +7933,15 @@ mod tests {
                 state.lock().unwrap().counts.lease += 1;
                 StatusCode::NO_CONTENT.into_response()
             }
+            // A real long poll against the recorded publication history: park
+            // until the revision passes `since`, then answer with the exact
+            // affected union (or report truncation when the watcher is behind
+            // the history). Parking on a fixed sleep instead — which is what the
+            // other stubs in this file do — would hide the cost every
+            // publication imposes on the mount that observes it, which is
+            // precisely what this benchmark exists to measure.
             (Method::GET, "/watch") => {
-                let (polls, revision) = {
-                    let mut state = state.lock().unwrap();
-                    state.counts.watch += 1;
-                    (state.counts.watch, state.revision)
-                };
-                serve_revision_watch(true, polls, revision).await
+                round_trip_watch(state, round_trip_query_since(&request)).await
             }
             _ => StatusCode::NOT_FOUND.into_response(),
         }
@@ -7242,12 +7978,20 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let mut files = std::collections::BTreeMap::new();
         for index in 0..SEED_FILES {
-            files.insert(format!("test-scope/seed/file-{index}"), 0);
+            // Non-empty: a zero-byte file is hashed even under
+            // `max_hash_bytes=0`, which would make every bulk answer look
+            // complete and hide what a full stat actually costs.
+            files.insert(
+                format!("test-scope/seed/file-{index}"),
+                format!("seed file {index}").into_bytes(),
+            );
         }
         let gateway = Arc::new(Mutex::new(RoundTripGateway {
             scope: "test-scope".to_string(),
             files,
             revision: 17,
+            publications: Vec::new(),
+            acked: 0,
             counts: RouteCounts::default(),
         }));
         let server_gateway = Arc::clone(&gateway);
@@ -7277,6 +8021,22 @@ mod tests {
         await_watch_live(&client);
 
         let sample = || gateway.lock().unwrap().counts;
+        // Wait until this mount has observed every publication the gateway has
+        // made. The stub holds each publication until the watcher acks it (see
+        // `await_watch_ack`), exactly as the gateway's
+        // `commit_and_await_acks_for` does, so this is normally already true the
+        // moment a publishing call returns — the wait exists so a "warm" phase
+        // can never be measured against a fence the watch has not applied.
+        let await_watch_catch_up = || {
+            let target = gateway.lock().unwrap().revision;
+            for _ in 0..600 {
+                if client.coherence_revision() >= target {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("revision watch never caught up to gateway revision {target}");
+        };
         // Start each class from a fresh fence: advance the gateway's revision
         // and take one throwaway wire call so this mount observes it. That
         // clears the shared cache (so a "cold" class really is cold) and
@@ -7347,6 +8107,71 @@ mod tests {
         // A genuinely deferred create leaves a tail for the drain to publish.
         rows.push(("create_drain", CREATE_OPS, 2, create_drain));
 
+        // create_write_close: the composite syscall shape the 1,000-file
+        // workload actually runs — create(2), write(2), close(2) per file — as
+        // opposed to the isolated `create` class above. This is the class whose
+        // round trips the user waits on when a build tool or `git checkout`
+        // materializes a tree, so it is the one the per-create budget is set
+        // against.
+        let base = sample();
+        for index in 0..CREATE_OPS {
+            let path = format!("many/file-{index}");
+            // Every publication revokes the parent directory's dentry and inode
+            // in the guest kernel (`PublicationInvalidation::paths` carries the
+            // changed path AND its parent), so the guest must re-LOOKUP the
+            // parent before it can create the next child. That re-lookup is a
+            // FUSE op this mount serves — from cache if the publication it
+            // originated left the parent's metadata serveable, over the wire if
+            // it dropped it. Modelling it here is what makes this class the
+            // measured workload rather than half of it.
+            assert!(fs.stat_path_attributes("many").unwrap().is_some() || index == 0);
+            let metadata = fs.reserve_file_if_absent(&path, 0o644, false).unwrap();
+            fs.cache.put_file(&path, Vec::new(), Some(metadata.clone()));
+            let fh = fs
+                .next_handle(
+                    &path,
+                    Vec::new(),
+                    true,
+                    metadata.content_hash.clone(),
+                    0o644,
+                    true,
+                    metadata.file_id.clone(),
+                    metadata.link_count,
+                )
+                .unwrap();
+            {
+                let mut handles = fs.lock_handles().unwrap();
+                let state = handles.files.get_mut(&fh).unwrap();
+                state.buffer = format!("contents of {path}").into_bytes();
+                state.dirty = true;
+                state.loaded = true;
+                state.revision = state.revision.saturating_add(1);
+                RemoteFuseFs::mirror_handle_state_locked(&mut handles, fh).unwrap();
+            }
+            // close(2) is a FLUSH followed by a RELEASE; neither is an fsync.
+            fs.flush_handle_immediate(fh, FlushBarrier::Close).unwrap();
+            {
+                let gate = fs.publication_gate_for_handle(fh).unwrap();
+                let _guard = gate.lock().unwrap();
+                fs.flush_handle_immediate_locked(fh, FlushBarrier::Close)
+                    .unwrap();
+                fs.lock_handles().unwrap().files.remove(&fh);
+            }
+        }
+        let create_write_close = sample().since(&base);
+        // Budget two publications per create plus the one cold lookup of the
+        // parent directory before it exists. The two are structural and are
+        // named in the assertions below: the namespace ordering fence a content
+        // write owes its own creation, and the content publication itself.
+        // Anything beyond them is a regression — this class cost 3.00 per op
+        // while every create re-stat'd the directory it had just written into.
+        rows.push((
+            "create_write_close",
+            CREATE_OPS,
+            CREATE_OPS * 2 + 1,
+            create_write_close,
+        ));
+
         // stat_cold: first touch of a path this mount has never seen.
         settle();
         let base = sample();
@@ -7408,6 +8233,40 @@ mod tests {
         let readdir_stat = sample().since(&base);
         rows.push(("readdir_stat", SEED_FILES, 0, readdir_stat));
 
+        // open_cold / open_warm: the FULL stat (`stat_path`), which is what
+        // open(2) resolves through — as opposed to the attribute stat every
+        // class above measures. A full stat promises a content hash, and every
+        // bulk route the mount uses asks the gateway NOT to hash
+        // (`max_hash_bytes=0`), so the listing above cannot supply one: the cold
+        // pass is one point stat per file, and it is the only thing that installs
+        // an entry complete enough to serve the warm pass.
+        //
+        // The warm pass is the one that matters. It was a point `/stat` per open
+        // no matter how many times the same file had been opened, because the
+        // full-stat route had no cache serve at all — 47 of them per measured
+        // `git status` phase, cold and warm alike.
+        let base = sample();
+        for index in 0..SEED_FILES {
+            assert!(
+                fs.stat_path(&format!("seed/file-{index}"))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let open_cold = sample().since(&base);
+        rows.push(("open_cold", SEED_FILES, SEED_FILES, open_cold));
+
+        let base = sample();
+        for index in 0..SEED_FILES {
+            assert!(
+                fs.stat_path(&format!("seed/file-{index}"))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let open_warm = sample().since(&base);
+        rows.push(("open_warm", SEED_FILES, 0, open_warm));
+
         // lookup_miss: a negative lookup, the dominant cost of a build tool's
         // include/module search.
         settle();
@@ -7423,6 +8282,70 @@ mod tests {
         // Budget 1 per op: one batched attribute read, negative-cached fenced.
         // Same two-trip snapshot tolerance as `stat_cold`.
         rows.push(("lookup_miss", STAT_OPS, STAT_OPS + 2, lookup_miss));
+
+        // status_cold / status_warm: the `git status` shape. A sequential
+        // attribute sweep over a tree nothing changed, run twice, with the one
+        // write git actually performs mid-status in between — rewriting its
+        // index, which is a namespace publication plus a content publication on
+        // a path unrelated to the tree being scanned.
+        //
+        // The warm sweep must be free. It was not: every publication, including
+        // this mount's own, came back on its revision watch as a bare revision
+        // and wiped the entire shared cache, so the second sweep re-read the
+        // whole tree. That is why a measured warm `git status` cost MORE wire
+        // calls than a cold one (179 batched attribute reads against 124).
+        settle();
+        let base = sample();
+        for index in 0..CREATE_OPS {
+            assert!(
+                fs.stat_path_attributes(&format!("many/file-{index}"))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let status_cold = sample().since(&base);
+        rows.push(("status_cold", CREATE_OPS, CREATE_OPS + 2, status_cold));
+
+        let index_path = "status-index".to_string();
+        let metadata = fs.reserve_file_if_absent(&index_path, 0o644, false).unwrap();
+        let index_handle = fs
+            .next_handle(
+                &index_path,
+                Vec::new(),
+                true,
+                metadata.content_hash.clone(),
+                0o644,
+                true,
+                metadata.file_id.clone(),
+                metadata.link_count,
+            )
+            .unwrap();
+        {
+            let mut handles = fs.lock_handles().unwrap();
+            let state = handles.files.get_mut(&index_handle).unwrap();
+            state.buffer = b"index contents".to_vec();
+            state.dirty = true;
+            state.loaded = true;
+            state.revision = state.revision.saturating_add(1);
+            RemoteFuseFs::mirror_handle_state_locked(&mut handles, index_handle).unwrap();
+        }
+        fs.flush_handle_immediate(index_handle, FlushBarrier::Close)
+            .unwrap();
+        fs.lock_handles().unwrap().files.remove(&index_handle);
+        await_watch_catch_up();
+
+        let base = sample();
+        for index in 0..CREATE_OPS {
+            assert!(
+                fs.stat_path_attributes(&format!("many/file-{index}"))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let status_warm = sample().since(&base);
+        // Budget 0: an unrelated local publication must leave every path it did
+        // not touch serveable at the new fence.
+        rows.push(("status_warm", CREATE_OPS, 0, status_warm));
 
         println!("\ngateway round trips per filesystem operation");
         println!(
@@ -7495,6 +8418,28 @@ mod tests {
             "creates must not issue confirmation stats: {}",
             create.breakdown()
         );
+        // Mechanism: a content publication supersedes the file it wrote, not the
+        // directory holding it. `write-many`'s publication snapshot names only
+        // the written paths, so evicting the parent's metadata leaves nothing to
+        // restore it and the next create pays a wire round trip to re-learn a
+        // directory this mount never changed.
+        assert!(
+            create_write_close.metadata_many <= 1,
+            "creates re-stat'd their parent directory {} times: {}",
+            create_write_close.metadata_many,
+            create_write_close.breakdown()
+        );
+        // Mechanism: an ordinary close is not a publication barrier, so the only
+        // namespace traffic a create/write/close owes is the ordering fence its
+        // own content write needs, and the only content traffic is the write.
+        assert_eq!(
+            create_write_close.charged(),
+            create_write_close.namespace_many
+                + create_write_close.write_many
+                + create_write_close.metadata_many,
+            "create/write/close reached a route it has no business on: {}",
+            create_write_close.breakdown()
+        );
         // Mechanism: a live revision watch keeps this mount's coherence fence
         // continuously confirmed, so `stat_path_attributes` serves a
         // fence-matched cached attribute with no wire call at all.
@@ -7502,6 +8447,27 @@ mod tests {
             stat_warm.charged(),
             0,
             "warm stats under a live watch must not touch the gateway"
+        );
+        // Mechanism: the full stat (`stat_path`, the open(2) route) serves from
+        // the same fence-matched cache as the attribute stat, provided the
+        // cached entry is complete. The listing above installed each child's
+        // content hash, so it is.
+        assert_eq!(
+            open_warm.charged(),
+            0,
+            "opening files a listing already described must not re-stat them: {}",
+            open_warm.breakdown()
+        );
+        // Mechanism: a publication reports its exact affected set on the
+        // revision watch, and the shared cache applies that set instead of
+        // clearing itself. An unrelated local write — git rewriting its index
+        // mid-status — must leave every other path serveable, or a warm status
+        // re-reads the entire tree and costs MORE than a cold one.
+        assert_eq!(
+            status_warm.charged(),
+            0,
+            "a warm status sweep after an unrelated publication cost {}",
+            status_warm.breakdown()
         );
         // Mechanism: `dir_entries` takes one authoritative listing and installs
         // both the listing and every child's metadata, so a directory costs one
@@ -7704,7 +8670,7 @@ impl RemoteFuseFs {
                     // through its stable identity instead of applying chmod
                     // to a pathname that another mount may have replaced.
                     if requested_mode.is_some() {
-                        self.flush_handle_immediate_locked(fh.0)?;
+                        self.flush_handle_immediate_locked(fh.0, FlushBarrier::Durable)?;
                     }
 
                     let state = {
@@ -8035,7 +9001,8 @@ impl RemoteFuseFs {
         lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
-        let flush_result = self.flush_handle_immediate(fh.0);
+        // FLUSH is what close(2) sends. It is not fsync: see `FlushBarrier`.
+        let flush_result = self.flush_handle_immediate(fh.0, FlushBarrier::Close);
         let cleanup_result =
             self.release_advisory_lock_owner(ino, lock_owner, LockNamespace::Posix, Some(fh.0));
         match combine_flush_and_lock_cleanup("flush", flush_result, cleanup_result) {
@@ -8045,7 +9012,33 @@ impl RemoteFuseFs {
     }
 
     pub(super) fn fsync(&self, _ino: INodeNo, fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
-        match self.flush_handle_immediate(fh.0) {
+        // The explicit durability point: both ordered journals remotely
+        // acknowledged before this returns.
+        match self.flush_handle_immediate(fh.0, FlushBarrier::Durable) {
+            Ok(()) => reply.ok(),
+            Err(err) => reply.error(err),
+        }
+    }
+
+    /// The directory-level durability point.
+    ///
+    /// A guest that fsyncs a directory is asking for the entries it created or
+    /// removed in it to be durable — which for this filesystem means published,
+    /// since the entries live in the namespace journal until then. Ordinary
+    /// `close()` deliberately stopped draining that journal (a close is not a
+    /// durability barrier and draining per close serializes every creation
+    /// behind its own publication), so this is the operation a caller uses to
+    /// demand it. Both journals are drained in the same order a file `fsync`
+    /// drains them: content first, then the namespace that names it.
+    pub(super) fn fsyncdir(
+        &self,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let barrier = self.flush_writes().and_then(|()| self.flush_namespace());
+        match barrier {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(err),
         }
@@ -8063,7 +9056,8 @@ impl RemoteFuseFs {
         let flush_result = match self.publication_gate_for_handle(fh.0) {
             Ok(gate) => match gate.lock() {
                 Ok(_guard) => {
-                    let result = self.flush_handle_immediate_locked(fh.0);
+                    // RELEASE is the second half of close(2), not an fsync.
+                    let result = self.flush_handle_immediate_locked(fh.0, FlushBarrier::Close);
                     if result.is_ok() {
                         // Remove only after the exact publication and
                         // authoritative verification succeed. A failed close

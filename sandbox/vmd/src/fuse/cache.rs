@@ -669,40 +669,16 @@ impl RemoteFuseCache {
     /// by this revision, so unrelated metadata can remain coherent. A skipped
     /// revision means an unknown writer may have changed anything and remains
     /// fail-closed.
+    /// A publication with no snapshot to seed from — every affected entry is
+    /// dropped rather than replaced. Retained for the tests that pin that
+    /// fail-closed half of the contract.
+    #[cfg(test)]
     pub(super) fn observe_namespace_publication(
         &self,
         revision: u64,
         mutations: &[VfsNamespaceMutation],
     ) -> PublicationInvalidation {
-        let mut inner = self.lock_inner();
-        let mut affected_paths = HashSet::new();
-        let mut affected_subtrees = HashSet::new();
-        let mut affected_identities = HashSet::new();
-        for mutation in mutations {
-            let affects_descendants = matches!(
-                mutation,
-                VfsNamespaceMutation::RemoveDirectory { .. } | VfsNamespaceMutation::Rename { .. }
-            );
-            for path in mutation.paths().into_iter().filter(|path| !path.is_empty()) {
-                collect_affected_path(
-                    &inner,
-                    path,
-                    affects_descendants,
-                    true,
-                    &mut affected_paths,
-                    &mut affected_subtrees,
-                    &mut affected_identities,
-                );
-            }
-        }
-        advance_known_revision_locked(
-            &mut inner,
-            revision,
-            &affected_paths,
-            &affected_subtrees,
-            &affected_identities,
-        );
-        publication_invalidation(affected_paths, affected_subtrees, affected_identities)
+        self.observe_namespace_publication_snapshot(revision, mutations, &[])
     }
 
     pub(super) fn observe_namespace_publication_snapshot(
@@ -711,44 +687,48 @@ impl RemoteFuseCache {
         mutations: &[VfsNamespaceMutation],
         entries: &[VfsPublicationSnapshotEntry],
     ) -> PublicationInvalidation {
-        let invalidation = self.observe_namespace_publication(revision, mutations);
-        self.install_publication_snapshot(revision, entries);
-        invalidation
+        let mut inner = self.lock_inner();
+        let mut affected = AffectedSet::default();
+        for mutation in mutations {
+            let affects_descendants = matches!(
+                mutation,
+                VfsNamespaceMutation::RemoveDirectory { .. } | VfsNamespaceMutation::Rename { .. }
+            );
+            for path in mutation.paths().into_iter().filter(|path| !path.is_empty()) {
+                // A namespace mutation changes the parent's OWN metadata too
+                // (an added or removed link), so the parent is superseded, not
+                // merely relisted. The gateway's publication snapshot carries
+                // the parent for exactly this reason (`namespace_snapshot_paths`
+                // in crates/sandbox/src/vfs.rs), so the install below puts the
+                // authoritative replacement back at this revision.
+                collect_affected_path(
+                    &inner,
+                    path,
+                    affects_descendants,
+                    ParentEffect::Superseded,
+                    &mut affected,
+                );
+            }
+        }
+        advance_known_revision_locked(&mut inner, revision, &affected);
+        // Replace, do not merely drop: this mount produced the publication, so
+        // the gateway answered it with the resulting state of everything it
+        // touched. Seeding inside the same critical section means no reader ever
+        // observes the transient hole between the eviction and the replacement
+        // and turns it into a wire round trip.
+        install_publication_snapshot_locked(&mut inner, revision, entries);
+        publication_invalidation(affected)
     }
 
     /// Content publication changes the named inode and every cached hard-link
     /// alias of its stable identity, but not unrelated namespace entries.
+    #[cfg(test)]
     pub(super) fn observe_write_publication(
         &self,
         revision: u64,
         writes: &[(String, Option<String>)],
     ) -> PublicationInvalidation {
-        let mut inner = self.lock_inner();
-        let mut affected_paths = HashSet::new();
-        let mut affected_subtrees = HashSet::new();
-        let mut affected_identities = HashSet::new();
-        for (path, expected_file_id) in writes {
-            collect_affected_path(
-                &inner,
-                path,
-                false,
-                true,
-                &mut affected_paths,
-                &mut affected_subtrees,
-                &mut affected_identities,
-            );
-            if let Some(file_id) = expected_file_id {
-                affected_identities.insert(file_id.clone());
-            }
-        }
-        advance_known_revision_locked(
-            &mut inner,
-            revision,
-            &affected_paths,
-            &affected_subtrees,
-            &affected_identities,
-        );
-        publication_invalidation(affected_paths, affected_subtrees, affected_identities)
+        self.observe_write_publication_snapshot(revision, writes, &[])
     }
 
     pub(super) fn observe_write_publication_snapshot(
@@ -757,18 +737,63 @@ impl RemoteFuseCache {
         writes: &[(String, Option<String>)],
         entries: &[VfsPublicationSnapshotEntry],
     ) -> PublicationInvalidation {
-        let invalidation = self.observe_write_publication(revision, writes);
-        self.install_publication_snapshot(revision, entries);
-        invalidation
-    }
-
-    fn install_publication_snapshot(&self, revision: u64, entries: &[VfsPublicationSnapshotEntry]) {
-        for entry in entries {
-            match entry.metadata.clone() {
-                Some(metadata) => self.put_metadata(entry.path.as_str(), metadata, revision),
-                None => self.put_missing_metadata(entry.path.as_str(), revision),
+        let mut inner = self.lock_inner();
+        let mut affected = AffectedSet::default();
+        for (path, expected_file_id) in writes {
+            // A content write changes the file, not the directory holding it:
+            // the parent's kind, identity, link count and mode are untouched.
+            // What it does change is the parent's cached LISTING, whose entries
+            // carry each child's size and content hash — and that listing is
+            // already dropped by the child's own invalidation below.
+            //
+            // Treating the parent as superseded metadata instead is what made a
+            // 1,000-file create storm: `write-many`'s publication snapshot names
+            // only the written paths (`post_write_many` in
+            // crates/sandbox/src/vfs.rs), so there is nothing to seed the parent
+            // back with, and every create re-stat'd the directory it had just
+            // written into. The parent is still revoked in the guest kernel (see
+            // `PublicationInvalidation`), so the guest re-asks — and this mount
+            // answers from the metadata it never had reason to drop.
+            collect_affected_path(&inner, path, false, ParentEffect::Relisted, &mut affected);
+            if let Some(file_id) = expected_file_id {
+                affected.identities.insert(file_id.clone());
             }
         }
+        advance_known_revision_locked(&mut inner, revision, &affected);
+        install_publication_snapshot_locked(&mut inner, revision, entries);
+        publication_invalidation(affected)
+    }
+
+    /// Advance the cache across one publication observed on the revision watch,
+    /// whose exact affected set the gateway reported.
+    ///
+    /// `since` is the fence the watch polled from, so the reported set is the
+    /// union of every publication in `(since, revision]`. That set can only be
+    /// applied to entries this cache has already classified up to `since`;
+    /// if the cache's own fence is older, publications between the two are
+    /// unaccounted for and the blunt authoritative-revision clear is the only
+    /// honest answer.
+    ///
+    /// Unlike a locally originated publication there is no snapshot to seed
+    /// with, so every reported path is fully invalidated — including its parent,
+    /// whose link metadata a remote create/delete may have changed, and its
+    /// descendants, since the watch does not distinguish a subtree mutation from
+    /// a point one.
+    pub(super) fn observe_remote_publication(&self, since: u64, revision: u64, paths: &[String]) {
+        if revision == 0 {
+            self.observe_authoritative_revision(revision);
+            return;
+        }
+        let mut inner = self.lock_inner();
+        if since > inner.metadata_revision {
+            observe_authoritative_revision_locked(&mut inner, revision);
+            return;
+        }
+        let mut affected = AffectedSet::default();
+        for path in paths.iter().filter(|path| !path.is_empty()) {
+            collect_affected_path(&inner, path, true, ParentEffect::Superseded, &mut affected);
+        }
+        advance_known_revision_locked(&mut inner, revision, &affected);
     }
 
     /// Coalesce one server-side subtree snapshot per prefix and stable
@@ -932,23 +957,55 @@ fn invalidate_path_locked(inner: &mut CacheState, path: &str) {
     }
 }
 
+/// What one publication did to the directory holding a changed entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParentEffect {
+    /// The parent's own metadata changed — a link was added or removed. Its
+    /// cached metadata is superseded and must not be served again until it is
+    /// replaced by the publication's snapshot or re-read.
+    Superseded,
+    /// Only the parent's cached listing changed (its entries carry each child's
+    /// size and content hash). The directory's own kind, identity, link count
+    /// and mode are what they were, so its cached metadata stays serveable —
+    /// the listing itself is dropped by the changed child's own invalidation.
+    Relisted,
+}
+
+/// The exact sets one publication superseded, accumulated per changed path.
+#[derive(Default)]
+struct AffectedSet {
+    /// Entries whose OWN metadata the publication superseded.
+    paths: HashSet<String>,
+    /// Directories the guest kernel must re-read but whose own metadata the
+    /// publication did not change. Kernel-revocation targets only; never a
+    /// cache-eviction reason.
+    relisted: HashSet<String>,
+    /// Directory prefixes whose entire subtree the publication superseded.
+    subtrees: HashSet<String>,
+    /// Stable identities (hard-link inodes) the publication changed.
+    identities: HashSet<String>,
+}
+
 fn collect_affected_path(
     inner: &CacheState,
     path: &str,
     affects_descendants: bool,
-    affects_parent: bool,
-    affected_paths: &mut HashSet<String>,
-    affected_subtrees: &mut HashSet<String>,
-    affected_identities: &mut HashSet<String>,
+    parent_effect: ParentEffect,
+    affected: &mut AffectedSet,
 ) {
     let path = path.trim_matches('/').to_string();
-    affected_paths.insert(path.clone());
+    affected.paths.insert(path.clone());
     if affects_descendants {
-        affected_subtrees.insert(path.clone());
+        affected.subtrees.insert(path.clone());
     }
-    if affects_parent {
-        if let Some(parent) = parent_path(path.as_str()) {
-            affected_paths.insert(parent);
+    if let Some(parent) = parent_path(path.as_str()) {
+        match parent_effect {
+            ParentEffect::Superseded => {
+                affected.paths.insert(parent);
+            }
+            ParentEffect::Relisted => {
+                affected.relisted.insert(parent);
+            }
         }
     }
     if let Some(file_id) = inner
@@ -956,34 +1013,29 @@ fn collect_affected_path(
         .get(path.as_str())
         .and_then(|entry| entry.metadata.file_id.clone())
     {
-        affected_identities.insert(file_id);
+        affected.identities.insert(file_id);
     }
 }
 
 /// Collect the affected sets computed for one publication into the
-/// invalidation record handed back to the kernel-invalidation fan-out. This is
-/// exactly what the shared cache just evicted, so the kernel drops precisely the
-/// same set — no more (unrelated leases stay warm) and no less (the superseded
-/// set is revoked before the publication is acked).
-fn publication_invalidation(
-    affected_paths: HashSet<String>,
-    affected_subtrees: HashSet<String>,
-    affected_identities: HashSet<String>,
-) -> PublicationInvalidation {
+/// invalidation record handed back to the kernel-invalidation fan-out.
+///
+/// The kernel set is the union of superseded and relisted paths, which is
+/// exactly what it has always been: a directory whose listing changed must
+/// still drop its cached dentry and page cache in every guest, even when this
+/// process can still answer a stat of it from metadata the publication did not
+/// touch. Narrowing the CACHE eviction never narrows the kernel revocation.
+fn publication_invalidation(affected: AffectedSet) -> PublicationInvalidation {
+    let mut paths = affected.paths;
+    paths.extend(affected.relisted);
     PublicationInvalidation {
-        paths: affected_paths.into_iter().collect(),
-        subtrees: affected_subtrees.into_iter().collect(),
-        identities: affected_identities.into_iter().collect(),
+        paths: paths.into_iter().collect(),
+        subtrees: affected.subtrees.into_iter().collect(),
+        identities: affected.identities.into_iter().collect(),
     }
 }
 
-fn advance_known_revision_locked(
-    inner: &mut CacheState,
-    revision: u64,
-    affected_paths: &HashSet<String>,
-    affected_subtrees: &HashSet<String>,
-    affected_identities: &HashSet<String>,
-) {
+fn advance_known_revision_locked(inner: &mut CacheState, revision: u64, affected: &AffectedSet) {
     if revision == 0 {
         inner.metadata_revision = 0;
         inner.metadata.clear();
@@ -993,18 +1045,22 @@ fn advance_known_revision_locked(
         return;
     }
     let previous_revision = inner.metadata_revision;
+    // An entry already tagged at or beyond this publication's revision has
+    // already incorporated it: the gateway sequences a publication before it
+    // serves any response carrying that revision, and nothing enters this cache
+    // except authoritative data tagged with the exact revision of the response
+    // that produced it. Re-evicting such an entry would throw away state that is
+    // newer than the publication being applied — which is exactly what happened
+    // when a mount's own publication was reported back to it on the revision
+    // watch after its commit hook had already installed the fresh snapshot.
+    let superseded = |path: &String, entry_revision: u64, file_id: Option<&str>| {
+        entry_revision < revision && path_or_identity_is_affected(path, file_id, affected)
+    };
     let stale_paths = inner
         .metadata
         .iter_mut()
         .filter_map(|(path, entry)| {
-            let affected = path_or_identity_is_affected(
-                path,
-                entry.metadata.file_id.as_deref(),
-                affected_paths,
-                affected_subtrees,
-                affected_identities,
-            );
-            if affected {
+            if superseded(path, entry.revision, entry.metadata.file_id.as_deref()) {
                 Some(path.clone())
             } else if revision <= previous_revision {
                 None
@@ -1023,13 +1079,8 @@ fn advance_known_revision_locked(
         .missing_metadata
         .iter_mut()
         .filter_map(|(path, entry_revision)| {
-            if path_or_identity_is_affected(
-                path,
-                None,
-                affected_paths,
-                affected_subtrees,
-                affected_identities,
-            ) || previous_revision == 0
+            if superseded(path, *entry_revision, None)
+                || previous_revision == 0
                 || *entry_revision != previous_revision
             {
                 Some(path.clone())
@@ -1046,13 +1097,8 @@ fn advance_known_revision_locked(
         .directories
         .iter_mut()
         .filter_map(|(path, entry)| {
-            if path_or_identity_is_affected(
-                path,
-                None,
-                affected_paths,
-                affected_subtrees,
-                affected_identities,
-            ) || previous_revision == 0
+            if superseded(path, entry.revision, None)
+                || previous_revision == 0
                 || entry.revision != previous_revision
             {
                 Some(path.clone())
@@ -1075,9 +1121,7 @@ fn advance_known_revision_locked(
                     .metadata
                     .as_ref()
                     .and_then(|metadata| metadata.file_id.as_deref()),
-                affected_paths,
-                affected_subtrees,
-                affected_identities,
+                affected,
             )
             .then(|| path.clone())
         })
@@ -1086,7 +1130,44 @@ fn advance_known_revision_locked(
         remove_file_locked(inner, path.as_str());
     }
     inner.metadata_revision = inner.metadata_revision.max(revision);
+    // A subtree snapshot is only usable while the fence it was taken at holds,
+    // and this publication moved the fence. Retire the per-prefix bookkeeping —
+    // the entries it installed remain individually fenced and were retagged
+    // above, so the snapshot's value is preserved without claiming the prefix is
+    // still wholly covered.
     inner.subtree_revisions.clear();
+}
+
+fn install_publication_snapshot_locked(
+    inner: &mut CacheState,
+    revision: u64,
+    entries: &[VfsPublicationSnapshotEntry],
+) {
+    if revision == 0 || inner.metadata_revision != revision {
+        return;
+    }
+    for entry in entries {
+        let path = entry.path.trim_matches('/');
+        match entry.metadata.clone() {
+            Some(metadata) => {
+                let metadata = inner
+                    .metadata
+                    .get(path)
+                    .filter(|cached| cached.revision == revision)
+                    .map(|cached| preserve_stronger_metadata(&cached.metadata, metadata.clone()))
+                    .unwrap_or(metadata);
+                inner
+                    .metadata
+                    .insert(path.to_string(), CachedMetadata { metadata, revision });
+                inner.missing_metadata.remove(path);
+            }
+            None => {
+                inner.metadata.remove(path);
+                remove_file_locked(inner, path);
+                inner.missing_metadata.insert(path.to_string(), revision);
+            }
+        }
+    }
 }
 
 /// Observe a revision whose exact mutation set is not available to this cache.
@@ -1108,21 +1189,24 @@ fn observe_authoritative_revision_locked(inner: &mut CacheState, revision: u64) 
     inner.metadata_revision = revision;
 }
 
+/// Whether one cached entry is among what a publication superseded.
+///
+/// `relisted` parents are deliberately not consulted: their listing is dropped
+/// through the changed child's own `invalidate_path_locked`, and their metadata
+/// was not superseded at all.
 fn path_or_identity_is_affected(
     path: &str,
     file_id: Option<&str>,
-    affected_paths: &HashSet<String>,
-    affected_subtrees: &HashSet<String>,
-    affected_identities: &HashSet<String>,
+    affected: &AffectedSet,
 ) -> bool {
-    affected_paths.contains(path)
-        || affected_subtrees.iter().any(|affected_path| {
+    affected.paths.contains(path)
+        || affected.subtrees.iter().any(|affected_path| {
             !affected_path.is_empty()
                 && path
                     .strip_prefix(affected_path)
                     .is_some_and(|suffix| suffix.starts_with('/'))
         })
-        || file_id.is_some_and(|file_id| affected_identities.contains(file_id))
+        || file_id.is_some_and(|file_id| affected.identities.contains(file_id))
 }
 
 fn remove_file_locked(inner: &mut CacheState, path: &str) {
@@ -1429,6 +1513,184 @@ mod tests {
         );
 
         assert_eq!(cache.get_metadata("tree/file", 18), Some(current));
+    }
+
+    fn directory_metadata() -> RemoteMetadata {
+        RemoteMetadata {
+            kind: "directory".to_string(),
+            size_bytes: 0,
+            file_id: None,
+            link_count: 1,
+            link_target: None,
+            content_hash: None,
+            executable: false,
+            mode: Some(0o755),
+            updated_at: None,
+        }
+    }
+
+    /// A content publication this mount originated must leave the directory it
+    /// wrote into serveable. `write-many`'s snapshot names only the written
+    /// paths, so evicting the parent leaves nothing to restore it and every
+    /// create in a loop re-stats a directory this mount never changed.
+    #[test]
+    fn local_write_publication_leaves_the_parent_directory_serveable() {
+        let cache = RemoteFuseCache::default();
+        cache.put_metadata("tree", directory_metadata(), 17);
+        cache.put_metadata("tree/file", metadata("old", 3), 17);
+        let written = metadata("new", 4);
+
+        let invalidation = cache.observe_write_publication_snapshot(
+            18,
+            &[("tree/file".to_string(), None)],
+            &[VfsPublicationSnapshotEntry {
+                path: "tree/file".to_string(),
+                metadata: Some(written.clone()),
+            }],
+        );
+
+        assert_eq!(cache.get_metadata("tree/file", 18), Some(written));
+        assert_eq!(
+            cache.get_metadata("tree", 18),
+            Some(directory_metadata()),
+            "a content write does not change its parent directory's own metadata"
+        );
+        // Narrowing the CACHE eviction must not narrow the KERNEL revocation:
+        // the guest still has to drop the directory's dentry and page cache,
+        // because its listing carries the child's size and content hash.
+        let mut paths = invalidation.paths.clone();
+        paths.sort();
+        assert_eq!(paths, vec!["tree".to_string(), "tree/file".to_string()]);
+    }
+
+    /// The other half of the same rule: a NAMESPACE publication does change the
+    /// parent (a link appeared), so the parent is superseded — and stays
+    /// invalidated whenever the publication's snapshot did not carry it.
+    #[test]
+    fn local_namespace_publication_replaces_a_carried_parent_and_drops_an_uncarried_one() {
+        let carried = RemoteFuseCache::default();
+        carried.put_metadata("tree", directory_metadata(), 17);
+        let mut relinked = directory_metadata();
+        relinked.link_count = 2;
+
+        carried.observe_namespace_publication_snapshot(
+            18,
+            &[VfsNamespaceMutation::CreateFile {
+                path: "tree/new".to_string(),
+                mode: Some(0o644),
+            }],
+            &[
+                VfsPublicationSnapshotEntry {
+                    path: "tree/new".to_string(),
+                    metadata: Some(metadata("new", 4)),
+                },
+                VfsPublicationSnapshotEntry {
+                    path: "tree".to_string(),
+                    metadata: Some(relinked.clone()),
+                },
+            ],
+        );
+        assert_eq!(
+            carried.get_metadata("tree", 18),
+            Some(relinked),
+            "a carried parent is REPLACED with the publication's own state, not dropped"
+        );
+
+        let uncarried = RemoteFuseCache::default();
+        uncarried.put_metadata("tree", directory_metadata(), 17);
+        uncarried.observe_namespace_publication_snapshot(
+            18,
+            &[VfsNamespaceMutation::CreateFile {
+                path: "tree/new".to_string(),
+                mode: Some(0o644),
+            }],
+            &[VfsPublicationSnapshotEntry {
+                path: "tree/new".to_string(),
+                metadata: Some(metadata("new", 4)),
+            }],
+        );
+        assert!(
+            uncarried.get_metadata("tree", 18).is_none(),
+            "freshness unknown means fail closed: never serve what the publication may have superseded"
+        );
+    }
+
+    /// A publication observed on the revision watch carries the gateway's exact
+    /// affected set, and the cache must apply that set rather than clearing
+    /// itself. Clearing is what made a warm `git status` cost MORE than a cold
+    /// one: git rewrites its index mid-scan, and every such publication —
+    /// including this mount's own, which comes back on its own watch — wiped
+    /// every unrelated path the scan had just read.
+    #[test]
+    fn remote_publication_applies_its_reported_set_instead_of_clearing() {
+        let cache = RemoteFuseCache::default();
+        cache.put_metadata("tree/scanned", metadata("scanned", 6), 17);
+        cache.put_metadata("index", metadata("old-index", 3), 17);
+        cache.put_dir("tree", vec![entry("scanned")], 17);
+
+        cache.observe_remote_publication(17, 18, &["index".to_string()]);
+
+        assert!(
+            cache.get_metadata("index", 18).is_none(),
+            "the reported path is superseded"
+        );
+        assert_eq!(
+            cache.get_metadata("tree/scanned", 18),
+            Some(metadata("scanned", 6)),
+            "a path the publication did not touch stays serveable at the new fence"
+        );
+        assert_eq!(cache.get_dir("tree", 18), Some(vec![entry("scanned")]));
+    }
+
+    /// Fail-closed, unchanged, on both edges: a watcher whose own fence is older
+    /// than the window the report covers, and a report the gateway could not
+    /// complete (which reaches the cache as the blunt authoritative clear).
+    #[test]
+    fn remote_publication_falls_back_to_a_full_clear_when_the_report_cannot_be_trusted() {
+        let behind = RemoteFuseCache::default();
+        behind.put_metadata("tree/scanned", metadata("scanned", 6), 17);
+        // `since` ahead of the cache's own fence means publications in between
+        // were never classified here, and the report does not cover them.
+        behind.observe_remote_publication(18, 19, &["index".to_string()]);
+        assert!(
+            behind.get_metadata("tree/scanned", 19).is_none(),
+            "an unclassified gap must clear rather than narrow"
+        );
+
+        let truncated = RemoteFuseCache::default();
+        truncated.put_metadata("tree/scanned", metadata("scanned", 6), 17);
+        // The truncated answer routes through `observe_authoritative_revision`,
+        // exactly as it did before the targeted path existed.
+        truncated.observe_authoritative_revision(18);
+        assert!(truncated.get_metadata("tree/scanned", 18).is_none());
+    }
+
+    /// An entry already tagged at the publication's own revision has already
+    /// incorporated it, so re-applying that publication must not throw it away.
+    /// This is what lets a mount's own publication arrive twice — once on its
+    /// watch, once through its commit hook — without the second arrival undoing
+    /// the fresh snapshot the first installed.
+    #[test]
+    fn a_publication_does_not_evict_entries_already_taken_at_its_own_revision() {
+        let cache = RemoteFuseCache::default();
+        cache.put_metadata("tree/file", metadata("old", 3), 17);
+        let published = metadata("new", 4);
+        cache.observe_write_publication_snapshot(
+            18,
+            &[("tree/file".to_string(), None)],
+            &[VfsPublicationSnapshotEntry {
+                path: "tree/file".to_string(),
+                metadata: Some(published.clone()),
+            }],
+        );
+
+        cache.observe_remote_publication(17, 18, &["tree/file".to_string()]);
+
+        assert_eq!(
+            cache.get_metadata("tree/file", 18),
+            Some(published),
+            "the same publication reported a second time must not evict its own result"
+        );
     }
 
     #[test]

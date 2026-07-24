@@ -1520,11 +1520,30 @@ async fn run_revision_watch(
                     // the loop, strictly after both stores below, so the order
                     // holds. Fence first:
                     state.coherence.fetch_max(revision, Ordering::AcqRel);
-                    // A newer owner revision the local view has not classified
-                    // must fail closed: clear superseded cache entries via the
-                    // audited authoritative-revision path.
+                    // Apply the publication to the shared cache with the SAME
+                    // set the kernel revocation below uses. The gateway reports
+                    // the exact union of paths published in `(since, revision]`
+                    // (or reports the answer truncated, in which case `affected`
+                    // is None), and that set is already trusted to be exhaustive
+                    // enough to drive every guest kernel's revocation — so
+                    // trusting anything less of it here was never a safety
+                    // property, only a cost. Discarding it meant every
+                    // publication, INCLUDING THIS PROCESS'S OWN, wiped the whole
+                    // shared cache: a warm `git status` re-read the entire tree
+                    // because git had rewritten its index mid-scan.
+                    //
+                    // Fail-closed is unchanged where it is load-bearing: without
+                    // a trustworthy set the blunt authoritative-revision clear
+                    // still runs, and the cache itself refuses the targeted path
+                    // whenever its own fence is older than `since` (publications
+                    // it never classified would otherwise go unaccounted for).
                     if let Some(cache) = cache.upgrade() {
-                        cache.observe_authoritative_revision(revision);
+                        match &affected {
+                            Some(paths) => {
+                                cache.observe_remote_publication(since, revision, paths)
+                            }
+                            None => cache.observe_authoritative_revision(revision),
+                        }
                     }
                     // Extend the ack-ordering invariant to the KERNEL: this
                     // remote publication carries only a revision (no path set),
