@@ -125,12 +125,34 @@ gc 51.4s / fsck 1664ms (prior baseline: 23-minute workload, status ≈2.4s).
 Landed and regression-tested in this tree: generation-safe file identity
 (`unix:{dev}:{ino}:{birth_s}:{birth_ns}`), descendant write-barrier +
 self-healing deletion recovery, rename gate dedup, wire-backed metadata
-serves with the revision watch + revocation-acked publications
-(fsync-returns-after-observer-coherence), watch-liveness-bounded kernel
-attr/entry leases with notifier push invalidation, and removal of
-FUSE_WRITEBACK_CACHE negotiation (host-kernel size authority made sibling
-extends invisible — the root cause of the deterministic cross-mount stale
-reads).
+serves with the revision watch + revocation-acked publications,
+watch-liveness-bounded kernel attr/entry leases with notifier push
+invalidation, and removal of FUSE_WRITEBACK_CACHE negotiation (host-kernel
+size authority made sibling extends invisible — the root cause of the
+deterministic cross-mount stale reads).
+
+Publication/ack semantics, stated exactly. A mutation's response waits for
+every registered watcher to re-poll with `since >= the new revision`, which
+is that watcher's ack that it has advanced its fence, cleared superseded
+cache entries, and revoked the matching kernel leases. The wait is bounded
+by `CHEVALIER_VFS_PUBLICATION_ACK_TIMEOUT_MS` (default 150ms) and then
+proceeds **fail-open**, logging the laggard count: a writer is therefore
+guaranteed observer coherence only when every watcher acked inside that
+window, not unconditionally. Watchers that go silent past their grace are
+pruned rather than blocking publications forever. A watcher whose kernel
+revocation does not fully land refuses to ack on that sweep: it drops watch
+liveness (replies revert to TTL=0 and every serve is wire-backed) and holds
+the ack until any lease granted before the failure has expired, so a failed
+sweep degrades to strict serving instead of silently acking stale state.
+
+Creation latency, stated exactly. Ordinary (non-`O_EXCL`) creates return
+once the mutation is durably appended to the namespace journal and
+projected; the publication batches behind them and a failure surfaces at the
+next barrier (fsync/close, or any delete/rename/set-mode) as EIO — the
+ordinary journaled-filesystem contract. `O_EXCL` creates still publish
+synchronously because cross-mount exclusivity is the gateway's
+`expect_absent` precondition. Reads never wait on a publication: read-your-
+writes is the journal projection.
 
 Known issue (pre-existing, outside the VFS): bismuth guest microVMs
 intermittently freeze 15–35s (guest timekeeping/vCPU tick stall;

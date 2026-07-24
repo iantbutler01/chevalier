@@ -674,7 +674,7 @@ pub fn parse_vfs_range_header(value: &str, total_size: u64) -> VfsResult<VfsRead
 #[cfg(feature = "vfs-server")]
 mod server {
     use std::{
-        collections::{HashMap, HashSet},
+        collections::{HashMap, HashSet, VecDeque},
         sync::{
             Arc, Mutex,
             atomic::{AtomicU64, Ordering},
@@ -761,13 +761,21 @@ mod server {
 
     /// Hard cap on how long a publication waits for its active watchers to ack
     /// the new revision before proceeding fail-open. Overridable via
-    /// `CHEVALIER_VFS_PUBLICATION_ACK_TIMEOUT_MS`; default 150ms. Read once per
-    /// coordinator (one per router), never per publication.
+    /// `CHEVALIER_VFS_PUBLICATION_ACK_TIMEOUT_MS`. Read once per coordinator
+    /// (one per router), never per publication.
+    ///
+    /// The default is deliberately close to a healthy watcher's round trip
+    /// rather than generous. A watcher that acks at all acks within a few
+    /// milliseconds on a LAN; a watcher that does not is going to miss the cap
+    /// no matter how long it is, and every millisecond of that cap is charged
+    /// to the writer's syscall. A generous cap therefore buys no additional
+    /// coherence — it only converts one lagging watcher into mount-wide write
+    /// latency.
     fn publication_ack_timeout_from_env() -> Duration {
         let millis = std::env::var("CHEVALIER_VFS_PUBLICATION_ACK_TIMEOUT_MS")
             .ok()
             .and_then(|raw| raw.trim().parse::<u64>().ok())
-            .unwrap_or(150);
+            .unwrap_or(25);
         Duration::from_millis(millis)
     }
 
@@ -808,7 +816,35 @@ mod server {
         last_ack_warn_us: AtomicU64,
         /// Hard cap for the ack wait, inherited from the coordinator.
         ack_timeout: Duration,
+        /// Recent publications as (revision, affected paths), newest last.
+        ///
+        /// A watcher learns only a revision number from its long poll, which
+        /// leaves it no choice but to invalidate everything it has cached — a
+        /// revocation proportional to the whole working set rather than to what
+        /// actually changed. Retaining the affected paths lets the watch answer
+        /// with the exact set instead, so a mount revokes what a publication
+        /// touched and nothing else. Bounded: a watcher that has fallen further
+        /// behind than this history is told the answer is truncated and falls
+        /// back to its own conservative handling.
+        publication_history: Mutex<VecDeque<PublishedPaths>>,
     }
+
+    /// One publication's affected paths, retained so a lagging watcher can be
+    /// told exactly what to revoke.
+    struct PublishedPaths {
+        revision: u64,
+        paths: Arc<Vec<String>>,
+    }
+
+    /// How many publications of affected-path history an owner retains. A
+    /// watcher polls continuously, so it is normally one publication behind;
+    /// this covers a watcher that missed a burst without letting the history
+    /// grow with the mount's lifetime.
+    const PUBLICATION_HISTORY_LIMIT: usize = 256;
+    /// Ceiling on paths returned for one watch answer. Past this the targeted
+    /// answer stops being cheaper than the watcher's own fallback, so the watch
+    /// reports truncation instead.
+    const WATCH_PATHS_LIMIT: usize = 1024;
 
     impl OwnerState {
         fn new(ack_timeout: Duration) -> Self {
@@ -822,7 +858,58 @@ mod server {
                 ack_progress_tx,
                 last_ack_warn_us: AtomicU64::new(0),
                 ack_timeout,
+                publication_history: Mutex::new(VecDeque::new()),
             }
+        }
+
+        /// Retain a publication's affected paths for lagging watchers, evicting
+        /// the oldest once the bound is reached.
+        fn record_publication(&self, revision: u64, paths: Vec<String>) {
+            let mut history = self
+                .publication_history
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            history.push_back(PublishedPaths {
+                revision,
+                paths: Arc::new(paths),
+            });
+            while history.len() > PUBLICATION_HISTORY_LIMIT {
+                history.pop_front();
+            }
+        }
+
+        /// The union of paths published in `(since, current]`.
+        ///
+        /// Returns `None` when the answer cannot be trusted to be complete —
+        /// the watcher is further behind than the retained history, or the union
+        /// exceeds [`WATCH_PATHS_LIMIT`] — in which case the caller reports
+        /// truncation and the watcher falls back to its own handling rather than
+        /// acting on a partial set.
+        fn paths_published_since(&self, since: u64) -> Option<Vec<String>> {
+            let history = self
+                .publication_history
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let oldest = history.front()?.revision;
+            // `since` must be covered: the watcher needs every publication after
+            // it, and anything at or before the oldest retained entry may have
+            // evicted publications the watcher never saw.
+            if since < oldest {
+                return None;
+            }
+            let mut seen = HashSet::new();
+            let mut union = Vec::new();
+            for entry in history.iter().filter(|entry| entry.revision > since) {
+                for path in entry.paths.iter() {
+                    if seen.insert(path.as_str()) {
+                        union.push(path.clone());
+                        if union.len() > WATCH_PATHS_LIMIT {
+                            return None;
+                        }
+                    }
+                }
+            }
+            Some(union)
         }
 
         /// Acquire a shared read snapshot of the current revision. The name and
@@ -860,10 +947,23 @@ mod server {
         /// revision for the response header.
         pub(super) async fn commit_and_await_acks(
             &self,
+            guard: tokio::sync::RwLockWriteGuard<'_, u64>,
+        ) -> u64 {
+            self.commit_and_await_acks_for(guard, Vec::new()).await
+        }
+
+        /// As [`OwnerState::commit_and_await_acks`], recording `paths` as this
+        /// publication's affected set so watchers can revoke precisely.
+        pub(super) async fn commit_and_await_acks_for(
+            &self,
             mut guard: tokio::sync::RwLockWriteGuard<'_, u64>,
+            paths: Vec<String>,
         ) -> u64 {
             *guard = (*guard + 1).max(namespace_revision_now());
             let published = *guard;
+            // Record before announcing: a watcher woken by `publish` must never
+            // find the history missing the revision it was woken for.
+            self.record_publication(published, paths);
             self.publish(published);
             // Release the publication lock BEFORE parking on acks: same-owner
             // ordering stays correct because the revision + storage are already
@@ -1437,6 +1537,20 @@ mod server {
     #[derive(Serialize)]
     struct WatchResponse {
         revision: u64,
+        /// Paths published in `(since, revision]`. A watcher revokes exactly
+        /// these instead of everything it has cached.
+        ///
+        /// Always serialized when the set is known, including when it is empty:
+        /// an omitted field means "this gateway does not report affected paths"
+        /// and must send the watcher down its conservative fallback, which is a
+        /// different statement from "this publication touched nothing".
+        paths: Vec<String>,
+        /// Set when the affected set could not be reported completely (the
+        /// watcher is behind the retained history, or the set is too large).
+        /// The watcher must not treat `paths` as exhaustive and falls back to
+        /// its own conservative revocation.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
     }
 
     /// `since` absent/invalid -> 0 (so the fast path answers immediately with the
@@ -1459,9 +1573,21 @@ mod server {
         std::time::Duration::from_millis(millis)
     }
 
-    fn watch_hit(revision: u64) -> Response {
+    fn watch_hit(revision: u64, affected: Option<Vec<String>>) -> Response {
+        let (paths, truncated) = match affected {
+            Some(paths) => (paths, false),
+            None => (Vec::new(), true),
+        };
         with_namespace_revision(
-            (StatusCode::OK, Json(WatchResponse { revision })).into_response(),
+            (
+                StatusCode::OK,
+                Json(WatchResponse {
+                    revision,
+                    paths,
+                    truncated,
+                }),
+            )
+                .into_response(),
             revision,
         )
     }
@@ -1506,7 +1632,10 @@ mod server {
         loop {
             let current = *publication.read().await;
             if current > since {
-                return watch_hit(current);
+                // Read the affected set under the same read guard that produced
+                // `current`, so the paths answered always cover exactly the
+                // revisions the watcher is being advanced across.
+                return watch_hit(current, publication.paths_published_since(since));
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -1719,8 +1848,11 @@ mod server {
                 scope: first_scope,
             })
             .await?;
+        let affected = snapshot_paths.clone();
         let entries = publication_snapshot(&backend, owner_id.as_str(), snapshot_paths).await?;
-        let published = publication.commit_and_await_acks(revision).await;
+        let published = publication
+            .commit_and_await_acks_for(revision, affected)
+            .await;
         Ok(with_namespace_revision(
             Json(VfsWriteManyPublicationResponse { results, entries }).into_response(),
             published,
@@ -1804,8 +1936,11 @@ mod server {
                 scope: first_scope,
             })
             .await?;
+        let affected = snapshot_paths.clone();
         let entries = publication_snapshot(&backend, owner_id.as_str(), snapshot_paths).await?;
-        let published = publication.commit_and_await_acks(revision).await;
+        let published = publication
+            .commit_and_await_acks_for(revision, affected)
+            .await;
         Ok(with_namespace_revision(
             Json(VfsNamespaceMutationBatchResponse { entries }).into_response(),
             published,

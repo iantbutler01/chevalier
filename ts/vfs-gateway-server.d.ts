@@ -39,7 +39,9 @@ export interface VfsGatewayServerOptions {
      *  Defaults to false, preserving the historical exclusion. */
     allowGitMetadata?: (ownerId: string) => boolean | Promise<boolean>;
     /** Hard cap (ms) a mutation waits for live watchers to ack the published
-     *  revision before proceeding fail-open. Default 150, overridable via
+     *  revision before proceeding fail-open. Default 25 (a healthy watcher acks
+     *  within a few ms; a longer cap only charges a lagging watcher to the
+     *  writer). Overridable via
      *  `CHEVALIER_VFS_PUBLICATION_ACK_TIMEOUT_MS`. */
     publicationAckTimeoutMs?: number;
     /** Override (ms) for how long a silent watcher stays registered before it is
@@ -48,5 +50,15 @@ export interface VfsGatewayServerOptions {
     publicationWatcherGraceMs?: number;
 }
 /** Build a WHATWG `(Request) => Promise<Response>` handler that serves chevalier's
- *  VFS gateway protocol, delegating storage to `resolveStore(ownerId)`. */
+ *  VFS gateway protocol, delegating storage to `resolveStore(ownerId)`.
+ *
+ *  HOSTING REQUIREMENT — the revision-watch route (`GET .../watch`) is a long
+ *  poll held open up to ~25s (see `REVISION_WATCH_TIMEOUT_MS` on the vmd client).
+ *  Whatever http server hosts this handler MUST keep idle keep-alive
+ *  connections open comfortably past that window — for Node's `http.Server`,
+ *  set `server.keepAliveTimeout` (default 5s) and `server.headersTimeout` well
+ *  above 25s (e.g. 120s / 125s). The default 5s reaps the watch's idle socket
+ *  and RSTs it, so the client's next pooled poll fails with a send-class error
+ *  and the watch flaps to strict serves. (The OB API host is configured
+ *  separately.) */
 export declare function createVfsGatewayServer(opts: VfsGatewayServerOptions): (req: Request) => Promise<Response>;

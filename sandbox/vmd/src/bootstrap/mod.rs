@@ -1372,16 +1372,26 @@ mod tests {
         // The portproxy.service unit must not copy its (potentially multi-MB/min)
         // stdout/stderr to the serial console — that flood is a guest soft-lockup
         // trigger. Route both streams to a file on the guest disk instead.
+        //
+        // Scope the assertion to the portproxy unit: other units in this script
+        // legitimately log to the console, and they are low-volume.
+        let portproxy_unit = script
+            .split_once("cat <<'EOF' >/etc/systemd/system/portproxy.service")
+            .expect("portproxy unit is generated")
+            .1
+            .split_once("\nEOF")
+            .expect("portproxy unit is terminated")
+            .0;
         assert!(
-            !script.contains("StandardOutput=journal+console"),
+            !portproxy_unit.contains("StandardOutput=journal+console"),
             "portproxy stdout must not be teed to the serial console"
         );
         assert!(
-            !script.contains("StandardError=journal+console"),
+            !portproxy_unit.contains("StandardError=journal+console"),
             "portproxy stderr must not be teed to the serial console"
         );
-        assert!(script.contains("StandardOutput=append:/var/log/portproxy.log"));
-        assert!(script.contains("StandardError=append:/var/log/portproxy.log"));
+        assert!(portproxy_unit.contains("StandardOutput=append:/var/log/portproxy.log"));
+        assert!(portproxy_unit.contains("StandardError=append:/var/log/portproxy.log"));
         // Truncate-on-start size guard (no rotation).
         assert!(script.contains(": > /var/log/portproxy.log"));
         // Default the transport stack down to WARN at the source; still

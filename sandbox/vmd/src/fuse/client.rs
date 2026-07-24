@@ -27,7 +27,8 @@ use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
-use super::cache::{MountInvalidators, RemoteFuseCache};
+use super::cache::{MountInvalidators, PublicationInvalidation, RemoteFuseCache};
+use super::fs::ATTR_ENTRY_LEASE_TTL;
 
 pub const RANGE_FINGERPRINT_HEADER: &str = "x-chevalier-vfs-range-fingerprint";
 /// Transient-failure budget sized to ride out a gateway restart, not mask a
@@ -1311,12 +1312,32 @@ impl RemoteVfsClient {
 #[derive(Deserialize)]
 struct RevisionWatchResponse {
     revision: u64,
+    /// Paths published between the poll's `since` and `revision`.
+    ///
+    /// `None` means the field was absent — a gateway that does not report
+    /// affected paths at all — which is NOT the same as a present-but-empty
+    /// set ("this publication touched nothing this mount must revoke"). The
+    /// former must fall back to the conservative sweep; the latter is a
+    /// complete answer.
+    #[serde(default)]
+    paths: Option<Vec<String>>,
+    /// Set when the gateway could not report the affected set completely, so
+    /// `paths` must not be treated as exhaustive.
+    #[serde(default)]
+    truncated: bool,
 }
 
 /// One completed watch poll. `Advanced` carries the new owner revision from a
 /// 200; `Unchanged` is a 204 long-poll timeout. Both mean the channel is live.
 enum RevisionWatchPoll {
-    Advanced(u64),
+    /// The owner revision advanced. `affected` carries the exact paths the
+    /// publications touched when the gateway could report them completely;
+    /// `None` means the watcher must fall back to its own conservative
+    /// revocation (older gateway, truncated set, or a watcher too far behind).
+    Advanced {
+        revision: u64,
+        affected: Option<Vec<String>>,
+    },
     Unchanged,
 }
 
@@ -1411,7 +1432,13 @@ async fn poll_revision_watch(
             .await
             .context("decode vfs revision watch response")
             .map_err(RevisionWatchError::Protocol)?;
-        return Ok(RevisionWatchPoll::Advanced(body.revision));
+        return Ok(RevisionWatchPoll::Advanced {
+            revision: body.revision,
+            // An empty set from a gateway that reports completeness is a real
+            // answer ("nothing this mount must revoke"); truncation, or a
+            // gateway that omits the field entirely, forces the fallback.
+            affected: if body.truncated { None } else { body.paths },
+        });
     }
     let body = response.text().await.unwrap_or_default();
     Err(RevisionWatchError::Protocol(anyhow!(
@@ -1481,7 +1508,7 @@ async fn run_revision_watch(
                 let Some(state) = revisions.upgrade() else {
                     return;
                 };
-                if let RevisionWatchPoll::Advanced(revision) = poll {
+                if let RevisionWatchPoll::Advanced { revision, affected } = poll {
                     // ACK-ORDERING INVARIANT (revocation-acked publications): the
                     // gateway treats the NEXT poll's `since` as this watcher's ack
                     // of that revision, and a sibling's publication is blocked
@@ -1509,8 +1536,40 @@ async fn run_revision_watch(
                     // Sweeping here guarantees the writer's fsync return implies
                     // this process's kernels hold no superseded attrs, exactly as
                     // the cache clear guarantees no stale userspace serve.
-                    if let Some(notifiers) = notifiers.upgrade() {
-                        notifiers.invalidate_all();
+                    let swept = match notifiers.upgrade() {
+                        Some(notifiers) => match &affected {
+                            // The gateway reported exactly what changed, so
+                            // revoke that and nothing else. This is the whole
+                            // point of the targeted set: an untargeted sweep is
+                            // proportional to the mount's working set and takes
+                            // a guest-kernel parent-inode write lock per entry,
+                            // which stalls the guest's own lookups behind it.
+                            Some(paths) => {
+                                notifiers.invalidate(&PublicationInvalidation::for_paths(paths))
+                            }
+                            // No trustworthy set: fall back to the untargeted
+                            // sweep, which declines itself past its own bound
+                            // and fails closed rather than storming.
+                            None => notifiers.invalidate_all(),
+                        },
+                        None => true,
+                    };
+                    if !swept {
+                        // A revocation did not land, so the kernel may still
+                        // serve an attr this revision supersedes. Acking now
+                        // would unblock the remote writer against that stale
+                        // lease, so fail closed instead: drop watch liveness
+                        // (subsequent replies carry TTL=0 and every serve is
+                        // wire-backed) and hold the ack until any lease granted
+                        // before the failure has expired on its own.
+                        tracing::warn!(
+                            revision,
+                            "vfs kernel revocation incomplete; serving strict until leases expire"
+                        );
+                        state.watch_live.store(false, Ordering::Release);
+                        drop(state);
+                        tokio::time::sleep(ATTR_ENTRY_LEASE_TTL).await;
+                        continue;
                     }
                 }
                 // Set last: an observer that sees watch_live is guaranteed to
@@ -2128,11 +2187,13 @@ mod tests {
             fired: Arc<AtomicBool>,
         }
         impl KernelInvalidator for RecordingInvalidator {
-            fn invalidate(&self, _: &PublicationInvalidation) {
+            fn invalidate(&self, _: &PublicationInvalidation) -> bool {
                 self.fired.store(true, Ordering::Release);
+                true
             }
-            fn invalidate_all(&self) {
+            fn invalidate_all(&self) -> bool {
                 self.fired.store(true, Ordering::Release);
+                true
             }
         }
 

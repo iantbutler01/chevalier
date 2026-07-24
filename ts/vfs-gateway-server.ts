@@ -64,6 +64,35 @@ const ADVISORY_LOCK_LEASE_MS = 45_000;
 const MAX_BATCH_ITEMS = 4096;
 const MAX_OPTIMISTIC_SNAPSHOT_ATTEMPTS = 3;
 
+/** How many publications of affected-path history an owner retains. A watcher
+ *  polls continuously, so it is normally one publication behind; this covers a
+ *  watcher that missed a burst without letting the history grow with the mount's
+ *  lifetime. Mirrors `PUBLICATION_HISTORY_LIMIT` in the Rust gateway. */
+const PUBLICATION_HISTORY_LIMIT = 256;
+/** Ceiling on paths returned for one watch answer. Past this the targeted answer
+ *  stops being cheaper than the watcher's own fallback, so the watch reports
+ *  truncation instead. Mirrors `WATCH_PATHS_LIMIT` in the Rust gateway. */
+const WATCH_PATHS_LIMIT = 1024;
+
+/** One publication's affected paths, retained so a lagging watcher can be told
+ *  exactly what to revoke. */
+type VfsPublishedPaths = {
+  revision: number;
+  paths: readonly string[];
+};
+
+/**
+ * A resolved long poll: the revision to answer with, plus the paths published in
+ * `(since, revision]`. `paths` is null when the answer cannot be trusted to be
+ * complete (the watcher is behind the retained history, or the union exceeds the
+ * cap) — the responder reports truncation and the watcher falls back to its own
+ * conservative revocation rather than acting on a partial set.
+ */
+type VfsWatchResult = {
+  revision: number;
+  paths: string[] | null;
+};
+
 type VfsPublicationState = {
   revision: number;
   activityEpoch: number;
@@ -87,6 +116,16 @@ type VfsPublicationState = {
   pendingAckWaiters: VfsAckWaiter[];
   // Epoch-ms of the last fail-open WARN, rate-limiting it to <=1/sec/owner.
   lastAckWarnAt: number;
+  // Recent publications as (revision, affected paths), newest last.
+  //
+  // A watcher learns only a revision number from its long poll, which leaves it
+  // no choice but to invalidate everything it has cached — a revocation
+  // proportional to the whole working set rather than to what actually changed.
+  // Retaining the affected paths lets the watch answer with the exact set
+  // instead, so a mount revokes what a publication touched and nothing else.
+  // Bounded: a watcher that has fallen further behind than this history is told
+  // the answer is truncated and falls back to its own conservative handling.
+  publicationHistory: VfsPublishedPaths[];
 };
 
 type VfsPendingWatcher = {
@@ -126,6 +165,7 @@ class VfsPublicationCoordinator {
         watcherAcks: new Map(),
         pendingAckWaiters: [],
         lastAckWarnAt: 0,
+        publicationHistory: [],
       };
       this.#states.set(ownerId, state);
     }
@@ -164,24 +204,46 @@ class VfsPublicationCoordinator {
     );
   }
 
+  /**
+   * Publish a mutation. `paths` is the set the mutation affected, recorded with
+   * the new revision so watchers can revoke precisely; omit it only where the
+   * handler genuinely does not know the set (it is then recorded as empty).
+   */
   async mutate<T>(
     ownerId: string,
     mutate: () => Promise<T>,
+    paths?: readonly string[],
   ): Promise<{ value: T; revision: number }> {
-    return this.transact(ownerId, async () => ({ value: await mutate(), mutated: true }));
+    return this.transact(ownerId, async () => ({
+      value: await mutate(),
+      mutated: true,
+      paths,
+    }));
   }
 
   async transact<T>(
     ownerId: string,
-    transaction: () => Promise<{ value: T; mutated: boolean }>,
+    transaction: () => Promise<{
+      value: T;
+      mutated: boolean;
+      paths?: readonly string[];
+    }>,
   ): Promise<{ value: T; revision: number }> {
     const state = this.#state(ownerId);
     const release = await this.#acquire(state, "write");
     let outcome!: { value: T; revision: number; mutated: boolean };
     try {
-      const { value, mutated } = await transaction();
+      const { value, mutated, paths } = await transaction();
       if (mutated) {
         state.revision = Math.max(state.revision + 1, Date.now() * 1_000);
+        // Record before releasing the writer, which is what wakes parked
+        // watchers: a watcher woken for a revision must never find the history
+        // missing the revision it was woken for. A publication whose affected
+        // set is unknown records an empty entry rather than none — a MISSING
+        // revision is what forces a later watcher onto the truncated fallback,
+        // so skipping the entry would silently downgrade every watcher behind
+        // it.
+        this.#recordPublication(state, state.revision, paths ?? []);
       }
       outcome = { value, revision: state.revision, mutated };
     } finally {
@@ -262,7 +324,7 @@ class VfsPublicationCoordinator {
     since: number,
     timeoutMs: number,
     watcherId: string,
-  ): Promise<number> {
+  ): Promise<VfsWatchResult> {
     const state = this.#state(ownerId);
     // This poll's `since` acks that revision for this watcher and unblocks any
     // sibling publication waiting on it. Register before the fast path so a fast
@@ -273,9 +335,9 @@ class VfsPublicationCoordinator {
     // happen with no `await` between them, so a mutation cannot slip in and be
     // missed — JS runs this to completion before any writer's revision bump.
     if (state.revision > since) {
-      return Promise.resolve(state.revision);
+      return Promise.resolve(this.#watchResult(state, state.revision, since));
     }
-    return new Promise<number>((resolve) => {
+    return new Promise<VfsWatchResult>((resolve) => {
       let settled = false;
       const watcher: VfsPendingWatcher = {
         since,
@@ -285,12 +347,75 @@ class VfsPublicationCoordinator {
           clearTimeout(timer);
           const index = state.pendingWatchers.indexOf(watcher);
           if (index >= 0) state.pendingWatchers.splice(index, 1);
-          resolve(revision);
+          resolve(this.#watchResult(state, revision, since));
         },
       };
       const timer = setTimeout(() => watcher.settle(state.revision), timeoutMs);
       state.pendingWatchers.push(watcher);
     });
+  }
+
+  /**
+   * Pair `revision` with the paths that carried the watcher to it. Always called
+   * in the same synchronous turn that read `revision` — the fast path above, or
+   * `settle` inside the writer release — so the answered paths cover exactly the
+   * revisions the watcher is being advanced across, with no publication able to
+   * interleave between the two reads. (This is the JS equivalent of the Rust
+   * gateway reading the history under the guard that produced `current`.)
+   */
+  #watchResult(
+    state: VfsPublicationState,
+    revision: number,
+    since: number,
+  ): VfsWatchResult {
+    // An unadvanced revision is answered 204, which carries no paths.
+    if (revision <= since) return { revision, paths: [] };
+    return { revision, paths: this.#pathsPublishedSince(state, since) };
+  }
+
+  /** Retain a publication's affected paths for lagging watchers, evicting the
+   *  oldest once the bound is reached. */
+  #recordPublication(
+    state: VfsPublicationState,
+    revision: number,
+    paths: readonly string[],
+  ): void {
+    state.publicationHistory.push({
+      revision,
+      paths: [...new Set(paths.map(normalizePath))],
+    });
+    while (state.publicationHistory.length > PUBLICATION_HISTORY_LIMIT) {
+      state.publicationHistory.shift();
+    }
+  }
+
+  /**
+   * The union of paths published in `(since, current]`.
+   *
+   * Returns null when the answer cannot be trusted to be complete — the watcher
+   * is further behind than the retained history, or the union exceeds
+   * `WATCH_PATHS_LIMIT` — in which case the caller reports truncation and the
+   * watcher falls back to its own handling rather than acting on a partial set.
+   */
+  #pathsPublishedSince(state: VfsPublicationState, since: number): string[] | null {
+    const oldest = state.publicationHistory[0];
+    if (oldest === undefined) return null;
+    // `since` must be covered: the watcher needs every publication after it, and
+    // anything before the oldest retained entry may have evicted publications
+    // the watcher never saw.
+    if (since < oldest.revision) return null;
+    const seen = new Set<string>();
+    const union: string[] = [];
+    for (const entry of state.publicationHistory) {
+      if (entry.revision <= since) continue;
+      for (const path of entry.paths) {
+        if (seen.has(path)) continue;
+        seen.add(path);
+        union.push(path);
+        if (union.length > WATCH_PATHS_LIMIT) return null;
+      }
+    }
+    return union;
   }
 
   #notifyWatchers(state: VfsPublicationState): void {
@@ -832,7 +957,9 @@ export interface VfsGatewayServerOptions {
    *  Defaults to false, preserving the historical exclusion. */
   allowGitMetadata?: (ownerId: string) => boolean | Promise<boolean>;
   /** Hard cap (ms) a mutation waits for live watchers to ack the published
-   *  revision before proceeding fail-open. Default 150, overridable via
+   *  revision before proceeding fail-open. Default 25 (a healthy watcher acks
+   *  within a few ms; a longer cap only charges a lagging watcher to the
+   *  writer). Overridable via
    *  `CHEVALIER_VFS_PUBLICATION_ACK_TIMEOUT_MS`. */
   publicationAckTimeoutMs?: number;
   /** Override (ms) for how long a silent watcher stays registered before it is
@@ -888,9 +1015,24 @@ export function createVfsGatewayServer(
         const since = parseWatchSince(url.searchParams.get("since"));
         const timeoutMs = parseWatchTimeout(url.searchParams.get("timeout_ms"));
         const watcherId = parseWatcherId(url.searchParams.get("watcher_id"));
-        const revision = await publications.watch(ownerId, since, timeoutMs, watcherId);
+        const { revision, paths } = await publications.watch(
+          ownerId,
+          since,
+          timeoutMs,
+          watcherId,
+        );
         if (revision > since) {
-          return withNamespaceRevision(json(200, { revision }), revision);
+          // `paths` is serialized whenever the affected set is known, the empty
+          // set included: an omitted field means "this gateway does not report
+          // affected paths" and sends the watcher down a conservative full-sweep
+          // fallback, which is a different statement from "this publication
+          // touched nothing". `truncated` appears only when true, and then the
+          // watcher must not treat `paths` as exhaustive.
+          const body =
+            paths === null
+              ? { revision, paths: [], truncated: true }
+              : { revision, paths };
+          return withNamespaceRevision(json(200, body), revision);
         }
         return withNamespaceRevision(new Response(null, { status: 204 }), revision);
       }
@@ -1094,12 +1236,15 @@ export function createVfsGatewayServer(
           );
         }
         try {
-          const publication = await publications.mutate(ownerId, async () => {
-            await store.applyNamespaceBatch(mutations);
-            return {
-              entries: await snapshotMutationPaths(store, mutations),
-            };
-          });
+          const affected = mutationSnapshotPaths(mutations);
+          const publication = await publications.mutate(
+            ownerId,
+            async () => {
+              await store.applyNamespaceBatch(mutations);
+              return { entries: await snapshotPaths(store, affected) };
+            },
+            affected,
+          );
           return withNamespaceRevision(
             json(200, publication.value),
             publication.revision,
@@ -1564,16 +1709,18 @@ export function createVfsGatewayServer(
             };
           });
           try {
-            const publication = await publications.mutate(ownerId, async () => {
-              const results = await writeMany(normalizedWrites);
-              return {
-                results,
-                entries: await snapshotPaths(
-                  store,
-                  normalizedWrites.map((write) => write.path),
-                ),
-              };
-            });
+            const affected = normalizedWrites.map((write) => write.path);
+            const publication = await publications.mutate(
+              ownerId,
+              async () => {
+                const results = await writeMany(normalizedWrites);
+                return {
+                  results,
+                  entries: await snapshotPaths(store, affected),
+                };
+              },
+              affected,
+            );
             return withNamespaceRevision(json(200, {
               results: publication.value.results.map((result: StreamingWriteManyResult) => ({
                 path: result.path,
@@ -1634,15 +1781,14 @@ export function createVfsGatewayServer(
               changed: res.changed ?? previousHash !== hash,
             });
           }
+          const affected = writes.map((write) => write.path);
           return {
             value: json(200, {
               results,
-              entries: await snapshotPaths(
-                store,
-                writes.map((write) => write.path),
-              ),
+              entries: await snapshotPaths(store, affected),
             }),
             mutated: true,
+            paths: affected,
           };
         });
         if (!publication.value.ok) {
@@ -2029,17 +2175,18 @@ async function snapshotPaths(
   }));
 }
 
-async function snapshotMutationPaths(
-  store: VfsStorage,
-  mutations: readonly NamespaceMutation[],
-): Promise<PublicationSnapshotEntry[]> {
+/** Every path a namespace batch touches — each mutation's own paths plus their
+ *  immediate parents, whose listings the batch also invalidates. Feeds both the
+ *  publication snapshot and the publication's recorded affected set, so a
+ *  watcher revokes exactly what the snapshot re-states. */
+function mutationSnapshotPaths(mutations: readonly NamespaceMutation[]): string[] {
   const paths: string[] = [];
   for (const mutation of mutations) {
     for (const path of mutationPaths(mutation)) {
       paths.push(path, immediateParent(path));
     }
   }
-  return snapshotPaths(store, paths);
+  return paths;
 }
 
 function normalizeNamespaceOperationIds(value: unknown): string[] | Response {
@@ -2283,10 +2430,10 @@ function parseWatcherId(raw: string | null): string {
   return raw === null ? "" : raw.trim();
 }
 
-const PUBLICATION_ACK_TIMEOUT_DEFAULT_MS = 150;
+const PUBLICATION_ACK_TIMEOUT_DEFAULT_MS = 25;
 
 /** Hard cap (ms) a publication waits for watcher acks before failing open.
- *  Overridable via `CHEVALIER_VFS_PUBLICATION_ACK_TIMEOUT_MS`; default 150. */
+ *  Overridable via `CHEVALIER_VFS_PUBLICATION_ACK_TIMEOUT_MS`; default 25. */
 function publicationAckTimeoutFromEnv(): number {
   const raw = process.env.CHEVALIER_VFS_PUBLICATION_ACK_TIMEOUT_MS;
   if (raw === undefined) return PUBLICATION_ACK_TIMEOUT_DEFAULT_MS;

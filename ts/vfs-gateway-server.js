@@ -10,7 +10,7 @@ var __classPrivateFieldGet = (this && this.__classPrivateFieldGet) || function (
     if (typeof state === "function" ? receiver !== state || !f : !state.has(receiver)) throw new TypeError("Cannot read private member from an object whose class did not declare it");
     return kind === "m" ? f : kind === "a" ? f.call(receiver) : f ? f.value : state.get(receiver);
 };
-var _VfsPublicationCoordinator_instances, _VfsPublicationCoordinator_states, _VfsPublicationCoordinator_ackTimeoutMs, _VfsPublicationCoordinator_watcherGraceOverrideMs, _VfsPublicationCoordinator_state, _VfsPublicationCoordinator_acquire, _VfsPublicationCoordinator_releaseReader, _VfsPublicationCoordinator_releaseWriter, _VfsPublicationCoordinator_notifyWatchers, _VfsPublicationCoordinator_recordWatcherAck, _VfsPublicationCoordinator_unackedWatchers, _VfsPublicationCoordinator_notifyAckWaiters, _VfsPublicationCoordinator_awaitPublicationAcks, _VfsPublicationCoordinator_warnPublicationLag, _VfsPublicationCoordinator_checkpoint, _VfsPublicationCoordinator_drain;
+var _VfsPublicationCoordinator_instances, _VfsPublicationCoordinator_states, _VfsPublicationCoordinator_ackTimeoutMs, _VfsPublicationCoordinator_watcherGraceOverrideMs, _VfsPublicationCoordinator_state, _VfsPublicationCoordinator_acquire, _VfsPublicationCoordinator_releaseReader, _VfsPublicationCoordinator_releaseWriter, _VfsPublicationCoordinator_watchResult, _VfsPublicationCoordinator_recordPublication, _VfsPublicationCoordinator_pathsPublishedSince, _VfsPublicationCoordinator_notifyWatchers, _VfsPublicationCoordinator_recordWatcherAck, _VfsPublicationCoordinator_unackedWatchers, _VfsPublicationCoordinator_notifyAckWaiters, _VfsPublicationCoordinator_awaitPublicationAcks, _VfsPublicationCoordinator_warnPublicationLag, _VfsPublicationCoordinator_checkpoint, _VfsPublicationCoordinator_drain;
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.createVfsGatewayServer = createVfsGatewayServer;
 // chevalier VFS gateway SERVER, in TypeScript.
@@ -76,6 +76,15 @@ const LEASE_MODE_HEADER = "x-chevalier-vfs-lease-mode";
 const ADVISORY_LOCK_LEASE_MS = 45_000;
 const MAX_BATCH_ITEMS = 4096;
 const MAX_OPTIMISTIC_SNAPSHOT_ATTEMPTS = 3;
+/** How many publications of affected-path history an owner retains. A watcher
+ *  polls continuously, so it is normally one publication behind; this covers a
+ *  watcher that missed a burst without letting the history grow with the mount's
+ *  lifetime. Mirrors `PUBLICATION_HISTORY_LIMIT` in the Rust gateway. */
+const PUBLICATION_HISTORY_LIMIT = 256;
+/** Ceiling on paths returned for one watch answer. Past this the targeted answer
+ *  stops being cheaper than the watcher's own fallback, so the watch reports
+ *  truncation instead. Mirrors `WATCH_PATHS_LIMIT` in the Rust gateway. */
+const WATCH_PATHS_LIMIT = 1024;
 class VfsSnapshotChangedError extends Error {
 }
 class VfsPublicationCoordinator {
@@ -115,17 +124,34 @@ class VfsPublicationCoordinator {
         }
         throw new VfsSnapshotChangedError("namespace changed during recursive snapshot; retry");
     }
-    async mutate(ownerId, mutate) {
-        return this.transact(ownerId, async () => ({ value: await mutate(), mutated: true }));
+    /**
+     * Publish a mutation. `paths` is the set the mutation affected, recorded with
+     * the new revision so watchers can revoke precisely; omit it only where the
+     * handler genuinely does not know the set (it is then recorded as empty).
+     */
+    async mutate(ownerId, mutate, paths) {
+        return this.transact(ownerId, async () => ({
+            value: await mutate(),
+            mutated: true,
+            paths,
+        }));
     }
     async transact(ownerId, transaction) {
         const state = __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_state).call(this, ownerId);
         const release = await __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_acquire).call(this, state, "write");
         let outcome;
         try {
-            const { value, mutated } = await transaction();
+            const { value, mutated, paths } = await transaction();
             if (mutated) {
                 state.revision = Math.max(state.revision + 1, Date.now() * 1_000);
+                // Record before releasing the writer, which is what wakes parked
+                // watchers: a watcher woken for a revision must never find the history
+                // missing the revision it was woken for. A publication whose affected
+                // set is unknown records an empty entry rather than none — a MISSING
+                // revision is what forces a later watcher onto the truncated fallback,
+                // so skipping the entry would silently downgrade every watcher behind
+                // it.
+                __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_recordPublication).call(this, state, state.revision, paths ?? []);
             }
             outcome = { value, revision: state.revision, mutated };
         }
@@ -161,7 +187,7 @@ class VfsPublicationCoordinator {
         // happen with no `await` between them, so a mutation cannot slip in and be
         // missed — JS runs this to completion before any writer's revision bump.
         if (state.revision > since) {
-            return Promise.resolve(state.revision);
+            return Promise.resolve(__classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_watchResult).call(this, state, state.revision, since));
         }
         return new Promise((resolve) => {
             let settled = false;
@@ -175,7 +201,7 @@ class VfsPublicationCoordinator {
                     const index = state.pendingWatchers.indexOf(watcher);
                     if (index >= 0)
                         state.pendingWatchers.splice(index, 1);
-                    resolve(revision);
+                    resolve(__classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_watchResult).call(this, state, revision, since));
                 },
             };
             const timer = setTimeout(() => watcher.settle(state.revision), timeoutMs);
@@ -196,6 +222,7 @@ _VfsPublicationCoordinator_states = new WeakMap(), _VfsPublicationCoordinator_ac
             watcherAcks: new Map(),
             pendingAckWaiters: [],
             lastAckWarnAt: 0,
+            publicationHistory: [],
         };
         __classPrivateFieldGet(this, _VfsPublicationCoordinator_states, "f").set(ownerId, state);
     }
@@ -240,6 +267,43 @@ _VfsPublicationCoordinator_states = new WeakMap(), _VfsPublicationCoordinator_ac
         __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_notifyWatchers).call(this, state);
         __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_drain).call(this, state);
     };
+}, _VfsPublicationCoordinator_watchResult = function _VfsPublicationCoordinator_watchResult(state, revision, since) {
+    // An unadvanced revision is answered 204, which carries no paths.
+    if (revision <= since)
+        return { revision, paths: [] };
+    return { revision, paths: __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_pathsPublishedSince).call(this, state, since) };
+}, _VfsPublicationCoordinator_recordPublication = function _VfsPublicationCoordinator_recordPublication(state, revision, paths) {
+    state.publicationHistory.push({
+        revision,
+        paths: [...new Set(paths.map(normalizePath))],
+    });
+    while (state.publicationHistory.length > PUBLICATION_HISTORY_LIMIT) {
+        state.publicationHistory.shift();
+    }
+}, _VfsPublicationCoordinator_pathsPublishedSince = function _VfsPublicationCoordinator_pathsPublishedSince(state, since) {
+    const oldest = state.publicationHistory[0];
+    if (oldest === undefined)
+        return null;
+    // `since` must be covered: the watcher needs every publication after it, and
+    // anything before the oldest retained entry may have evicted publications
+    // the watcher never saw.
+    if (since < oldest.revision)
+        return null;
+    const seen = new Set();
+    const union = [];
+    for (const entry of state.publicationHistory) {
+        if (entry.revision <= since)
+            continue;
+        for (const path of entry.paths) {
+            if (seen.has(path))
+                continue;
+            seen.add(path);
+            union.push(path);
+            if (union.length > WATCH_PATHS_LIMIT)
+                return null;
+        }
+    }
+    return union;
 }, _VfsPublicationCoordinator_notifyWatchers = function _VfsPublicationCoordinator_notifyWatchers(state) {
     if (state.pendingWatchers.length === 0)
         return;
@@ -601,7 +665,17 @@ function lockResponse(lock) {
     };
 }
 /** Build a WHATWG `(Request) => Promise<Response>` handler that serves chevalier's
- *  VFS gateway protocol, delegating storage to `resolveStore(ownerId)`. */
+ *  VFS gateway protocol, delegating storage to `resolveStore(ownerId)`.
+ *
+ *  HOSTING REQUIREMENT — the revision-watch route (`GET .../watch`) is a long
+ *  poll held open up to ~25s (see `REVISION_WATCH_TIMEOUT_MS` on the vmd client).
+ *  Whatever http server hosts this handler MUST keep idle keep-alive
+ *  connections open comfortably past that window — for Node's `http.Server`,
+ *  set `server.keepAliveTimeout` (default 5s) and `server.headersTimeout` well
+ *  above 25s (e.g. 120s / 125s). The default 5s reaps the watch's idle socket
+ *  and RSTs it, so the client's next pooled poll fails with a send-class error
+ *  and the watch flaps to strict serves. (The OB API host is configured
+ *  separately.) */
 function createVfsGatewayServer(opts) {
     const prefix = opts.routePrefix ?? DEFAULT_ROUTE_PREFIX;
     const advisoryLocks = new AdvisoryLockCoordinator(opts.advisoryLockState ?? new InMemoryAdvisoryLockStateStore());
@@ -633,9 +707,18 @@ function createVfsGatewayServer(opts) {
                 const since = parseWatchSince(url.searchParams.get("since"));
                 const timeoutMs = parseWatchTimeout(url.searchParams.get("timeout_ms"));
                 const watcherId = parseWatcherId(url.searchParams.get("watcher_id"));
-                const revision = await publications.watch(ownerId, since, timeoutMs, watcherId);
+                const { revision, paths } = await publications.watch(ownerId, since, timeoutMs, watcherId);
                 if (revision > since) {
-                    return withNamespaceRevision(json(200, { revision }), revision);
+                    // `paths` is serialized whenever the affected set is known, the empty
+                    // set included: an omitted field means "this gateway does not report
+                    // affected paths" and sends the watcher down a conservative full-sweep
+                    // fallback, which is a different statement from "this publication
+                    // touched nothing". `truncated` appears only when true, and then the
+                    // watcher must not treat `paths` as exhaustive.
+                    const body = paths === null
+                        ? { revision, paths: [], truncated: true }
+                        : { revision, paths };
+                    return withNamespaceRevision(json(200, body), revision);
                 }
                 return withNamespaceRevision(new Response(null, { status: 204 }), revision);
             }
@@ -821,12 +904,11 @@ function createVfsGatewayServer(opts) {
                     return errorResponse(400, "namespace-many requires one operation_id per mutation");
                 }
                 try {
+                    const affected = mutationSnapshotPaths(mutations);
                     const publication = await publications.mutate(ownerId, async () => {
                         await store.applyNamespaceBatch(mutations);
-                        return {
-                            entries: await snapshotMutationPaths(store, mutations),
-                        };
-                    });
+                        return { entries: await snapshotPaths(store, affected) };
+                    }, affected);
                     return withNamespaceRevision(json(200, publication.value), publication.revision);
                 }
                 catch (error) {
@@ -1231,13 +1313,14 @@ function createVfsGatewayServer(opts) {
                         };
                     });
                     try {
+                        const affected = normalizedWrites.map((write) => write.path);
                         const publication = await publications.mutate(ownerId, async () => {
                             const results = await writeMany(normalizedWrites);
                             return {
                                 results,
-                                entries: await snapshotPaths(store, normalizedWrites.map((write) => write.path)),
+                                entries: await snapshotPaths(store, affected),
                             };
-                        });
+                        }, affected);
                         return withNamespaceRevision(json(200, {
                             results: publication.value.results.map((result) => ({
                                 path: result.path,
@@ -1289,12 +1372,14 @@ function createVfsGatewayServer(opts) {
                             changed: res.changed ?? previousHash !== hash,
                         });
                     }
+                    const affected = writes.map((write) => write.path);
                     return {
                         value: json(200, {
                             results,
-                            entries: await snapshotPaths(store, writes.map((write) => write.path)),
+                            entries: await snapshotPaths(store, affected),
                         }),
                         mutated: true,
+                        paths: affected,
                     };
                 });
                 if (!publication.value.ok) {
@@ -1608,14 +1693,18 @@ async function snapshotPaths(store, requestedPaths) {
         metadata: metadata[index] == null ? null : toRemoteMetadata(metadata[index]),
     }));
 }
-async function snapshotMutationPaths(store, mutations) {
+/** Every path a namespace batch touches — each mutation's own paths plus their
+ *  immediate parents, whose listings the batch also invalidates. Feeds both the
+ *  publication snapshot and the publication's recorded affected set, so a
+ *  watcher revokes exactly what the snapshot re-states. */
+function mutationSnapshotPaths(mutations) {
     const paths = [];
     for (const mutation of mutations) {
         for (const path of mutationPaths(mutation)) {
             paths.push(path, immediateParent(path));
         }
     }
-    return snapshotPaths(store, paths);
+    return paths;
 }
 function normalizeNamespaceOperationIds(value) {
     if (!Array.isArray(value)) {
@@ -1844,9 +1933,9 @@ function parseWatchTimeout(raw) {
 function parseWatcherId(raw) {
     return raw === null ? "" : raw.trim();
 }
-const PUBLICATION_ACK_TIMEOUT_DEFAULT_MS = 150;
+const PUBLICATION_ACK_TIMEOUT_DEFAULT_MS = 25;
 /** Hard cap (ms) a publication waits for watcher acks before failing open.
- *  Overridable via `CHEVALIER_VFS_PUBLICATION_ACK_TIMEOUT_MS`; default 150. */
+ *  Overridable via `CHEVALIER_VFS_PUBLICATION_ACK_TIMEOUT_MS`; default 25. */
 function publicationAckTimeoutFromEnv() {
     const raw = process.env.CHEVALIER_VFS_PUBLICATION_ACK_TIMEOUT_MS;
     if (raw === undefined)

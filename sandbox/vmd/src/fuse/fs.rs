@@ -46,7 +46,15 @@ use super::write::{WriteBarrierGuard, WriteJournal};
 /// userspace and reconfirms), and any entry already leased in the kernel
 /// naturally expires within this bound. `lease_ttl_for` selects between the two
 /// at reply time based on watch liveness.
-const ATTR_ENTRY_LEASE_TTL: Duration = Duration::from_secs(1);
+pub(super) const ATTR_ENTRY_LEASE_TTL: Duration = Duration::from_secs(1);
+/// Largest untargeted kernel revocation this mount will issue in one sweep.
+///
+/// `notify_inval_entry` acquires the parent inode's write lock in the guest
+/// kernel, so a sweep proportional to the whole working set blocks the guest's
+/// own lookups for as long as it runs. Past this bound the mount declines the
+/// sweep and falls back to strict serving until its leases expire — bounded
+/// staleness-free degradation instead of a mount-wide stall.
+const KERNEL_SWEEP_MAX_TARGETS: usize = 128;
 const ROOT_INO_RAW: u64 = 1;
 const ROOT_INO: INodeNo = INodeNo(ROOT_INO_RAW);
 const LARGE_FILE_BYTES: u64 = 10 * 1024 * 1024;
@@ -735,7 +743,7 @@ pub(super) struct MountKernelInvalidator {
 impl MountKernelInvalidator {
     /// Fire the notifier for each target, resolving the inode-table lock first
     /// and dropping it before any `writev` into `/dev/fuse`.
-    fn apply(&self, targets: &[KernelInvalTarget]) {
+    fn apply(&self, targets: &[KernelInvalTarget]) -> bool {
         let mut clean = true;
         for target in targets {
             if let Some(ino) = target.ino
@@ -755,6 +763,17 @@ impl MountKernelInvalidator {
             // A fully clean sweep re-arms the edge so a later failure warns again.
             self.warned.store(false, Ordering::Release);
         }
+        clean
+    }
+
+    fn warn_sweep_declined(&self, targets: usize) {
+        if !self.warned.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                targets,
+                limit = KERNEL_SWEEP_MAX_TARGETS,
+                "vfs kernel sweep declined; serving strict until leases expire"
+            );
+        }
     }
 
     fn warn_once(&self, error: &io::Error) {
@@ -768,9 +787,10 @@ impl MountKernelInvalidator {
 }
 
 impl KernelInvalidator for MountKernelInvalidator {
-    fn invalidate(&self, invalidation: &PublicationInvalidation) {
+    fn invalidate(&self, invalidation: &PublicationInvalidation) -> bool {
         let Some(inodes) = self.inodes.upgrade() else {
-            return;
+            // The mount is gone; it holds no kernel state to revoke.
+            return true;
         };
         let targets = {
             let table = inodes.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -788,18 +808,35 @@ impl KernelInvalidator for MountKernelInvalidator {
             }
             targets
         };
-        self.apply(&targets);
+        self.apply(&targets)
     }
 
-    fn invalidate_all(&self) {
+    fn invalidate_all(&self) -> bool {
         let Some(inodes) = self.inodes.upgrade() else {
-            return;
+            return true;
         };
         let targets = {
             let table = inodes.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             table.all_invalidation_targets()
         };
-        self.apply(&targets);
+        // A remote publication carries no path set, so the only fully accurate
+        // revocation is every entry this mount handed the kernel. That is safe
+        // when the working set is small and actively harmful when it is not:
+        // `notify_inval_entry` takes the parent inode's write lock in the guest
+        // kernel, so sweeping thousands of dentries stalls the guest's own
+        // lookups behind the storm — a mount-wide freeze, not a fast revocation.
+        //
+        // Past the bound, decline the sweep instead. Returning `false` routes
+        // the caller down the same fail-closed path a failed revocation takes:
+        // watch liveness drops (replies revert to TTL=0, every serve becomes
+        // wire-backed) and the ack is withheld until the leases granted before
+        // this point have expired on their own. Correctness is preserved by
+        // strictness rather than by a storm the guest cannot absorb.
+        if targets.len() > KERNEL_SWEEP_MAX_TARGETS {
+            self.warn_sweep_declined(targets.len());
+            return false;
+        }
+        self.apply(&targets)
     }
 }
 
@@ -1564,7 +1601,12 @@ impl RemoteFuseFs {
     }
 
     fn dir_entries(&self, path: &str) -> FuseResult<Vec<RemoteDirEntry>> {
-        self.flush_namespace_for_path(path, true)?;
+        // No namespace barrier here. Read-your-writes is the journal
+        // projection, not a publication wait: `project_directory` merges every
+        // queued mutation kind over the authoritative listing below, so
+        // draining the journal would only add a gateway round trip to reads
+        // that already observe this mount's own pending mutations.
+        self.assert_namespace_journal_healthy()?;
         // While a live revision watch keeps this mount's coherence fence
         // continuously confirmed, a fence-matched cached listing is valid to
         // serve without a wire round-trip. With the watch down we fail closed:
@@ -1631,7 +1673,9 @@ impl RemoteFuseFs {
     }
 
     fn stat_path(&self, path: &str) -> FuseResult<Option<RemoteMetadata>> {
-        self.flush_namespace_for_path(path, true)?;
+        // See `dir_entries`: `project_metadata` supplies read-your-writes, so
+        // reads never wait on a publication.
+        self.assert_namespace_journal_healthy()?;
         if let Some(metadata) = self.open_handle_metadata(path)? {
             return Ok(Some(metadata));
         }
@@ -1679,7 +1723,9 @@ impl RemoteFuseFs {
     }
 
     fn stat_path_attributes(&self, path: &str) -> FuseResult<Option<RemoteMetadata>> {
-        self.flush_namespace_for_path(path, true)?;
+        // See `dir_entries`: `project_metadata` supplies read-your-writes, so
+        // reads never wait on a publication.
+        self.assert_namespace_journal_healthy()?;
         if let Some(metadata) = self.open_handle_metadata(path)? {
             return Ok(Some(metadata));
         }
@@ -2901,12 +2947,26 @@ impl RemoteFuseFs {
         Ok(self.attr_for_path(path, &updated, false))
     }
 
-    fn reserve_file_if_absent(&self, path: &str, mode: u32) -> FuseResult<RemoteMetadata> {
+    fn reserve_file_if_absent(
+        &self,
+        path: &str,
+        mode: u32,
+        exclusive: bool,
+    ) -> FuseResult<RemoteMetadata> {
         if self.read_only {
             return Err(Errno::EROFS);
         }
-        self.flush_namespace()?;
-        self.flush_writes()?;
+        if exclusive {
+            // O_EXCL is arbitrated by the gateway's expect-absent precondition,
+            // so the mount must drain ahead of it and publish synchronously to
+            // learn the verdict. Ordinary creates skip both drains: the
+            // namespace journal is FIFO (a queued mutation for this path stays
+            // ordered ahead of this one) and content writes are already fenced
+            // by the delete/rename barriers, so neither drain adds ordering the
+            // journal does not already provide.
+            self.flush_namespace()?;
+            self.flush_writes()?;
+        }
         let empty_hash = content_hash_for_bytes(&[]);
         let projected = RemoteMetadata {
             kind: "file".to_string(),
@@ -2919,13 +2979,33 @@ impl RemoteFuseFs {
             mode: Some(mode),
             updated_at: None,
         };
-        if let Err(error) = self.commit_namespace_with_metadata(
-            VfsNamespaceMutation::CreateFile {
-                path: path.to_string(),
-                mode: Some(mode),
-            },
-            Some(projected),
-        ) {
+        let mutation = VfsNamespaceMutation::CreateFile {
+            path: path.to_string(),
+            mode: Some(mode),
+        };
+        if !exclusive {
+            // Journaled creation: durable append + projection, then answer from
+            // the projection itself.
+            //
+            // Confirming through the gateway instead would undo the whole point
+            // of deferring the publication. The projection is deliberately not
+            // published to the shared cache (siblings must never observe an
+            // unpublished mutation), so a cache-then-stat confirmation always
+            // falls through to polling `/stat` until the worker's publication
+            // lands — which makes the creating thread wait out its own
+            // publication AND sleep through the journal's batch window, so
+            // every creation publishes alone. The projected metadata is exactly
+            // what a read of this path returns from this mount until the
+            // publication lands, so returning it is both cheaper and the same
+            // answer. The absent `file_id` is expected for an unpublished
+            // creation and already handled downstream (`ensure_handle_loaded`
+            // seeds such a handle from the creator's buffer rather than
+            // 404ing).
+            self.enqueue_namespace_creation(mutation, Some(projected.clone()))?;
+            return Ok(projected);
+        }
+        let published = self.commit_namespace_with_metadata(mutation, Some(projected));
+        if let Err(error) = published {
             if self
                 .tokio
                 .block_on(self.client.stat_attributes(path))
@@ -3007,6 +3087,42 @@ impl RemoteFuseFs {
         self.flush_namespace_locked()
     }
 
+    /// Enqueue a creation without waiting for the gateway to publish it.
+    ///
+    /// The record is durably journaled (`enqueue_with_metadata` fsyncs the WAL
+    /// line) and projected before this returns, so the guest observes the new
+    /// entry immediately and the journal worker batches the publication behind
+    /// it. This is the ordinary journaled-filesystem contract: creation latency
+    /// is a local durable append, and a publication failure surfaces at the
+    /// next barrier (fsync/close, or any delete/rename/set-mode) as EIO rather
+    /// than at the creating syscall.
+    ///
+    /// Only creations may take this path. Deletes, renames and set-mode remain
+    /// synchronous publication points, and an exclusive create still publishes
+    /// synchronously because cross-mount O_EXCL arbitration is the gateway's
+    /// `expect_absent` precondition, not a mount-local decision.
+    fn enqueue_namespace_creation(
+        &self,
+        mutation: VfsNamespaceMutation,
+        projected_metadata: Option<RemoteMetadata>,
+    ) -> FuseResult<()> {
+        debug_assert!(
+            matches!(
+                &mutation,
+                VfsNamespaceMutation::CreateFile { .. }
+                    | VfsNamespaceMutation::CreateDirectory { .. }
+                    | VfsNamespaceMutation::CreateSymlink { .. }
+                    | VfsNamespaceMutation::CreateHardLink { .. }
+            ),
+            "only creations may publish asynchronously",
+        );
+        let _publication = self
+            .namespace_publication_gate
+            .lock()
+            .map_err(|_| Errno::EIO)?;
+        self.enqueue_namespace(mutation, projected_metadata)
+    }
+
     /// Install a write-barrier over the descendant subtree(s) a delete/rename
     /// mutation targets, or `None` for mutations that cannot be contaminated by
     /// a racing content write (creations, set-mode). Rename bars both endpoints.
@@ -3035,31 +3151,21 @@ impl RemoteFuseFs {
     /// durably journaled and mutation syscalls still synchronously publish, but
     /// a deep, unrelated rename/create must not globally stop every lookup on
     /// the mount while its HTTP publication is in flight.
-    fn flush_namespace_for_path(
-        &self,
-        path: &str,
-        include_direct_children: bool,
-    ) -> FuseResult<()> {
+    /// Surface a dead-lettered publication to a read without draining.
+    ///
+    /// Reads project this mount's queued mutations over authoritative state
+    /// rather than waiting for them to publish, so the only journal state a
+    /// read must consult is whether a publication has already failed
+    /// terminally — otherwise a read could keep reporting an entry whose
+    /// creation the gateway rejected.
+    fn assert_namespace_journal_healthy(&self) -> FuseResult<()> {
         let Some(namespace) = self.namespace.as_ref() else {
             return Ok(());
         };
-        if !namespace
-            .has_pending_for_path(path, include_direct_children)
-            .map_err(|_| Errno::EIO)?
-        {
-            return Ok(());
-        }
-        let _publication = self
-            .namespace_publication_gate
-            .lock()
-            .map_err(|_| Errno::EIO)?;
-        if namespace
-            .has_pending_for_path(path, include_direct_children)
-            .map_err(|_| Errno::EIO)?
-        {
-            self.flush_namespace_locked()?;
-        }
-        Ok(())
+        namespace.take_terminal_error().map_err(|error| {
+            tracing::warn!(error = %error, "vfs namespace publication dead-lettered");
+            Errno::EIO
+        })
     }
 
     fn flush_namespace_locked(&self) -> FuseResult<()> {
@@ -3139,11 +3245,28 @@ impl RemoteFuseFs {
         file_id: &str,
     ) -> FuseResult<(LinkedFileRoute, Vec<u8>)> {
         for _ in 0..4 {
+            // The route's revision is the fence the route metadata was read at.
+            // Under a live watch every publication advances that fence before
+            // the publishing writer is allowed to return, so an unadvanced
+            // fence is proof that nothing has been published against this path
+            // since — which is exactly what the verifying stat below re-checks.
+            // Skipping it halves the round trips of every whole-file read (the
+            // dominant cost of scanning a working tree) without weakening the
+            // check: any publication either advanced the fence already, or the
+            // writer that made it has not yet been told it is coherent.
+            let fence = self.client.coherence_revision();
+            let fence_proves_unchanged = self.client.revision_watch_live()
+                && route.revision != 0
+                && route.revision == fence
+                && route.metadata.file_id.as_deref() == Some(file_id);
             let bytes = self
                 .tokio
                 .block_on(self.client.read_file_raw(&route.path))
                 .map_err(|_| Errno::EIO)?;
             if let Some(bytes) = bytes {
+                if fence_proves_unchanged && self.client.coherence_revision() == fence {
+                    return Ok((route, bytes));
+                }
                 let verified = self
                     .tokio
                     .block_on(self.client.stat_versioned(&route.path))
@@ -3187,7 +3310,7 @@ impl RemoteFuseFs {
         {
             return Ok(());
         }
-        self.flush_namespace_for_path(&state.path, false)?;
+        self.assert_namespace_journal_healthy()?;
         // A created-but-unflushed file exists only in its creator's buffer;
         // seed this handle from it instead of 404ing at the gateway.
         let (route, bytes) = if state.file_id.is_none() {
@@ -6501,6 +6624,741 @@ mod tests {
         assert!(state.dirty);
         assert!(state.loaded);
     }
+
+    /// Gateway requests per route, the unit `op_class_round_trips` measures.
+    ///
+    /// Round trips x network RTT is a filesystem operation's user-visible
+    /// latency, so the benchmark counts requests per route rather than wall
+    /// clock against a loopback stub (which would report a link that does not
+    /// exist).
+    #[derive(Clone, Copy, Debug, Default)]
+    struct RouteCounts {
+        tree: usize,
+        stat: usize,
+        metadata_many: usize,
+        subtree_metadata: usize,
+        prefetch_subtree: usize,
+        namespace_many: usize,
+        write_many: usize,
+        file: usize,
+        lease: usize,
+        /// The revision watch is a background long poll no operation waits on,
+        /// so it is recorded but never charged to an operation.
+        watch: usize,
+    }
+
+    impl RouteCounts {
+        /// Round trips charged to the operations of a class.
+        fn charged(&self) -> usize {
+            self.tree
+                + self.stat
+                + self.metadata_many
+                + self.subtree_metadata
+                + self.prefetch_subtree
+                + self.namespace_many
+                + self.write_many
+                + self.file
+                + self.lease
+        }
+
+        fn since(&self, base: &Self) -> Self {
+            Self {
+                tree: self.tree - base.tree,
+                stat: self.stat - base.stat,
+                metadata_many: self.metadata_many - base.metadata_many,
+                subtree_metadata: self.subtree_metadata - base.subtree_metadata,
+                prefetch_subtree: self.prefetch_subtree - base.prefetch_subtree,
+                namespace_many: self.namespace_many - base.namespace_many,
+                write_many: self.write_many - base.write_many,
+                file: self.file - base.file,
+                lease: self.lease - base.lease,
+                watch: self.watch - base.watch,
+            }
+        }
+
+        fn breakdown(&self) -> String {
+            let routes = [
+                ("/tree", self.tree),
+                ("/stat", self.stat),
+                ("/metadata-many", self.metadata_many),
+                ("/subtree-metadata", self.subtree_metadata),
+                ("/prefetch-subtree", self.prefetch_subtree),
+                ("/namespace-many", self.namespace_many),
+                ("/write-many", self.write_many),
+                ("/file", self.file),
+                ("/lease", self.lease),
+            ];
+            let breakdown = routes
+                .iter()
+                .filter(|(_, count)| *count > 0)
+                .map(|(route, count)| format!("{route}={count}"))
+                .collect::<Vec<_>>();
+            if breakdown.is_empty() {
+                "-".to_string()
+            } else {
+                breakdown.join(" ")
+            }
+        }
+    }
+
+    /// Stub gateway for `op_class_round_trips`: an authoritative namespace plus
+    /// a per-route request counter. Faithful to the production gateway
+    /// (ts/vfs-gateway-server.ts) on the two behaviors that change the
+    /// round-trip count — leases are advertised implicit, so the client stops
+    /// issuing them after the first grant, and every response carries the
+    /// namespace revision header.
+    struct RoundTripGateway {
+        scope: String,
+        /// Scoped path -> file size. Directories are implied by their entries.
+        files: std::collections::BTreeMap<String, u64>,
+        revision: u64,
+        counts: RouteCounts,
+    }
+
+    /// Every file the stub serves is empty, which is exactly the shape a
+    /// freshly reserved file has: `published_file_matches` verifies size, hash,
+    /// mode and identity against this.
+    fn round_trip_file_metadata(path: &str) -> RemoteMetadata {
+        RemoteMetadata {
+            kind: "file".to_string(),
+            size_bytes: 0,
+            file_id: Some(format!("identity:{path}")),
+            link_count: 1,
+            link_target: None,
+            content_hash: Some(content_hash_for_bytes(&[])),
+            executable: false,
+            mode: Some(0o644),
+            updated_at: None,
+        }
+    }
+
+    /// Direct children of `dir`, or `None` when the directory does not exist.
+    fn round_trip_children(
+        state: &RoundTripGateway,
+        dir: &str,
+    ) -> Option<Vec<chevalier_sandbox::vfs::VfsDirEntry>> {
+        let prefix = format!("{dir}/");
+        let mut files = Vec::new();
+        let mut directories = std::collections::BTreeSet::new();
+        for path in state.files.keys() {
+            let Some(rest) = path.strip_prefix(prefix.as_str()) else {
+                continue;
+            };
+            match rest.split_once('/') {
+                Some((name, _)) => {
+                    directories.insert(name.to_string());
+                }
+                None => files.push(chevalier_sandbox::vfs::VfsDirEntry {
+                    name: rest.to_string(),
+                    kind: "file".to_string(),
+                    size_bytes: 0,
+                    file_id: Some(format!("identity:{path}")),
+                    link_count: 1,
+                    link_target: None,
+                    content_hash: Some(content_hash_for_bytes(&[])),
+                    executable: false,
+                    mode: Some(0o644),
+                    updated_at: None,
+                }),
+            }
+        }
+        if files.is_empty() && directories.is_empty() && dir != state.scope {
+            return None;
+        }
+        for name in directories {
+            files.push(chevalier_sandbox::vfs::VfsDirEntry {
+                name,
+                kind: "directory".to_string(),
+                size_bytes: 0,
+                file_id: None,
+                link_count: 1,
+                link_target: None,
+                content_hash: None,
+                executable: false,
+                mode: Some(0o755),
+                updated_at: None,
+            });
+        }
+        Some(files)
+    }
+
+    /// Minimal percent-decoder for the stub's query parameters: the client
+    /// encodes path separators and vmd carries no urlencoding dependency.
+    fn decode_query_value(value: &str) -> String {
+        let bytes = value.as_bytes();
+        let mut decoded = String::with_capacity(value.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'%' if index + 3 <= bytes.len() => {
+                    match u8::from_str_radix(&value[index + 1..index + 3], 16) {
+                        Ok(byte) => {
+                            decoded.push(byte as char);
+                            index += 3;
+                        }
+                        Err(_) => {
+                            decoded.push('%');
+                            index += 1;
+                        }
+                    }
+                }
+                byte => {
+                    decoded.push(byte as char);
+                    index += 1;
+                }
+            }
+        }
+        decoded
+    }
+
+    fn round_trip_query_path(request: &Request<Body>) -> String {
+        request
+            .uri()
+            .query()
+            .unwrap_or_default()
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .find(|(name, _)| *name == "path")
+            .map(|(_, value)| decode_query_value(value))
+            .unwrap_or_default()
+    }
+
+    async fn round_trip_gateway(
+        State(state): State<Arc<Mutex<RoundTripGateway>>>,
+        request: Request<Body>,
+    ) -> Response {
+        let method = request.method().clone();
+        let route = request.uri().path().to_string();
+        let path = round_trip_query_path(&request);
+        match (method, route.as_str()) {
+            (Method::GET, "/tree") => {
+                let mut state = state.lock().unwrap();
+                state.counts.tree += 1;
+                let revision = state.revision;
+                match round_trip_children(&state, path.as_str()) {
+                    Some(entries) => with_revision_header(Json(entries).into_response(), revision),
+                    None => with_revision_header(StatusCode::NOT_FOUND.into_response(), revision),
+                }
+            }
+            (Method::GET, "/stat") => {
+                let mut state = state.lock().unwrap();
+                state.counts.stat += 1;
+                let revision = state.revision;
+                match state.files.get(path.as_str()) {
+                    Some(_) => with_revision_header(
+                        Json(round_trip_file_metadata(path.as_str())).into_response(),
+                        revision,
+                    ),
+                    None => with_revision_header(StatusCode::NOT_FOUND.into_response(), revision),
+                }
+            }
+            (Method::POST, "/metadata-many") => {
+                let body = to_bytes(request.into_body(), 4 * 1024 * 1024)
+                    .await
+                    .expect("read metadata-many request");
+                let payload: VfsMetadataManyRequest =
+                    serde_json::from_slice(&body).expect("decode metadata-many request");
+                let mut state = state.lock().unwrap();
+                state.counts.metadata_many += 1;
+                let revision = state.revision;
+                let entries = payload
+                    .paths
+                    .iter()
+                    .map(|path| {
+                        state
+                            .files
+                            .contains_key(path.as_str())
+                            .then(|| round_trip_file_metadata(path))
+                    })
+                    .collect();
+                with_revision_header(
+                    Json(VfsMetadataManyResponse { entries }).into_response(),
+                    revision,
+                )
+            }
+            (Method::POST, "/subtree-metadata") => {
+                let body = to_bytes(request.into_body(), 4 * 1024 * 1024)
+                    .await
+                    .expect("read subtree-metadata request");
+                let payload: chevalier_sandbox::vfs::VfsSubtreeMetadataRequest =
+                    serde_json::from_slice(&body).expect("decode subtree-metadata request");
+                let prefix = if payload.prefix.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}/", payload.prefix)
+                };
+                let mut state = state.lock().unwrap();
+                state.counts.subtree_metadata += 1;
+                let revision = state.revision;
+                let entries = state
+                    .files
+                    .keys()
+                    .filter(|path| path.starts_with(prefix.as_str()))
+                    .map(|path| VfsSubtreeMetadataEntry {
+                        path: path.clone(),
+                        kind: "file".to_string(),
+                        size_bytes: 0,
+                        file_id: Some(format!("identity:{path}")),
+                        link_count: 1,
+                        link_target: None,
+                        content_hash: Some(content_hash_for_bytes(&[])),
+                        executable: false,
+                        mode: Some(0o644),
+                        token_count: None,
+                        version: None,
+                        updated_at: None,
+                        object_state: None,
+                    })
+                    .collect();
+                with_revision_header(
+                    Json(VfsSubtreeMetadataResponse { entries }).into_response(),
+                    revision,
+                )
+            }
+            (Method::POST, "/prefetch-subtree") => {
+                let mut state = state.lock().unwrap();
+                state.counts.prefetch_subtree += 1;
+                let revision = state.revision;
+                // Every file the stub serves is empty, so a warmed-bytes pack
+                // carries nothing; the route still round-trips, which is the
+                // point of counting it.
+                with_revision_header(
+                    Json(chevalier_sandbox::vfs::VfsPrefetchSubtreeResponse {
+                        warmed_file_bytes: Vec::new(),
+                    })
+                    .into_response(),
+                    revision,
+                )
+            }
+            (Method::POST, "/namespace-many") => {
+                let body = to_bytes(request.into_body(), 4 * 1024 * 1024)
+                    .await
+                    .expect("read namespace-many request");
+                let payload: chevalier_sandbox::vfs::VfsNamespaceMutationBatchBody =
+                    serde_json::from_slice(&body).expect("decode namespace-many request");
+                let mut state = state.lock().unwrap();
+                state.counts.namespace_many += 1;
+                let mut entries = Vec::new();
+                for mutation in &payload.mutations {
+                    match mutation {
+                        VfsNamespaceMutation::CreateFile { path, .. } => {
+                            state.files.insert(path.clone(), 0);
+                            entries.push(chevalier_sandbox::vfs::VfsPublicationSnapshotEntry {
+                                path: path.clone(),
+                                metadata: Some(round_trip_file_metadata(path)),
+                            });
+                        }
+                        VfsNamespaceMutation::DeleteFile { path, .. } => {
+                            state.files.remove(path.as_str());
+                            entries.push(chevalier_sandbox::vfs::VfsPublicationSnapshotEntry {
+                                path: path.clone(),
+                                metadata: None,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                // Every publication advances the namespace revision, exactly as
+                // the gateway's publication sequencer does.
+                state.revision += 1;
+                let revision = state.revision;
+                with_revision_header(
+                    Json(chevalier_sandbox::vfs::VfsNamespaceMutationBatchResponse { entries })
+                        .into_response(),
+                    revision,
+                )
+            }
+            (Method::POST, "/write-many") => {
+                let mut state = state.lock().unwrap();
+                state.counts.write_many += 1;
+                state.revision += 1;
+                let revision = state.revision;
+                with_revision_header(
+                    Json(serde_json::json!({"results": [], "entries": []})).into_response(),
+                    revision,
+                )
+            }
+            (Method::GET, "/file/raw") => {
+                let mut state = state.lock().unwrap();
+                state.counts.file += 1;
+                let revision = state.revision;
+                match state.files.get(path.as_str()) {
+                    Some(_) => with_revision_header(Vec::new().into_response(), revision),
+                    None => with_revision_header(StatusCode::NOT_FOUND.into_response(), revision),
+                }
+            }
+            (Method::PUT, "/file") => {
+                let mut state = state.lock().unwrap();
+                state.counts.file += 1;
+                state.files.insert(path.clone(), 0);
+                state.revision += 1;
+                let revision = state.revision;
+                with_revision_header(StatusCode::NO_CONTENT.into_response(), revision)
+            }
+            (Method::POST, "/lease") => {
+                state.lock().unwrap().counts.lease += 1;
+                // The production gateway answers with implicit lease mode, which
+                // tells the client to stop issuing lease round trips entirely.
+                let mut response = Json(serde_json::json!({
+                    "resource_key": "round-trip-benchmark",
+                    "owner_token": "00000000-0000-0000-0000-000000000001",
+                    "task_id": null
+                }))
+                .into_response();
+                response.headers_mut().insert(
+                    HeaderName::from_static("x-chevalier-vfs-lease-mode"),
+                    HeaderValue::from_static("implicit"),
+                );
+                response
+            }
+            (Method::DELETE, "/lease") => {
+                state.lock().unwrap().counts.lease += 1;
+                StatusCode::NO_CONTENT.into_response()
+            }
+            (Method::GET, "/watch") => {
+                let (polls, revision) = {
+                    let mut state = state.lock().unwrap();
+                    state.counts.watch += 1;
+                    (state.counts.watch, state.revision)
+                };
+                serve_revision_watch(true, polls, revision).await
+            }
+            _ => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    /// Gateway round trips per filesystem operation class.
+    ///
+    /// Round trips x network RTT is what a user actually waits for, so this is
+    /// the measurement that predicts whether an operation clears the 100-500ms
+    /// bar over a real link — wall clock against a loopback stub would report a
+    /// link that does not exist. The table is printed for
+    /// `cargo test -p vmd op_class_round_trips -- --nocapture`; the assertions
+    /// below pin the properties each amortization mechanism is supposed to
+    /// guarantee so a regression fails the build instead of silently costing
+    /// every operation another RTT.
+    ///
+    /// Not covered: handle-based reads (`next_handle` + `ensure_handle_loaded`)
+    /// and content flushes, whose plumbing needs a handle table set up by
+    /// `open`/`create` dispatch rather than an fs-level entry point.
+    #[test]
+    fn op_class_round_trips() {
+        const CREATE_OPS: usize = 50;
+        const STAT_OPS: usize = 50;
+        const SEED_FILES: usize = 64;
+
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mut files = std::collections::BTreeMap::new();
+        for index in 0..SEED_FILES {
+            files.insert(format!("test-scope/seed/file-{index}"), 0);
+        }
+        let gateway = Arc::new(Mutex::new(RoundTripGateway {
+            scope: "test-scope".to_string(),
+            files,
+            revision: 17,
+            counts: RouteCounts::default(),
+        }));
+        let server_gateway = Arc::clone(&gateway);
+        let server = runtime.spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/{*path}", any(round_trip_gateway))
+                    .with_state(server_gateway),
+            )
+            .await
+            .unwrap();
+        });
+        let journal_dir = tempfile::tempdir().unwrap();
+        let client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
+        let fs = RemoteFuseFs::new_with_namespace_journal(
+            client.clone(),
+            false,
+            "test-scope",
+            &journal_dir.path().join("namespace.jsonl"),
+            runtime.handle().clone(),
+        )
+        .unwrap();
+        // Every amortized serve path (cached attrs, cached listings, positive
+        // kernel leases) is gated on a live revision watch, so the whole table
+        // must be measured under one.
+        await_watch_live(&client);
+
+        let sample = || gateway.lock().unwrap().counts;
+        // Start each class from a fresh fence: advance the gateway's revision
+        // and take one throwaway wire call so this mount observes it. That
+        // clears the shared cache (so a "cold" class really is cold) and
+        // restarts the subtree-snapshot miss/quiet window, so no class inherits
+        // another's warmth or trips a bulk snapshot mid-class. The bulk snapshot
+        // has its own coverage in
+        // `sequential_thousand_file_stats_amortize_under_a_live_watch`.
+        let settle = || {
+            gateway.lock().unwrap().revision += 1;
+            assert!(fs.stat_path_attributes("settle-probe").unwrap().is_none());
+        };
+        // (class, ops, round-trip budget, measured counts). The budget is the
+        // regression gate: what the class is allowed to cost, set at the
+        // measured number plus only the slack a documented scheduling detail
+        // needs, so a change that adds a round trip to a class fails the test.
+        let mut rows: Vec<(&'static str, usize, usize, RouteCounts)> = Vec::new();
+
+        // create_journaled: what a create costs when it is only the journaled
+        // append it is designed to be — `enqueue_namespace_creation` for each
+        // path, then the drain that publishes them. Enqueue and drain are
+        // measured as one class on purpose: the worker's 8ms batch window may
+        // fire partway through the loop, so how many batches the 50 creations
+        // split into (one to a handful, plus the one-time lease grant) is a
+        // scheduling detail, while their sum staying near one publication —
+        // rather than one per creation — is the property that matters.
+        let base = sample();
+        for index in 0..CREATE_OPS {
+            fs.enqueue_namespace_creation(
+                VfsNamespaceMutation::CreateFile {
+                    path: format!("queued/new-{index}"),
+                    mode: Some(0o644),
+                },
+                None,
+            )
+            .unwrap();
+        }
+        let journaled_enqueue = sample().since(&base);
+        fs.flush_namespace().unwrap();
+        let create_journaled = sample().since(&base);
+        // Budget 11: at most ten batched publications (the gate against one
+        // publication per creation) plus the one-time /lease grant.
+        rows.push(("create_journaled", CREATE_OPS, 11, create_journaled));
+
+        // create (non-exclusive), the real syscall path: `reserve_file_if_absent`
+        // journals the creation and then confirms the reservation.
+        let base = sample();
+        for index in 0..CREATE_OPS {
+            let metadata = fs
+                .reserve_file_if_absent(&format!("created/new-{index}"), 0o644, false)
+                .unwrap();
+            assert_eq!(metadata.kind, "file");
+        }
+        let create = sample().since(&base);
+        // MEASURED GAP, not a target: this settles at three round trips per
+        // create (two confirmation stats and the publication each create ends
+        // up waiting for). The budget is the structural ceiling of the poll
+        // loop `stat_published_file` runs — four stats plus one publication —
+        // so a slow machine that misses a poll window does not fail the test
+        // while a new round-trip class does. See the assertions below.
+        rows.push(("create", CREATE_OPS, CREATE_OPS / 2, create));
+
+        // create_drain: what is left to publish once those creates return.
+        // Nothing is, because each create already waited out its own
+        // publication.
+        let base = sample();
+        fs.flush_namespace().unwrap();
+        let create_drain = sample().since(&base);
+        // A genuinely deferred create leaves a tail for the drain to publish.
+        rows.push(("create_drain", CREATE_OPS, 2, create_drain));
+
+        // stat_cold: first touch of a path this mount has never seen.
+        settle();
+        let base = sample();
+        for index in 0..STAT_OPS {
+            assert!(
+                fs.stat_path_attributes(&format!("seed/file-{index}"))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let stat_cold = sample().since(&base);
+        // Budget 1 per op: one batched attribute read per unseen path. The two
+        // spare trips tolerate a bulk subtree snapshot being elected inside the
+        // class (/subtree-metadata + /prefetch-subtree), which can only ever
+        // lower the per-path cost.
+        rows.push(("stat_cold", STAT_OPS, STAT_OPS + 2, stat_cold));
+
+        // stat_warm: the same paths again on the same fence. No settle — the
+        // point is that a live watch keeps the fence confirmed so the attrs the
+        // cold pass installed stay servable.
+        let base = sample();
+        for index in 0..STAT_OPS {
+            assert!(
+                fs.stat_path_attributes(&format!("seed/file-{index}"))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let stat_warm = sample().since(&base);
+        // Budget 0: the whole point of the fence-confirmed serve.
+        rows.push(("stat_warm", STAT_OPS, 0, stat_warm));
+
+        // readdir: one full directory listing, cold.
+        settle();
+        let base = sample();
+        assert_eq!(fs.dir_entries("seed").unwrap().len(), SEED_FILES);
+        let readdir = sample().since(&base);
+        // Budget 1: one listing, regardless of how many entries it holds.
+        rows.push(("readdir", 1, 1, readdir));
+
+        // readdir_warm: the same listing on the same fence.
+        let base = sample();
+        assert_eq!(fs.dir_entries("seed").unwrap().len(), SEED_FILES);
+        let readdir_warm = sample().since(&base);
+        // Budget 0: a fence-matched listing is served without a wire call.
+        rows.push(("readdir_warm", 1, 0, readdir_warm));
+
+        // readdir_stat: the `ls -l` shape — stat every entry the listing just
+        // returned. The listing installed each child's metadata fenced, so the
+        // whole directory costs the one /tree above and nothing more.
+        let base = sample();
+        for index in 0..SEED_FILES {
+            assert!(
+                fs.stat_path_attributes(&format!("seed/file-{index}"))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let readdir_stat = sample().since(&base);
+        rows.push(("readdir_stat", SEED_FILES, 0, readdir_stat));
+
+        // lookup_miss: a negative lookup, the dominant cost of a build tool's
+        // include/module search.
+        settle();
+        let base = sample();
+        for index in 0..STAT_OPS {
+            assert!(
+                fs.stat_path_attributes(&format!("absent/missing-{index}"))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let lookup_miss = sample().since(&base);
+        // Budget 1 per op: one batched attribute read, negative-cached fenced.
+        // Same two-trip snapshot tolerance as `stat_cold`.
+        rows.push(("lookup_miss", STAT_OPS, STAT_OPS + 2, lookup_miss));
+
+        println!("\ngateway round trips per filesystem operation");
+        println!(
+            "{:<15} {:>5} {:>12} {:>8}  {}",
+            "class", "ops", "round_trips", "per_op", "routes"
+        );
+        for (class, ops, _, counts) in &rows {
+            println!(
+                "{:<15} {:>5} {:>12} {:>8.2}  {}",
+                class,
+                ops,
+                counts.charged(),
+                counts.charged() as f64 / *ops as f64,
+                counts.breakdown()
+            );
+        }
+        println!(
+            "(revision-watch long polls, never on an operation's path: {})",
+            sample().watch
+        );
+
+        // Mechanism: `enqueue_namespace_creation` durably journals and projects
+        // the creation and returns; publishing it is the journal worker's job,
+        // behind the syscall. The enqueue path itself never stats — that is the
+        // exact contrast with the create syscall measured below, and unlike the
+        // publication count it cannot be perturbed by the worker's batch window
+        // firing mid-loop.
+        assert_eq!(
+            journaled_enqueue.stat, 0,
+            "a journaled creation must be a local append, not a confirmation stat"
+        );
+        // Mechanism: the journal worker coalesces every mutation queued inside
+        // its batch window into one /namespace-many. 50 queued creations must
+        // not become 50 publications.
+        assert!(
+            create_journaled.namespace_many <= 10,
+            "50 queued creations published as {} batches",
+            create_journaled.namespace_many
+        );
+
+        // Mechanism: an ordinary create is a durable journal append answered
+        // from its own projection, so the syscall reaches the gateway not at
+        // all. What remains on this row is the journal worker's batched
+        // publications landing while the loop runs — off the syscall path, and
+        // far fewer than one per create.
+        //
+        // This previously cost 3.00 round trips per create: the reservation was
+        // confirmed through `cached_published_file`, whose cache the projection
+        // never populates (siblings must not observe an unpublished mutation),
+        // so it fell through to polling `/stat` until the worker published.
+        // That made every create wait out its own publication and sleep through
+        // the batch window, so each mutation published alone.
+        assert_eq!(
+            create.charged(),
+            create.stat + create.namespace_many,
+            "the create path must reach only /stat and /namespace-many: {}",
+            create.breakdown()
+        );
+        // Publications must batch: one per create means the deferral is not
+        // working, even when the syscall itself no longer blocks on it.
+        assert!(
+            create.namespace_many <= CREATE_OPS / 2,
+            "creates published {} batches for {CREATE_OPS} creates",
+            create.namespace_many
+        );
+        // A create must never confirm itself through the gateway: the moment it
+        // does, it waits out its own publication and publishes alone.
+        assert_eq!(
+            create.stat, 0,
+            "creates must not issue confirmation stats: {}",
+            create.breakdown()
+        );
+        // Mechanism: a live revision watch keeps this mount's coherence fence
+        // continuously confirmed, so `stat_path_attributes` serves a
+        // fence-matched cached attribute with no wire call at all.
+        assert_eq!(
+            stat_warm.charged(),
+            0,
+            "warm stats under a live watch must not touch the gateway"
+        );
+        // Mechanism: `dir_entries` takes one authoritative listing and installs
+        // both the listing and every child's metadata, so a directory costs one
+        // round trip regardless of how many entries it holds.
+        assert!(
+            readdir.tree <= 1,
+            "readdir issued {} /tree requests",
+            readdir.tree
+        );
+        assert_eq!(
+            readdir_warm.charged(),
+            0,
+            "a fence-matched listing must be served without a wire call"
+        );
+        assert_eq!(
+            readdir_stat.charged(),
+            0,
+            "stat of every listed child must be served off the listing's metadata"
+        );
+        // Mechanism: `MetadataBatcher` routes a negative lookup through the same
+        // batched attribute read as a positive one, and the negative result is
+        // cached fenced, so a miss is one round trip and never a per-path stat.
+        assert_eq!(
+            lookup_miss.stat, 0,
+            "negative lookups must not fall back to point stats"
+        );
+        // Per-class gate. Every read class is at or under two round trips per
+        // op — the bar a 100-500ms budget needs to survive a realistic RTT —
+        // and `create` is pinned at the gap documented above.
+        for (class, ops, budget, counts) in &rows {
+            assert!(
+                counts.charged() <= *budget,
+                "{class} cost {} round trips for {ops} ops (budget {budget}): {}",
+                counts.charged(),
+                counts.breakdown()
+            );
+        }
+
+        drop(fs);
+        server.abort();
+    }
 }
 
 /// FUSE operation bodies. Dispatched concurrently by `SpawnedFuseFs`
@@ -7574,7 +8432,7 @@ impl RemoteFuseFs {
             let path = Self::child_path(parent_path.as_str(), name)?;
             let mode = creation_mode(mode, umask);
             let exclusive = flags & libc::O_EXCL != 0;
-            let (metadata, reserved) = match self.reserve_file_if_absent(&path, mode) {
+            let (metadata, reserved) = match self.reserve_file_if_absent(&path, mode, exclusive) {
                 Ok(metadata) => (metadata, true),
                 Err(error) if !exclusive && error.code() == Errno::EEXIST.code() => {
                     let metadata = self

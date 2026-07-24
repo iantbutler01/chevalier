@@ -259,6 +259,27 @@ impl NamespaceJournal {
         Ok(())
     }
 
+    /// Take the latched terminal error without waiting for the journal to
+    /// drain.
+    ///
+    /// Reads serve this mount's queued mutations from the projection instead of
+    /// waiting on a publication, so they never call `flush`. They still must
+    /// not report a projected entry whose publication has already been
+    /// dead-lettered, which is what this surfaces: the same terminal error
+    /// `flush` would return, consumed once so a single failure is reported to
+    /// one caller rather than latched against every later read.
+    pub fn take_terminal_error(&self) -> Result<()> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| anyhow!("vfs namespace journal lock poisoned"))?;
+        if let Some(error) = state.dead_letter_error.take() {
+            return Err(anyhow!(error));
+        }
+        Ok(())
+    }
+
     /// Whether an in-flight namespace mutation can change the lookup result for
     /// `path`. A mutation of an ancestor can retarget or remove the path. When
     /// `include_direct_children` is true, creation/removal/rename of an

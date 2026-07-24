@@ -42,6 +42,22 @@ impl PublicationInvalidation {
     pub(super) fn is_empty(&self) -> bool {
         self.paths.is_empty() && self.subtrees.is_empty() && self.identities.is_empty()
     }
+
+    /// The set a remote publication reported over the revision watch.
+    ///
+    /// Path-only: the watch answer names the paths a publication touched, and
+    /// each is also treated as a subtree prefix because a remote
+    /// `RemoveDirectory`/`Rename` supersedes everything the kernel cached
+    /// beneath it and the watch does not distinguish the kinds. Identities are
+    /// empty — a hard-link alias this mount cached under another name is
+    /// reached through its own path in the same answer.
+    pub(super) fn for_paths(paths: &[String]) -> Self {
+        Self {
+            paths: paths.to_vec(),
+            subtrees: paths.to_vec(),
+            identities: Vec::new(),
+        }
+    }
 }
 
 /// One mount's hook into its kernel FUSE session's invalidation channel.
@@ -50,11 +66,17 @@ impl PublicationInvalidation {
 /// the coherence stack stays decoupled from the FUSE wiring.
 pub(super) trait KernelInvalidator: Send + Sync {
     /// Drop the kernel's cached attrs/dentries for exactly the superseded set.
-    fn invalidate(&self, invalidation: &PublicationInvalidation);
+    ///
+    /// Returns whether every revocation landed. A `false` return means the
+    /// kernel may still serve a leased attr the coherence stack has superseded,
+    /// so the caller must not report itself coherent on the strength of this
+    /// sweep.
+    fn invalidate(&self, invalidation: &PublicationInvalidation) -> bool;
     /// Drop every attr/dentry this mount handed the kernel. Used for a remote
     /// (cross-process) publication whose exact path set this process never
-    /// learned — the watch 200 carries only a revision.
-    fn invalidate_all(&self);
+    /// learned — the watch 200 carries only a revision. Same return contract as
+    /// [`KernelInvalidator::invalidate`].
+    fn invalidate_all(&self) -> bool;
 }
 
 /// Per-registry set of live mount kernel-invalidation hooks, keyed by the same
@@ -95,19 +117,27 @@ impl MountInvalidators {
         guard.push(invalidator);
     }
 
-    pub(super) fn invalidate(&self, invalidation: &PublicationInvalidation) {
+    /// Returns whether every mount's revocation landed.
+    pub(super) fn invalidate(&self, invalidation: &PublicationInvalidation) -> bool {
         if invalidation.is_empty() {
-            return;
+            return true;
         }
+        let mut clean = true;
         for invalidator in self.live() {
-            invalidator.invalidate(invalidation);
+            // Sweep every mount before reporting: a failure must not skip the
+            // mounts behind it.
+            clean &= invalidator.invalidate(invalidation);
         }
+        clean
     }
 
-    pub(super) fn invalidate_all(&self) {
+    /// Returns whether every mount's revocation landed.
+    pub(super) fn invalidate_all(&self) -> bool {
+        let mut clean = true;
         for invalidator in self.live() {
-            invalidator.invalidate_all();
+            clean &= invalidator.invalidate_all();
         }
+        clean
     }
 
     /// Snapshot the live hooks and release the registry lock before invoking any
