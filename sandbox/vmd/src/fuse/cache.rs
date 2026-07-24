@@ -1,6 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+use tokio::sync::oneshot;
 
 use chevalier_sandbox::vfs::{
     VfsDirEntry as RemoteDirEntry, VfsMetadata as RemoteMetadata, VfsNamespaceMutation,
@@ -13,14 +16,29 @@ const MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_FILES: usize = 16_384;
 const SUBTREE_LOAD_MISS_THRESHOLD: u32 = 8;
 pub(super) const SUBTREE_LOAD_REVISION_QUIET_PERIOD: Duration = Duration::from_millis(250);
+/// Kernel revocations the invalidation worker may have outstanding before the
+/// queue refuses new work.
+///
+/// The queue exists to keep the notifier's blocking `writev` off any thread a
+/// FUSE op waits on, not to buffer unbounded history: a saturated queue means
+/// the guest kernel is absorbing revocations slower than this process publishes,
+/// and the honest answer at that point is a single full sweep (a strict superset
+/// of everything dropped) rather than an ever-growing backlog of exact sets.
+const KERNEL_REVOCATION_QUEUE_DEPTH: usize = 256;
 
 /// The exact set of entries one locally observed publication superseded,
 /// returned by the `observe_*` publication hooks so the caller can mirror the
 /// eviction into each sibling mount's *kernel* attribute/entry cache. The FUSE
 /// layer hands the kernel positive attr/entry leases only while the revision
 /// watch is live (see `fs::ATTR_ENTRY_LEASE_TTL`); those leases stay coherent
-/// precisely because every publication revokes exactly this set in the kernel
-/// before the publication is acked (the revocation-ack ordering invariant).
+/// because a *remote* publication revokes exactly this set in the kernel before
+/// the watch acks it (the revocation-ack ordering invariant), and a *local*
+/// publication's own projection answers reads of the paths it just published
+/// while its revocation drains on the invalidation worker.
+///
+/// Every revocation is applied by that worker (see [`MountInvalidators`]), never
+/// inline on a thread a FUSE op is waiting on: `notify_inval_entry` blocks in the
+/// guest kernel on the parent inode's lock, which the in-flight op holds.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct PublicationInvalidation {
     /// Exact paths whose attrs/dentry the publication changed (each changed
@@ -79,15 +97,275 @@ pub(super) trait KernelInvalidator: Send + Sync {
     fn invalidate_all(&self) -> bool;
 }
 
-/// Per-registry set of live mount kernel-invalidation hooks, keyed by the same
-/// coherence key as the shared cache. A local publication's commit hook and the
-/// revision watch both fan out over every mount of the registry in this process,
-/// so a sibling observer's kernel is revoked in lockstep with the shared cache
-/// (a same-process observer has no other notification channel: the single shared
-/// watch loop only acks cross-process publications through the gateway).
+/// One queued kernel revocation's target set.
+enum RevocationRequest {
+    /// Revoke exactly the entries one publication superseded.
+    Targeted(PublicationInvalidation),
+    /// Revoke every entry each mount handed its kernel, for a cross-process
+    /// publication whose exact path set this process never learned.
+    Full,
+}
+
+/// One unit of work on the kernel-invalidation queue.
+struct QueuedRevocation {
+    request: RevocationRequest,
+    /// Present when the enqueuer must learn whether this revocation landed
+    /// before it proceeds (the revision watch, whose ack may not precede the
+    /// revocation). Absent for fire-and-forget enqueues — this mount's own
+    /// commit hooks, which must never wait on the worker.
+    completion: Option<oneshot::Sender<bool>>,
+}
+
+/// Handle onto one enqueued revocation, resolving to whether it landed.
+///
+/// Awaiting it is how a caller keeps the revocation-ack ordering invariant
+/// without running the notifier itself: the wait happens on the caller's own
+/// task, while the blocking notifier calls happen on the invalidation worker.
+pub(super) struct RevocationTicket {
+    receiver: Option<oneshot::Receiver<bool>>,
+    /// Outcome when the request never reached the worker: `true` when there was
+    /// nothing to revoke, `false` when the queue refused it (saturated, or the
+    /// worker is shutting down) — which the caller must treat exactly like a
+    /// failed revocation.
+    resolved: bool,
+}
+
+impl RevocationTicket {
+    fn resolved(landed: bool) -> Self {
+        Self {
+            receiver: None,
+            resolved: landed,
+        }
+    }
+
+    fn pending(receiver: oneshot::Receiver<bool>) -> Self {
+        Self {
+            receiver: Some(receiver),
+            resolved: false,
+        }
+    }
+
+    /// Whether every mount's revocation for this request landed. Resolves only
+    /// once the worker has actually applied (or refused) the queued item.
+    pub(super) async fn landed(self) -> bool {
+        match self.receiver {
+            // A dropped sender means the worker shut down without applying this
+            // revocation. Fail closed: the kernel may still hold a superseded
+            // lease, so the caller must not report itself coherent.
+            Some(receiver) => receiver.await.unwrap_or(false),
+            None => self.resolved,
+        }
+    }
+}
+
 #[derive(Default)]
-pub(super) struct MountInvalidators {
+struct RevocationQueueState {
+    queued: VecDeque<QueuedRevocation>,
+    /// A fire-and-forget revocation was dropped because the queue was saturated.
+    /// The worker escalates to one full sweep — a strict superset of whatever
+    /// was dropped — rather than leaving a superseded lease in some kernel.
+    overflowed: bool,
+    closed: bool,
+}
+
+/// Bounded hand-off from the publication paths to the invalidation worker.
+#[derive(Default)]
+struct RevocationQueue {
+    state: Mutex<RevocationQueueState>,
+    changed: Condvar,
+}
+
+impl RevocationQueue {
+    /// Hand a revocation to the worker. Returns whether the worker now owns it;
+    /// `false` means the caller's request was refused (bounded queue saturated,
+    /// or shutting down) and any ordering guarantee it needed is unmet.
+    fn push(&self, request: RevocationRequest, completion: Option<oneshot::Sender<bool>>) -> bool {
+        let mut state = self.lock();
+        if state.closed {
+            return false;
+        }
+        if state.queued.len() >= KERNEL_REVOCATION_QUEUE_DEPTH {
+            if completion.is_some() {
+                // A tracked enqueue's caller fails closed on `false`; never grow
+                // the queue past its bound to accommodate it.
+                return false;
+            }
+            state.overflowed = true;
+        } else {
+            state.queued.push_back(QueuedRevocation {
+                request,
+                completion,
+            });
+        }
+        drop(state);
+        self.changed.notify_one();
+        true
+    }
+
+    fn close(&self) {
+        let mut state = self.lock();
+        state.closed = true;
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    /// Block until there is work, returning the whole queued batch in FIFO order
+    /// plus whether an overflow full sweep is owed. `None` once the queue is
+    /// closed: still-queued completions are dropped there, so their waiters
+    /// resolve to "did not land" instead of parking forever.
+    fn take(&self) -> Option<(Vec<QueuedRevocation>, bool)> {
+        let mut state = self.lock();
+        loop {
+            if state.closed {
+                state.queued.clear();
+                return None;
+            }
+            if !state.queued.is_empty() || state.overflowed {
+                let overflowed = std::mem::take(&mut state.overflowed);
+                let batch = state.queued.drain(..).collect::<Vec<_>>();
+                return Some((batch, overflowed));
+            }
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, RevocationQueueState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// The live mount hooks, split out of [`MountInvalidators`] so the worker thread
+/// can hold them without keeping the registry — and therefore its own join
+/// handle — alive.
+#[derive(Default)]
+struct InvalidatorRegistry {
     inner: Mutex<Vec<Weak<dyn KernelInvalidator>>>,
+}
+
+impl InvalidatorRegistry {
+    fn register(&self, invalidator: Weak<dyn KernelInvalidator>) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.retain(|existing| existing.strong_count() > 0);
+        guard.push(invalidator);
+    }
+
+    /// Returns whether every mount's revocation landed.
+    fn invalidate(&self, invalidation: &PublicationInvalidation) -> bool {
+        if invalidation.is_empty() {
+            return true;
+        }
+        let mut clean = true;
+        for invalidator in self.live() {
+            // Sweep every mount before reporting: a failure must not skip the
+            // mounts behind it.
+            clean &= invalidator.invalidate(invalidation);
+        }
+        clean
+    }
+
+    /// Returns whether every mount's revocation landed.
+    fn invalidate_all(&self) -> bool {
+        let mut clean = true;
+        for invalidator in self.live() {
+            clean &= invalidator.invalidate_all();
+        }
+        clean
+    }
+
+    /// Snapshot the live hooks and release the registry lock before invoking any
+    /// of them: an invalidator performs blocking `writev`s into `/dev/fuse`,
+    /// which must never run under the registry mutex.
+    fn live(&self) -> Vec<Arc<dyn KernelInvalidator>> {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.retain(|existing| existing.strong_count() > 0);
+        guard.iter().filter_map(Weak::upgrade).collect()
+    }
+}
+
+/// Drains the revocation queue on its own OS thread.
+///
+/// Owning a thread (rather than a tokio task) is the point: every notifier call
+/// blocks — `fuse_reverse_inval_entry` waits on the guest kernel's parent-inode
+/// lock, which an in-flight FUSE op holds for the duration of that op. Running
+/// that on the publishing thread deadlocks (the op waits for the publication,
+/// the publication waits for the revocation, the revocation waits for the op's
+/// lock); running it on a tokio worker steals a runtime thread from the very
+/// requests that must complete to release the lock. This thread holds no journal
+/// state, no FUSE lock, and nothing waits on it except the revision watch, which
+/// holds neither.
+fn run_revocation_worker(queue: Arc<RevocationQueue>, registry: Arc<InvalidatorRegistry>) {
+    while let Some((batch, overflowed)) = queue.take() {
+        if overflowed && !registry.invalidate_all() {
+            // The escalated sweep is itself bounded and may decline
+            // (`KERNEL_SWEEP_MAX_TARGETS`); replies stay strict until the
+            // affected leases expire on their own.
+            tracing::warn!(
+                "vfs kernel-revocation queue overflowed and the catch-up sweep did not land"
+            );
+        }
+        for item in batch {
+            let landed = match &item.request {
+                RevocationRequest::Targeted(invalidation) => registry.invalidate(invalidation),
+                RevocationRequest::Full => registry.invalidate_all(),
+            };
+            if let Some(completion) = item.completion {
+                let _ = completion.send(landed);
+            }
+        }
+    }
+}
+
+/// Per-registry set of live mount kernel-invalidation hooks plus the worker that
+/// applies their revocations, keyed by the same coherence key as the shared
+/// cache. A local publication's commit hook and the revision watch both enqueue
+/// over every mount of the registry in this process, so a sibling observer's
+/// kernel is revoked alongside the shared cache (a same-process observer has no
+/// other notification channel: the single shared watch loop only acks
+/// cross-process publications through the gateway).
+///
+/// Nothing here ever calls a notifier on the caller's thread. Callers either
+/// enqueue and return ([`MountInvalidators::enqueue_revocation`]) or enqueue and
+/// await the drain ([`RevocationTicket::landed`]).
+pub(super) struct MountInvalidators {
+    registry: Arc<InvalidatorRegistry>,
+    queue: Arc<RevocationQueue>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Default for MountInvalidators {
+    fn default() -> Self {
+        let registry = Arc::new(InvalidatorRegistry::default());
+        let queue = Arc::new(RevocationQueue::default());
+        let worker_registry = Arc::clone(&registry);
+        let worker_queue = Arc::clone(&queue);
+        let worker = std::thread::Builder::new()
+            .name("chevalier-vfs-kernel-revocation".to_string())
+            .spawn(move || run_revocation_worker(worker_queue, worker_registry))
+            .map_err(|error| {
+                // Without the worker there is no safe way to revoke, so close the
+                // queue: every enqueue then refuses, the watch withholds its acks
+                // and serves strict, and no path silently skips a revocation.
+                tracing::warn!(%error, "failed to spawn vfs kernel-revocation worker");
+                queue.close();
+            })
+            .ok();
+        Self {
+            registry,
+            queue,
+            worker,
+        }
+    }
 }
 
 impl MountInvalidators {
@@ -109,47 +387,63 @@ impl MountInvalidators {
     /// Register one mount's kernel-invalidation hook. Dead (unmounted) hooks are
     /// pruned opportunistically so the registry never grows across remounts.
     pub(super) fn register(&self, invalidator: Weak<dyn KernelInvalidator>) {
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.retain(|existing| existing.strong_count() > 0);
-        guard.push(invalidator);
+        self.registry.register(invalidator);
     }
 
-    /// Returns whether every mount's revocation landed.
-    pub(super) fn invalidate(&self, invalidation: &PublicationInvalidation) -> bool {
+    /// Queue a revocation and return immediately, without waiting for any
+    /// notifier call. This is the only form a FUSE-op thread (a commit hook) may
+    /// use — see [`run_revocation_worker`] for why waiting there deadlocks.
+    pub(super) fn enqueue_revocation(&self, invalidation: &PublicationInvalidation) {
         if invalidation.is_empty() {
-            return true;
+            return;
         }
-        let mut clean = true;
-        for invalidator in self.live() {
-            // Sweep every mount before reporting: a failure must not skip the
-            // mounts behind it.
-            clean &= invalidator.invalidate(invalidation);
-        }
-        clean
+        self.queue
+            .push(RevocationRequest::Targeted(invalidation.clone()), None);
     }
 
-    /// Returns whether every mount's revocation landed.
-    pub(super) fn invalidate_all(&self) -> bool {
-        let mut clean = true;
-        for invalidator in self.live() {
-            clean &= invalidator.invalidate_all();
+    /// Queue a revocation whose completion the caller will await before it
+    /// reports itself coherent (the revision watch's ack ordering).
+    pub(super) fn enqueue_revocation_tracked(
+        &self,
+        invalidation: &PublicationInvalidation,
+    ) -> RevocationTicket {
+        if invalidation.is_empty() {
+            return RevocationTicket::resolved(true);
         }
-        clean
+        let (sender, receiver) = oneshot::channel();
+        if self.queue.push(
+            RevocationRequest::Targeted(invalidation.clone()),
+            Some(sender),
+        ) {
+            RevocationTicket::pending(receiver)
+        } else {
+            RevocationTicket::resolved(false)
+        }
     }
 
-    /// Snapshot the live hooks and release the registry lock before invoking any
-    /// of them: an invalidator performs blocking `writev`s into `/dev/fuse`,
-    /// which must never run under the registry mutex.
-    fn live(&self) -> Vec<Arc<dyn KernelInvalidator>> {
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.retain(|existing| existing.strong_count() > 0);
-        guard.iter().filter_map(Weak::upgrade).collect()
+    /// Queue an untargeted sweep whose completion the caller will await. The
+    /// sweep still declines itself past `fs::KERNEL_SWEEP_MAX_TARGETS`, which
+    /// resolves the ticket to `false` exactly as a failed revocation does.
+    pub(super) fn enqueue_full_sweep_tracked(&self) -> RevocationTicket {
+        let (sender, receiver) = oneshot::channel();
+        if self.queue.push(RevocationRequest::Full, Some(sender)) {
+            RevocationTicket::pending(receiver)
+        } else {
+            RevocationTicket::resolved(false)
+        }
+    }
+}
+
+impl Drop for MountInvalidators {
+    fn drop(&mut self) {
+        // Closing first makes the worker abandon queued work (waiters resolve to
+        // "did not land") so the join below cannot outlast the revocation
+        // already in flight. Process exit never joins this thread: the registry
+        // outlives every mount and is only dropped when the last one unmounts.
+        self.queue.close();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -994,10 +1288,13 @@ fn parent_path(path: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
     use super::{
-        CacheState, CachedFile, MAX_FILES, RemoteFuseCache, SUBTREE_LOAD_MISS_THRESHOLD,
+        CacheState, CachedFile, KernelInvalidator, MAX_FILES, MountInvalidators,
+        PublicationInvalidation, RemoteFuseCache, SUBTREE_LOAD_MISS_THRESHOLD,
         SUBTREE_LOAD_REVISION_QUIET_PERIOD, enforce_file_limits_locked,
     };
     use chevalier_sandbox::vfs::{
@@ -1407,5 +1704,189 @@ mod tests {
         let current = cache.directory_generation("tree");
         assert!(cache.put_dir_if_generation("tree", current, vec![entry("current")], 17));
         assert_eq!(cache.get_dir("tree", 17), Some(vec![entry("current")]));
+    }
+
+    fn one_path(path: &str) -> PublicationInvalidation {
+        PublicationInvalidation {
+            paths: vec![path.to_string()],
+            subtrees: Vec::new(),
+            identities: Vec::new(),
+        }
+    }
+
+    /// Records the order revocations are applied in, and parks inside the FIRST
+    /// one it is handed (standing in for a notifier call blocked in the guest
+    /// kernel) so everything enqueued after it piles up in the queue.
+    struct OrderingInvalidator {
+        applied: Arc<Mutex<Vec<String>>>,
+        entered: mpsc::Sender<()>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        parked: AtomicBool,
+    }
+
+    impl KernelInvalidator for OrderingInvalidator {
+        fn invalidate(&self, invalidation: &PublicationInvalidation) -> bool {
+            if !self.parked.swap(true, Ordering::AcqRel) {
+                let _ = self.entered.send(());
+                let (lock, condvar) = &*self.gate;
+                let mut open = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                while !*open {
+                    open = condvar
+                        .wait(open)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+            }
+            self.applied
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(invalidation.paths.join(","));
+            true
+        }
+
+        fn invalidate_all(&self) -> bool {
+            self.applied
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push("*".to_string());
+            true
+        }
+    }
+
+    /// The registry under test plus the handles its parked double exposes.
+    /// Destructured by each test: the shutdown test has to move the registry
+    /// Arc out (dropping it is what shuts the worker down) while still reading
+    /// the recorded order.
+    struct WorkerProbe {
+        invalidators: Arc<MountInvalidators>,
+        applied: Arc<Mutex<Vec<String>>>,
+        entered: mpsc::Receiver<()>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        registered: Arc<dyn KernelInvalidator>,
+    }
+
+    fn worker_probe() -> WorkerProbe {
+        let invalidators = Arc::new(MountInvalidators::default());
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let registered: Arc<dyn KernelInvalidator> = Arc::new(OrderingInvalidator {
+            applied: Arc::clone(&applied),
+            entered: entered_tx,
+            gate: Arc::clone(&gate),
+            parked: AtomicBool::new(false),
+        });
+        invalidators.register(Arc::downgrade(&registered));
+        WorkerProbe {
+            invalidators,
+            applied,
+            entered: entered_rx,
+            gate,
+            registered,
+        }
+    }
+
+    fn recorded(applied: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        applied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn release(gate: &Arc<(Mutex<bool>, Condvar)>) {
+        let (lock, condvar) = &**gate;
+        *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        condvar.notify_all();
+    }
+
+    #[test]
+    fn kernel_revocation_worker_drains_queued_batches_in_order() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let WorkerProbe {
+            invalidators,
+            applied,
+            entered,
+            gate,
+            registered,
+        } = worker_probe();
+
+        // The first enqueue parks the worker inside the notifier double; the
+        // rest queue up behind it and must be applied in enqueue order.
+        invalidators.enqueue_revocation(&one_path("first"));
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the worker must pick the first queued revocation up");
+        invalidators.enqueue_revocation(&one_path("second"));
+        invalidators.enqueue_revocation(&one_path("third"));
+        let ticket = invalidators.enqueue_revocation_tracked(&one_path("fourth"));
+        assert!(
+            recorded(&applied).is_empty(),
+            "nothing is applied while the worker is parked in the first revocation"
+        );
+
+        release(&gate);
+        assert!(
+            runtime.block_on(ticket.landed()),
+            "a tracked revocation resolves once the worker has applied it"
+        );
+        assert_eq!(
+            recorded(&applied),
+            vec!["first", "second", "third", "fourth"],
+            "queued revocations drain in FIFO order across batches"
+        );
+        drop(registered);
+    }
+
+    #[test]
+    fn kernel_revocation_worker_shuts_down_cleanly_and_fails_closed_on_undrained_work() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let WorkerProbe {
+            invalidators,
+            applied,
+            entered,
+            gate,
+            registered,
+        } = worker_probe();
+        invalidators.enqueue_revocation(&one_path("in-flight"));
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the worker must pick the first queued revocation up");
+        let ticket = invalidators.enqueue_revocation_tracked(&one_path("undrained"));
+
+        // Dropping the last registry reference closes the queue and joins the
+        // worker. Done on another thread so a shutdown that cannot complete
+        // fails this test on a timeout instead of hanging the suite.
+        let (shut_down_tx, shut_down_rx) = mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(invalidators);
+            shut_down_tx.send(()).unwrap();
+        });
+        assert!(
+            shut_down_rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "shutdown waits out the revocation already in flight rather than abandoning it"
+        );
+
+        release(&gate);
+        shut_down_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the worker exits and the registry drop joins it");
+        dropper.join().unwrap();
+        assert_eq!(
+            recorded(&applied),
+            vec!["in-flight"],
+            "work still queued at shutdown is abandoned, not applied"
+        );
+        assert!(
+            !runtime.block_on(ticket.landed()),
+            "an abandoned revocation resolves fail-closed so its caller never acks"
+        );
+        drop(registered);
     }
 }

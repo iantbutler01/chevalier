@@ -34,12 +34,15 @@ use super::write::{WriteBarrierGuard, WriteJournal};
 /// Positive attribute/entry lease handed to the kernel for a warm metadata hit.
 ///
 /// This is a *liveness-bounded lease*, never a correctness boundary. While the
-/// revision watch is live, every publication — local (a sibling mount's commit
-/// hook) or remote (observed by the watch) — revokes the affected kernel
+/// revision watch is live, a remote publication revokes the affected kernel
 /// entries via the fuser notifier *before* it is acked (the revocation-ack
-/// ordering invariant in `run_revision_watch` and the commit hooks). So the
-/// kernel can never serve an attr the coherence stack has superseded: any lease
-/// still alive is for a path no publication has touched since it was granted.
+/// ordering invariant in `run_revision_watch`), so a writer in another process
+/// never unblocks while this process's kernels hold a superseded attr. A local
+/// publication instead *queues* its revocation on the invalidation worker and
+/// returns (see the commit hooks in `new_with_namespace_journal`: waiting there
+/// deadlocks against the guest kernel's parent-inode lock); the publishing
+/// mount's own projection answers reads of those paths in the meantime, and a
+/// sibling mount's kernel is caught up as the worker drains.
 ///
 /// The lease therefore bounds only the window *after* the watch drops: replies
 /// then carry `Duration::ZERO` (strict — every lstat/getattr crosses into
@@ -1158,12 +1161,11 @@ impl RemoteFuseFs {
                 Some(Box::new(move |revision, writes, entries| {
                     let invalidation =
                         commit_cache.observe_write_publication_snapshot(revision, writes, entries);
-                    // Ordering invariant (local publication): the kernel drop
-                    // completes before this hook returns — i.e. before the
-                    // writer's publish RPC returns — so a same-process sibling
-                    // observer's kernel never serves an attr the shared cache was
-                    // just cleared of.
-                    commit_invalidators.invalidate(&invalidation);
+                    // Enqueue and return IMMEDIATELY; never block the publication
+                    // on the kernel revocation. See the namespace commit hook
+                    // below for the deadlock this avoids and why a local
+                    // publication's own revocation is a catch-up, not a barrier.
+                    commit_invalidators.enqueue_revocation(&invalidation);
                 })),
             )?)
         };
@@ -1181,7 +1183,25 @@ impl RemoteFuseFs {
                 Some(Box::new(move |revision, mutations, entries| {
                     let invalidation = commit_cache
                         .observe_namespace_publication_snapshot(revision, mutations, entries);
-                    commit_invalidators.invalidate(&invalidation);
+                    // Enqueue and return IMMEDIATELY. This hook runs on the
+                    // journal worker while the guest's unlink/create op is parked
+                    // in flush_namespace_locked waiting for exactly this
+                    // publication — and the guest kernel holds the parent
+                    // directory's inode lock for that whole op. Calling the
+                    // notifier here would block in fuse_reverse_inval_entry on
+                    // that same parent lock, so the hook never returns, the
+                    // record is never marked committed, the flush never
+                    // completes, the op never releases the lock: a hard deadlock
+                    // broken only by the 30s flush timeout (EIO).
+                    //
+                    // Deferring is sound because this mount's own projection
+                    // already answers reads of the paths it just published
+                    // (read-your-writes), so revoking its kernel entries is a
+                    // catch-up rather than a correctness barrier. The barrier
+                    // that does matter — a cross-process publication's ack —
+                    // still waits for its revocation, on the watch task, which
+                    // holds no FUSE lock (see client::run_revision_watch).
+                    commit_invalidators.enqueue_revocation(&invalidation);
                 })),
                 write_drain,
             )?)
@@ -3728,7 +3748,10 @@ mod tests {
     use tokio::runtime::Builder;
     use tokio::sync::Notify;
 
-    use super::super::cache::{MountInvalidators, RemoteFuseCache, SUBTREE_LOAD_REVISION_QUIET_PERIOD};
+    use super::super::cache::{
+        KernelInvalidator, MountInvalidators, PublicationInvalidation, RemoteFuseCache,
+        SUBTREE_LOAD_REVISION_QUIET_PERIOD,
+    };
     use super::super::client::RemoteVfsClient;
     use super::super::namespace::NamespaceProjection;
     use super::{
@@ -6141,6 +6164,167 @@ mod tests {
         barred_writer.join().unwrap();
 
         drop(fs);
+        server.abort();
+    }
+
+    /// Publishes every namespace batch immediately, so the only thing a
+    /// publication can wait on in the test below is its own commit hook.
+    async fn always_ok_namespace_gateway(request: Request<Body>) -> Response {
+        let revision = |mut response: Response| -> Response {
+            response.headers_mut().insert(
+                HeaderName::from_static("x-chevalier-vfs-namespace-revision"),
+                HeaderValue::from_static("7"),
+            );
+            response
+        };
+        match (request.method().clone(), request.uri().path()) {
+            (Method::POST, "/lease") => Json(serde_json::json!({
+                "resource_key": "commit-hook-revocation-test",
+                "owner_token": "00000000-0000-0000-0000-000000000001",
+                "task_id": null
+            }))
+            .into_response(),
+            (Method::DELETE, "/lease") => StatusCode::NO_CONTENT.into_response(),
+            (Method::POST, "/namespace-many") => revision(StatusCode::OK.into_response()),
+            (Method::POST, "/write-many") => {
+                revision(Json(serde_json::json!({"results": [], "entries": []})).into_response())
+            }
+            _ => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    /// Kernel-invalidation double that parks *inside* the notifier call, exactly
+    /// as `fuse_reverse_inval_entry` parks on the parent inode lock the in-flight
+    /// FUSE op holds. Anything that waits on this revocation never returns until
+    /// the test releases it.
+    struct BlockingInvalidator {
+        entered: mpsc::Sender<()>,
+        released: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        completed: Arc<Mutex<usize>>,
+    }
+
+    impl BlockingInvalidator {
+        fn park(&self) -> bool {
+            let _ = self.entered.send(());
+            let (lock, condvar) = &*self.released;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = condvar.wait(released).unwrap();
+            }
+            *self.completed.lock().unwrap() += 1;
+            true
+        }
+    }
+
+    impl KernelInvalidator for BlockingInvalidator {
+        fn invalidate(&self, _: &PublicationInvalidation) -> bool {
+            self.park()
+        }
+
+        fn invalidate_all(&self) -> bool {
+            self.park()
+        }
+    }
+
+    /// Regression for the publish/revoke deadlock. A guest unlink parks in
+    /// `flush_namespace_locked` while the guest kernel holds the parent
+    /// directory's inode lock for the whole op; the journal worker's commit hook
+    /// fires before the record is marked committed. If that hook waited for the
+    /// kernel revocation — which blocks on the very inode lock the op holds —
+    /// nothing would ever return and the op would fail at the 30s flush timeout.
+    /// So the hook must enqueue and return while the revocation is still parked.
+    #[test]
+    fn namespace_commit_hook_publishes_without_waiting_for_the_kernel_revocation() {
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = runtime.spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/{*path}", any(always_ok_namespace_gateway)),
+            )
+            .await
+            .unwrap();
+        });
+        let journal_dir = tempfile::tempdir().unwrap();
+        let client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
+
+        // Park every revocation this registry issues. Registered before the mount
+        // so the publication below cannot slip past it.
+        let invalidators = MountInvalidators::shared(&client.coherence_key());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let released = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let completed = Arc::new(Mutex::new(0usize));
+        let parked: Arc<dyn KernelInvalidator> = Arc::new(BlockingInvalidator {
+            entered: entered_tx,
+            released: Arc::clone(&released),
+            completed: Arc::clone(&completed),
+        });
+        invalidators.register(Arc::downgrade(&parked));
+
+        let fs = Arc::new(
+            RemoteFuseFs::new_with_namespace_journal(
+                client,
+                false,
+                "test-scope",
+                &journal_dir.path().join("namespace.jsonl"),
+                runtime.handle().clone(),
+            )
+            .unwrap(),
+        );
+
+        // Publish on its own thread so a regression to a synchronous revocation
+        // fails this test on a timeout instead of hanging the suite.
+        let commit_fs = Arc::clone(&fs);
+        let (published_tx, published_rx) = mpsc::channel();
+        let publisher = std::thread::spawn(move || {
+            let result = commit_fs.commit_namespace(VfsNamespaceMutation::DeleteFile {
+                path: "probe/doomed".to_string(),
+                precondition: None,
+            });
+            published_tx.send(result).unwrap();
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the queued revocation must reach the invalidation worker");
+        published_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the publication must not wait for the kernel revocation")
+            .expect("the publication itself succeeds");
+        assert_eq!(
+            *completed.lock().unwrap(),
+            0,
+            "the publication completed while its revocation was still parked in the notifier"
+        );
+
+        // Releasing proves the revocation is genuinely queued, not dropped: the
+        // worker finishes it off the publication path.
+        {
+            let (lock, condvar) = &*released;
+            *lock.lock().unwrap() = true;
+            condvar.notify_all();
+        }
+        publisher.join().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while *completed.lock().unwrap() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            *completed.lock().unwrap(),
+            1,
+            "the deferred revocation still runs, just not on the publication's thread"
+        );
+
+        drop(parked);
+        drop(fs);
+        drop(invalidators);
         server.abort();
     }
 

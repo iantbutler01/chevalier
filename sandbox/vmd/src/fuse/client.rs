@@ -1536,22 +1536,41 @@ async fn run_revision_watch(
                     // Sweeping here guarantees the writer's fsync return implies
                     // this process's kernels hold no superseded attrs, exactly as
                     // the cache clear guarantees no stale userspace serve.
+                    //
+                    // The notifier calls themselves run on the registry's
+                    // invalidation worker, never inline here: they block in the
+                    // guest kernel (`fuse_reverse_inval_entry` waits on the
+                    // parent inode's lock, held by whatever op is mutating that
+                    // directory) and this is a tokio runtime thread — the same
+                    // pool serving the FUSE dispatch work that must complete for
+                    // that lock to drop. So enqueue, then await the drain: this
+                    // task holds no FUSE lock and no FUSE op waits on it, so
+                    // waiting here is safe and keeps the ordering exact.
                     let swept = match notifiers.upgrade() {
-                        Some(notifiers) => match &affected {
-                            // The gateway reported exactly what changed, so
-                            // revoke that and nothing else. This is the whole
-                            // point of the targeted set: an untargeted sweep is
-                            // proportional to the mount's working set and takes
-                            // a guest-kernel parent-inode write lock per entry,
-                            // which stalls the guest's own lookups behind it.
-                            Some(paths) => {
-                                notifiers.invalidate(&PublicationInvalidation::for_paths(paths))
-                            }
-                            // No trustworthy set: fall back to the untargeted
-                            // sweep, which declines itself past its own bound
-                            // and fails closed rather than storming.
-                            None => notifiers.invalidate_all(),
-                        },
+                        Some(notifiers) => {
+                            let ticket = match &affected {
+                                // The gateway reported exactly what changed, so
+                                // revoke that and nothing else. This is the whole
+                                // point of the targeted set: an untargeted sweep
+                                // is proportional to the mount's working set and
+                                // takes a guest-kernel parent-inode write lock
+                                // per entry, which stalls the guest's own lookups
+                                // behind it.
+                                Some(paths) => notifiers.enqueue_revocation_tracked(
+                                    &PublicationInvalidation::for_paths(paths),
+                                ),
+                                // No trustworthy set: fall back to the untargeted
+                                // sweep, which declines itself past its own bound
+                                // and fails closed rather than storming.
+                                None => notifiers.enqueue_full_sweep_tracked(),
+                            };
+                            // Resolves only once THIS enqueued revocation has
+                            // been applied (or refused: a saturated queue and a
+                            // shutting-down worker both resolve to `false`, which
+                            // takes the same fail-closed path below as a notifier
+                            // error).
+                            ticket.landed().await
+                        }
                         None => true,
                     };
                     if !swept {
@@ -2183,17 +2202,29 @@ mod tests {
         // fuser notifier needs a live /dev/fuse fd, so the invalidation is
         // factored through the `KernelInvalidator` trait the watch drives, which
         // this double captures. A remote publication reaches `invalidate_all`.
+        //
+        // The watch no longer calls this inline — it enqueues onto the
+        // registry's invalidation worker and waits for that item to drain — so
+        // the double takes its time before recording. A watch that acked on
+        // enqueue rather than on drain would send the ack poll during this
+        // delay, and the ack-time assertions below would see `fired == false`.
+        const REVOCATION_WORK: Duration = Duration::from_millis(250);
         struct RecordingInvalidator {
             fired: Arc<AtomicBool>,
         }
-        impl KernelInvalidator for RecordingInvalidator {
-            fn invalidate(&self, _: &PublicationInvalidation) -> bool {
+        impl RecordingInvalidator {
+            fn apply(&self) -> bool {
+                std::thread::sleep(REVOCATION_WORK);
                 self.fired.store(true, Ordering::Release);
                 true
             }
+        }
+        impl KernelInvalidator for RecordingInvalidator {
+            fn invalidate(&self, _: &PublicationInvalidation) -> bool {
+                self.apply()
+            }
             fn invalidate_all(&self) -> bool {
-                self.fired.store(true, Ordering::Release);
-                true
+                self.apply()
             }
         }
 
@@ -2318,10 +2349,175 @@ mod tests {
         );
         assert!(
             guard.kernel_invalidated_before_ack,
-            "the kernel sweep MUST precede the ack poll so a writer never unblocks \
-             while this mount's kernel can still serve a stale attr lease"
+            "the queued kernel revocation MUST have DRAINED before the ack poll: \
+             enqueueing is not enough, or a writer unblocks while this mount's \
+             kernel can still serve a stale attr lease"
         );
         drop(guard);
+        drop(double);
+        server.abort();
+    }
+
+    #[test]
+    fn watch_withholds_the_ack_and_drops_liveness_when_the_revocation_fails() {
+        use std::collections::HashMap;
+
+        use super::super::cache::{KernelInvalidator, PublicationInvalidation};
+
+        // Moving the revocation onto a worker thread must not soften the
+        // fail-closed path: a revocation that does not land still means the
+        // kernel may serve a superseded attr, so the watch drops liveness
+        // (replies revert to TTL=0) and holds the ack until the leases granted
+        // before the failure have expired on their own.
+        struct FailingInvalidator {
+            fired: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        }
+        impl FailingInvalidator {
+            fn refuse(&self) -> bool {
+                if let Some(fired) = self
+                    .fired
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                {
+                    let _ = fired.send(());
+                }
+                false
+            }
+        }
+        impl KernelInvalidator for FailingInvalidator {
+            fn invalidate(&self, _: &PublicationInvalidation) -> bool {
+                self.refuse()
+            }
+            fn invalidate_all(&self) -> bool {
+                self.refuse()
+            }
+        }
+
+        const PUBLISHED: u64 = 3_000;
+
+        struct FailProbe {
+            polls: usize,
+            withheld_ack_since: Option<u64>,
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+
+        let cache = Arc::new(RemoteFuseCache::default());
+        let probe = Arc::new(Mutex::new(FailProbe {
+            polls: 0,
+            withheld_ack_since: None,
+        }));
+        let acked = Arc::new(tokio::sync::Notify::new());
+
+        let (fired_tx, fired_rx) = std::sync::mpsc::channel();
+        let invalidators = Arc::new(MountInvalidators::default());
+        let double: Arc<dyn KernelInvalidator> = Arc::new(FailingInvalidator {
+            fired: Mutex::new(Some(fired_tx)),
+        });
+        invalidators.register(Arc::downgrade(&double));
+
+        let server_probe = Arc::clone(&probe);
+        let server_acked = Arc::clone(&acked);
+        let server = runtime.spawn(async move {
+            let app = axum::Router::new().route(
+                "/watch",
+                axum::routing::get(
+                    move |axum::extract::Query(params): axum::extract::Query<
+                        HashMap<String, String>,
+                    >| {
+                        let probe = Arc::clone(&server_probe);
+                        let acked = Arc::clone(&server_acked);
+                        async move {
+                            let since = params
+                                .get("since")
+                                .and_then(|value| value.parse::<u64>().ok())
+                                .unwrap_or(0);
+                            let count = {
+                                let mut guard =
+                                    probe.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                guard.polls += 1;
+                                guard.polls
+                            };
+                            match count {
+                                // Establish the watch so `watch_live` is true and
+                                // the drop below is a real transition.
+                                1 => axum::http::StatusCode::NO_CONTENT.into_response(),
+                                // A remote publication whose revocation fails.
+                                2 => axum::Json(serde_json::json!({ "revision": PUBLISHED }))
+                                    .into_response(),
+                                // The withheld ack, issuable only after the lease
+                                // TTL has elapsed.
+                                3 => {
+                                    let mut guard = probe
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    guard.withheld_ack_since = Some(since);
+                                    drop(guard);
+                                    acked.notify_one();
+                                    axum::http::StatusCode::NO_CONTENT.into_response()
+                                }
+                                _ => {
+                                    std::future::pending::<()>().await;
+                                    unreachable!()
+                                }
+                            }
+                        }
+                    },
+                ),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = RemoteVfsClient::new(&endpoint, "token", "scope").unwrap();
+        client.ensure_revision_watch(runtime.handle(), &cache, &invalidators);
+
+        fired_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the publication's revocation must reach the invalidation worker");
+
+        // The failure must land as dropped liveness, not as a silent ack.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while client.revision_watch_live() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !client.revision_watch_live(),
+            "a revocation that did not land must drop watch liveness so replies serve strict"
+        );
+        assert_eq!(
+            probe
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .polls,
+            2,
+            "the ack poll must be withheld while a superseded lease may still be live"
+        );
+
+        // It is withheld, not abandoned: once the lease TTL has elapsed the ack
+        // goes out carrying the fence-advanced revision.
+        runtime.block_on(async {
+            tokio::time::timeout(ATTR_ENTRY_LEASE_TTL * 5, acked.notified())
+                .await
+                .expect("the ack must follow once the pre-failure leases have expired");
+        });
+        assert_eq!(
+            probe
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .withheld_ack_since,
+            Some(PUBLISHED),
+            "the withheld ack still carries the fence-advanced revision"
+        );
+
         drop(double);
         server.abort();
     }
