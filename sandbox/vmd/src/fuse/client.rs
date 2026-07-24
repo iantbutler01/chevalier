@@ -58,6 +58,35 @@ const REVISION_WATCH_BACKOFF_MIN: Duration = Duration::from_millis(500);
 /// Reconnect backoff ceiling. The watch is down and serves fail closed to
 /// strict while backing off, so a bounded retry cadence is enough.
 const REVISION_WATCH_BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// Content-hash budget the mount asks every bulk metadata route (`/tree`,
+/// `/metadata-many`, `/subtree-metadata`) to honour: hash a file at or under
+/// this size, skip it above.
+///
+/// A full stat (`stat_path`, the route open(2) resolves through) promises a
+/// content hash — `read_bytes` matches cached bytes against it and `open`
+/// chains a write's CAS base from it — so an entry a bulk route installed
+/// WITHOUT one cannot stand in for it, and every open of such a path fell
+/// through to a point `/stat` (~30 per measured `git status` phase). Asking the
+/// bulk routes to hash makes those entries complete, so the open is served from
+/// the fence-matched cache instead of costing an RTT.
+///
+/// The bound is the whole design. Hashing is the gateway reading the file, and
+/// a bulk route can name thousands of paths, so an unbounded budget would turn
+/// a metadata sweep into a full content read of the tree. At 1 MiB a hash costs
+/// the gateway well under a millisecond of hardware-accelerated SHA-256 against
+/// a local read (and is memoized in its mtime/ctime-keyed hash cache, so a
+/// re-sweep is free), against the ~4ms RTT each avoided point stat saves. Above
+/// it, the point stat is the cheaper of the two and is what the mount keeps
+/// paying — `full_stat_metadata_is_complete` still gates the serve, so an
+/// unhashed entry wires exactly as it does today. The bulk routes are entry
+/// capped (`MAX_METADATA_BATCH_PATHS` / `MAX_SUBTREE_METADATA_ENTRIES`), so this
+/// bound is also what caps the work one request can ask of the gateway.
+///
+/// This is a request, not a requirement: `max_hash_bytes` is an established
+/// query/body field on all three routes, and a gateway that ignores it (or
+/// answers without hashes at all) simply leaves entries incomplete and the
+/// mount falls through to the wire as before.
+pub(super) const BULK_METADATA_MAX_HASH_BYTES: u64 = 1024 * 1024;
 #[derive(Clone, Debug)]
 pub struct RemoteVfsClient {
     client: Client,
@@ -291,7 +320,7 @@ impl RemoteVfsClient {
                 .get(self.url("/tree"))
                 .query(&[
                     ("path", self.path_arg(path)),
-                    ("max_hash_bytes", "0".to_string()),
+                    ("max_hash_bytes", BULK_METADATA_MAX_HASH_BYTES.to_string()),
                 ])
                 .timeout(METADATA_READ_ATTEMPT_TIMEOUT),
             METADATA_READ_RETRY_TIMEOUT,
@@ -343,7 +372,7 @@ impl RemoteVfsClient {
         self.read_decoded(
             self.client
                 .post(self.url("/metadata-many"))
-                .query(&[("max_hash_bytes", 0_u64)])
+                .query(&[("max_hash_bytes", BULK_METADATA_MAX_HASH_BYTES)])
                 .json(&body)
                 .timeout(METADATA_READ_ATTEMPT_TIMEOUT),
             METADATA_READ_RETRY_TIMEOUT,
@@ -372,7 +401,7 @@ impl RemoteVfsClient {
                     include_object_state: false,
                     include_token_count: false,
                     limit: Some(limit),
-                    max_hash_bytes: Some(0),
+                    max_hash_bytes: Some(BULK_METADATA_MAX_HASH_BYTES),
                 })
                 .timeout(METADATA_READ_ATTEMPT_TIMEOUT),
             METADATA_READ_RETRY_TIMEOUT,
@@ -1844,6 +1873,114 @@ mod tests {
     fn read_retry_budgets_exceed_their_attempt_timeouts() {
         assert!(METADATA_READ_RETRY_TIMEOUT > METADATA_READ_ATTEMPT_TIMEOUT);
         assert!(FILE_READ_RETRY_TIMEOUT > FILE_READ_ATTEMPT_TIMEOUT);
+    }
+
+    /// Every bulk metadata route asks the gateway for a BOUNDED content hash,
+    /// and the point stat asks for an unbounded one.
+    ///
+    /// A full stat is the route open(2) resolves through, and it can only be
+    /// served from a cached entry carrying a content hash (`read_bytes` matches
+    /// cached bytes against it, a write chains its CAS base from it). While the
+    /// bulk routes sent `max_hash_bytes=0`, everything they installed was
+    /// incomplete and every open of a path they had already described still fell
+    /// through to a point `/stat` — ~30 per measured `git status` phase.
+    ///
+    /// Both halves are the fix. Sending a budget is what makes the bulk answer
+    /// complete; keeping it finite is what stops a metadata sweep over thousands
+    /// of paths from becoming a full content read of the tree. The point stat
+    /// keeps no budget at all: it owes its caller a hash at any size, and it is
+    /// where an oversized file's open still goes.
+    #[test]
+    fn bulk_metadata_routes_request_a_bounded_content_hash() {
+        // Finite and non-zero: zero is "hash nothing", which is what left every
+        // bulk-seeded entry incomplete; unbounded would hash whatever a sweep
+        // over thousands of paths happened to name.
+        const _: () = assert!(BULK_METADATA_MAX_HASH_BYTES > 0);
+        const _: () = assert!(BULK_METADATA_MAX_HASH_BYTES <= 16 * 1024 * 1024);
+
+        /// Route -> the `max_hash_bytes` that request carried, in arrival order.
+        type RequestedBudgets = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+        async fn record(
+            axum::extract::State(seen): axum::extract::State<RequestedBudgets>,
+            request: axum::http::Request<axum::body::Body>,
+        ) -> axum::response::Response {
+            let route = request.uri().path().to_string();
+            let query = request.uri().query().unwrap_or_default().to_string();
+            let query_budget = query.split('&').find_map(|pair| {
+                pair.strip_prefix("max_hash_bytes=")
+                    .map(std::string::ToString::to_string)
+            });
+            let body = axum::body::to_bytes(request.into_body(), 1 << 20)
+                .await
+                .unwrap_or_default();
+            let body_budget = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|body| {
+                    body.get("max_hash_bytes")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|budget| budget.to_string())
+                });
+            seen.lock()
+                .unwrap()
+                .push((route.clone(), query_budget.or(body_budget)));
+            match route.as_str() {
+                "/tree" => axum::Json(serde_json::json!([])).into_response(),
+                "/metadata-many" => {
+                    axum::Json(serde_json::json!({ "entries": [null] })).into_response()
+                }
+                "/subtree-metadata" => {
+                    axum::Json(serde_json::json!({ "entries": [] })).into_response()
+                }
+                // 404 is a legitimate stat answer (absent path), so the point
+                // stat completes without needing a metadata body here.
+                _ => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let seen: RequestedBudgets = Arc::new(Mutex::new(Vec::new()));
+        let server_seen = Arc::clone(&seen);
+        let server = runtime.spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new()
+                    .route("/{*path}", axum::routing::any(record))
+                    .with_state(server_seen),
+            )
+            .await
+            .unwrap();
+        });
+        let client = RemoteVfsClient::new(&endpoint, "token", "scope").unwrap();
+
+        runtime.block_on(client.list_dir_versioned("dir")).unwrap();
+        runtime
+            .block_on(client.metadata_many_attributes_versioned(&["dir/file".to_string()]))
+            .unwrap();
+        runtime
+            .block_on(client.subtree_metadata_attributes_versioned("dir", 64))
+            .unwrap();
+        runtime.block_on(client.stat_versioned("dir/file")).unwrap();
+
+        let expected = BULK_METADATA_MAX_HASH_BYTES.to_string();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                ("/tree".to_string(), Some(expected.clone())),
+                ("/metadata-many".to_string(), Some(expected.clone())),
+                ("/subtree-metadata".to_string(), Some(expected)),
+                ("/stat".to_string(), None),
+            ]
+        );
+        server.abort();
     }
 
     #[test]

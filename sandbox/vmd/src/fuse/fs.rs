@@ -112,13 +112,19 @@ fn metadata_from_dir_entry(entry: &RemoteDirEntry) -> RemoteMetadata {
 }
 
 /// Whether a cached entry carries everything a FULL stat (`/stat`) promises its
-/// callers, as opposed to an attributes-only entry installed by
-/// `/metadata-many`.
+/// callers, as opposed to an entry installed by a bulk route that answered
+/// without a content hash.
 ///
 /// The difference is the content hash: `read_bytes` matches cached file bytes
 /// against it and a write chains its CAS base from it, so a file entry without
 /// one must not be served in place of a full stat. Directories and symlinks
 /// carry no content hash at all, so for them the entry is already complete.
+///
+/// The bulk routes ask the gateway to hash up to
+/// `BULK_METADATA_MAX_HASH_BYTES`, so most file entries now arrive complete.
+/// This gate is what keeps the rest honest: a file over that bound, or any
+/// answer from a gateway that does not hash at all, still lands incomplete and
+/// still falls through to a point `/stat`.
 fn full_stat_metadata_is_complete(metadata: &RemoteMetadata) -> bool {
     metadata.kind != "file" || metadata.content_hash.is_some()
 }
@@ -1762,10 +1768,14 @@ impl RemoteFuseFs {
         // a tree nothing had touched — 47 of them per `git status` phase.
         //
         // The one extra condition a full stat carries is completeness: it
-        // promises the content hash its callers use to match cached bytes and to
-        // chain a CAS write, and an attributes-only response (`/metadata-many`)
-        // installs an entry without one. Serve only a complete entry; anything
-        // less falls through to the wire, where it belongs.
+        // promises the content hash its callers use to match cached bytes and
+        // to chain a CAS write. The bulk routes now ask the gateway to supply
+        // that hash for files at or under `BULK_METADATA_MAX_HASH_BYTES`, so a
+        // listing or batched attribute read installs an entry a full stat can be
+        // served from — which is what removes the ~30 point stats a `git status`
+        // phase was paying. Serve only a complete entry; anything less (a file
+        // over the bound, or a gateway that answered without hashes) falls
+        // through to the wire, where it belongs.
         if !has_projection && self.client.revision_watch_live() {
             let revision = self.client.coherence_revision();
             if let Some(metadata) = self
@@ -3876,7 +3886,7 @@ mod tests {
         KernelInvalidator, MountInvalidators, PublicationInvalidation, RemoteFuseCache,
         SUBTREE_LOAD_REVISION_QUIET_PERIOD,
     };
-    use super::super::client::RemoteVfsClient;
+    use super::super::client::{BULK_METADATA_MAX_HASH_BYTES, RemoteVfsClient};
     use super::super::namespace::NamespaceProjection;
     use super::{
         ATTR_ENTRY_LEASE_TTL, ActiveAdvisoryLockFile, ActiveAdvisoryLocks, FlushBarrier,
@@ -4315,11 +4325,17 @@ mod tests {
                 state.batches.iter().map(Vec::len).sum::<usize>(),
                 PATH_COUNT
             );
+            // The batched attribute read asks the gateway for a bounded content
+            // hash, not for none at all: an entry that carries one is complete
+            // enough for `stat_path` (the open(2) route) to serve, which is what
+            // keeps open off a point stat. The bound is what stops a metadata
+            // sweep from becoming a full content read of the tree.
+            let expected_query = format!("max_hash_bytes={BULK_METADATA_MAX_HASH_BYTES}");
             assert!(
                 state
                     .queries
                     .iter()
-                    .all(|query| query.as_deref() == Some("max_hash_bytes=0"))
+                    .all(|query| query.as_deref() == Some(expected_query.as_str()))
             );
             assert_eq!(state.stat_requests, 0);
         }
@@ -6207,6 +6223,14 @@ mod tests {
     ///
     /// Without this, every open(2) cost a point `/stat` even over a tree nothing
     /// had touched: 47 of them per measured `git status` phase.
+    ///
+    /// Completeness is the content hash, and the bulk routes now ask the gateway
+    /// for one up to `BULK_METADATA_MAX_HASH_BYTES` — so a batched attribute
+    /// read already installs an entry an open can be served from, which is what
+    /// removed the last ~30 point stats a `git status` phase paid. Both halves
+    /// are pinned here: inside the bound the open is free, past it the entry is
+    /// still incomplete and the full stat still wires rather than hand a caller
+    /// a hashless entry to match cached bytes or chain a CAS write against.
     #[test]
     fn full_stat_serves_a_complete_fence_matched_entry_and_wires_for_an_incomplete_one() {
         let runtime = Builder::new_multi_thread()
@@ -6218,12 +6242,13 @@ mod tests {
             .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
             .unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let oversized = vec![b'x'; BULK_METADATA_MAX_HASH_BYTES as usize + 1];
         let gateway = Arc::new(Mutex::new(RoundTripGateway {
             scope: "test-scope".to_string(),
-            files: std::collections::BTreeMap::from([(
-                "test-scope/seed/file".to_string(),
-                b"content".to_vec(),
-            )]),
+            files: std::collections::BTreeMap::from([
+                ("test-scope/seed/file".to_string(), b"content".to_vec()),
+                ("test-scope/seed/oversized".to_string(), oversized.clone()),
+            ]),
             revision: 17,
             publications: Vec::new(),
             acked: 0,
@@ -6244,42 +6269,66 @@ mod tests {
         let fs = RemoteFuseFs::new(client.clone(), false, "test-scope", runtime.handle().clone());
         await_watch_live(&client);
 
-        // The first full stat wires — every bulk route asks the gateway not to
-        // hash, so nothing else can supply the content hash a full stat owes —
-        // and installs a complete entry.
-        let complete = fs.stat_path("seed/file").unwrap().expect("file exists");
+        // A batched attribute read of a file inside the hash budget installs a
+        // COMPLETE entry: the gateway hashed it because the mount asked it to.
+        let attributes = fs
+            .stat_path_attributes("seed/file")
+            .unwrap()
+            .expect("file exists");
         assert_eq!(
-            complete.content_hash,
-            Some(content_hash_for_bytes(b"content"))
+            attributes.content_hash,
+            Some(content_hash_for_bytes(b"content")),
+            "a bulk metadata read must carry the content hash inside the budget"
         );
-        assert_eq!(gateway.lock().unwrap().counts.stat, 1);
+        assert_eq!(gateway.lock().unwrap().counts.stat, 0);
 
-        // Every later open of the same file at the same fence is served from it.
+        // So every open of that file at the same fence is served from it,
+        // including the first: no point stat is ever issued for this path.
         for _ in 0..8 {
-            assert_eq!(fs.stat_path("seed/file").unwrap(), Some(complete.clone()));
+            assert_eq!(fs.stat_path("seed/file").unwrap(), Some(attributes.clone()));
         }
         assert_eq!(
             gateway.lock().unwrap().counts.stat,
-            1,
+            0,
             "a complete fence-matched entry must be served without a point stat"
         );
 
-        // An attributes-only entry (what /metadata-many installs) carries no
-        // content hash, so it cannot stand in for a full stat: callers match
-        // cached bytes and chain CAS writes off that hash. It must wire.
-        fs.cache.invalidate("seed/file");
+        // Past the budget the gateway declines to hash, so the bulk entry is
+        // incomplete and cannot stand in for a full stat: callers match cached
+        // bytes and chain CAS writes off that hash. It must wire.
         assert!(
-            fs.stat_path_attributes("seed/file")
+            fs.stat_path_attributes("seed/oversized")
                 .unwrap()
                 .is_some_and(|metadata| metadata.content_hash.is_none()),
-            "the attribute route installs an entry without a content hash"
+            "a file over the hash budget must come back without a content hash"
         );
         let stats_before = gateway.lock().unwrap().counts.stat;
-        assert!(fs.stat_path("seed/file").unwrap().is_some());
+        let complete = fs
+            .stat_path("seed/oversized")
+            .unwrap()
+            .expect("file exists");
+        assert_eq!(
+            complete.content_hash,
+            Some(content_hash_for_bytes(&oversized))
+        );
         assert_eq!(
             gateway.lock().unwrap().counts.stat,
             stats_before + 1,
             "an incomplete entry must fall through to the wire"
+        );
+
+        // And the entry that point stat installed is complete, so the file is
+        // only ever paid for once per fence.
+        for _ in 0..8 {
+            assert_eq!(
+                fs.stat_path("seed/oversized").unwrap(),
+                Some(complete.clone())
+            );
+        }
+        assert_eq!(
+            gateway.lock().unwrap().counts.stat,
+            stats_before + 1,
+            "a complete fence-matched entry must be served without a point stat"
         );
 
         drop(fs);
@@ -7978,9 +8027,12 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let mut files = std::collections::BTreeMap::new();
         for index in 0..SEED_FILES {
-            // Non-empty: a zero-byte file is hashed even under
-            // `max_hash_bytes=0`, which would make every bulk answer look
-            // complete and hide what a full stat actually costs.
+            // Non-empty, and well inside `BULK_METADATA_MAX_HASH_BYTES`: the
+            // ordinary source-file shape, whose hash a bulk route supplies so an
+            // open never has to point-stat for it. The oversized case — past the
+            // budget, where the entry stays incomplete and the full stat still
+            // wires — is pinned by
+            // `full_stat_serves_a_complete_fence_matched_entry_and_wires_for_an_incomplete_one`.
             files.insert(
                 format!("test-scope/seed/file-{index}"),
                 format!("seed file {index}").into_bytes(),
@@ -8235,16 +8287,18 @@ mod tests {
 
         // open_cold / open_warm: the FULL stat (`stat_path`), which is what
         // open(2) resolves through — as opposed to the attribute stat every
-        // class above measures. A full stat promises a content hash, and every
-        // bulk route the mount uses asks the gateway NOT to hash
-        // (`max_hash_bytes=0`), so the listing above cannot supply one: the cold
-        // pass is one point stat per file, and it is the only thing that installs
-        // an entry complete enough to serve the warm pass.
+        // class above measures. A full stat promises a content hash, so it can
+        // only be served from a cached entry that carries one.
         //
-        // The warm pass is the one that matters. It was a point `/stat` per open
-        // no matter how many times the same file had been opened, because the
-        // full-stat route had no cache serve at all — 47 of them per measured
-        // `git status` phase, cold and warm alike.
+        // Both halves of this used to cost a point `/stat` per file. The warm
+        // half did because the full-stat route had no cache serve at all — 47 of
+        // them per measured `git status` phase. The cold half did because every
+        // bulk route asked the gateway NOT to hash (`max_hash_bytes=0`), so the
+        // /tree listing above installed hashless entries and every open fell
+        // through anyway — the ~30 point stats a status phase still paid after
+        // the warm serve landed. The bulk routes now request a bounded hash, so
+        // the listing's entries are complete and BOTH passes are free: the
+        // budget here is 0, not one stat per file.
         let base = sample();
         for index in 0..SEED_FILES {
             assert!(
@@ -8254,7 +8308,7 @@ mod tests {
             );
         }
         let open_cold = sample().since(&base);
-        rows.push(("open_cold", SEED_FILES, SEED_FILES, open_cold));
+        rows.push(("open_cold", SEED_FILES, 0, open_cold));
 
         let base = sample();
         for index in 0..SEED_FILES {
@@ -8283,25 +8337,35 @@ mod tests {
         // Same two-trip snapshot tolerance as `stat_cold`.
         rows.push(("lookup_miss", STAT_OPS, STAT_OPS + 2, lookup_miss));
 
-        // status_cold / status_warm: the `git status` shape. A sequential
-        // attribute sweep over a tree nothing changed, run twice, with the one
-        // write git actually performs mid-status in between — rewriting its
-        // index, which is a namespace publication plus a content publication on
-        // a path unrelated to the tree being scanned.
+        // status_cold / status_warm: the `git status` shape. A sequential sweep
+        // over a tree nothing changed — lstat(2) on every path, then open(2) on
+        // it, because git does not stop at the lstat: it opens the entries whose
+        // stat data cannot settle them, plus every .gitignore and ref it walks.
+        // Run twice, with the one write git actually performs mid-status in
+        // between — rewriting its index, which is a namespace publication plus a
+        // content publication on a path unrelated to the tree being scanned.
         //
-        // The warm sweep must be free. It was not: every publication, including
-        // this mount's own, came back on its revision watch as a bare revision
-        // and wiped the entire shared cache, so the second sweep re-read the
-        // whole tree. That is why a measured warm `git status` cost MORE wire
-        // calls than a cold one (179 batched attribute reads against 124).
+        // Both halves of the sweep must reach the gateway at most once per
+        // unseen path, and the warm sweep not at all.
+        //
+        // The warm sweep was not free: every publication, including this mount's
+        // own, came back on its revision watch as a bare revision and wiped the
+        // entire shared cache, so the second sweep re-read the whole tree. That
+        // is why a measured warm `git status` cost MORE wire calls than a cold
+        // one (179 batched attribute reads against 124).
+        //
+        // The open half then stayed expensive on its own: a full stat is the
+        // only route that promises a content hash, the bulk routes asked the
+        // gateway not to hash, so every open fell through to a point `/stat` —
+        // 30 of them per measured status phase, warm and cold alike. The bulk
+        // routes now request a bounded hash, so the open half rides the lstat
+        // half's batched read and adds nothing.
         settle();
         let base = sample();
         for index in 0..CREATE_OPS {
-            assert!(
-                fs.stat_path_attributes(&format!("many/file-{index}"))
-                    .unwrap()
-                    .is_some()
-            );
+            let path = format!("many/file-{index}");
+            assert!(fs.stat_path_attributes(&path).unwrap().is_some());
+            assert!(fs.stat_path(&path).unwrap().is_some());
         }
         let status_cold = sample().since(&base);
         rows.push(("status_cold", CREATE_OPS, CREATE_OPS + 2, status_cold));
@@ -8336,15 +8400,14 @@ mod tests {
 
         let base = sample();
         for index in 0..CREATE_OPS {
-            assert!(
-                fs.stat_path_attributes(&format!("many/file-{index}"))
-                    .unwrap()
-                    .is_some()
-            );
+            let path = format!("many/file-{index}");
+            assert!(fs.stat_path_attributes(&path).unwrap().is_some());
+            assert!(fs.stat_path(&path).unwrap().is_some());
         }
         let status_warm = sample().since(&base);
         // Budget 0: an unrelated local publication must leave every path it did
-        // not touch serveable at the new fence.
+        // not touch serveable at the new fence — for the open half of the sweep
+        // as well as the lstat half.
         rows.push(("status_warm", CREATE_OPS, 0, status_warm));
 
         println!("\ngateway round trips per filesystem operation");
@@ -8451,7 +8514,17 @@ mod tests {
         // Mechanism: the full stat (`stat_path`, the open(2) route) serves from
         // the same fence-matched cache as the attribute stat, provided the
         // cached entry is complete. The listing above installed each child's
-        // content hash, so it is.
+        // content hash, so it is — that is the whole point of the bulk routes
+        // asking for a bounded hash instead of none. Assert on the COLD pass:
+        // an open of a file this mount has never point-stat'd, only listed,
+        // must not reach the gateway at all. This class cost one /stat per file
+        // while the bulk routes sent `max_hash_bytes=0`.
+        assert_eq!(
+            open_cold.charged(),
+            0,
+            "opening files a listing already described must not point-stat them: {}",
+            open_cold.breakdown()
+        );
         assert_eq!(
             open_warm.charged(),
             0,
@@ -8467,6 +8540,17 @@ mod tests {
             status_warm.charged(),
             0,
             "a warm status sweep after an unrelated publication cost {}",
+            status_warm.breakdown()
+        );
+        // Mechanism: the open half of a status sweep rides the batched read the
+        // lstat half already paid for, because that read now carries the content
+        // hash a full stat owes. A status phase must issue NO point stats — this
+        // was 30 of them per measured phase, cold and warm alike.
+        assert_eq!(
+            (status_cold.stat, status_warm.stat),
+            (0, 0),
+            "status sweeps point-stat'd for their opens: cold {} / warm {}",
+            status_cold.breakdown(),
             status_warm.breakdown()
         );
         // Mechanism: `dir_entries` takes one authoritative listing and installs
