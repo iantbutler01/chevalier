@@ -63,16 +63,23 @@ impl PublicationInvalidation {
 
     /// The set a remote publication reported over the revision watch.
     ///
-    /// Path-only: the watch answer names the paths a publication touched, and
-    /// each is also treated as a subtree prefix because a remote
-    /// `RemoveDirectory`/`Rename` supersedes everything the kernel cached
-    /// beneath it and the watch does not distinguish the kinds. Identities are
-    /// empty — a hard-link alias this mount cached under another name is
-    /// reached through its own path in the same answer.
-    pub(super) fn for_paths(paths: &[String]) -> Self {
+    /// `paths` are point-scoped (each changed path plus its parent); `subtrees`
+    /// are the prefixes the gateway reported as wholly superseded — a
+    /// `RemoveDirectory` or `Rename`, the only mutations that move or remove a
+    /// whole tree. A gateway too old to distinguish the two passes `paths` for
+    /// both, which is the conservative reading this client had no alternative
+    /// to before the watch answer carried the split.
+    ///
+    /// The split matters because a publication's affected set names each
+    /// changed path AND its parent directory: reading every entry as a prefix
+    /// means one `.git/index.lock` create revokes every `.git` internal the
+    /// kernel had cached. Identities are empty — a hard-link alias this mount
+    /// cached under another name is reached through its own path in the same
+    /// answer.
+    pub(super) fn for_affected(paths: &[String], subtrees: &[String]) -> Self {
         Self {
             paths: paths.to_vec(),
-            subtrees: paths.to_vec(),
+            subtrees: subtrees.to_vec(),
             identities: Vec::new(),
         }
     }
@@ -775,11 +782,38 @@ impl RemoteFuseCache {
     /// honest answer.
     ///
     /// Unlike a locally originated publication there is no snapshot to seed
-    /// with, so every reported path is fully invalidated — including its parent,
-    /// whose link metadata a remote create/delete may have changed, and its
-    /// descendants, since the watch does not distinguish a subtree mutation from
-    /// a point one.
-    pub(super) fn observe_remote_publication(&self, since: u64, revision: u64, paths: &[String]) {
+    /// with, so every reported path is fully invalidated.
+    ///
+    /// A reported path's parent is only RELISTED, never superseded, and that is
+    /// not an omission: the gateway already names the parent among the reported
+    /// paths whenever the parent's own metadata changed. A namespace publication
+    /// reports each mutated path plus its immediate parent
+    /// (`namespace_snapshot_paths` in crates/sandbox/src/vfs.rs); a content
+    /// publication reports only the written paths, because a write changes the
+    /// file, not the directory's kind, identity, link count or mode. Synthesizing
+    /// a superseded parent here would therefore evict a directory nothing
+    /// changed, with no snapshot to put it back — which is exactly the wire round
+    /// trip per create that `observe_write_publication_snapshot` documents and
+    /// avoids on the local side. The parent's cached LISTING is still dropped, by
+    /// the reported child's own `invalidate_path_locked`.
+    ///
+    /// Descendants are dropped only for the prefixes the gateway reported in
+    /// `subtrees` (`RemoveDirectory` / `Rename`). Everything else is
+    /// point-scoped. Treating every reported path as a prefix was a measured
+    /// self-inflicted regression: a publication's affected set names the changed
+    /// path AND its parent directory, so git creating and removing
+    /// `.git/index.lock` mid-status invalidated all of `.git/` twice per status,
+    /// and the sweep re-read `config`, `HEAD`, `info/exclude`, `refs/*` and
+    /// `objects/*` over the wire — 30 point stats over 9 paths per warm phase.
+    /// A gateway that cannot report the split passes `paths` for both, which
+    /// restores exactly the old conservative behavior.
+    pub(super) fn observe_remote_publication(
+        &self,
+        since: u64,
+        revision: u64,
+        paths: &[String],
+        subtrees: &[String],
+    ) {
         if revision == 0 {
             self.observe_authoritative_revision(revision);
             return;
@@ -789,9 +823,28 @@ impl RemoteFuseCache {
             observe_authoritative_revision_locked(&mut inner, revision);
             return;
         }
+        let prefixes = subtrees
+            .iter()
+            .map(|prefix| prefix.trim_matches('/'))
+            .filter(|prefix| !prefix.is_empty())
+            .collect::<HashSet<_>>();
         let mut affected = AffectedSet::default();
-        for path in paths.iter().filter(|path| !path.is_empty()) {
-            collect_affected_path(&inner, path, true, ParentEffect::Superseded, &mut affected);
+        // Every reported prefix is itself an affected path, whether or not the
+        // gateway also listed it in `paths` (it always does today).
+        for path in paths
+            .iter()
+            .map(|path| path.trim_matches('/'))
+            .chain(prefixes.iter().copied())
+            .filter(|path| !path.is_empty())
+            .collect::<HashSet<_>>()
+        {
+            collect_affected_path(
+                &inner,
+                path,
+                prefixes.contains(path),
+                ParentEffect::Relisted,
+                &mut affected,
+            );
         }
         advance_known_revision_locked(&mut inner, revision, &affected);
     }
@@ -1628,7 +1681,7 @@ mod tests {
         cache.put_metadata("index", metadata("old-index", 3), 17);
         cache.put_dir("tree", vec![entry("scanned")], 17);
 
-        cache.observe_remote_publication(17, 18, &["index".to_string()]);
+        cache.observe_remote_publication(17, 18, &["index".to_string()], &[]);
 
         assert!(
             cache.get_metadata("index", 18).is_none(),
@@ -1642,6 +1695,111 @@ mod tests {
         assert_eq!(cache.get_dir("tree", 18), Some(vec![entry("scanned")]));
     }
 
+    /// A point mutation's affected set names the changed path AND its parent
+    /// directory. Reading that parent as a subtree prefix wipes every sibling —
+    /// which is what git creating and removing `.git/index.lock` mid-status did
+    /// to `.git/config`, `.git/HEAD`, `.git/info/exclude` and every ref, twice
+    /// per status, at 30 point stats over 9 paths per warm phase.
+    #[test]
+    fn a_point_publication_leaves_its_siblings_serveable() {
+        let cache = RemoteFuseCache::default();
+        for sibling in ["git/config", "git/HEAD", "git/info/exclude", "git/index"] {
+            cache.put_metadata(sibling, metadata(sibling, 6), 17);
+        }
+
+        // Exactly what the gateway reports for `create_file git/index.lock`:
+        // the file and its parent, and NO superseded subtree.
+        cache.observe_remote_publication(
+            17,
+            18,
+            &["git/index.lock".to_string(), "git".to_string()],
+            &[],
+        );
+
+        for sibling in ["git/config", "git/HEAD", "git/info/exclude", "git/index"] {
+            assert_eq!(
+                cache.get_metadata(sibling, 18),
+                Some(metadata(sibling, 6)),
+                "{sibling} was evicted by an unrelated lock file in its directory"
+            );
+        }
+    }
+
+    /// The gateway names a parent directory among a publication's paths exactly
+    /// when the parent's OWN metadata changed (a namespace mutation does, a
+    /// content write does not). So a reported path's parent is only relisted
+    /// here: synthesizing a superseded parent would evict a directory nothing
+    /// changed, with no snapshot to put it back, and every create would re-stat
+    /// the directory it had just written into.
+    #[test]
+    fn a_remote_content_publication_leaves_the_parent_directory_serveable() {
+        let cache = RemoteFuseCache::default();
+        let mut directory = metadata("dir", 0);
+        directory.kind = "directory".to_string();
+        directory.content_hash = None;
+        cache.put_metadata("many", directory.clone(), 17);
+        cache.put_metadata("many/file", metadata("old", 3), 17);
+        cache.put_dir("many", vec![entry("file")], 17);
+
+        // What `post_write_many` reports: the written path, no parent.
+        cache.observe_remote_publication(17, 18, &["many/file".to_string()], &[]);
+
+        assert!(cache.get_metadata("many/file", 18).is_none());
+        assert_eq!(
+            cache.get_metadata("many", 18),
+            Some(directory),
+            "a content write changes the file, not its directory's own metadata"
+        );
+        assert!(
+            cache.get_dir("many", 18).is_none(),
+            "the directory's cached LISTING carries the child's size and hash, \
+             so it is still dropped"
+        );
+    }
+
+    /// The other half of the same contract: a mutation the gateway DOES report
+    /// as superseding a subtree still drops every descendant.
+    #[test]
+    fn a_reported_subtree_publication_still_evicts_descendants() {
+        let cache = RemoteFuseCache::default();
+        cache.put_metadata("tree/doomed/deep/file", metadata("deep", 4), 17);
+        cache.put_metadata("tree/kept", metadata("kept", 4), 17);
+
+        cache.observe_remote_publication(
+            17,
+            18,
+            &["tree/doomed".to_string(), "tree".to_string()],
+            &["tree/doomed".to_string()],
+        );
+
+        assert!(
+            cache.get_metadata("tree/doomed/deep/file", 18).is_none(),
+            "a removed directory supersedes everything beneath it"
+        );
+        assert_eq!(
+            cache.get_metadata("tree/kept", 18),
+            Some(metadata("kept", 4)),
+            "a sibling of the removed directory is untouched"
+        );
+    }
+
+    /// An older gateway cannot say which affected paths were directories, so the
+    /// watcher passes `paths` as the prefix set too. That is the conservative
+    /// reading this cache has always applied, and it must still hold.
+    #[test]
+    fn an_unreported_subtree_set_falls_back_to_treating_paths_as_prefixes() {
+        let cache = RemoteFuseCache::default();
+        cache.put_metadata("git/config", metadata("config", 6), 17);
+        let paths = vec!["git/index.lock".to_string(), "git".to_string()];
+
+        cache.observe_remote_publication(17, 18, &paths, &paths);
+
+        assert!(
+            cache.get_metadata("git/config", 18).is_none(),
+            "without the split, every affected path must still be read as a prefix"
+        );
+    }
+
     /// Fail-closed, unchanged, on both edges: a watcher whose own fence is older
     /// than the window the report covers, and a report the gateway could not
     /// complete (which reaches the cache as the blunt authoritative clear).
@@ -1651,7 +1809,7 @@ mod tests {
         behind.put_metadata("tree/scanned", metadata("scanned", 6), 17);
         // `since` ahead of the cache's own fence means publications in between
         // were never classified here, and the report does not cover them.
-        behind.observe_remote_publication(18, 19, &["index".to_string()]);
+        behind.observe_remote_publication(18, 19, &["index".to_string()], &[]);
         assert!(
             behind.get_metadata("tree/scanned", 19).is_none(),
             "an unclassified gap must clear rather than narrow"
@@ -1684,7 +1842,7 @@ mod tests {
             }],
         );
 
-        cache.observe_remote_publication(17, 18, &["tree/file".to_string()]);
+        cache.observe_remote_publication(17, 18, &["tree/file".to_string()], &[]);
 
         assert_eq!(
             cache.get_metadata("tree/file", 18),

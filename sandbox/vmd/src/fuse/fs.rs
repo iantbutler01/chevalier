@@ -26,7 +26,8 @@ use super::cache::{
     KernelInvalidator, MountInvalidators, PublicationInvalidation, RemoteFuseCache,
 };
 use super::client::{
-    AdvisoryLockRenewalIdentity, RangeRead, RemoteVfsClient, Versioned, request_status,
+    AdvisoryLockRenewalIdentity, OPEN_STAT_MAX_HASH_BYTES, RangeRead, RemoteVfsClient, Versioned,
+    request_status,
 };
 use super::namespace::{NamespaceJournal, NamespaceProjection};
 use super::write::{WriteBarrierGuard, WriteJournal};
@@ -127,6 +128,60 @@ fn metadata_from_dir_entry(entry: &RemoteDirEntry) -> RemoteMetadata {
 /// still falls through to a point `/stat`.
 fn full_stat_metadata_is_complete(metadata: &RemoteMetadata) -> bool {
     metadata.kind != "file" || metadata.content_hash.is_some()
+}
+
+/// What a full-stat caller needs of a file entry's content hash.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FullStatHash {
+    /// The caller uses the hash NOW: to match cached bytes, or as a CAS base it
+    /// fixes at this instant and publishes from without ever loading the file
+    /// (`O_TRUNC`). An incomplete entry falls through to an unbounded point
+    /// `/stat`, which hashes whatever it costs.
+    Required,
+    /// The caller can proceed without a hash for a file the whole-file content
+    /// cache could not hold anyway — see [`deferred_hash_is_safe`]. The hash is
+    /// obtained later, from the authoritative route the first write resolves
+    /// (`ensure_handle_loaded_locked`), so no CAS precondition is weakened; it
+    /// is simply not paid for at open.
+    Deferred,
+}
+
+/// Whether serving `metadata` without its content hash defers work rather than
+/// dropping a check.
+///
+/// True only for a file past `LARGE_FILE_BYTES`, and that bound is the whole
+/// argument. At or under it a file lives in the mount's whole-file content
+/// cache (`MAX_FILE_BYTES`, the same 10 MiB), and the hash is what
+/// `get_file_matching` matches those cached bytes against — deferring it there
+/// would silently turn cache hits into wire reads. Past it the file is never
+/// cached whole, ranged reads are pinned by fingerprint rather than by hash, and
+/// the only remaining consumer of the open-time hash is the CAS base a later
+/// write chains from. That base is established, authoritatively and unbounded,
+/// when the handle is first loaded for that write.
+///
+/// What this buys: the point `/stat` an open falls through to sends no hashing
+/// budget, and hashing is the gateway reading the file. An `open(2)` of a 5 GiB
+/// dataset made the gateway read 5 GiB to produce a hash the open could not use.
+fn deferred_hash_is_safe(metadata: &RemoteMetadata) -> bool {
+    metadata.kind == "file" && metadata.size_bytes > LARGE_FILE_BYTES
+}
+
+/// The mount's content-cache ceiling and the point stat's hashing budget are the
+/// same line, and the deferral argument above depends on that: a file the
+/// gateway declines to hash must also be one this mount would never have held
+/// whole.
+const _: () = assert!(LARGE_FILE_BYTES == OPEN_STAT_MAX_HASH_BYTES);
+
+/// How much metadata one inode-route resolution owes its caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RouteMetadata {
+    /// Attributes only — no content hash requested at all (`max_hash_bytes=0`).
+    Attributes,
+    /// A full stat, hash included at any size.
+    Full,
+    /// A full stat whose hash may be deferred for a file too large for the
+    /// content cache. See [`FullStatHash::Deferred`].
+    FullDeferredHash,
 }
 
 /// A namespace projection is mount-local read-your-writes state. Only an
@@ -1339,30 +1394,27 @@ impl RemoteFuseFs {
     }
 
     fn authoritative_file_route(&self, path: &str, file_id: &str) -> FuseResult<StableFileRoute> {
-        self.authoritative_file_route_with_metadata(path, file_id, false)
-    }
-
-    fn authoritative_file_route_attributes(
-        &self,
-        path: &str,
-        file_id: &str,
-    ) -> FuseResult<StableFileRoute> {
-        self.authoritative_file_route_with_metadata(path, file_id, true)
+        self.authoritative_file_route_with_metadata(path, file_id, RouteMetadata::Full)
     }
 
     fn authoritative_file_route_with_metadata(
         &self,
         path: &str,
         file_id: &str,
-        attributes_only: bool,
+        metadata: RouteMetadata,
     ) -> FuseResult<StableFileRoute> {
         let current = self
             .tokio
             .block_on(async {
-                if attributes_only {
-                    self.client.stat_attributes_versioned(path).await
-                } else {
-                    self.client.stat_versioned(path).await
+                match metadata {
+                    RouteMetadata::Attributes => self.client.stat_attributes_versioned(path).await,
+                    RouteMetadata::Full => self.client.stat_versioned(path).await,
+                    // Same deferral as `stat_path_hashed`: this is the
+                    // hard-link retarget branch of the same open, and it must
+                    // not reintroduce the whole-file hash the open just avoided.
+                    RouteMetadata::FullDeferredHash => {
+                        self.client.stat_bounded_hash_versioned(path).await
+                    }
                 }
             })
             .map_err(|error| {
@@ -1396,13 +1448,17 @@ impl RemoteFuseFs {
         else {
             return Ok(StableFileRoute::Unlinked);
         };
-        let metadata = self
+        let alias_metadata = self
             .tokio
             .block_on(async {
-                if attributes_only {
-                    self.client.stat_attributes_versioned(&alias).await
-                } else {
-                    self.client.stat_versioned(&alias).await
+                match metadata {
+                    RouteMetadata::Attributes => {
+                        self.client.stat_attributes_versioned(&alias).await
+                    }
+                    RouteMetadata::Full => self.client.stat_versioned(&alias).await,
+                    RouteMetadata::FullDeferredHash => {
+                        self.client.stat_bounded_hash_versioned(&alias).await
+                    }
                 }
             })
             .map_err(|error| {
@@ -1414,14 +1470,14 @@ impl RemoteFuseFs {
                 );
                 Errno::EIO
             })?;
-        let revision = metadata.revision;
-        let metadata = metadata.value.ok_or(Errno::EAGAIN)?;
-        if metadata.file_id.as_deref() != Some(file_id) {
+        let revision = alias_metadata.revision;
+        let alias_metadata = alias_metadata.value.ok_or(Errno::EAGAIN)?;
+        if alias_metadata.file_id.as_deref() != Some(file_id) {
             return Err(Errno::EAGAIN);
         }
         Ok(StableFileRoute::Linked(LinkedFileRoute {
             path: alias,
-            metadata,
+            metadata: alias_metadata,
             revision,
         }))
     }
@@ -1439,23 +1495,34 @@ impl RemoteFuseFs {
     }
 
     fn resolve_inode_file_route(&self, ino: INodeNo) -> FuseResult<LinkedFileRoute> {
-        self.resolve_inode_file_route_with_metadata(ino, false)
+        self.resolve_inode_file_route_with_metadata(ino, RouteMetadata::Full)
+    }
+
+    /// The `open(2)` route for a caller that does not need a content hash now.
+    /// See [`FullStatHash::Deferred`].
+    fn resolve_inode_file_route_deferred_hash(
+        &self,
+        ino: INodeNo,
+    ) -> FuseResult<LinkedFileRoute> {
+        self.resolve_inode_file_route_with_metadata(ino, RouteMetadata::FullDeferredHash)
     }
 
     fn resolve_inode_file_route_attributes(&self, ino: INodeNo) -> FuseResult<LinkedFileRoute> {
-        self.resolve_inode_file_route_with_metadata(ino, true)
+        self.resolve_inode_file_route_with_metadata(ino, RouteMetadata::Attributes)
     }
 
     fn resolve_inode_file_route_with_metadata(
         &self,
         ino: INodeNo,
-        attributes_only: bool,
+        metadata: RouteMetadata,
     ) -> FuseResult<LinkedFileRoute> {
         let (path, identity) = self.inode_route(ino)?;
-        let projected = if attributes_only {
-            self.stat_path_attributes(&path)?
-        } else {
-            self.stat_path(&path)?
+        let projected = match metadata {
+            RouteMetadata::Attributes => self.stat_path_attributes(&path)?,
+            RouteMetadata::Full => self.stat_path_hashed(&path, FullStatHash::Required)?,
+            RouteMetadata::FullDeferredHash => {
+                self.stat_path_hashed(&path, FullStatHash::Deferred)?
+            }
         };
         let Some(identity) = identity else {
             let metadata = projected.ok_or(Errno::ENOENT)?;
@@ -1482,11 +1549,7 @@ impl RemoteFuseFs {
                 revision: 0,
             });
         }
-        let route = if attributes_only {
-            self.authoritative_file_route_attributes(&path, &identity)?
-        } else {
-            self.authoritative_file_route(&path, &identity)?
-        };
+        let route = self.authoritative_file_route_with_metadata(&path, &identity, metadata)?;
         match route {
             StableFileRoute::Linked(route) => {
                 if !self
@@ -1731,6 +1794,14 @@ impl RemoteFuseFs {
     }
 
     fn stat_path(&self, path: &str) -> FuseResult<Option<RemoteMetadata>> {
+        self.stat_path_hashed(path, FullStatHash::Required)
+    }
+
+    fn stat_path_hashed(
+        &self,
+        path: &str,
+        hash: FullStatHash,
+    ) -> FuseResult<Option<RemoteMetadata>> {
         // See `dir_entries`: `project_metadata` supplies read-your-writes, so
         // reads never wait on a publication.
         self.assert_namespace_journal_healthy()?;
@@ -1776,22 +1847,38 @@ impl RemoteFuseFs {
         // phase was paying. Serve only a complete entry; anything less (a file
         // over the bound, or a gateway that answered without hashes) falls
         // through to the wire, where it belongs.
+        //
+        // A `FullStatHash::Deferred` caller widens that serve by exactly one
+        // case: a file too large for the content cache, whose hash it has no use
+        // for now (see `deferred_hash_is_safe`). Without it, opening a file past
+        // the bulk hash budget point-stats — and the point stat carries no
+        // budget, so the gateway reads the whole file to hash it.
+        let serveable = |metadata: &RemoteMetadata| {
+            full_stat_metadata_is_complete(metadata)
+                || (hash == FullStatHash::Deferred && deferred_hash_is_safe(metadata))
+        };
         if !has_projection && self.client.revision_watch_live() {
             let revision = self.client.coherence_revision();
-            if let Some(metadata) = self
-                .cache
-                .get_metadata(path, revision)
-                .filter(full_stat_metadata_is_complete)
-            {
+            if let Some(metadata) = self.cache.get_metadata(path, revision).filter(serveable) {
                 return Ok(Some(metadata));
             }
             if self.cache.is_known_missing(path, revision) {
                 return Ok(None);
             }
         }
+        // A deferring caller also bounds what it asks the gateway to hash on the
+        // way through: at or under the content-cache ceiling the hash is still
+        // wanted and cheap, past it the answer comes back hashless and is served
+        // as such. A `Required` caller keeps the unbounded stat — it owes its
+        // caller a hash at any size.
         let response = self
             .tokio
-            .block_on(self.client.stat_versioned(path))
+            .block_on(async {
+                match hash {
+                    FullStatHash::Required => self.client.stat_versioned(path).await,
+                    FullStatHash::Deferred => self.client.stat_bounded_hash_versioned(path).await,
+                }
+            })
             .map_err(|_| Errno::EIO)?;
         let metadata = response.value;
         let projection = if let Some(namespace) = self.namespace.as_ref() {
@@ -3864,6 +3951,7 @@ impl RemoteFuseFs {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Barrier;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
@@ -3890,11 +3978,11 @@ mod tests {
     use super::super::namespace::NamespaceProjection;
     use super::{
         ATTR_ENTRY_LEASE_TTL, ActiveAdvisoryLockFile, ActiveAdvisoryLocks, FlushBarrier,
-        HandlePublication, InodeTable, LockWaitCancellation, ROOT_INO, RemoteFuseFs,
-        active_advisory_lock_identities,
-        combine_flush_and_lock_cleanup, content_hash_conflicts, content_hash_for_bytes,
-        creation_mode, lease_ttl_for, publish_authoritative_projection, range_fingerprint,
-        remote_file_open_flags, take_active_advisory_lock_file_id, take_active_posix_handle_locks,
+        FullStatHash, HandlePublication, InodeTable, LARGE_FILE_BYTES, LockWaitCancellation,
+        ROOT_INO, RemoteFuseFs, active_advisory_lock_identities, combine_flush_and_lock_cleanup,
+        content_hash_conflicts, content_hash_for_bytes, creation_mode, lease_ttl_for,
+        publish_authoritative_projection, range_fingerprint, remote_file_open_flags,
+        take_active_advisory_lock_file_id, take_active_posix_handle_locks,
     };
 
     #[derive(Default)]
@@ -6252,6 +6340,7 @@ mod tests {
             revision: 17,
             publications: Vec::new(),
             acked: 0,
+            hashed_bytes: AtomicU64::new(0),
             counts: RouteCounts::default(),
         }));
         let server_gateway = Arc::clone(&gateway);
@@ -6330,6 +6419,135 @@ mod tests {
             stats_before + 1,
             "a complete fence-matched entry must be served without a point stat"
         );
+
+        drop(fs);
+        server.abort();
+    }
+
+    /// Opening a file too large for the whole-file content cache must not make
+    /// the gateway read it.
+    ///
+    /// The point `/stat` an open falls through to carries no hashing budget, and
+    /// hashing IS the gateway reading the file — so an `open(2)` of a 5 GiB
+    /// dataset made the gateway read 5 GiB, to produce a hash the open cannot
+    /// use: nothing is cached to match it against, and ranged reads are pinned by
+    /// fingerprint. Its one remaining consumer, the CAS base a write chains from,
+    /// is established when the handle loads for that write.
+    ///
+    /// Both edges of the deferral are pinned here — past the bound the hash is
+    /// deferred and the gateway never reads the file; at or under it the hash is
+    /// still fetched, because there the open really does use it.
+    #[test]
+    fn opening_a_file_past_the_content_cache_defers_its_hash_instead_of_reading_it() {
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        // Past the whole-file content cache, and so past the point stat's budget.
+        let huge = vec![b'd'; LARGE_FILE_BYTES as usize + 1];
+        // Past the BULK budget but INSIDE the content cache: the open still needs
+        // this hash to match cached bytes, so it must still be fetched.
+        let middling = vec![b'm'; BULK_METADATA_MAX_HASH_BYTES as usize + 1];
+        let gateway = Arc::new(Mutex::new(RoundTripGateway {
+            scope: "test-scope".to_string(),
+            files: std::collections::BTreeMap::from([
+                ("test-scope/data/huge.bin".to_string(), huge.clone()),
+                ("test-scope/data/middling.bin".to_string(), middling.clone()),
+            ]),
+            revision: 17,
+            publications: Vec::new(),
+            acked: 0,
+            hashed_bytes: AtomicU64::new(0),
+            counts: RouteCounts::default(),
+        }));
+        let server_gateway = Arc::clone(&gateway);
+        let server = runtime.spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/{*path}", any(round_trip_gateway))
+                    .with_state(server_gateway),
+            )
+            .await
+            .unwrap();
+        });
+        let client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
+        let fs = RemoteFuseFs::new(client.clone(), false, "test-scope", runtime.handle().clone());
+        await_watch_live(&client);
+
+        let hashed = || {
+            gateway
+                .lock()
+                .unwrap()
+                .hashed_bytes
+                .load(AtomicOrdering::Relaxed)
+        };
+        let stats = || gateway.lock().unwrap().counts.stat;
+
+        // Cold: nothing cached, so the open point-stats — but with a bounded
+        // budget, so the gateway answers from metadata alone and never reads the
+        // file. One round trip, zero bytes hashed.
+        let before = hashed();
+        let cold = fs
+            .stat_path_hashed("data/huge.bin", FullStatHash::Deferred)
+            .unwrap()
+            .expect("the file exists");
+        assert_eq!(stats(), 1);
+        assert!(
+            cold.content_hash.is_none(),
+            "a file past the budget must come back hashless"
+        );
+        assert_eq!(
+            hashed(),
+            before,
+            "the gateway read the file to hash it for an open that cannot use it"
+        );
+
+        // Warm: the hashless entry is serveable for this caller at the same
+        // fence, so re-opening costs nothing at all.
+        for _ in 0..8 {
+            assert_eq!(
+                fs.stat_path_hashed("data/huge.bin", FullStatHash::Deferred)
+                    .unwrap(),
+                Some(cold.clone())
+            );
+        }
+        assert_eq!(stats(), 1, "a deferred-hash entry must be reserveable");
+        assert_eq!(hashed(), before);
+
+        // A caller that genuinely needs the hash now (O_TRUNC, whose CAS base is
+        // fixed at open) still gets it, at the cost the file dictates. Deferral
+        // postpones the hash; it never drops it.
+        let required = fs
+            .stat_path("data/huge.bin")
+            .unwrap()
+            .expect("the file exists");
+        assert_eq!(
+            required.content_hash,
+            Some(content_hash_for_bytes(&huge)),
+            "a Required caller must still be answered with a hash"
+        );
+        assert_eq!(hashed(), before + huge.len() as u64);
+
+        // And inside the content cache the deferral does not apply: the open
+        // needs this hash to match cached bytes, so it is fetched even for a
+        // deferring caller.
+        let before = hashed();
+        let cached_size = fs
+            .stat_path_hashed("data/middling.bin", FullStatHash::Deferred)
+            .unwrap()
+            .expect("the file exists");
+        assert_eq!(
+            cached_size.content_hash,
+            Some(content_hash_for_bytes(&middling)),
+            "a file the content cache can hold must not be served hashless"
+        );
+        assert_eq!(hashed(), before + middling.len() as u64);
 
         drop(fs);
         server.abort();
@@ -7362,25 +7580,49 @@ mod tests {
         /// entries, exactly as the production gateway's namespace is.
         files: std::collections::BTreeMap<String, Vec<u8>>,
         revision: u64,
-        /// Recent publications as (revision, affected paths), newest last —
-        /// the history the production gateway retains so a watcher is told
-        /// exactly what to revoke instead of "something changed". Without it
-        /// the benchmark cannot measure what a publication actually costs the
-        /// mount that observes it.
-        publications: Vec<(u64, Vec<String>)>,
+        /// Recent publications, newest last — the history the production
+        /// gateway retains so a watcher is told exactly what to revoke instead
+        /// of "something changed". Without it the benchmark cannot measure what
+        /// a publication actually costs the mount that observes it.
+        publications: Vec<RoundTripPublication>,
         /// Highest revision the watcher has acked. A poll's `since` IS the ack
         /// of that revision, exactly as the production gateway treats it.
         acked: u64,
+        /// Bytes this gateway has HASHED, which is bytes it has read. A hash is
+        /// not free server-side work the mount may ask for at will: an open that
+        /// point-stats a 5 GiB dataset with no hashing budget makes the gateway
+        /// read 5 GiB. Round trips alone cannot see that cost, so it is counted
+        /// separately.
+        hashed_bytes: AtomicU64,
         counts: RouteCounts,
+    }
+
+    /// One publication's affected set, split exactly as the production gateway
+    /// splits it: the paths it touched, and the prefixes whose WHOLE subtree it
+    /// superseded (`RemoveDirectory` / `Rename` only).
+    #[derive(Clone, Debug, Default)]
+    struct RoundTripPublication {
+        revision: u64,
+        paths: Vec<String>,
+        subtrees: Vec<String>,
     }
 
     impl RoundTripGateway {
         /// Record one publication's affected set against the revision it
-        /// produced, and return that revision.
+        /// produced, and return that revision. `subtrees` is the subset of
+        /// `paths` whose whole subtree the publication superseded.
         fn publish(&mut self, paths: Vec<String>) -> u64 {
+            self.publish_with_subtrees(paths, Vec::new())
+        }
+
+        fn publish_with_subtrees(&mut self, paths: Vec<String>, subtrees: Vec<String>) -> u64 {
             self.revision += 1;
             let revision = self.revision;
-            self.publications.push((revision, paths));
+            self.publications.push(RoundTripPublication {
+                revision,
+                paths,
+                subtrees,
+            });
             revision
         }
 
@@ -7388,31 +7630,38 @@ mod tests {
         /// the watcher is behind the retained history and the answer cannot be
         /// claimed exhaustive. Mirrors `#pathsPublishedSince` in
         /// ts/vfs-gateway-server.ts, truncation semantics included.
-        fn published_since(&self, since: u64) -> Option<Vec<String>> {
+        fn published_since(&self, since: u64) -> Option<(Vec<String>, Vec<String>)> {
             // The history must account for the revision being reported. A
             // revision the stub advanced without recording an affected set
             // models exactly what the production gateway reports as truncated:
             // "something changed and I cannot tell you what".
-            if self.publications.last().map(|entry| entry.0) != Some(self.revision) {
+            if self.publications.last().map(|entry| entry.revision) != Some(self.revision) {
                 return None;
             }
             let oldest = self.publications.first()?;
-            if since < oldest.0 {
+            if since < oldest.revision {
                 return None;
             }
             let mut seen = std::collections::BTreeSet::new();
             let mut union = Vec::new();
-            for (revision, paths) in &self.publications {
-                if *revision <= since {
+            let mut seen_subtrees = std::collections::BTreeSet::new();
+            let mut subtrees = Vec::new();
+            for entry in &self.publications {
+                if entry.revision <= since {
                     continue;
                 }
-                for path in paths {
+                for path in &entry.paths {
                     if seen.insert(path.clone()) {
                         union.push(path.clone());
                     }
                 }
+                for prefix in &entry.subtrees {
+                    if seen_subtrees.insert(prefix.clone()) {
+                        subtrees.push(prefix.clone());
+                    }
+                }
             }
-            Some(union)
+            Some((union, subtrees))
         }
     }
 
@@ -7430,8 +7679,15 @@ mod tests {
         path: &str,
         bytes: &[u8],
         max_hash_bytes: Option<u64>,
+        hashed_bytes: &AtomicU64,
     ) -> RemoteMetadata {
         let hashed = max_hash_bytes.is_none_or(|budget| bytes.len() as u64 <= budget);
+        if hashed {
+            // Hashing is the gateway READING the file. Charge it, so a route
+            // that quietly asks for an unbounded hash of a multi-GB file is
+            // visible even though it costs exactly one round trip.
+            hashed_bytes.fetch_add(bytes.len() as u64, AtomicOrdering::Relaxed);
+        }
         RemoteMetadata {
             kind: "file".to_string(),
             size_bytes: bytes.len() as u64,
@@ -7472,7 +7728,12 @@ mod tests {
         max_hash_bytes: Option<u64>,
     ) -> Option<RemoteMetadata> {
         if let Some(bytes) = state.files.get(path) {
-            return Some(round_trip_file_metadata(path, bytes, max_hash_bytes));
+            return Some(round_trip_file_metadata(
+                path,
+                bytes,
+                max_hash_bytes,
+                &state.hashed_bytes,
+            ));
         }
         if path == state.scope {
             return Some(round_trip_directory_metadata());
@@ -7524,7 +7785,12 @@ mod tests {
                     directories.insert(name.to_string());
                 }
                 None => {
-                    let metadata = round_trip_file_metadata(path, bytes, max_hash_bytes);
+                    let metadata = round_trip_file_metadata(
+                        path,
+                        bytes,
+                        max_hash_bytes,
+                        &state.hashed_bytes,
+                    );
                     files.push(chevalier_sandbox::vfs::VfsDirEntry {
                         name: rest.to_string(),
                         kind: metadata.kind,
@@ -7619,11 +7885,25 @@ mod tests {
     /// The watch answer shape the production gateway sends: the revision plus
     /// the affected set, or `truncated` when the set cannot be claimed
     /// exhaustive (which sends the watcher down its conservative fallback).
-    fn round_trip_watch_response(revision: u64, published: Option<Vec<String>>) -> Response {
+    fn round_trip_watch_response(
+        revision: u64,
+        published: Option<(Vec<String>, Vec<String>)>,
+    ) -> Response {
         let body = match published {
-            Some(paths) => serde_json::json!({ "revision": revision, "paths": paths }),
+            // `subtrees` is serialized on the same always-when-known terms as
+            // `paths`: an absent field means "this gateway cannot tell you which
+            // affected paths were directories", which sends the watcher back to
+            // reading every path as a prefix.
+            Some((paths, subtrees)) => {
+                serde_json::json!({ "revision": revision, "paths": paths, "subtrees": subtrees })
+            }
             None => {
-                serde_json::json!({ "revision": revision, "paths": [], "truncated": true })
+                serde_json::json!({
+                    "revision": revision,
+                    "paths": [],
+                    "subtrees": [],
+                    "truncated": true,
+                })
             }
         };
         with_revision_header(Json(body).into_response(), revision)
@@ -7752,8 +8032,12 @@ mod tests {
                     .iter()
                     .filter(|(path, _)| path.starts_with(prefix.as_str()))
                     .map(|(path, bytes)| {
-                        let metadata =
-                            round_trip_file_metadata(path, bytes, payload.max_hash_bytes);
+                        let metadata = round_trip_file_metadata(
+                            path,
+                            bytes,
+                            payload.max_hash_bytes,
+                            &state.hashed_bytes,
+                        );
                         VfsSubtreeMetadataEntry {
                             path: path.clone(),
                             kind: metadata.kind,
@@ -7829,8 +8113,32 @@ mod tests {
                         .collect::<Vec<_>>();
                     // Every publication advances the namespace revision and
                     // records its affected set, exactly as the gateway's
-                    // publication sequencer does.
-                    let revision = state.publish(snapshot_paths);
+                    // publication sequencer does — including the split between
+                    // the paths it touched and the prefixes whose whole subtree
+                    // it superseded (`namespace_superseded_subtrees` in
+                    // crates/sandbox/src/vfs.rs). A create/delete supersedes no
+                    // subtree, which is what keeps it from evicting the cached
+                    // metadata of every sibling in its directory.
+                    let superseded = payload
+                        .mutations
+                        .iter()
+                        .filter(|mutation| {
+                            matches!(
+                                mutation,
+                                VfsNamespaceMutation::RemoveDirectory { .. }
+                                    | VfsNamespaceMutation::Rename { .. }
+                            )
+                        })
+                        .flat_map(|mutation| {
+                            mutation
+                                .paths()
+                                .into_iter()
+                                .filter(|path| !path.is_empty())
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>();
+                    let revision = state.publish_with_subtrees(snapshot_paths, superseded);
                     (entries, revision)
                 };
                 await_watch_ack(state, revision).await;
@@ -8015,6 +8323,26 @@ mod tests {
         const CREATE_OPS: usize = 50;
         const STAT_OPS: usize = 50;
         const SEED_FILES: usize = 64;
+        /// The `.git` internals a warm `git status` re-opens: measured at 30
+        /// point `/stat` calls across these 9 paths per phase, every one of them
+        /// collateral damage from git creating and removing `index.lock` in the
+        /// same directory.
+        const GIT_INTERNALS: [&str; 9] = [
+            "gitdir/config",
+            "gitdir/HEAD",
+            "gitdir/info/exclude",
+            "gitdir/refs/heads/main",
+            "gitdir/refs/stash",
+            "gitdir/index",
+            "gitdir/objects/ab/cdef",
+            "gitdir/objects/12/3456",
+            "gitdir/packed-refs",
+        ];
+        /// A file past both the bulk hashing budget AND the mount's whole-file
+        /// content cache — the shape of an ML dataset in a sandbox, only smaller
+        /// so the stub can hold it. Its open must cost neither a point stat nor a
+        /// server-side hash of its contents.
+        const LARGE_FILE: &str = "large/dataset.bin";
 
         let runtime = Builder::new_multi_thread()
             .worker_threads(4)
@@ -8038,12 +8366,20 @@ mod tests {
                 format!("seed file {index}").into_bytes(),
             );
         }
+        for name in GIT_INTERNALS {
+            files.insert(format!("test-scope/{name}"), format!("{name} contents").into_bytes());
+        }
+        files.insert(
+            format!("test-scope/{LARGE_FILE}"),
+            vec![b'd'; LARGE_FILE_BYTES as usize + 1],
+        );
         let gateway = Arc::new(Mutex::new(RoundTripGateway {
             scope: "test-scope".to_string(),
             files,
             revision: 17,
             publications: Vec::new(),
             acked: 0,
+            hashed_bytes: AtomicU64::new(0),
             counts: RouteCounts::default(),
         }));
         let server_gateway = Arc::clone(&gateway);
@@ -8410,6 +8746,90 @@ mod tests {
         // as well as the lstat half.
         rows.push(("status_warm", CREATE_OPS, 0, status_warm));
 
+        // publish_siblings: what a publication costs the OTHER entries of the
+        // directory it landed in. This is the `.git` shape of a real `git
+        // status`: git creates and removes `index.lock` inside `.git/`, and a
+        // publication's affected set names the changed path AND its parent
+        // directory. A watcher that cannot tell a touched path from a superseded
+        // subtree has to read that parent as a prefix, so one lock file drops the
+        // cached metadata of `config`, `HEAD`, `info/exclude`, every ref and
+        // every loose object — and the next phase re-reads all of them. Measured:
+        // 30 point `/stat` calls over 9 unique `.git` paths per warm status,
+        // against exactly 2 `/namespace-many`, both for `index.lock`.
+        settle();
+        for name in GIT_INTERNALS {
+            assert!(fs.stat_path_attributes(name).unwrap().is_some());
+            assert!(fs.stat_path(name).unwrap().is_some());
+        }
+        await_watch_catch_up();
+        // The lock file's whole life cycle: created, then removed, exactly the
+        // two publications a status phase issues.
+        fs.reserve_file_if_absent("gitdir/index.lock", 0o644, false)
+            .unwrap();
+        fs.flush_namespace().unwrap();
+        fs.enqueue_namespace(
+            VfsNamespaceMutation::DeleteFile {
+                path: "gitdir/index.lock".to_string(),
+                precondition: None,
+            },
+            None,
+        )
+        .unwrap();
+        fs.flush_namespace().unwrap();
+        await_watch_catch_up();
+        let base = sample();
+        for name in GIT_INTERNALS {
+            assert!(fs.stat_path_attributes(name).unwrap().is_some());
+            assert!(fs.stat_path(name).unwrap().is_some());
+        }
+        let publish_siblings = sample().since(&base);
+        // Budget 0: a point mutation supersedes its own path and its parent's
+        // listing. Its siblings' metadata is untouched and must stay serveable.
+        rows.push(("publish_siblings", GIT_INTERNALS.len(), 0, publish_siblings));
+
+        // open_large_cold / open_large: opening a file past the bulk hashing
+        // budget. The bulk routes answer hashless past 1 MiB, so such an entry
+        // cannot stand in for a full stat and the open falls through to a point
+        // `/stat` — which carries no hashing budget, so the gateway reads the
+        // ENTIRE file to hash it. For the multi-GB datasets these sandboxes hold,
+        // an open of a 5 GiB file made the gateway read 5 GiB.
+        //
+        // A file this large is never held in the whole-file content cache, so the
+        // hash has nothing to match; its only remaining consumer is the CAS base
+        // a write chains from, which is established when the handle loads. So the
+        // open serves the hashless entry and bounds what it asks the gateway to
+        // hash on the way through.
+        settle();
+        let hashed_before = gateway.lock().unwrap().hashed_bytes.load(AtomicOrdering::Relaxed);
+        let base = sample();
+        let cold = fs
+            .stat_path_hashed(LARGE_FILE, FullStatHash::Deferred)
+            .unwrap()
+            .expect("the large file exists");
+        let open_large_cold = sample().since(&base);
+        assert!(cold.content_hash.is_none());
+        // Budget 1: the one point stat a never-seen path owes, now bounded.
+        rows.push(("open_large_cold", 1, 1, open_large_cold));
+
+        let base = sample();
+        for _ in 0..8 {
+            assert!(
+                fs.stat_path_hashed(LARGE_FILE, FullStatHash::Deferred)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let open_large = sample().since(&base);
+        // Budget 0: the hashless entry the bounded stat installed is servable for
+        // this caller at the same fence, so re-opening is free.
+        rows.push(("open_large", 8, 0, open_large));
+        let hashed_large = gateway
+            .lock()
+            .unwrap()
+            .hashed_bytes
+            .load(AtomicOrdering::Relaxed)
+            - hashed_before;
+
         println!("\ngateway round trips per filesystem operation");
         println!(
             "{:<15} {:>5} {:>12} {:>8}  {}",
@@ -8552,6 +8972,34 @@ mod tests {
             "status sweeps point-stat'd for their opens: cold {} / warm {}",
             status_cold.breakdown(),
             status_warm.breakdown()
+        );
+        // Mechanism: a publication reports the paths it TOUCHED separately from
+        // the prefixes whose whole subtree it SUPERSEDED, and only the second
+        // set may evict descendants. Without the split every affected path is a
+        // prefix, and a publication's affected set always names the changed
+        // path's parent directory — so creating and removing `.git/index.lock`
+        // wipes every `.git` internal this mount had cached, twice per status.
+        assert_eq!(
+            publish_siblings.charged(),
+            0,
+            "a lock file's publication cost its {} innocent siblings {}",
+            GIT_INTERNALS.len(),
+            publish_siblings.breakdown()
+        );
+        // Mechanism: a file past the whole-file content cache has no use for a
+        // content hash at open, so the open serves the hashless entry and bounds
+        // the hashing budget of the point stat it falls through to. The gateway
+        // must therefore never read the file's contents to answer an open.
+        assert_eq!(
+            (open_large_cold.stat, open_large.stat),
+            (1, 0),
+            "opening a large file cost point stats: cold {} / warm {}",
+            open_large_cold.breakdown(),
+            open_large.breakdown()
+        );
+        assert_eq!(
+            hashed_large, 0,
+            "opening a large file made the gateway hash (i.e. read) {hashed_large} bytes of it"
         );
         // Mechanism: `dir_entries` takes one authoritative listing and installs
         // both the listing and every child's metadata, so a directory costs one
@@ -8946,13 +9394,29 @@ impl RemoteFuseFs {
 
     pub(super) fn open(&self, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let result: FuseResult<u64> = (|| {
-            let route = self.resolve_inode_file_route(ino)?;
+            let truncate = flags.0 & libc::O_TRUNC != 0;
+            // An ordinary open uses the content hash for two things, and neither
+            // applies to a file the whole-file cache cannot hold: matching
+            // cached bytes (`get_file_matching`, which has nothing to match) and
+            // seeding the handle's CAS base — which, for a handle that must load
+            // before it can be written, is re-established authoritatively by
+            // that load. So such an open defers the hash rather than making the
+            // gateway read a multi-GB file to produce one.
+            //
+            // O_TRUNC is the exception and keeps the unbounded stat: it marks
+            // the handle dirty at open, so nothing ever loads it, and the CAS
+            // base it publishes from is exactly the hash resolved here. Deferral
+            // there would drop a content precondition, not postpone it.
+            let route = if truncate {
+                self.resolve_inode_file_route(ino)?
+            } else {
+                self.resolve_inode_file_route_deferred_hash(ino)?
+            };
             let path = route.path;
             let metadata = route.metadata;
             if metadata.kind == "directory" {
                 return Err(Errno::EISDIR);
             }
-            let truncate = flags.0 & libc::O_TRUNC != 0;
             if truncate && self.read_only {
                 return Err(Errno::EROFS);
             }

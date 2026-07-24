@@ -75,22 +75,42 @@ const PUBLICATION_HISTORY_LIMIT = 256;
 const WATCH_PATHS_LIMIT = 1024;
 
 /** One publication's affected paths, retained so a lagging watcher can be told
- *  exactly what to revoke. */
+ *  exactly what to revoke. `subtrees` is the subset of `paths` whose ENTIRE
+ *  subtree the publication superseded — only `remove_directory` and `rename` can
+ *  do that. Everything else is point-scoped and must never cost a sibling entry
+ *  its cached metadata. */
 type VfsPublishedPaths = {
   revision: number;
   paths: readonly string[];
+  subtrees: readonly string[];
 };
 
 /**
- * A resolved long poll: the revision to answer with, plus the paths published in
- * `(since, revision]`. `paths` is null when the answer cannot be trusted to be
- * complete (the watcher is behind the retained history, or the union exceeds the
- * cap) — the responder reports truncation and the watcher falls back to its own
- * conservative revocation rather than acting on a partial set.
+ * The affected set one watch answer reports: the point-scoped paths the
+ * publications touched, plus the strictly smaller set of prefixes whose whole
+ * subtree they superseded.
+ *
+ * A watcher that cannot tell the two apart has to treat every affected path as a
+ * prefix, so publishing one lock file inside `.git/` — whose affected set names
+ * the parent directory — evicts every sibling's cached metadata. That was
+ * measured as 30 point stats over 9 `.git` internals per warm `git status`.
+ */
+type VfsAffected = {
+  paths: string[];
+  subtrees: string[];
+};
+
+/**
+ * A resolved long poll: the revision to answer with, plus the affected set
+ * published in `(since, revision]`. `affected` is null when the answer cannot be
+ * trusted to be complete (the watcher is behind the retained history, or the
+ * union exceeds the cap) — the responder reports truncation and the watcher
+ * falls back to its own conservative revocation rather than acting on a partial
+ * set.
  */
 type VfsWatchResult = {
   revision: number;
-  paths: string[] | null;
+  affected: VfsAffected | null;
 };
 
 type VfsPublicationState = {
@@ -208,16 +228,22 @@ class VfsPublicationCoordinator {
    * Publish a mutation. `paths` is the set the mutation affected, recorded with
    * the new revision so watchers can revoke precisely; omit it only where the
    * handler genuinely does not know the set (it is then recorded as empty).
+   * `subtrees` is the subset of `paths` whose whole subtree the mutation
+   * superseded (`remove_directory` / `rename`); omitting it means "this
+   * mutation superseded no subtree", which is the truth for every point
+   * mutation.
    */
   async mutate<T>(
     ownerId: string,
     mutate: () => Promise<T>,
     paths?: readonly string[],
+    subtrees?: readonly string[],
   ): Promise<{ value: T; revision: number }> {
     return this.transact(ownerId, async () => ({
       value: await mutate(),
       mutated: true,
       paths,
+      subtrees,
     }));
   }
 
@@ -227,13 +253,14 @@ class VfsPublicationCoordinator {
       value: T;
       mutated: boolean;
       paths?: readonly string[];
+      subtrees?: readonly string[];
     }>,
   ): Promise<{ value: T; revision: number }> {
     const state = this.#state(ownerId);
     const release = await this.#acquire(state, "write");
     let outcome!: { value: T; revision: number; mutated: boolean };
     try {
-      const { value, mutated, paths } = await transaction();
+      const { value, mutated, paths, subtrees } = await transaction();
       if (mutated) {
         state.revision = Math.max(state.revision + 1, Date.now() * 1_000);
         // Record before releasing the writer, which is what wakes parked
@@ -243,7 +270,7 @@ class VfsPublicationCoordinator {
         // revision is what forces a later watcher onto the truncated fallback,
         // so skipping the entry would silently downgrade every watcher behind
         // it.
-        this.#recordPublication(state, state.revision, paths ?? []);
+        this.#recordPublication(state, state.revision, paths ?? [], subtrees ?? []);
       }
       outcome = { value, revision: state.revision, mutated };
     } finally {
@@ -369,20 +396,23 @@ class VfsPublicationCoordinator {
     since: number,
   ): VfsWatchResult {
     // An unadvanced revision is answered 204, which carries no paths.
-    if (revision <= since) return { revision, paths: [] };
-    return { revision, paths: this.#pathsPublishedSince(state, since) };
+    if (revision <= since) return { revision, affected: { paths: [], subtrees: [] } };
+    return { revision, affected: this.#pathsPublishedSince(state, since) };
   }
 
   /** Retain a publication's affected paths for lagging watchers, evicting the
-   *  oldest once the bound is reached. */
+   *  oldest once the bound is reached. `subtrees` is a subset of `paths` for
+   *  every producer in this file. */
   #recordPublication(
     state: VfsPublicationState,
     revision: number,
     paths: readonly string[],
+    subtrees: readonly string[],
   ): void {
     state.publicationHistory.push({
       revision,
       paths: [...new Set(paths.map(normalizePath))],
+      subtrees: [...new Set(subtrees.map(normalizePath))],
     });
     while (state.publicationHistory.length > PUBLICATION_HISTORY_LIMIT) {
       state.publicationHistory.shift();
@@ -390,14 +420,15 @@ class VfsPublicationCoordinator {
   }
 
   /**
-   * The union of paths published in `(since, current]`.
+   * The union of paths published in `(since, current]`, together with the union
+   * of the subtree prefixes among them.
    *
    * Returns null when the answer cannot be trusted to be complete — the watcher
    * is further behind than the retained history, or the union exceeds
    * `WATCH_PATHS_LIMIT` — in which case the caller reports truncation and the
    * watcher falls back to its own handling rather than acting on a partial set.
    */
-  #pathsPublishedSince(state: VfsPublicationState, since: number): string[] | null {
+  #pathsPublishedSince(state: VfsPublicationState, since: number): VfsAffected | null {
     const oldest = state.publicationHistory[0];
     if (oldest === undefined) return null;
     // `since` must be covered: the watcher needs every publication after it, and
@@ -406,6 +437,8 @@ class VfsPublicationCoordinator {
     if (since < oldest.revision) return null;
     const seen = new Set<string>();
     const union: string[] = [];
+    const seenSubtrees = new Set<string>();
+    const subtrees: string[] = [];
     for (const entry of state.publicationHistory) {
       if (entry.revision <= since) continue;
       for (const path of entry.paths) {
@@ -414,8 +447,17 @@ class VfsPublicationCoordinator {
         union.push(path);
         if (union.length > WATCH_PATHS_LIMIT) return null;
       }
+      for (const prefix of entry.subtrees) {
+        if (seenSubtrees.has(prefix)) continue;
+        seenSubtrees.add(prefix);
+        subtrees.push(prefix);
+        // Subtrees are a subset of `paths` for every producer here, so this can
+        // only fire if that invariant is ever broken; truncation is the
+        // fail-closed answer.
+        if (subtrees.length > WATCH_PATHS_LIMIT) return null;
+      }
     }
-    return union;
+    return { paths: union, subtrees };
   }
 
   #notifyWatchers(state: VfsPublicationState): void {
@@ -1015,23 +1057,26 @@ export function createVfsGatewayServer(
         const since = parseWatchSince(url.searchParams.get("since"));
         const timeoutMs = parseWatchTimeout(url.searchParams.get("timeout_ms"));
         const watcherId = parseWatcherId(url.searchParams.get("watcher_id"));
-        const { revision, paths } = await publications.watch(
+        const { revision, affected } = await publications.watch(
           ownerId,
           since,
           timeoutMs,
           watcherId,
         );
         if (revision > since) {
-          // `paths` is serialized whenever the affected set is known, the empty
-          // set included: an omitted field means "this gateway does not report
-          // affected paths" and sends the watcher down a conservative full-sweep
+          // `paths` and `subtrees` are serialized whenever the affected set is
+          // known, the empty set included: an omitted field means "this gateway
+          // does not report that set" and sends the watcher down a conservative
           // fallback, which is a different statement from "this publication
-          // touched nothing". `truncated` appears only when true, and then the
-          // watcher must not treat `paths` as exhaustive.
+          // touched nothing" / "this publication superseded no subtree". For
+          // `subtrees` that fallback is specifically "treat every affected path
+          // as a prefix", which is what an older gateway forces. `truncated`
+          // appears only when true, and then the watcher must not treat either
+          // list as exhaustive.
           const body =
-            paths === null
-              ? { revision, paths: [], truncated: true }
-              : { revision, paths };
+            affected === null
+              ? { revision, paths: [], subtrees: [], truncated: true }
+              : { revision, paths: affected.paths, subtrees: affected.subtrees };
           return withNamespaceRevision(json(200, body), revision);
         }
         return withNamespaceRevision(new Response(null, { status: 204 }), revision);
@@ -1237,6 +1282,7 @@ export function createVfsGatewayServer(
         }
         try {
           const affected = mutationSnapshotPaths(mutations);
+          const superseded = mutationSupersededSubtrees(mutations);
           const publication = await publications.mutate(
             ownerId,
             async () => {
@@ -1244,6 +1290,7 @@ export function createVfsGatewayServer(
               return { entries: await snapshotPaths(store, affected) };
             },
             affected,
+            superseded,
           );
           return withNamespaceRevision(
             json(200, publication.value),
@@ -2187,6 +2234,30 @@ function mutationSnapshotPaths(mutations: readonly NamespaceMutation[]): string[
     }
   }
   return paths;
+}
+
+/**
+ * The prefixes a namespace batch superseded WHOLESALE — every path a watcher
+ * must drop everything beneath, not merely the path itself.
+ *
+ * Only `remove_directory` and `rename` qualify: the first removes a whole tree,
+ * the second moves one (and can land on top of another). Every other mutation
+ * supersedes exactly its own path plus its parent's listing, both of which
+ * `mutationSnapshotPaths` already names point-scoped. Reporting a create or a
+ * delete as a prefix is what makes a sibling's cached metadata collateral
+ * damage. Mirrors `namespace_superseded_subtrees` in the Rust gateway.
+ */
+function mutationSupersededSubtrees(
+  mutations: readonly NamespaceMutation[],
+): string[] {
+  const prefixes: string[] = [];
+  for (const mutation of mutations) {
+    if (mutation.kind !== "remove_directory" && mutation.kind !== "rename") {
+      continue;
+    }
+    prefixes.push(...mutationPaths(mutation));
+  }
+  return prefixes;
 }
 
 function normalizeNamespaceOperationIds(value: unknown): string[] | Response {

@@ -87,6 +87,29 @@ const REVISION_WATCH_BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// answers without hashes at all) simply leaves entries incomplete and the
 /// mount falls through to the wire as before.
 pub(super) const BULK_METADATA_MAX_HASH_BYTES: u64 = 1024 * 1024;
+
+/// Hashing budget for the point `/stat` an `open(2)` falls through to when the
+/// bulk-seeded entry is incomplete.
+///
+/// The point stat sends no budget by default — it owes its caller a hash at any
+/// size — and hashing is the gateway READING the file. For a file past this
+/// bound that trade is indefensible: opening a 5 GiB ML dataset makes the
+/// gateway read 5 GiB, once per hash-cache expiry, to produce a hash the open
+/// cannot use. It cannot, because a file this large is never held in the mount's
+/// whole-file content cache (`MAX_FILE_BYTES` in fuse/cache.rs, the same 10 MiB
+/// as `LARGE_FILE_BYTES`): there are no cached bytes to match it against, and
+/// ranged reads are pinned by fingerprint, not by hash. The one remaining
+/// consumer is the CAS base a later write chains from, and that base is
+/// established authoritatively when the handle is first loaded for that write.
+///
+/// So the budget is set exactly at the content-cache ceiling: at or under it the
+/// gateway still hashes (the open needs the hash to match cached bytes, and the
+/// read is bounded), past it the answer comes back hashless and the open serves
+/// it as-is. Callers that genuinely require a hash now (`O_TRUNC`, whose CAS
+/// base is fixed at open because it publishes without ever loading) keep using
+/// the unbounded `stat_versioned`.
+pub(super) const OPEN_STAT_MAX_HASH_BYTES: u64 = 10 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct RemoteVfsClient {
     client: Client,
@@ -299,11 +322,15 @@ impl RemoteVfsClient {
         let http = self.client.clone();
         let endpoint = self.endpoint.clone();
         let auth_token = self.auth_token.clone();
+        // The registry is keyed by endpoint + scope, so every mount sharing this
+        // watch shares this scope — which is what makes it sound to translate
+        // one answer's owner-absolute paths into mount-relative ones once, here.
+        let scope_path = self.scope_path.clone();
         let revisions = Arc::downgrade(&self.revisions);
         let cache = Arc::downgrade(cache);
         let notifiers = Arc::downgrade(invalidators);
         tokio.spawn(run_revision_watch(
-            http, endpoint, auth_token, revisions, cache, notifiers,
+            http, endpoint, auth_token, scope_path, revisions, cache, notifiers,
         ));
     }
 
@@ -353,6 +380,18 @@ impl RemoteVfsClient {
         path: &str,
     ) -> Result<Versioned<Option<RemoteMetadata>>> {
         self.stat_with_max_hash_bytes_versioned(path, Some(0)).await
+    }
+
+    /// A point stat for a caller that can proceed without a hash it would have
+    /// no use for. See [`OPEN_STAT_MAX_HASH_BYTES`]: the gateway hashes up to
+    /// the mount's content-cache ceiling and answers hashless past it, so an
+    /// open of a multi-GB file never asks the gateway to read multi-GB.
+    pub async fn stat_bounded_hash_versioned(
+        &self,
+        path: &str,
+    ) -> Result<Versioned<Option<RemoteMetadata>>> {
+        self.stat_with_max_hash_bytes_versioned(path, Some(OPEN_STAT_MAX_HASH_BYTES))
+            .await
     }
 
     pub async fn metadata_many_attributes(
@@ -1350,22 +1389,90 @@ struct RevisionWatchResponse {
     /// complete answer.
     #[serde(default)]
     paths: Option<Vec<String>>,
+    /// The subset of `paths` whose ENTIRE subtree the publications superseded —
+    /// a `RemoveDirectory` or a `Rename`, the only two mutations that can move
+    /// or remove a whole tree.
+    ///
+    /// `None` means the field was absent — a gateway too old to distinguish the
+    /// kinds — which is NOT the same as a present-but-empty set ("these
+    /// publications superseded no subtree"). The former must fall back to the
+    /// conservative reading of `paths` as prefixes; the latter is a complete
+    /// answer, and is what keeps a lock-file publication inside `.git/` from
+    /// evicting `.git/config`.
+    #[serde(default)]
+    subtrees: Option<Vec<String>>,
     /// Set when the gateway could not report the affected set completely, so
     /// `paths` must not be treated as exhaustive.
     #[serde(default)]
     truncated: bool,
 }
 
+/// The affected set one watch answer reported, split by scope.
+///
+/// The split is the whole point: a publication's affected set names each
+/// changed path AND its parent directory, so reading every entry as a subtree
+/// prefix means one `.git/index.lock` create drops the cached metadata of
+/// `.git/config`, `.git/HEAD`, `.git/info/exclude` and every ref — measured as
+/// 30 point stats over 9 paths per warm `git status`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WatchAffected {
+    /// Exact paths the publications changed (each changed path plus its parent).
+    paths: Vec<String>,
+    /// Prefixes whose whole subtree they superseded. Equal to `paths` when the
+    /// gateway did not report the set at all — the conservative reading an
+    /// older gateway leaves no alternative to.
+    subtrees: Vec<String>,
+}
+
+impl WatchAffected {
+    /// Translate one answer out of the owner's namespace and into the one this
+    /// registry's cache and inode tables are keyed on.
+    ///
+    /// The watch is per (endpoint, scope) registry, so one scope applies to
+    /// every mount that observes this answer. A path outside that scope is
+    /// dropped rather than passed through: this mount cannot name it, so it
+    /// holds nothing to revoke for it, and passing it through would alias an
+    /// unrelated owner path onto a mount-relative one of the same spelling.
+    fn unscoped(self, scope_path: &str) -> Self {
+        let unscope = |paths: Vec<String>| {
+            paths
+                .into_iter()
+                .filter_map(|path| unscope_watch_path(scope_path, path.as_str()))
+                .collect()
+        };
+        Self {
+            paths: unscope(self.paths),
+            subtrees: unscope(self.subtrees),
+        }
+    }
+}
+
+/// One owner-absolute watch path as this registry's mounts name it, or `None`
+/// when it lies outside their scope.
+fn unscope_watch_path(scope_path: &str, path: &str) -> Option<String> {
+    let path = path.trim_matches('/');
+    let scope_path = scope_path.trim_matches('/');
+    if scope_path.is_empty() {
+        return Some(path.to_string());
+    }
+    if path == scope_path {
+        // The scope root itself: the mount's own root directory.
+        return Some(String::new());
+    }
+    path.strip_prefix(&format!("{scope_path}/"))
+        .map(str::to_string)
+}
+
 /// One completed watch poll. `Advanced` carries the new owner revision from a
 /// 200; `Unchanged` is a 204 long-poll timeout. Both mean the channel is live.
 enum RevisionWatchPoll {
-    /// The owner revision advanced. `affected` carries the exact paths the
-    /// publications touched when the gateway could report them completely;
+    /// The owner revision advanced. `affected` carries the exact set the
+    /// publications touched when the gateway could report it completely;
     /// `None` means the watcher must fall back to its own conservative
     /// revocation (older gateway, truncated set, or a watcher too far behind).
     Advanced {
         revision: u64,
-        affected: Option<Vec<String>>,
+        affected: Option<WatchAffected>,
     },
     Unchanged,
 }
@@ -1424,6 +1531,29 @@ impl WatchHealth {
     }
 }
 
+/// Read one watch 200 body into the affected set the watcher may act on.
+///
+/// An empty set from a gateway that reports completeness is a real answer
+/// ("nothing this mount must revoke"); truncation, or a gateway that omits
+/// `paths` entirely, forces the conservative fallback (`None`).
+///
+/// `subtrees` is read on the same terms one level down: present (empty
+/// included) means the gateway distinguished the prefixes it wholly superseded
+/// from the paths it merely touched, so a create/delete may not evict its
+/// siblings. Absent means an older gateway that cannot say which affected paths
+/// were directories it removed or renamed, and the only sound reading left is
+/// the one this client used before the split existed — every path is a prefix.
+fn watch_affected(body: RevisionWatchResponse) -> Option<WatchAffected> {
+    if body.truncated {
+        return None;
+    }
+    let paths = body.paths?;
+    Some(WatchAffected {
+        subtrees: body.subtrees.unwrap_or_else(|| paths.clone()),
+        paths,
+    })
+}
+
 /// Issue one long-poll against the gateway watch endpoint. Uses the same bearer
 /// auth as every other route and an explicit read-class timeout above the
 /// long-poll window so the client's default mutation timeout never applies.
@@ -1463,10 +1593,7 @@ async fn poll_revision_watch(
             .map_err(RevisionWatchError::Protocol)?;
         return Ok(RevisionWatchPoll::Advanced {
             revision: body.revision,
-            // An empty set from a gateway that reports completeness is a real
-            // answer ("nothing this mount must revoke"); truncation, or a
-            // gateway that omits the field entirely, forces the fallback.
-            affected: if body.truncated { None } else { body.paths },
+            affected: watch_affected(body),
         });
     }
     let body = response.text().await.unwrap_or_default();
@@ -1511,6 +1638,7 @@ async fn run_revision_watch(
     http: Client,
     endpoint: String,
     auth_token: String,
+    scope_path: String,
     revisions: Weak<SharedRevisionState>,
     cache: Weak<RemoteFuseCache>,
     notifiers: Weak<MountInvalidators>,
@@ -1538,6 +1666,15 @@ async fn run_revision_watch(
                     return;
                 };
                 if let RevisionWatchPoll::Advanced { revision, affected } = poll {
+                    // The gateway answers in the owner's namespace; this cache
+                    // and every mount's inode table are keyed on paths relative
+                    // to the registry's scope. Translate once, here, before
+                    // either is touched. Without it every targeted revocation
+                    // silently matched nothing: the path a sibling actually
+                    // changed was never evicted (it was retagged forward as
+                    // "unaffected"), and no kernel lease was revoked, yet the
+                    // watch still acked and unblocked the writer.
+                    let affected = affected.map(|affected| affected.unscoped(scope_path.as_str()));
                     // ACK-ORDERING INVARIANT (revocation-acked publications): the
                     // gateway treats the NEXT poll's `since` as this watcher's ack
                     // of that revision, and a sibling's publication is blocked
@@ -1568,9 +1705,19 @@ async fn run_revision_watch(
                     // it never classified would otherwise go unaccounted for).
                     if let Some(cache) = cache.upgrade() {
                         match &affected {
-                            Some(paths) => {
-                                cache.observe_remote_publication(since, revision, paths)
-                            }
+                            // Point paths evict their own entry (and their
+                            // parent's listing); only the prefixes the gateway
+                            // named as superseded subtrees evict descendants.
+                            // Reading every path as a prefix is what made one
+                            // `.git/index.lock` publication drop the cached
+                            // metadata of every `.git` internal and cost the
+                            // next `git status` phase 30 point stats.
+                            Some(affected) => cache.observe_remote_publication(
+                                since,
+                                revision,
+                                &affected.paths,
+                                &affected.subtrees,
+                            ),
                             None => cache.observe_authoritative_revision(revision),
                         }
                     }
@@ -1604,8 +1751,11 @@ async fn run_revision_watch(
                                 // takes a guest-kernel parent-inode write lock
                                 // per entry, which stalls the guest's own lookups
                                 // behind it.
-                                Some(paths) => notifiers.enqueue_revocation_tracked(
-                                    &PublicationInvalidation::for_paths(paths),
+                                Some(affected) => notifiers.enqueue_revocation_tracked(
+                                    &PublicationInvalidation::for_affected(
+                                        &affected.paths,
+                                        &affected.subtrees,
+                                    ),
                                 ),
                                 // No trustworthy set: fall back to the untargeted
                                 // sweep, which declines itself past its own bound
@@ -1873,6 +2023,120 @@ mod tests {
     fn read_retry_budgets_exceed_their_attempt_timeouts() {
         assert!(METADATA_READ_RETRY_TIMEOUT > METADATA_READ_ATTEMPT_TIMEOUT);
         assert!(FILE_READ_RETRY_TIMEOUT > FILE_READ_ATTEMPT_TIMEOUT);
+    }
+
+    /// The gateway answers in the OWNER's namespace; the shared cache and every
+    /// mount's inode table are keyed relative to the registry's scope. Until the
+    /// answer is translated, every targeted revocation matched nothing at all —
+    /// the path a sibling mount actually changed was retagged forward as
+    /// "unaffected" instead of evicted, and no kernel lease was revoked, yet the
+    /// watch still acked and unblocked the writer.
+    #[test]
+    fn watch_paths_are_translated_out_of_the_owner_namespace() {
+        let affected = WatchAffected {
+            paths: vec![
+                "test-scope/git/index.lock".to_string(),
+                "test-scope/git".to_string(),
+                "test-scope".to_string(),
+                "other-scope/unrelated".to_string(),
+            ],
+            subtrees: vec![
+                "test-scope/tree/doomed".to_string(),
+                "other-scope/tree".to_string(),
+            ],
+        };
+
+        assert_eq!(
+            affected.clone().unscoped("test-scope"),
+            WatchAffected {
+                // The scope root maps to this mount's own root ("").
+                paths: vec![
+                    "git/index.lock".to_string(),
+                    "git".to_string(),
+                    String::new(),
+                ],
+                subtrees: vec!["tree/doomed".to_string()],
+            },
+            "a path outside the scope is dropped, never passed through: this \
+             mount cannot name it, and passing it through would alias an \
+             unrelated owner path onto a mount-relative one of the same spelling"
+        );
+
+        // An unscoped registry sees the owner namespace directly.
+        assert_eq!(
+            WatchAffected {
+                paths: vec!["a/b".to_string()],
+                subtrees: Vec::new(),
+            }
+            .unscoped(""),
+            WatchAffected {
+                paths: vec!["a/b".to_string()],
+                subtrees: Vec::new(),
+            }
+        );
+    }
+
+    /// A watch answer's `subtrees` field decides whether a publication may cost
+    /// a sibling entry its cached metadata, so all three of its states must stay
+    /// distinguishable on the wire: populated, present-and-empty, and absent.
+    #[test]
+    fn watch_subtrees_distinguish_present_empty_from_absent() {
+        let decode = |body: serde_json::Value| {
+            watch_affected(serde_json::from_value::<RevisionWatchResponse>(body).unwrap())
+        };
+
+        // Present and EMPTY: a create/delete supersedes its own path and its
+        // parent's listing, and nothing beneath either. No prefixes.
+        assert_eq!(
+            decode(serde_json::json!({
+                "revision": 18,
+                "paths": ["git/index.lock", "git"],
+                "subtrees": [],
+            })),
+            Some(WatchAffected {
+                paths: vec!["git/index.lock".to_string(), "git".to_string()],
+                subtrees: Vec::new(),
+            })
+        );
+
+        // Populated: only the rmdir/rename prefixes, never their parents.
+        assert_eq!(
+            decode(serde_json::json!({
+                "revision": 19,
+                "paths": ["tree/doomed", "tree"],
+                "subtrees": ["tree/doomed"],
+            })),
+            Some(WatchAffected {
+                paths: vec!["tree/doomed".to_string(), "tree".to_string()],
+                subtrees: vec!["tree/doomed".to_string()],
+            })
+        );
+
+        // ABSENT: an older gateway that cannot say which paths were directories.
+        // The only sound reading left is the pre-split one — every path is a
+        // prefix — which is conservative, not weaker.
+        assert_eq!(
+            decode(serde_json::json!({
+                "revision": 20,
+                "paths": ["git/index.lock", "git"],
+            })),
+            Some(WatchAffected {
+                paths: vec!["git/index.lock".to_string(), "git".to_string()],
+                subtrees: vec!["git/index.lock".to_string(), "git".to_string()],
+            })
+        );
+
+        // Truncated and path-less answers keep forcing the full sweep.
+        assert_eq!(
+            decode(serde_json::json!({
+                "revision": 21,
+                "paths": [],
+                "subtrees": [],
+                "truncated": true,
+            })),
+            None
+        );
+        assert_eq!(decode(serde_json::json!({ "revision": 22 })), None);
     }
 
     /// Every bulk metadata route asks the gateway for a BOUNDED content hash,

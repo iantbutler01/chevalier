@@ -128,12 +128,17 @@ class VfsPublicationCoordinator {
      * Publish a mutation. `paths` is the set the mutation affected, recorded with
      * the new revision so watchers can revoke precisely; omit it only where the
      * handler genuinely does not know the set (it is then recorded as empty).
+     * `subtrees` is the subset of `paths` whose whole subtree the mutation
+     * superseded (`remove_directory` / `rename`); omitting it means "this
+     * mutation superseded no subtree", which is the truth for every point
+     * mutation.
      */
-    async mutate(ownerId, mutate, paths) {
+    async mutate(ownerId, mutate, paths, subtrees) {
         return this.transact(ownerId, async () => ({
             value: await mutate(),
             mutated: true,
             paths,
+            subtrees,
         }));
     }
     async transact(ownerId, transaction) {
@@ -141,7 +146,7 @@ class VfsPublicationCoordinator {
         const release = await __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_acquire).call(this, state, "write");
         let outcome;
         try {
-            const { value, mutated, paths } = await transaction();
+            const { value, mutated, paths, subtrees } = await transaction();
             if (mutated) {
                 state.revision = Math.max(state.revision + 1, Date.now() * 1_000);
                 // Record before releasing the writer, which is what wakes parked
@@ -151,7 +156,7 @@ class VfsPublicationCoordinator {
                 // revision is what forces a later watcher onto the truncated fallback,
                 // so skipping the entry would silently downgrade every watcher behind
                 // it.
-                __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_recordPublication).call(this, state, state.revision, paths ?? []);
+                __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_recordPublication).call(this, state, state.revision, paths ?? [], subtrees ?? []);
             }
             outcome = { value, revision: state.revision, mutated };
         }
@@ -270,12 +275,13 @@ _VfsPublicationCoordinator_states = new WeakMap(), _VfsPublicationCoordinator_ac
 }, _VfsPublicationCoordinator_watchResult = function _VfsPublicationCoordinator_watchResult(state, revision, since) {
     // An unadvanced revision is answered 204, which carries no paths.
     if (revision <= since)
-        return { revision, paths: [] };
-    return { revision, paths: __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_pathsPublishedSince).call(this, state, since) };
-}, _VfsPublicationCoordinator_recordPublication = function _VfsPublicationCoordinator_recordPublication(state, revision, paths) {
+        return { revision, affected: { paths: [], subtrees: [] } };
+    return { revision, affected: __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_pathsPublishedSince).call(this, state, since) };
+}, _VfsPublicationCoordinator_recordPublication = function _VfsPublicationCoordinator_recordPublication(state, revision, paths, subtrees) {
     state.publicationHistory.push({
         revision,
         paths: [...new Set(paths.map(normalizePath))],
+        subtrees: [...new Set(subtrees.map(normalizePath))],
     });
     while (state.publicationHistory.length > PUBLICATION_HISTORY_LIMIT) {
         state.publicationHistory.shift();
@@ -291,6 +297,8 @@ _VfsPublicationCoordinator_states = new WeakMap(), _VfsPublicationCoordinator_ac
         return null;
     const seen = new Set();
     const union = [];
+    const seenSubtrees = new Set();
+    const subtrees = [];
     for (const entry of state.publicationHistory) {
         if (entry.revision <= since)
             continue;
@@ -302,8 +310,19 @@ _VfsPublicationCoordinator_states = new WeakMap(), _VfsPublicationCoordinator_ac
             if (union.length > WATCH_PATHS_LIMIT)
                 return null;
         }
+        for (const prefix of entry.subtrees) {
+            if (seenSubtrees.has(prefix))
+                continue;
+            seenSubtrees.add(prefix);
+            subtrees.push(prefix);
+            // Subtrees are a subset of `paths` for every producer here, so this can
+            // only fire if that invariant is ever broken; truncation is the
+            // fail-closed answer.
+            if (subtrees.length > WATCH_PATHS_LIMIT)
+                return null;
+        }
     }
-    return union;
+    return { paths: union, subtrees };
 }, _VfsPublicationCoordinator_notifyWatchers = function _VfsPublicationCoordinator_notifyWatchers(state) {
     if (state.pendingWatchers.length === 0)
         return;
@@ -707,17 +726,20 @@ function createVfsGatewayServer(opts) {
                 const since = parseWatchSince(url.searchParams.get("since"));
                 const timeoutMs = parseWatchTimeout(url.searchParams.get("timeout_ms"));
                 const watcherId = parseWatcherId(url.searchParams.get("watcher_id"));
-                const { revision, paths } = await publications.watch(ownerId, since, timeoutMs, watcherId);
+                const { revision, affected } = await publications.watch(ownerId, since, timeoutMs, watcherId);
                 if (revision > since) {
-                    // `paths` is serialized whenever the affected set is known, the empty
-                    // set included: an omitted field means "this gateway does not report
-                    // affected paths" and sends the watcher down a conservative full-sweep
+                    // `paths` and `subtrees` are serialized whenever the affected set is
+                    // known, the empty set included: an omitted field means "this gateway
+                    // does not report that set" and sends the watcher down a conservative
                     // fallback, which is a different statement from "this publication
-                    // touched nothing". `truncated` appears only when true, and then the
-                    // watcher must not treat `paths` as exhaustive.
-                    const body = paths === null
-                        ? { revision, paths: [], truncated: true }
-                        : { revision, paths };
+                    // touched nothing" / "this publication superseded no subtree". For
+                    // `subtrees` that fallback is specifically "treat every affected path
+                    // as a prefix", which is what an older gateway forces. `truncated`
+                    // appears only when true, and then the watcher must not treat either
+                    // list as exhaustive.
+                    const body = affected === null
+                        ? { revision, paths: [], subtrees: [], truncated: true }
+                        : { revision, paths: affected.paths, subtrees: affected.subtrees };
                     return withNamespaceRevision(json(200, body), revision);
                 }
                 return withNamespaceRevision(new Response(null, { status: 204 }), revision);
@@ -905,10 +927,11 @@ function createVfsGatewayServer(opts) {
                 }
                 try {
                     const affected = mutationSnapshotPaths(mutations);
+                    const superseded = mutationSupersededSubtrees(mutations);
                     const publication = await publications.mutate(ownerId, async () => {
                         await store.applyNamespaceBatch(mutations);
                         return { entries: await snapshotPaths(store, affected) };
-                    }, affected);
+                    }, affected, superseded);
                     return withNamespaceRevision(json(200, publication.value), publication.revision);
                 }
                 catch (error) {
@@ -1705,6 +1728,27 @@ function mutationSnapshotPaths(mutations) {
         }
     }
     return paths;
+}
+/**
+ * The prefixes a namespace batch superseded WHOLESALE — every path a watcher
+ * must drop everything beneath, not merely the path itself.
+ *
+ * Only `remove_directory` and `rename` qualify: the first removes a whole tree,
+ * the second moves one (and can land on top of another). Every other mutation
+ * supersedes exactly its own path plus its parent's listing, both of which
+ * `mutationSnapshotPaths` already names point-scoped. Reporting a create or a
+ * delete as a prefix is what makes a sibling's cached metadata collateral
+ * damage. Mirrors `namespace_superseded_subtrees` in the Rust gateway.
+ */
+function mutationSupersededSubtrees(mutations) {
+    const prefixes = [];
+    for (const mutation of mutations) {
+        if (mutation.kind !== "remove_directory" && mutation.kind !== "rename") {
+            continue;
+        }
+        prefixes.push(...mutationPaths(mutation));
+    }
+    return prefixes;
 }
 function normalizeNamespaceOperationIds(value) {
     if (!Array.isArray(value)) {

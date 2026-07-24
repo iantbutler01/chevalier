@@ -773,6 +773,107 @@ test("watch serializes an empty-but-complete path set distinguishably from a tru
   assert.strictEqual(behindBody.truncated, true);
 });
 
+test("watch reports superseded subtrees separately from the paths it touched", async () => {
+  const handler = createVfsGatewayServer({ resolveStore: () => watchPathStore() });
+  const owner = "owner-subtree-scoped";
+
+  // Seed the retained history so a later poll is answered from it rather than
+  // reported truncated.
+  const seeded = await namespaceMany(handler, owner, [
+    { kind: "create_file", path: "seed/first.txt" },
+  ]);
+  const baseline = Number(seeded.headers.get(NAMESPACE_REVISION_HEADER));
+
+  // A point mutation: create a lock file inside a directory. `paths` names the
+  // file and its parent; `subtrees` must be present and EMPTY. If the watcher
+  // had to read that parent as a subtree prefix — the only thing it can do when
+  // the two sets are not distinguished — one `index.lock` publication would
+  // evict every sibling's cached metadata (measured on `.git/`, whose Git
+  // metadata this gateway excludes from the mutation routes by default).
+  const created = await namespaceMany(handler, owner, [
+    { kind: "create_file", path: "repo/index.lock" },
+  ]);
+  assert.strictEqual(created.status, 200);
+  const createdRevision = Number(created.headers.get(NAMESPACE_REVISION_HEADER));
+
+  const pointAnswer = await (
+    await watchRequest(handler, owner, `since=${baseline}&timeout_ms=1000`)
+  ).json();
+  assert.strictEqual(pointAnswer.revision, createdRevision);
+  assert.deepStrictEqual([...pointAnswer.paths].sort(), ["repo", "repo/index.lock"]);
+  assert.ok(
+    Object.prototype.hasOwnProperty.call(pointAnswer, "subtrees"),
+    "an empty subtree set is still serialized; an omitted field means the gateway cannot report which paths were directories, and sends the watcher back to treating every path as a prefix",
+  );
+  assert.deepStrictEqual(pointAnswer.subtrees, []);
+  assert.strictEqual(pointAnswer.truncated, undefined);
+
+  // A subtree mutation: rmdir + rename. Both are prefixes whose descendants the
+  // publication superseded.
+  const superseded = await namespaceMany(handler, owner, [
+    { kind: "remove_directory", path: "tree/doomed" },
+    { kind: "rename", from: "tree/from", to: "tree/to" },
+  ]);
+  assert.strictEqual(superseded.status, 200);
+
+  const subtreeAnswer = await (
+    await watchRequest(handler, owner, `since=${createdRevision}&timeout_ms=1000`)
+  ).json();
+  assert.deepStrictEqual(
+    [...subtreeAnswer.subtrees].sort(),
+    ["tree/doomed", "tree/from", "tree/to"],
+    "only remove_directory and rename supersede a subtree",
+  );
+  assert.deepStrictEqual(
+    [...subtreeAnswer.paths].sort(),
+    ["tree", "tree/doomed", "tree/from", "tree/to"],
+    "the point set still names every touched path plus the parents whose listings changed",
+  );
+
+  // Truncation is unchanged, and neither list may be acted on.
+  const truncated = await (await watchRequest(handler, owner, "since=1&timeout_ms=1000")).json();
+  assert.strictEqual(truncated.truncated, true);
+  assert.deepStrictEqual(truncated.paths, []);
+  assert.deepStrictEqual(truncated.subtrees, []);
+});
+
+test("a content publication reports no superseded subtrees", async () => {
+  const files = new Map();
+  const handler = createVfsGatewayServer({
+    resolveStore: () => ({
+      async applyNamespaceBatch() {},
+      async stat(path) {
+        return files.has(path) ? { kind: "file", sizeBytes: files.get(path).length } : null;
+      },
+      async write(path, body) {
+        files.set(path, body);
+        return { content_hash: "hash", previous_hash: null, changed: true };
+      },
+    }),
+  });
+  const owner = "owner-content-scoped";
+
+  const seeded = await namespaceMany(handler, owner, [
+    { kind: "create_file", path: "seed/first.txt" },
+  ]);
+  const baseline = Number(seeded.headers.get(NAMESPACE_REVISION_HEADER));
+
+  const written = await handler(
+    new Request(`http://local/internal/chevalier/vfs/${owner}/write-many`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ writes: [{ path: "tree/file.txt", body: [1, 2, 3] }] }),
+    }),
+  );
+  assert.strictEqual(written.status, 200);
+
+  const answer = await (
+    await watchRequest(handler, owner, `since=${baseline}&timeout_ms=1000`)
+  ).json();
+  assert.deepStrictEqual(answer.paths, ["tree/file.txt"]);
+  assert.deepStrictEqual(answer.subtrees, []);
+});
+
 test("a watcher behind the retained publication history is answered truncated", async () => {
   const handler = createVfsGatewayServer({ resolveStore: () => watchPathStore() });
   const owner = "owner-history-evicted";

@@ -834,6 +834,25 @@ mod server {
     struct PublishedPaths {
         revision: u64,
         paths: Arc<Vec<String>>,
+        subtrees: Arc<Vec<String>>,
+    }
+
+    /// The affected set one watch answer reports: the point-scoped paths the
+    /// publications touched, plus the strictly smaller set of prefixes whose
+    /// WHOLE subtree they superseded.
+    ///
+    /// The distinction is load-bearing on the client. A watcher that cannot tell
+    /// them apart has to treat every affected path as a subtree prefix, so
+    /// publishing one lock file inside `.git/` (whose affected set names the
+    /// parent directory) evicts every sibling's cached metadata — measured as 30
+    /// point stats across 9 `.git` internals per warm `git status`. Only
+    /// `RemoveDirectory` and `Rename` actually supersede a subtree; a
+    /// create/delete/symlink/hard-link/chmod supersedes its own path plus its
+    /// parent's listing and nothing else.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub(super) struct PublishedAffected {
+        paths: Vec<String>,
+        subtrees: Vec<String>,
     }
 
     /// How many publications of affected-path history an owner retains. A
@@ -863,8 +882,10 @@ mod server {
         }
 
         /// Retain a publication's affected paths for lagging watchers, evicting
-        /// the oldest once the bound is reached.
-        fn record_publication(&self, revision: u64, paths: Vec<String>) {
+        /// the oldest once the bound is reached. `subtrees` is the subset of
+        /// prefixes whose whole subtree the publication superseded, and is
+        /// always a subset of `paths`.
+        fn record_publication(&self, revision: u64, paths: Vec<String>, subtrees: Vec<String>) {
             let mut history = self
                 .publication_history
                 .lock()
@@ -872,20 +893,22 @@ mod server {
             history.push_back(PublishedPaths {
                 revision,
                 paths: Arc::new(paths),
+                subtrees: Arc::new(subtrees),
             });
             while history.len() > PUBLICATION_HISTORY_LIMIT {
                 history.pop_front();
             }
         }
 
-        /// The union of paths published in `(since, current]`.
+        /// The union of paths published in `(since, current]`, together with the
+        /// union of the subtree prefixes among them.
         ///
         /// Returns `None` when the answer cannot be trusted to be complete —
         /// the watcher is further behind than the retained history, or the union
         /// exceeds [`WATCH_PATHS_LIMIT`] — in which case the caller reports
         /// truncation and the watcher falls back to its own handling rather than
         /// acting on a partial set.
-        fn paths_published_since(&self, since: u64) -> Option<Vec<String>> {
+        fn paths_published_since(&self, since: u64) -> Option<PublishedAffected> {
             let history = self
                 .publication_history
                 .lock()
@@ -899,6 +922,8 @@ mod server {
             }
             let mut seen = HashSet::new();
             let mut union = Vec::new();
+            let mut seen_subtrees = HashSet::new();
+            let mut subtrees = Vec::new();
             for entry in history.iter().filter(|entry| entry.revision > since) {
                 for path in entry.paths.iter() {
                     if seen.insert(path.as_str()) {
@@ -908,8 +933,22 @@ mod server {
                         }
                     }
                 }
+                for prefix in entry.subtrees.iter() {
+                    if seen_subtrees.insert(prefix.as_str()) {
+                        subtrees.push(prefix.clone());
+                        // Subtrees are a subset of `paths` for every producer in
+                        // this file, so this can only fire if that invariant is
+                        // ever broken; truncation is the fail-closed answer.
+                        if subtrees.len() > WATCH_PATHS_LIMIT {
+                            return None;
+                        }
+                    }
+                }
             }
-            Some(union)
+            Some(PublishedAffected {
+                paths: union,
+                subtrees,
+            })
         }
 
         /// Acquire a shared read snapshot of the current revision. The name and
@@ -949,21 +988,27 @@ mod server {
             &self,
             guard: tokio::sync::RwLockWriteGuard<'_, u64>,
         ) -> u64 {
-            self.commit_and_await_acks_for(guard, Vec::new()).await
+            self.commit_and_await_acks_for(guard, Vec::new(), Vec::new())
+                .await
         }
 
         /// As [`OwnerState::commit_and_await_acks`], recording `paths` as this
-        /// publication's affected set so watchers can revoke precisely.
+        /// publication's affected set so watchers can revoke precisely, and
+        /// `subtrees` as the prefixes among them whose whole subtree this
+        /// publication superseded (only `RemoveDirectory` and `Rename` can).
+        /// Anything not in `subtrees` is point-scoped: it must never cost a
+        /// sibling entry its cached metadata.
         pub(super) async fn commit_and_await_acks_for(
             &self,
             mut guard: tokio::sync::RwLockWriteGuard<'_, u64>,
             paths: Vec<String>,
+            subtrees: Vec<String>,
         ) -> u64 {
             *guard = (*guard + 1).max(namespace_revision_now());
             let published = *guard;
             // Record before announcing: a watcher woken by `publish` must never
             // find the history missing the revision it was woken for.
-            self.record_publication(published, paths);
+            self.record_publication(published, paths, subtrees);
             self.publish(published);
             // Release the publication lock BEFORE parking on acks: same-owner
             // ordering stays correct because the revision + storage are already
@@ -1545,6 +1590,18 @@ mod server {
         /// and must send the watcher down its conservative fallback, which is a
         /// different statement from "this publication touched nothing".
         paths: Vec<String>,
+        /// The subset of `paths` whose ENTIRE subtree the publications
+        /// superseded — a `RemoveDirectory` or a `Rename`, the only two
+        /// mutations that can move or remove a whole tree.
+        ///
+        /// Serialized on exactly the same terms as `paths` (always when the set
+        /// is known, empty included), because the two statements a watcher must
+        /// distinguish are "no subtree was superseded" (empty) and "this gateway
+        /// cannot tell you which were" (absent). Absent sends the watcher back
+        /// to treating every affected path as a prefix, which is correct but
+        /// evicts innocent siblings; present-and-empty is what lets a lock-file
+        /// publication inside `.git/` leave `.git/config` cached.
+        subtrees: Vec<String>,
         /// Set when the affected set could not be reported completely (the
         /// watcher is behind the retained history, or the set is too large).
         /// The watcher must not treat `paths` as exhaustive and falls back to
@@ -1573,10 +1630,10 @@ mod server {
         std::time::Duration::from_millis(millis)
     }
 
-    fn watch_hit(revision: u64, affected: Option<Vec<String>>) -> Response {
-        let (paths, truncated) = match affected {
-            Some(paths) => (paths, false),
-            None => (Vec::new(), true),
+    fn watch_hit(revision: u64, affected: Option<PublishedAffected>) -> Response {
+        let (paths, subtrees, truncated) = match affected {
+            Some(affected) => (affected.paths, affected.subtrees, false),
+            None => (Vec::new(), Vec::new(), true),
         };
         with_namespace_revision(
             (
@@ -1584,6 +1641,7 @@ mod server {
                 Json(WatchResponse {
                     revision,
                     paths,
+                    subtrees,
                     truncated,
                 }),
             )
@@ -1850,8 +1908,10 @@ mod server {
             .await?;
         let affected = snapshot_paths.clone();
         let entries = publication_snapshot(&backend, owner_id.as_str(), snapshot_paths).await?;
+        // A content write supersedes the file it wrote and nothing beneath any
+        // path: no subtree prefixes.
         let published = publication
-            .commit_and_await_acks_for(revision, affected)
+            .commit_and_await_acks_for(revision, affected, Vec::new())
             .await;
         Ok(with_namespace_revision(
             Json(VfsWriteManyPublicationResponse { results, entries }).into_response(),
@@ -1928,6 +1988,7 @@ mod server {
         )?;
         validate_declared_resource_key(&headers, &aliases, first_scope.resource_key.as_str())?;
         let snapshot_paths = namespace_snapshot_paths(body.mutations.as_slice());
+        let superseded_subtrees = namespace_superseded_subtrees(body.mutations.as_slice());
         backend
             .apply_namespace_batch(VfsNamespaceMutationBatchRequest {
                 owner_id: owner_id.clone(),
@@ -1939,7 +2000,7 @@ mod server {
         let affected = snapshot_paths.clone();
         let entries = publication_snapshot(&backend, owner_id.as_str(), snapshot_paths).await?;
         let published = publication
-            .commit_and_await_acks_for(revision, affected)
+            .commit_and_await_acks_for(revision, affected, superseded_subtrees)
             .await;
         Ok(with_namespace_revision(
             Json(VfsNamespaceMutationBatchResponse { entries }).into_response(),
@@ -1960,6 +2021,34 @@ mod server {
             }
         }
         paths
+    }
+
+    /// The prefixes a namespace batch superseded WHOLESALE — every path a
+    /// watcher must drop everything beneath, not merely the path itself.
+    ///
+    /// Only `RemoveDirectory` and `Rename` qualify: the first removes a whole
+    /// tree, the second moves one (and can land on top of another). Every other
+    /// mutation supersedes exactly its own path plus its parent's listing, both
+    /// of which `namespace_snapshot_paths` already names point-scoped. Reporting
+    /// a create or a delete as a prefix is what makes a sibling's cached
+    /// metadata collateral damage.
+    fn namespace_superseded_subtrees(mutations: &[VfsNamespaceMutation]) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut prefixes = Vec::new();
+        for mutation in mutations {
+            if !matches!(
+                mutation,
+                VfsNamespaceMutation::RemoveDirectory { .. } | VfsNamespaceMutation::Rename { .. }
+            ) {
+                continue;
+            }
+            for path in mutation.paths().into_iter().filter(|path| !path.is_empty()) {
+                if seen.insert(path.to_string()) {
+                    prefixes.push(path.to_string());
+                }
+            }
+        }
+        prefixes
     }
 
     fn immediate_parent(path: &str) -> String {
@@ -3522,6 +3611,194 @@ mod server_tests {
 
         stop.store(true, Ordering::Release);
         observer.abort();
+    }
+
+    fn namespace_many_request(owner: &str, mutations: serde_json::Value) -> Request<Body> {
+        let operation_ids = (0..mutations.as_array().expect("mutations array").len())
+            .map(|index| format!("op-{index}"))
+            .collect::<Vec<_>>();
+        Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/internal/chevalier/vfs/{owner}/namespace-many"
+            ))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(
+                CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+                format!("owner:{owner}:workspace"),
+            )
+            .header(
+                CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                Uuid::new_v4().to_string(),
+            )
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "operation_ids": operation_ids,
+                    "mutations": mutations,
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    }
+
+    async fn watch_body(app: &axum::Router, owner: &str, since: u64) -> serde_json::Value {
+        let response = watch_poll(app, owner, &format!("since={since}&timeout_ms=1000")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// A watch answer separates the paths a publication touched from the
+    /// prefixes whose WHOLE subtree it superseded, and serializes the second set
+    /// on the same always-when-known terms as the first.
+    ///
+    /// This is what keeps a point mutation from evicting innocent siblings. A
+    /// create/delete names its own path plus its parent directory; if the
+    /// watcher has to read that parent as a subtree prefix (the only thing it
+    /// can do when the two sets are not distinguished), one `.git/index.lock`
+    /// publication drops the cached metadata of every `.git` internal — measured
+    /// as 30 point stats over 9 paths per warm `git status`.
+    #[tokio::test]
+    async fn watch_reports_superseded_subtrees_separately_from_touched_paths() {
+        let app = ack_app(Duration::from_secs(1));
+        let owner = "subtree-scoped";
+        // Seed the retained history so a later poll is answered from it rather
+        // than reported truncated (`since` must be covered by the history).
+        assert_eq!(
+            app.clone()
+                .oneshot(mkdir_request(owner, "tree"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        let seeded = seed_revision(&app, owner).await;
+
+        // A point mutation: create inside `tree/`. `paths` names the file and
+        // its parent; `subtrees` must be present and EMPTY.
+        let created = app
+            .clone()
+            .oneshot(namespace_many_request(
+                owner,
+                serde_json::json!([{"kind": "create_file", "path": "tree/index.lock"}]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let created_revision = namespace_revision(&created);
+
+        let answer = watch_body(&app, owner, seeded).await;
+        assert_eq!(answer["revision"].as_u64(), Some(created_revision));
+        let paths = answer["paths"]
+            .as_array()
+            .expect("paths is always serialized when known")
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(paths.contains("tree/index.lock"), "paths: {paths:?}");
+        assert!(
+            paths.contains("tree"),
+            "the parent's listing changed: {paths:?}"
+        );
+        assert_eq!(
+            answer["subtrees"].as_array().map(Vec::len),
+            Some(0),
+            "a create supersedes no subtree, and the empty set must still be \
+             serialized so the watcher can tell it from an older gateway: {answer}"
+        );
+        assert!(answer.get("truncated").is_none());
+
+        // A subtree mutation: rmdir + rename. Both prefixes must be reported.
+        let removed = app
+            .clone()
+            .oneshot(namespace_many_request(
+                owner,
+                serde_json::json!([
+                    {"kind": "remove_directory", "path": "tree/doomed"},
+                    {"kind": "rename", "from": "tree/from", "to": "tree/to"},
+                ]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(removed.status(), StatusCode::OK);
+        let removed_revision = namespace_revision(&removed);
+
+        let answer = watch_body(&app, owner, created_revision).await;
+        assert_eq!(answer["revision"].as_u64(), Some(removed_revision));
+        let subtrees = answer["subtrees"]
+            .as_array()
+            .expect("subtrees is always serialized when known")
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            subtrees,
+            ["tree/doomed", "tree/from", "tree/to"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<std::collections::BTreeSet<_>>(),
+            "only RemoveDirectory and Rename supersede a subtree: {answer}"
+        );
+
+        // Truncation is unchanged: no trustworthy set, so neither list may be
+        // acted on.
+        let truncated = watch_body(&app, owner, 1).await;
+        assert_eq!(truncated["truncated"].as_bool(), Some(true));
+        assert_eq!(truncated["paths"].as_array().map(Vec::len), Some(0));
+        assert_eq!(truncated["subtrees"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// A content publication supersedes the bytes it wrote and nothing beneath
+    /// any path, so `write-many` must report an empty subtree set.
+    #[tokio::test]
+    async fn write_many_publications_report_no_superseded_subtrees() {
+        let app = ack_app(Duration::from_secs(1));
+        let owner = "write-scoped";
+        assert_eq!(
+            app.clone()
+                .oneshot(mkdir_request(owner, "tree"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        let seeded = seed_revision(&app, owner).await;
+
+        let written = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/internal/chevalier/vfs/{owner}/write-many"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+                        format!("owner:{owner}:workspace"),
+                    )
+                    .header(
+                        CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                        Uuid::new_v4().to_string(),
+                    )
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "writes": [{"path": "tree/file.txt", "body": [1, 2, 3]}],
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(written.status(), StatusCode::OK);
+
+        let answer = watch_body(&app, owner, seeded).await;
+        assert_eq!(
+            answer["paths"]
+                .as_array()
+                .map(|paths| paths.iter().map(|p| p.as_str().unwrap()).collect::<Vec<_>>()),
+            Some(vec!["tree/file.txt"])
+        );
+        assert_eq!(answer["subtrees"].as_array().map(Vec::len), Some(0));
     }
 
     #[async_trait]
