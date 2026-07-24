@@ -1,20 +1,33 @@
+use std::collections::HashMap;
+use std::sync::{
+    Arc, Mutex, OnceLock, Weak,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use chevalier_sandbox::vfs::{
     CHEVALIER_VFS_COMPONENT_HEADER, CHEVALIER_VFS_EXECUTABLE_HEADER,
+    CHEVALIER_VFS_LEASE_MODE_HEADER, CHEVALIER_VFS_LEASE_MODE_IMPLICIT,
     CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, CHEVALIER_VFS_MODE_HEADER,
-    CHEVALIER_VFS_OPERATION_HEADER, CHEVALIER_VFS_PRECONDITION_FILE_ID_HEADER,
-    CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER, CHEVALIER_VFS_PRECONDITION_KIND_HEADER,
-    CHEVALIER_VFS_RESOURCE_KEY_HEADER, CHEVALIER_VFS_SURFACE_KIND_HEADER, VFS_COMPONENT_VM_RUNTIME,
-    VfsCasPredicate, VfsDirEntry as RemoteDirEntry, VfsHardLinkAliasBody, VfsHardLinkAliasResponse,
-    VfsHardLinkBody, VfsHardLinkMetadataResponse, VfsLeaseAcquireRequest,
-    VfsLeaseGrant as LeaseGrant, VfsLeaseReleaseRequest, VfsMetadata as RemoteMetadata,
-    VfsNamespaceMutation, VfsNamespaceMutationBatchBody, VfsWriteManyBody, VfsWriteManyItem,
-    VfsWritePrecondition, scoped_vfs_path,
+    CHEVALIER_VFS_NAMESPACE_REVISION_HEADER, CHEVALIER_VFS_OPERATION_HEADER,
+    CHEVALIER_VFS_PRECONDITION_FILE_ID_HEADER, CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER,
+    CHEVALIER_VFS_PRECONDITION_KIND_HEADER, CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+    CHEVALIER_VFS_SURFACE_KIND_HEADER, VFS_COMPONENT_VM_RUNTIME, VfsCasPredicate,
+    VfsDirEntry as RemoteDirEntry, VfsHardLinkAliasBody, VfsHardLinkAliasResponse, VfsHardLinkBody,
+    VfsHardLinkMetadataResponse, VfsLeaseAcquireRequest, VfsLeaseGrant as LeaseGrant,
+    VfsLeaseReleaseRequest, VfsMetadata as RemoteMetadata, VfsMetadataManyRequest,
+    VfsMetadataManyResponse, VfsNamespaceMutation, VfsNamespaceMutationBatchBody,
+    VfsNamespaceMutationBatchResponse, VfsPrefetchSubtreeRequest, VfsPrefetchSubtreeResponse,
+    VfsPublicationSnapshotEntry, VfsSubtreeMetadataRequest, VfsSubtreeMetadataResponse,
+    VfsWriteManyBody, VfsWriteManyItem, VfsWriteManyPublicationResponse, VfsWritePrecondition,
+    scoped_vfs_path,
 };
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
+use tokio::runtime::Handle;
+
+use super::cache::{MountInvalidators, RemoteFuseCache};
 
 pub const RANGE_FINGERPRINT_HEADER: &str = "x-chevalier-vfs-range-fingerprint";
 /// Transient-failure budget sized to ride out a gateway restart, not mask a
@@ -30,13 +43,76 @@ const ADVISORY_LOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const ADVISORY_LOCK_RENEWAL_BATCH_SIZE: usize = 4_096;
 const READ_RETRY_DELAY_MIN: Duration = Duration::from_millis(50);
 const READ_RETRY_DELAY_MAX: Duration = Duration::from_millis(500);
-
+/// Long-poll window advertised to the gateway watch endpoint. The gateway
+/// returns 200 as soon as the owner revision advances past `since`, or 204 at
+/// this deadline. Kept inside the contract's 1000..30000 ms band.
+const REVISION_WATCH_TIMEOUT_MS: u64 = 25_000;
+/// Per-attempt HTTP budget for the watch poll: the long-poll window plus slack
+/// for the response to land. Explicitly overrides the client's 30s mutation
+/// timeout so a held-open watch is never mistaken for a stuck mutation.
+const REVISION_WATCH_ATTEMPT_TIMEOUT: Duration =
+    Duration::from_millis(REVISION_WATCH_TIMEOUT_MS + 5_000);
+/// Reconnect backoff floor after a watch failure; rides out a gateway restart.
+const REVISION_WATCH_BACKOFF_MIN: Duration = Duration::from_millis(500);
+/// Reconnect backoff ceiling. The watch is down and serves fail closed to
+/// strict while backing off, so a bounded retry cadence is enough.
+const REVISION_WATCH_BACKOFF_MAX: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug)]
 pub struct RemoteVfsClient {
     client: Client,
     endpoint: String,
     auth_token: String,
     scope_path: String,
+    revisions: Arc<SharedRevisionState>,
+}
+
+#[derive(Debug, Default)]
+struct SharedRevisionState {
+    /// Highest revision proven visible by an authoritative read. Namespace
+    /// projections may retire only against this value.
+    observed_read: AtomicU64,
+    /// Highest revision either read or published by a sibling mount. Cache
+    /// entries are valid only while this generation is unchanged.
+    coherence: AtomicU64,
+    /// Set only after the gateway explicitly advertises that mutation
+    /// endpoints provide their own serialization. Real lease-backed gateways
+    /// never set this and retain acquire/release behavior unchanged.
+    implicit_leases: AtomicBool,
+    /// True only while a long-poll revision watch is actively confirming this
+    /// registry's coherence fence. Amortized cache serves are valid only under
+    /// a live watch; when it drops the fs layer fails closed to strict,
+    /// wire-backed serves. This is a live-channel signal, never a wall-clock
+    /// freshness window.
+    watch_live: AtomicBool,
+    /// Guards lazy, once-per-registry spawn of the watch task. The first mount
+    /// to use this registry flips it and owns the detached watch loop.
+    watch_started: AtomicBool,
+    /// Stable, opaque identity for this registry's single watch loop, sent as
+    /// `watcher_id` on every poll. The gateway keys revocation-ack progress by
+    /// it: a poll's `since` acks that revision, and a sibling's publication
+    /// blocks until this watcher's ack reaches the published revision. Generated
+    /// once per registry — every sibling mount of the same (endpoint, scope)
+    /// shares this one watch loop and therefore this one identity.
+    watcher_id: String,
+}
+
+fn shared_revision_state(key: &str) -> Arc<SharedRevisionState> {
+    static STATES: OnceLock<Mutex<HashMap<String, Weak<SharedRevisionState>>>> = OnceLock::new();
+    let mut states = STATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(state) = states.get(key).and_then(Weak::upgrade) {
+        return state;
+    }
+    let state = Arc::new(SharedRevisionState {
+        // A fresh identity per registry so every observer mount-host acks
+        // independently; the default atomics fill the rest.
+        watcher_id: uuid::Uuid::new_v4().to_string(),
+        ..Default::default()
+    });
+    states.insert(key.to_string(), Arc::downgrade(&state));
+    state
 }
 
 pub struct RemoteWrite {
@@ -44,6 +120,21 @@ pub struct RemoteWrite {
     pub bytes: Vec<u8>,
     pub base_content_hash: Option<String>,
     pub expected_file_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Versioned<T> {
+    pub value: T,
+    /// Exact namespace revision attached to the response that produced
+    /// `value`. Zero means the gateway did not provide a revision and the
+    /// result must not seed a coherence-sensitive cache.
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RemotePublication {
+    pub revision: u64,
+    pub entries: Vec<VfsPublicationSnapshotEntry>,
 }
 
 /// Outcome of a fingerprint-pinned ranged read.
@@ -102,24 +193,98 @@ struct AdvisoryLockRequest<'a> {
 
 impl RemoteVfsClient {
     pub fn new(endpoint: &str, auth_token: &str, scope_path: &str) -> Result<Self> {
+        let endpoint = endpoint.trim_end_matches('/').to_string();
+        let scope_path = scope_path.trim_matches('/').to_string();
         let mut builder = Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(30))
             .pool_idle_timeout(Duration::from_secs(90))
             .http2_adaptive_window(true);
-        if http2_prior_knowledge_enabled(endpoint) {
+        if http2_prior_knowledge_enabled(&endpoint) {
             builder = builder.http2_prior_knowledge();
         }
         let client = builder.build().context("build vfs reqwest client")?;
+        let revisions = shared_revision_state(&format!("{endpoint}\n{scope_path}"));
         Ok(Self {
             client,
-            endpoint: endpoint.trim_end_matches('/').to_string(),
+            endpoint,
             auth_token: auth_token.to_string(),
-            scope_path: scope_path.trim_matches('/').to_string(),
+            scope_path,
+            revisions,
         })
     }
 
+    pub fn observed_namespace_revision(&self) -> u64 {
+        self.revisions.observed_read.load(Ordering::Acquire)
+    }
+
+    pub fn coherence_revision(&self) -> u64 {
+        self.revisions.coherence.load(Ordering::Acquire)
+    }
+
+    pub fn coherence_key(&self) -> String {
+        format!("{}\n{}", self.endpoint, self.scope_path)
+    }
+
+    fn observe_read_revision(&self, revision: u64) {
+        self.revisions
+            .observed_read
+            .fetch_max(revision, Ordering::AcqRel);
+        self.revisions
+            .coherence
+            .fetch_max(revision, Ordering::AcqRel);
+    }
+
+    pub(super) fn observe_published_revision(&self, revision: u64) {
+        self.revisions
+            .coherence
+            .fetch_max(revision, Ordering::AcqRel);
+    }
+
+    /// Whether a long-poll revision watch is currently confirming this
+    /// registry's coherence fence. The fs layer serves amortized cache hits
+    /// only while this is true and fails closed to strict serves otherwise.
+    pub(super) fn revision_watch_live(&self) -> bool {
+        self.revisions.watch_live.load(Ordering::Acquire)
+    }
+
+    /// Lazily start the per-registry revision watch on first mount use. The
+    /// watch keeps the coherence fence continuously confirmed so cache serves
+    /// are valid; it is spawned exactly once per endpoint+scope registry and
+    /// runs detached (it holds only weak references and never blocks process
+    /// shutdown). `cache` is the shared cache for this registry, notified so a
+    /// remote publication observed by the watch clears superseded entries;
+    /// `invalidators` is the shared set of every mount's kernel-invalidation
+    /// hook, swept in lockstep so a remote publication also revokes the affected
+    /// kernel attr/entry leases before the watch acks it.
+    pub(super) fn ensure_revision_watch(
+        &self,
+        tokio: &Handle,
+        cache: &Arc<RemoteFuseCache>,
+        invalidators: &Arc<MountInvalidators>,
+    ) {
+        if self.revisions.watch_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let http = self.client.clone();
+        let endpoint = self.endpoint.clone();
+        let auth_token = self.auth_token.clone();
+        let revisions = Arc::downgrade(&self.revisions);
+        let cache = Arc::downgrade(cache);
+        let notifiers = Arc::downgrade(invalidators);
+        tokio.spawn(run_revision_watch(
+            http, endpoint, auth_token, revisions, cache, notifiers,
+        ));
+    }
+
     pub async fn list_dir(&self, path: &str) -> Result<Option<Vec<RemoteDirEntry>>> {
+        Ok(self.list_dir_versioned(path).await?.value)
+    }
+
+    pub async fn list_dir_versioned(
+        &self,
+        path: &str,
+    ) -> Result<Versioned<Option<Vec<RemoteDirEntry>>>> {
         self.read_decoded(
             self.client
                 .get(self.url("/tree"))
@@ -142,18 +307,151 @@ impl RemoteVfsClient {
     }
 
     pub async fn stat(&self, path: &str) -> Result<Option<RemoteMetadata>> {
-        self.stat_with_max_hash_bytes(path, None).await
+        Ok(self.stat_versioned(path).await?.value)
     }
 
     pub async fn stat_attributes(&self, path: &str) -> Result<Option<RemoteMetadata>> {
-        self.stat_with_max_hash_bytes(path, Some(0)).await
+        Ok(self.stat_attributes_versioned(path).await?.value)
     }
 
-    async fn stat_with_max_hash_bytes(
+    pub async fn stat_versioned(&self, path: &str) -> Result<Versioned<Option<RemoteMetadata>>> {
+        self.stat_with_max_hash_bytes_versioned(path, None).await
+    }
+
+    pub async fn stat_attributes_versioned(
+        &self,
+        path: &str,
+    ) -> Result<Versioned<Option<RemoteMetadata>>> {
+        self.stat_with_max_hash_bytes_versioned(path, Some(0)).await
+    }
+
+    pub async fn metadata_many_attributes(
+        &self,
+        paths: &[String],
+    ) -> Result<Vec<Option<RemoteMetadata>>> {
+        Ok(self.metadata_many_attributes_versioned(paths).await?.value)
+    }
+
+    pub async fn metadata_many_attributes_versioned(
+        &self,
+        paths: &[String],
+    ) -> Result<Versioned<Vec<Option<RemoteMetadata>>>> {
+        let body = VfsMetadataManyRequest {
+            paths: paths.iter().map(|path| self.path_arg(path)).collect(),
+        };
+        self.read_decoded(
+            self.client
+                .post(self.url("/metadata-many"))
+                .query(&[("max_hash_bytes", 0_u64)])
+                .json(&body)
+                .timeout(METADATA_READ_ATTEMPT_TIMEOUT),
+            METADATA_READ_RETRY_TIMEOUT,
+            |status, body| {
+                if !status.is_success() {
+                    return Err(anyhow!("vfs metadata-many failed: {status}"));
+                }
+                serde_json::from_slice::<VfsMetadataManyResponse>(body)
+                    .context("decode vfs metadata-many response")
+                    .map(|response| response.entries)
+            },
+        )
+        .await
+    }
+
+    pub async fn subtree_metadata_attributes_versioned(
+        &self,
+        prefix: &str,
+        limit: i64,
+    ) -> Result<Versioned<Vec<(String, RemoteMetadata)>>> {
+        self.read_decoded(
+            self.client
+                .post(self.url("/subtree-metadata"))
+                .json(&VfsSubtreeMetadataRequest {
+                    prefix: self.path_arg(prefix),
+                    include_object_state: false,
+                    include_token_count: false,
+                    limit: Some(limit),
+                    max_hash_bytes: Some(0),
+                })
+                .timeout(METADATA_READ_ATTEMPT_TIMEOUT),
+            METADATA_READ_RETRY_TIMEOUT,
+            |status, body| {
+                if status == StatusCode::NOT_FOUND {
+                    return Err(anyhow::Error::new(VfsRequestStatusError { status })
+                        .context("vfs subtree-metadata route not found"));
+                }
+                if !status.is_success() {
+                    return Err(anyhow!("vfs subtree-metadata failed: {status}"));
+                }
+                let response = serde_json::from_slice::<VfsSubtreeMetadataResponse>(body)
+                    .context("decode vfs subtree-metadata response")?;
+                Ok(response
+                    .entries
+                    .into_iter()
+                    .map(|entry| {
+                        (
+                            self.unscoped_path(entry.path.as_str()),
+                            RemoteMetadata {
+                                kind: entry.kind,
+                                size_bytes: entry.size_bytes,
+                                file_id: entry.file_id,
+                                link_count: entry.link_count,
+                                link_target: entry.link_target,
+                                content_hash: entry.content_hash,
+                                executable: entry.executable,
+                                mode: entry.mode,
+                                updated_at: entry.updated_at,
+                            },
+                        )
+                    })
+                    .collect())
+            },
+        )
+        .await
+    }
+
+    pub async fn prefetch_subtree_versioned(
+        &self,
+        prefix: &str,
+        max_entries: i64,
+        max_pack_bytes: u64,
+    ) -> Result<Versioned<Vec<(String, Vec<u8>)>>> {
+        self.read_decoded(
+            self.client
+                .post(self.url("/prefetch-subtree"))
+                .json(&VfsPrefetchSubtreeRequest {
+                    prefix: self.path_arg(prefix),
+                    include_small_file_bytes: true,
+                    max_entries: Some(max_entries),
+                    max_pack_bytes: Some(max_pack_bytes),
+                })
+                .timeout(FILE_READ_ATTEMPT_TIMEOUT),
+            FILE_READ_RETRY_TIMEOUT,
+            |status, body| {
+                if status == StatusCode::NOT_FOUND {
+                    return Err(anyhow::Error::new(VfsRequestStatusError { status })
+                        .context("vfs prefetch-subtree route not found"));
+                }
+                if !status.is_success() {
+                    return Err(anyhow!("vfs prefetch-subtree failed: {status}"));
+                }
+                let response = serde_json::from_slice::<VfsPrefetchSubtreeResponse>(body)
+                    .context("decode vfs prefetch-subtree response")?;
+                Ok(response
+                    .warmed_file_bytes
+                    .into_iter()
+                    .map(|entry| (self.unscoped_path(entry.path.as_str()), entry.body))
+                    .collect())
+            },
+        )
+        .await
+    }
+
+    async fn stat_with_max_hash_bytes_versioned(
         &self,
         path: &str,
         max_hash_bytes: Option<u64>,
-    ) -> Result<Option<RemoteMetadata>> {
+    ) -> Result<Versioned<Option<RemoteMetadata>>> {
         let mut query = vec![("path", self.path_arg(path))];
         if let Some(max_hash_bytes) = max_hash_bytes {
             query.push(("max_hash_bytes", max_hash_bytes.to_string()));
@@ -177,6 +475,10 @@ impl RemoteVfsClient {
     }
 
     pub async fn read_file_raw(&self, path: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.read_file_raw_versioned(path).await?.value)
+    }
+
+    pub async fn read_file_raw_versioned(&self, path: &str) -> Result<Versioned<Option<Vec<u8>>>> {
         self.read_decoded(
             self.client
                 .get(self.url("/file/raw"))
@@ -203,6 +505,19 @@ impl RemoteVfsClient {
         length: u64,
         fingerprint: Option<&str>,
     ) -> Result<RangeRead> {
+        Ok(self
+            .read_file_range_versioned(path, offset, length, fingerprint)
+            .await?
+            .value)
+    }
+
+    pub async fn read_file_range_versioned(
+        &self,
+        path: &str,
+        offset: u64,
+        length: u64,
+        fingerprint: Option<&str>,
+    ) -> Result<Versioned<RangeRead>> {
         let mut request = self
             .client
             .get(self.url("/file/raw"))
@@ -257,7 +572,7 @@ impl RemoteVfsClient {
             );
         request = with_mode_header(request, mode);
         request = with_precondition_headers(request, base_content_hash, expected_file_id);
-        self.request(request.body(bytes.to_vec())).await?;
+        self.request_mutation(request.body(bytes.to_vec())).await?;
         Ok(())
     }
 
@@ -268,7 +583,7 @@ impl RemoteVfsClient {
         surface_kind: &str,
         operation: &str,
     ) -> Result<()> {
-        self.request(
+        self.request_mutation(
             self.client
                 .delete(self.url("/file"))
                 .query(&[("path", self.path_arg(path))])
@@ -311,7 +626,8 @@ impl RemoteVfsClient {
                 CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
                 lease.owner_token.to_string(),
             );
-        self.request(with_mode_header(request, mode)).await?;
+        self.request_mutation(with_mode_header(request, mode))
+            .await?;
         Ok(())
     }
 
@@ -323,7 +639,7 @@ impl RemoteVfsClient {
         surface_kind: &str,
         operation: &str,
     ) -> Result<()> {
-        self.request(
+        self.request_mutation(
             self.client
                 .put(self.url("/symlink"))
                 .query(&[
@@ -353,7 +669,7 @@ impl RemoteVfsClient {
         lease: &LeaseGrant,
         surface_kind: &str,
     ) -> Result<VfsHardLinkMetadataResponse> {
-        self.request(
+        self.request_mutation(
             self.client
                 .post(self.url("/hard-link/v1"))
                 .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
@@ -383,17 +699,27 @@ impl RemoteVfsClient {
         file_id: &str,
         excluding_path: &str,
     ) -> Result<Option<String>> {
-        self.request(self.client.post(self.url("/hard-link-alias/v1")).json(
-            &VfsHardLinkAliasBody {
-                file_id: file_id.to_string(),
-                excluding_path: self.path_arg(excluding_path),
-            },
-        ))
-        .await?
-        .json::<VfsHardLinkAliasResponse>()
-        .await
-        .map(|response| response.path.map(|path| self.unscoped_path(path.as_str())))
-        .context("decode vfs hard-link alias response")
+        Ok(self
+            .read_decoded(
+                self.client
+                    .post(self.url("/hard-link-alias/v1"))
+                    .json(&VfsHardLinkAliasBody {
+                        file_id: file_id.to_string(),
+                        excluding_path: self.path_arg(excluding_path),
+                    })
+                    .timeout(METADATA_READ_ATTEMPT_TIMEOUT),
+                METADATA_READ_RETRY_TIMEOUT,
+                |status, body| {
+                    if !status.is_success() {
+                        return Err(anyhow!("vfs hard-link alias failed: {status}"));
+                    }
+                    serde_json::from_slice::<VfsHardLinkAliasResponse>(body)
+                        .context("decode vfs hard-link alias response")
+                        .map(|response| response.path.map(|path| self.unscoped_path(path.as_str())))
+                },
+            )
+            .await?
+            .value)
     }
 
     pub async fn rmdir(
@@ -403,7 +729,7 @@ impl RemoteVfsClient {
         surface_kind: &str,
         operation: &str,
     ) -> Result<()> {
-        self.request(
+        self.request_mutation(
             self.client
                 .delete(self.url("/dir"))
                 .query(&[("path", self.path_arg(path))])
@@ -431,7 +757,7 @@ impl RemoteVfsClient {
         surface_kind: &str,
         operation: &str,
     ) -> Result<()> {
-        self.request(
+        self.request_mutation(
             self.client
                 .post(self.url("/rename"))
                 .query(&[("from", self.path_arg(from)), ("to", self.path_arg(to))])
@@ -458,24 +784,39 @@ impl RemoteVfsClient {
         reason: &str,
     ) -> Result<LeaseGrant> {
         let scoped_path = self.path_arg(path);
-        self.request(
-            self.client
-                .post(self.url("/lease"))
-                .json(&VfsLeaseAcquireRequest {
-                    path: scoped_path,
-                    mutation_count: Some(mutation_count),
-                    component: Some(VFS_COMPONENT_VM_RUNTIME.to_string()),
-                    run_id: None,
-                    reason: Some(reason.to_string()),
-                }),
-        )
-        .await?
-        .json()
-        .await
-        .context("decode vfs lease response")
+        if self.revisions.implicit_leases.load(Ordering::Acquire) {
+            return Ok(implicit_lease_grant(scoped_path.as_str()));
+        }
+        let response = self
+            .request(
+                self.client
+                    .post(self.url("/lease"))
+                    .json(&VfsLeaseAcquireRequest {
+                        path: scoped_path,
+                        mutation_count: Some(mutation_count),
+                        component: Some(VFS_COMPONENT_VM_RUNTIME.to_string()),
+                        run_id: None,
+                        reason: Some(reason.to_string()),
+                    }),
+            )
+            .await?;
+        if response
+            .headers()
+            .get(CHEVALIER_VFS_LEASE_MODE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            == Some(CHEVALIER_VFS_LEASE_MODE_IMPLICIT)
+        {
+            self.revisions
+                .implicit_leases
+                .store(true, Ordering::Release);
+        }
+        response.json().await.context("decode vfs lease response")
     }
 
     pub async fn release_lease(&self, lease: &LeaseGrant) -> Result<()> {
+        if self.revisions.implicit_leases.load(Ordering::Acquire) {
+            return Ok(());
+        }
         self.request(
             self.client
                 .delete(self.url("/lease"))
@@ -604,11 +945,22 @@ impl RemoteVfsClient {
 
     pub async fn apply_namespace_batch(
         &self,
+        operation_ids: &[String],
         mutations: &[VfsNamespaceMutation],
         surface_kind: &str,
-    ) -> Result<()> {
+    ) -> Result<RemotePublication> {
         if mutations.is_empty() {
-            return Ok(());
+            return Ok(RemotePublication {
+                revision: self.observed_namespace_revision(),
+                entries: Vec::new(),
+            });
+        }
+        if operation_ids.len() != mutations.len() {
+            return Err(anyhow!(
+                "namespace batch has {} operation ids for {} mutations",
+                operation_ids.len(),
+                mutations.len()
+            ));
         }
         let lease_path = common_namespace_parent(mutations);
         let lease = self
@@ -622,36 +974,71 @@ impl RemoteVfsClient {
             .iter()
             .map(|mutation| self.scope_namespace_mutation(mutation))
             .collect::<Vec<_>>();
-        let result = self
-            .request(
-                self.client
-                    .post(self.url("/namespace-many"))
-                    .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
-                    .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
-                    .header(CHEVALIER_VFS_OPERATION_HEADER, "vfs_namespace_batch")
-                    .header(
-                        CHEVALIER_VFS_RESOURCE_KEY_HEADER,
-                        lease.resource_key.as_str(),
-                    )
-                    .header(
-                        CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
-                        lease.owner_token.to_string(),
-                    )
-                    .json(&VfsNamespaceMutationBatchBody { mutations: scoped }),
-            )
-            .await
-            .map(|_| ());
+        let result = async {
+            let response = self
+                .request_mutation(
+                    self.client
+                        .post(self.url("/namespace-many"))
+                        .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
+                        .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
+                        .header(CHEVALIER_VFS_OPERATION_HEADER, "vfs_namespace_batch")
+                        .header(
+                            CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+                            lease.resource_key.as_str(),
+                        )
+                        .header(
+                            CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                            lease.owner_token.to_string(),
+                        )
+                        .json(&VfsNamespaceMutationBatchBody {
+                            operation_ids: operation_ids.to_vec(),
+                            mutations: scoped,
+                        }),
+                )
+                .await?;
+            let revision = parse_namespace_revision(response.headers())
+                .expect("mutation response revision was validated");
+            let body = response
+                .bytes()
+                .await
+                .context("read namespace batch response")?;
+            let decoded = if body.is_empty() {
+                VfsNamespaceMutationBatchResponse::default()
+            } else {
+                serde_json::from_slice::<VfsNamespaceMutationBatchResponse>(body.as_ref())
+                    .context("decode namespace batch response")?
+            };
+            Ok(RemotePublication {
+                revision,
+                entries: self.unscoped_publication_entries(decoded.entries),
+            })
+        }
+        .await;
         let release = self.release_lease(&lease).await;
         match (result, release) {
-            (Ok(()), Ok(())) => Ok(()),
+            (Ok(publication), Ok(())) => Ok(publication),
             (Err(error), _) => Err(error),
-            (Ok(()), Err(error)) => Err(error),
+            (Ok(publication), Err(error)) => {
+                tracing::warn!(
+                    revision = publication.revision,
+                    error = %error,
+                    "namespace batch committed but lease release failed"
+                );
+                Ok(publication)
+            }
         }
     }
 
-    pub async fn write_many(&self, writes: Vec<RemoteWrite>, surface_kind: &str) -> Result<()> {
+    pub async fn write_many(
+        &self,
+        writes: Vec<RemoteWrite>,
+        surface_kind: &str,
+    ) -> Result<RemotePublication> {
         if writes.is_empty() {
-            return Ok(());
+            return Ok(RemotePublication {
+                revision: self.coherence_revision(),
+                entries: Vec::new(),
+            });
         }
         let lease_path = common_parent(writes.iter().map(|write| write.path.as_str()));
         let lease = self
@@ -667,35 +1054,53 @@ impl RemoteVfsClient {
                 .map(|write| self.scope_remote_write(write))
                 .collect(),
         };
-        let result = self
-            .request(
-                self.client
-                    .post(self.url("/write-many"))
-                    .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
-                    .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
-                    .header(CHEVALIER_VFS_OPERATION_HEADER, "vfs_write_many")
-                    .header(
-                        CHEVALIER_VFS_RESOURCE_KEY_HEADER,
-                        lease.resource_key.as_str(),
-                    )
-                    .header(
-                        CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
-                        lease.owner_token.to_string(),
-                    )
-                    .json(&body),
-            )
-            .await
-            .map(|_| ());
+        let result = async {
+            let response = self
+                .request_mutation(
+                    self.client
+                        .post(self.url("/write-many"))
+                        .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
+                        .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
+                        .header(CHEVALIER_VFS_OPERATION_HEADER, "vfs_write_many")
+                        .header(
+                            CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+                            lease.resource_key.as_str(),
+                        )
+                        .header(
+                            CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                            lease.owner_token.to_string(),
+                        )
+                        .json(&body),
+                )
+                .await?;
+            let revision = parse_namespace_revision(response.headers())
+                .expect("mutation response revision was validated");
+            let body = response
+                .bytes()
+                .await
+                .context("read write batch response")?;
+            let decoded = serde_json::from_slice::<VfsWriteManyPublicationResponse>(body.as_ref())
+                .context("decode write batch response")?;
+            Ok(RemotePublication {
+                revision,
+                entries: self.unscoped_publication_entries(decoded.entries),
+            })
+        }
+        .await;
         let release = self.release_lease(&lease).await;
         match (result, release) {
-            (Ok(()), Ok(())) => Ok(()),
+            (Ok(publication), Ok(())) => Ok(publication),
             (Err(error), _) => Err(error),
-            (Ok(()), Err(error)) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
         }
     }
 
     fn scope_namespace_mutation(&self, mutation: &VfsNamespaceMutation) -> VfsNamespaceMutation {
         match mutation {
+            VfsNamespaceMutation::CreateFile { path, mode } => VfsNamespaceMutation::CreateFile {
+                path: self.path_arg(path),
+                mode: mode.map(|mode| mode & 0o7777),
+            },
             VfsNamespaceMutation::CreateDirectory { path, mode } => {
                 VfsNamespaceMutation::CreateDirectory {
                     path: self.path_arg(path),
@@ -708,6 +1113,13 @@ impl RemoteVfsClient {
                     target: target.clone(),
                 }
             }
+            VfsNamespaceMutation::CreateHardLink {
+                source_path,
+                destination_path,
+            } => VfsNamespaceMutation::CreateHardLink {
+                source_path: self.path_arg(source_path),
+                destination_path: self.path_arg(destination_path),
+            },
             VfsNamespaceMutation::DeleteFile { path, precondition } => {
                 VfsNamespaceMutation::DeleteFile {
                     path: self.path_arg(path),
@@ -770,6 +1182,19 @@ impl RemoteVfsClient {
             .to_string()
     }
 
+    fn unscoped_publication_entries(
+        &self,
+        entries: Vec<VfsPublicationSnapshotEntry>,
+    ) -> Vec<VfsPublicationSnapshotEntry> {
+        entries
+            .into_iter()
+            .map(|entry| VfsPublicationSnapshotEntry {
+                path: self.unscoped_path(entry.path.as_str()),
+                metadata: entry.metadata,
+            })
+            .collect()
+    }
+
     fn url(&self, suffix: &str) -> String {
         format!("{}{}", self.endpoint, suffix)
     }
@@ -789,12 +1214,22 @@ impl RemoteVfsClient {
             .context(format!("vfs request failed: {status} {body}")))
     }
 
+    async fn request_mutation(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response> {
+        let response = self.request(builder).await?;
+        let revision = parse_namespace_revision(response.headers())?;
+        self.observe_published_revision(revision);
+        Ok(response)
+    }
+
     async fn read_decoded<T>(
         &self,
         builder: reqwest::RequestBuilder,
         retry_timeout: Duration,
         mut decode: impl FnMut(StatusCode, &[u8]) -> Result<T>,
-    ) -> Result<T> {
+    ) -> Result<Versioned<T>> {
         let request_url = builder
             .try_clone()
             .and_then(|request| request.build().ok())
@@ -819,12 +1254,14 @@ impl RemoteVfsClient {
                     || status == StatusCode::NOT_FOUND
                     || status == StatusCode::PRECONDITION_FAILED
                 {
+                    let revision = optional_namespace_revision(response.headers())
+                        .map_err(ReadFailure::terminal)?;
                     let body = response
                         .bytes()
                         .await
                         .context("read vfs response body")
                         .map_err(ReadFailure::transient)?;
-                    return Ok((status, body));
+                    return Ok((status, body, revision));
                 }
                 let body = response.text().await.unwrap_or_default();
                 let error = anyhow!("vfs read failed: {status} {body}");
@@ -841,7 +1278,16 @@ impl RemoteVfsClient {
             }
             .await;
             match outcome {
-                Ok((status, body)) => return decode(status, body.as_ref()),
+                Ok((status, body, revision)) => {
+                    let value = decode(status, body.as_ref())?;
+                    if let Some(revision) = revision {
+                        self.observe_read_revision(revision);
+                    }
+                    return Ok(Versioned {
+                        value,
+                        revision: revision.unwrap_or(0),
+                    });
+                }
                 Err(failure) if failure.transient && Instant::now() < deadline => {
                     tracing::debug!(error = %failure.error, "retrying transient vfs read failure");
                     tokio::time::sleep(retry_delay).await;
@@ -862,6 +1308,249 @@ impl RemoteVfsClient {
     }
 }
 
+#[derive(Deserialize)]
+struct RevisionWatchResponse {
+    revision: u64,
+}
+
+/// One completed watch poll. `Advanced` carries the new owner revision from a
+/// 200; `Unchanged` is a 204 long-poll timeout. Both mean the channel is live.
+enum RevisionWatchPoll {
+    Advanced(u64),
+    Unchanged,
+}
+
+/// A watch poll that did not complete cleanly. `Transport` is a send-class
+/// failure — the request never round-tripped (connect refused, or, by far most
+/// often, the gateway reaped our idle keep-alive socket under its own
+/// keepAliveTimeout, which is well under our 25s long-poll window). reqwest
+/// evicts the dead socket on that error, so an immediate retry lands on a fresh
+/// connection. `Protocol` is a completed round-trip the client rejects (a
+/// non-200/204 status, or an undecodable 200 body); retrying it on a fresh
+/// connection would not change the answer, so it fails through immediately.
+enum RevisionWatchError {
+    Transport(anyhow::Error),
+    Protocol(anyhow::Error),
+}
+
+impl RevisionWatchError {
+    /// The underlying cause, for the once-per-transition WARN. The classifier
+    /// only gates the immediate retry; the operator-facing message is identical
+    /// either way.
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            RevisionWatchError::Transport(error) | RevisionWatchError::Protocol(error) => error,
+        }
+    }
+}
+
+/// Edge-detects watch health so a WARN is emitted once per transition (down,
+/// then restored), never once per retry. Initial establishment is silent.
+#[derive(Debug, Default, PartialEq, Eq)]
+enum WatchHealth {
+    #[default]
+    Establishing,
+    Live,
+    Down,
+}
+
+impl WatchHealth {
+    /// Record a successful poll. Returns true only on the down -> live edge,
+    /// where a "watch restored" WARN should fire. The first establishment
+    /// (Establishing -> Live) returns false and stays silent.
+    fn on_success(&mut self) -> bool {
+        let restored = *self == WatchHealth::Down;
+        *self = WatchHealth::Live;
+        restored
+    }
+
+    /// Record a failed poll. Returns true only on the first edge into Down,
+    /// where a "watch unavailable" WARN should fire; further failures are
+    /// silent until the channel is restored.
+    fn on_failure(&mut self) -> bool {
+        let newly_down = *self != WatchHealth::Down;
+        *self = WatchHealth::Down;
+        newly_down
+    }
+}
+
+/// Issue one long-poll against the gateway watch endpoint. Uses the same bearer
+/// auth as every other route and an explicit read-class timeout above the
+/// long-poll window so the client's default mutation timeout never applies.
+async fn poll_revision_watch(
+    http: &Client,
+    endpoint: &str,
+    auth_token: &str,
+    watcher_id: &str,
+    since: u64,
+) -> Result<RevisionWatchPoll, RevisionWatchError> {
+    let response = http
+        .get(format!("{endpoint}/watch"))
+        .query(&[
+            ("since", since.to_string()),
+            ("timeout_ms", REVISION_WATCH_TIMEOUT_MS.to_string()),
+            // The stable identity that lets the gateway treat this poll's `since`
+            // as an ack of that revision and gate sibling publications on it.
+            ("watcher_id", watcher_id.to_string()),
+        ])
+        .bearer_auth(auth_token)
+        .timeout(REVISION_WATCH_ATTEMPT_TIMEOUT)
+        .send()
+        .await
+        // A failed `send` is the send-class case: the request never round-
+        // tripped, so the pooled socket (if any) is now evicted.
+        .context("send vfs revision watch")
+        .map_err(RevisionWatchError::Transport)?;
+    let status = response.status();
+    if status == StatusCode::NO_CONTENT {
+        return Ok(RevisionWatchPoll::Unchanged);
+    }
+    if status == StatusCode::OK {
+        let body: RevisionWatchResponse = response
+            .json()
+            .await
+            .context("decode vfs revision watch response")
+            .map_err(RevisionWatchError::Protocol)?;
+        return Ok(RevisionWatchPoll::Advanced(body.revision));
+    }
+    let body = response.text().await.unwrap_or_default();
+    Err(RevisionWatchError::Protocol(anyhow!(
+        "vfs revision watch returned {status} {body}"
+    )))
+}
+
+/// One watch poll, absorbing a single send-class blip. A gateway that reaps our
+/// idle keep-alive socket surfaces the reap as a transport error on the NEXT
+/// poll; reqwest evicts that dead socket as it fails, so the immediate retry
+/// lands on a fresh connection and succeeds. Only when the retry ALSO fails
+/// (a second consecutive failure) — or the first failure is a protocol reject,
+/// which a retry cannot fix — does the error reach the caller, which then
+/// declares the watch down. This keeps one reaped socket from flapping
+/// `watch_live` (and resurfacing strict serves) every keepAlive interval.
+async fn poll_revision_watch_resilient(
+    http: &Client,
+    endpoint: &str,
+    auth_token: &str,
+    watcher_id: &str,
+    since: u64,
+) -> Result<RevisionWatchPoll, RevisionWatchError> {
+    match poll_revision_watch(http, endpoint, auth_token, watcher_id, since).await {
+        Err(RevisionWatchError::Transport(first)) => {
+            tracing::debug!(
+                error = %first,
+                "vfs revision watch transport blip; retrying once on a fresh connection"
+            );
+            poll_revision_watch(http, endpoint, auth_token, watcher_id, since).await
+        }
+        other => other,
+    }
+}
+
+/// Per-registry watch loop. Keeps the coherence fence continuously confirmed so
+/// the fs layer may serve fence-matched cache hits. Fails closed: any transport
+/// error or non-200/204 clears `watch_live` (strict serves resume) and backs
+/// off before retrying. Exits only when the registry itself is dropped so it
+/// never blocks process shutdown.
+async fn run_revision_watch(
+    http: Client,
+    endpoint: String,
+    auth_token: String,
+    revisions: Weak<SharedRevisionState>,
+    cache: Weak<RemoteFuseCache>,
+    notifiers: Weak<MountInvalidators>,
+) {
+    let mut health = WatchHealth::default();
+    let mut backoff = REVISION_WATCH_BACKOFF_MIN;
+    // Capture the stable watcher identity once. It never changes for the life of
+    // the registry, and every poll must present it so the gateway can key ack
+    // progress to this watcher.
+    let watcher_id = match revisions.upgrade() {
+        Some(state) => state.watcher_id.clone(),
+        None => return,
+    };
+    loop {
+        // Read the fence, then drop the strong ref so a long-poll never pins
+        // the registry alive across the await.
+        let since = match revisions.upgrade() {
+            Some(state) => state.coherence.load(Ordering::Acquire),
+            None => return,
+        };
+        match poll_revision_watch_resilient(&http, &endpoint, &auth_token, &watcher_id, since).await
+        {
+            Ok(poll) => {
+                let Some(state) = revisions.upgrade() else {
+                    return;
+                };
+                if let RevisionWatchPoll::Advanced(revision) = poll {
+                    // ACK-ORDERING INVARIANT (revocation-acked publications): the
+                    // gateway treats the NEXT poll's `since` as this watcher's ack
+                    // of that revision, and a sibling's publication is blocked
+                    // until this ack lands. We MUST advance the fence and clear the
+                    // cache BEFORE that next poll is issued, so the ack can never
+                    // precede this mount becoming coherent — otherwise the writer
+                    // would unblock while this mount could still serve stale reads.
+                    // The next poll reads `since` from `coherence` at the top of
+                    // the loop, strictly after both stores below, so the order
+                    // holds. Fence first:
+                    state.coherence.fetch_max(revision, Ordering::AcqRel);
+                    // A newer owner revision the local view has not classified
+                    // must fail closed: clear superseded cache entries via the
+                    // audited authoritative-revision path.
+                    if let Some(cache) = cache.upgrade() {
+                        cache.observe_authoritative_revision(revision);
+                    }
+                    // Extend the ack-ordering invariant to the KERNEL: this
+                    // remote publication carries only a revision (no path set),
+                    // so sweep every attr/dentry each mount of this registry
+                    // handed its kernel. This MUST complete before the ack — the
+                    // next loop iteration reads `since` from `coherence`
+                    // (advanced above) and re-polls, and the gateway treats that
+                    // poll as this watcher's ack, unblocking the remote writer.
+                    // Sweeping here guarantees the writer's fsync return implies
+                    // this process's kernels hold no superseded attrs, exactly as
+                    // the cache clear guarantees no stale userspace serve.
+                    if let Some(notifiers) = notifiers.upgrade() {
+                        notifiers.invalidate_all();
+                    }
+                }
+                // Set last: an observer that sees watch_live is guaranteed to
+                // also see the fence advance, cache clear, and kernel sweep
+                // above.
+                state.watch_live.store(true, Ordering::Release);
+                drop(state);
+                if health.on_success() {
+                    tracing::warn!("vfs revision watch restored");
+                }
+                backoff = REVISION_WATCH_BACKOFF_MIN;
+                // Immediate re-poll (no sleep/backoff on success): this next poll
+                // carries the ack for the revision just applied, so writer-visible
+                // ack latency is ~RTT + apply cost, not RTT + a backoff.
+            }
+            Err(error) => {
+                if let Some(state) = revisions.upgrade() {
+                    state.watch_live.store(false, Ordering::Release);
+                }
+                if health.on_failure() {
+                    tracing::warn!(
+                        error = %error.into_inner(),
+                        "vfs revision watch unavailable; serving strict metadata"
+                    );
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(2).min(REVISION_WATCH_BACKOFF_MAX);
+            }
+        }
+    }
+}
+
+fn implicit_lease_grant(scoped_path: &str) -> LeaseGrant {
+    LeaseGrant {
+        resource_key: format!("implicit:{scoped_path}"),
+        owner_token: uuid::Uuid::nil(),
+        task_id: None,
+    }
+}
+
 fn with_mode_header(
     request: reqwest::RequestBuilder,
     mode: Option<u32>,
@@ -870,6 +1559,28 @@ fn with_mode_header(
         Some(mode) => request.header(CHEVALIER_VFS_MODE_HEADER, (mode & 0o7777).to_string()),
         None => request,
     }
+}
+
+fn optional_namespace_revision(headers: &header::HeaderMap) -> Result<Option<u64>> {
+    headers
+        .get(CHEVALIER_VFS_NAMESPACE_REVISION_HEADER)
+        .map(|value| {
+            value
+                .to_str()
+                .context("namespace revision header is not ASCII")?
+                .parse::<u64>()
+                .context("namespace revision header is not a u64")
+        })
+        .transpose()
+}
+
+fn parse_namespace_revision(headers: &header::HeaderMap) -> Result<u64> {
+    optional_namespace_revision(headers)?.ok_or_else(|| {
+        anyhow!(
+            "vfs namespace mutation response omitted {}",
+            CHEVALIER_VFS_NAMESPACE_REVISION_HEADER
+        )
+    })
 }
 
 fn with_precondition_headers(
@@ -1030,11 +1741,188 @@ fn common_parent<'a>(paths: impl Iterator<Item = &'a str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
 
     #[test]
     fn read_retry_budgets_exceed_their_attempt_timeouts() {
         assert!(METADATA_READ_RETRY_TIMEOUT > METADATA_READ_ATTEMPT_TIMEOUT);
         assert!(FILE_READ_RETRY_TIMEOUT > FILE_READ_ATTEMPT_TIMEOUT);
+    }
+
+    #[test]
+    fn revision_watch_attempt_timeout_exceeds_the_long_poll_window() {
+        // The read-class budget must outlast a full long-poll so a held-open
+        // watch is never cut short by the client's default mutation timeout.
+        assert!(
+            REVISION_WATCH_ATTEMPT_TIMEOUT
+                > Duration::from_millis(REVISION_WATCH_TIMEOUT_MS)
+        );
+        assert!(REVISION_WATCH_BACKOFF_MAX > REVISION_WATCH_BACKOFF_MIN);
+    }
+
+    #[test]
+    fn watch_health_warns_once_per_transition() {
+        let mut health = WatchHealth::default();
+        // Initial establishment is silent (no "restored" on first success).
+        assert!(!health.on_success());
+        assert!(!health.on_success());
+        // The first failure warns once; further failures stay silent.
+        assert!(health.on_failure());
+        assert!(!health.on_failure());
+        assert!(!health.on_failure());
+        // Recovery warns exactly once, then stays silent.
+        assert!(health.on_success());
+        assert!(!health.on_success());
+        // A fresh drop warns again.
+        assert!(health.on_failure());
+        assert!(!health.on_failure());
+    }
+
+    #[test]
+    fn watch_health_warns_on_a_first_poll_failure() {
+        // A watch that never establishes still surfaces one WARN.
+        let mut health = WatchHealth::default();
+        assert!(health.on_failure());
+        assert!(!health.on_failure());
+    }
+
+    #[test]
+    fn sibling_mounts_share_cache_coherence_without_retiring_on_publish() {
+        let endpoint = format!("http://revision-test-{}", uuid::Uuid::new_v4());
+        let first = RemoteVfsClient::new(&endpoint, "token-a", "scope").unwrap();
+        let second = RemoteVfsClient::new(&endpoint, "token-b", "scope").unwrap();
+
+        first.observe_published_revision(41);
+        assert_eq!(first.coherence_revision(), 41);
+        assert_eq!(second.coherence_revision(), 41);
+        assert_eq!(first.observed_namespace_revision(), 0);
+        assert_eq!(second.observed_namespace_revision(), 0);
+
+        second.observe_read_revision(41);
+        assert_eq!(first.observed_namespace_revision(), 41);
+        assert_eq!(second.observed_namespace_revision(), 41);
+    }
+
+    #[test]
+    fn explicitly_implicit_leases_elide_followup_acquire_and_release_round_trips() {
+        use std::sync::atomic::AtomicUsize;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let posts = Arc::new(AtomicUsize::new(0));
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let server_posts = Arc::clone(&posts);
+        let server_deletes = Arc::clone(&deletes);
+        let server = runtime.spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/lease",
+                    axum::routing::post(move || {
+                        let posts = Arc::clone(&server_posts);
+                        async move {
+                            posts.fetch_add(1, Ordering::AcqRel);
+                            let mut response = axum::Json(serde_json::json!({
+                                "resource_key": "rk:first",
+                                "owner_token": uuid::Uuid::new_v4()
+                            }))
+                            .into_response();
+                            response.headers_mut().insert(
+                                header::HeaderName::from_static(CHEVALIER_VFS_LEASE_MODE_HEADER),
+                                header::HeaderValue::from_static(CHEVALIER_VFS_LEASE_MODE_IMPLICIT),
+                            );
+                            response
+                        }
+                    })
+                    .delete(move || {
+                        let deletes = Arc::clone(&server_deletes);
+                        async move {
+                            deletes.fetch_add(1, Ordering::AcqRel);
+                            axum::http::StatusCode::NO_CONTENT
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let client = RemoteVfsClient::new(&endpoint, "token", "scope").unwrap();
+
+        let first = runtime
+            .block_on(client.acquire_lease("a", 1, "first"))
+            .unwrap();
+        runtime.block_on(client.release_lease(&first)).unwrap();
+        let second = runtime
+            .block_on(client.acquire_lease("b", 1, "second"))
+            .unwrap();
+        runtime.block_on(client.release_lease(&second)).unwrap();
+
+        assert_eq!(posts.load(Ordering::Acquire), 1);
+        assert_eq!(deletes.load(Ordering::Acquire), 0);
+        assert_eq!(second.owner_token, uuid::Uuid::nil());
+        server.abort();
+    }
+
+    #[test]
+    fn versioned_read_keeps_its_response_revision_when_shared_coherence_is_newer() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = runtime.spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/stat",
+                    axum::routing::get(|| async {
+                        let mut response = axum::Json(serde_json::json!({
+                            "kind": "file",
+                            "size_bytes": 1,
+                            "file_id": "file-1",
+                            "link_count": 1,
+                            "link_target": null,
+                            "content_hash": null,
+                            "executable": false,
+                            "mode": 420,
+                            "updated_at": null
+                        }))
+                        .into_response();
+                        response.headers_mut().insert(
+                            header::HeaderName::from_static(
+                                CHEVALIER_VFS_NAMESPACE_REVISION_HEADER,
+                            ),
+                            header::HeaderValue::from_static("41"),
+                        );
+                        response
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let client = RemoteVfsClient::new(&endpoint, "token", "").unwrap();
+        client.observe_read_revision(99);
+
+        let response = runtime
+            .block_on(client.stat_attributes_versioned("file"))
+            .unwrap();
+
+        assert_eq!(response.revision, 41);
+        assert_eq!(client.coherence_revision(), 99);
+        assert_eq!(response.value.unwrap().file_id.as_deref(), Some("file-1"));
+        server.abort();
     }
 
     #[test]
@@ -1212,5 +2100,289 @@ mod tests {
                 .is_some_and(|precondition| precondition.fingerprint.is_none()
                     && precondition.secondary_fingerprint.is_none())
         );
+    }
+
+    #[test]
+    fn watch_acks_only_after_the_fence_advance_and_cache_clear() {
+        use std::collections::HashMap;
+
+        use super::super::cache::{KernelInvalidator, PublicationInvalidation};
+
+        // In-process probe: the stub gateway, the client's cache, and a kernel-
+        // invalidation double all share this process, so the ack-poll handler can
+        // inspect them directly to prove BOTH the cache clear AND the kernel sweep
+        // preceded the ack. (revocation-ack ordering invariant, cache + kernel)
+        struct AckProbe {
+            poll_count: usize,
+            ack_since: Option<u64>,
+            ack_watcher_id: Option<String>,
+            cache_cleared_before_ack: bool,
+            kernel_invalidated_before_ack: bool,
+        }
+
+        // Stands in for a mounted session's kernel-invalidation hook: the real
+        // fuser notifier needs a live /dev/fuse fd, so the invalidation is
+        // factored through the `KernelInvalidator` trait the watch drives, which
+        // this double captures. A remote publication reaches `invalidate_all`.
+        struct RecordingInvalidator {
+            fired: Arc<AtomicBool>,
+        }
+        impl KernelInvalidator for RecordingInvalidator {
+            fn invalidate(&self, _: &PublicationInvalidation) {
+                self.fired.store(true, Ordering::Release);
+            }
+            fn invalidate_all(&self) {
+                self.fired.store(true, Ordering::Release);
+            }
+        }
+
+        const BASELINE: u64 = 1_000;
+        const PUBLISHED: u64 = 2_000;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+
+        let cache = Arc::new(RemoteFuseCache::default());
+        // Seed a directory listing fenced at BASELINE. The client's fence advance
+        // + cache clear on PUBLISHED must evict it BEFORE the ack poll is sent.
+        cache.put_dir("probe", Vec::new(), BASELINE);
+
+        let probe = Arc::new(Mutex::new(AckProbe {
+            poll_count: 0,
+            ack_since: None,
+            ack_watcher_id: None,
+            cache_cleared_before_ack: false,
+            kernel_invalidated_before_ack: false,
+        }));
+        let ready = Arc::new(tokio::sync::Notify::new());
+
+        // Register the kernel-invalidation double so the watch's remote-
+        // publication sweep reaches it. Its flag mirrors the cache-clear probe.
+        let kernel_invalidated = Arc::new(AtomicBool::new(false));
+        let invalidators = Arc::new(MountInvalidators::default());
+        let double: Arc<dyn KernelInvalidator> = Arc::new(RecordingInvalidator {
+            fired: Arc::clone(&kernel_invalidated),
+        });
+        invalidators.register(Arc::downgrade(&double));
+
+        let server_cache = Arc::clone(&cache);
+        let server_probe = Arc::clone(&probe);
+        let server_ready = Arc::clone(&ready);
+        let server_kernel_invalidated = Arc::clone(&kernel_invalidated);
+        let server = runtime.spawn(async move {
+            let app = axum::Router::new().route(
+                "/watch",
+                axum::routing::get(
+                    move |axum::extract::Query(params): axum::extract::Query<
+                        HashMap<String, String>,
+                    >| {
+                        let cache = Arc::clone(&server_cache);
+                        let probe = Arc::clone(&server_probe);
+                        let ready = Arc::clone(&server_ready);
+                        let kernel_invalidated = Arc::clone(&server_kernel_invalidated);
+                        async move {
+                            let since = params
+                                .get("since")
+                                .and_then(|value| value.parse::<u64>().ok())
+                                .unwrap_or(0);
+                            let watcher_id = params.get("watcher_id").cloned().unwrap_or_default();
+                            let count = {
+                                let mut guard =
+                                    probe.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                guard.poll_count += 1;
+                                guard.poll_count
+                            };
+                            if count == 1 {
+                                // A sibling's publication lands on the first poll.
+                                return axum::Json(serde_json::json!({ "revision": PUBLISHED }))
+                                    .into_response();
+                            }
+                            if count == 2 {
+                                // This poll is the ACK. The BASELINE-fenced entry
+                                // must already be evicted by the client's clear,
+                                // and the kernel double must already have been
+                                // swept — both strictly before this ack is sent.
+                                let cleared = cache.get_dir("probe", BASELINE).is_none();
+                                let swept = kernel_invalidated.load(Ordering::Acquire);
+                                let mut guard =
+                                    probe.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                guard.ack_since = Some(since);
+                                guard.ack_watcher_id = Some(watcher_id);
+                                guard.cache_cleared_before_ack = cleared;
+                                guard.kernel_invalidated_before_ack = swept;
+                                drop(guard);
+                                ready.notify_one();
+                            }
+                            axum::http::StatusCode::NO_CONTENT.into_response()
+                        }
+                    },
+                ),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = RemoteVfsClient::new(&endpoint, "token", "scope").unwrap();
+        client.ensure_revision_watch(runtime.handle(), &cache, &invalidators);
+
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), ready.notified())
+                .await
+                .expect("client must issue the ack poll after applying the publication");
+        });
+
+        let guard = probe.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            guard.ack_since,
+            Some(PUBLISHED),
+            "the ack poll's since must equal the fence-advanced (published) revision"
+        );
+        assert!(
+            guard
+                .ack_watcher_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty()),
+            "the ack poll must carry the stable watcher_id"
+        );
+        assert!(
+            guard.cache_cleared_before_ack,
+            "the cache clear MUST precede the ack poll so a writer never unblocks \
+             while this mount can still serve stale reads"
+        );
+        assert!(
+            guard.kernel_invalidated_before_ack,
+            "the kernel sweep MUST precede the ack poll so a writer never unblocks \
+             while this mount's kernel can still serve a stale attr lease"
+        );
+        drop(guard);
+        drop(double);
+        server.abort();
+    }
+
+    #[test]
+    fn watch_survives_a_single_transport_blip_without_flapping_live() {
+        // Mirrors the ack stub test: an in-process raw-TCP stub drives the real
+        // watch loop. A gateway that reaps our idle keep-alive socket surfaces
+        // the reap as a send-class error on the NEXT poll. The transport retry
+        // must absorb that single blip WITHOUT ever clearing watch_live (which
+        // would resurface strict serves and emit the down/restored WARN pair).
+        //
+        // Sequence: poll #1 establishes (204 -> watch_live true); poll #2 is the
+        // reaped-socket blip (connection dropped, no response -> a `send`
+        // failure); poll #3 is the immediate retry. The stub snapshots watch_live
+        // exactly when poll #3 arrives — still MID-retry, before its own success
+        // is recorded. With the retry, the blip never touched watch_live, so the
+        // snapshot is `true`. Without it, poll #2's failure would have cleared it
+        // and the snapshot would be `false`. Deterministic: no timing, no WARN
+        // capture. Every response sets `connection: close` so each poll lands on
+        // its own fresh connection and the poll count is unambiguous.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const RESP_204: &[u8] =
+            b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+
+        let cache = Arc::new(RemoteFuseCache::default());
+        let client = RemoteVfsClient::new(&endpoint, "token", "scope").unwrap();
+
+        // Records watch_live as observed by the stub at the recovery poll (#3).
+        let live_at_recovery = Arc::new(Mutex::new(None::<bool>));
+        let ready = Arc::new(tokio::sync::Notify::new());
+
+        let server_client = client.clone();
+        let server_live = Arc::clone(&live_at_recovery);
+        let server_ready = Arc::clone(&ready);
+        let server = runtime.spawn(async move {
+            let mut poll = 0usize;
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                // Drain the request head so the peer's `send` fully lands before
+                // we choose how (or whether) to answer.
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                loop {
+                    match socket.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            head.extend_from_slice(&buf[..n]);
+                            if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                poll += 1;
+                match poll {
+                    1 => {
+                        // Establish the watch: a live long-poll timeout.
+                        let _ = socket.write_all(RESP_204).await;
+                        let _ = socket.flush().await;
+                    }
+                    2 => {
+                        // The reaped-socket blip: drop with no response, exactly
+                        // as a gateway keepAliveTimeout close would.
+                        drop(socket);
+                    }
+                    3 => {
+                        // The immediate retry. Snapshot watch_live as seen right
+                        // now — the retry must have kept it live.
+                        let live = server_client.revision_watch_live();
+                        *server_live.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some(live);
+                        let _ = socket.write_all(RESP_204).await;
+                        let _ = socket.flush().await;
+                        server_ready.notify_one();
+                    }
+                    _ => {
+                        // Hold subsequent long-polls open so the client neither
+                        // errors nor busy-loops while the test asserts.
+                        std::future::pending::<()>().await;
+                    }
+                }
+            }
+        });
+
+        let invalidators = Arc::new(MountInvalidators::default());
+        client.ensure_revision_watch(runtime.handle(), &cache, &invalidators);
+
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), ready.notified())
+                .await
+                .expect("the watch must issue a recovery poll after the transport blip");
+        });
+
+        let observed = *live_at_recovery
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            observed,
+            Some(true),
+            "a single send-class blip must be absorbed by the immediate retry: \
+             watch_live must never be cleared, so it is still live at the recovery poll"
+        );
+        assert!(
+            client.revision_watch_live(),
+            "the watch must remain live after the retry recovers the blip"
+        );
+        server.abort();
     }
 }

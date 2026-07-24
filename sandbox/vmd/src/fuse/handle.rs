@@ -18,6 +18,10 @@ const UNMOUNT_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct FuseHandle {
     session: Arc<Mutex<Option<fuser::BackgroundSession>>>,
     mountpoint: PathBuf,
+    // Keeps this mount's kernel-invalidation hook registered for the mount's
+    // lifetime (the shared registry holds only a Weak). Dropping the last
+    // FuseHandle clone deregisters it. Never read directly.
+    _kernel_invalidator: Arc<super::fs::MountKernelInvalidator>,
 }
 
 impl Clone for FuseHandle {
@@ -25,6 +29,7 @@ impl Clone for FuseHandle {
         Self {
             session: Arc::clone(&self.session),
             mountpoint: self.mountpoint.clone(),
+            _kernel_invalidator: Arc::clone(&self._kernel_invalidator),
         }
     }
 }
@@ -94,15 +99,25 @@ pub async fn mount_remote_vfs_fuse(
         Handle::current(),
     )?;
     let options = filesystem.mount_options(mount_tag);
+    // Capture the kernel-invalidation registration handles while the fs is still
+    // reachable — the fuser notifier only exists after the session is spawned,
+    // by which point the fs has been moved into it.
+    let registrar = filesystem.kernel_invalidation_registrar();
     // Concurrent dispatch: the single-threaded fuser session loop only decodes
     // requests; ops fan out to workers (see fuse/dispatch.rs).
     let filesystem = super::dispatch::SpawnedFuseFs::new(filesystem);
     let session = fuser::spawn_mount2(filesystem, mountpoint, &options)
         .with_context(|| format!("mount fuse filesystem at {}", mountpoint.display()))?;
 
+    // Bind this session's kernel notifier into the shared invalidator registry
+    // so remote/sibling publications revoke this mount's kernel attr/entry
+    // leases. The returned handle must outlive the mount (kept in FuseHandle).
+    let kernel_invalidator = registrar.install(session.notifier());
+
     let handle = FuseHandle {
         session: Arc::new(Mutex::new(Some(session))),
         mountpoint: mountpoint.to_path_buf(),
+        _kernel_invalidator: kernel_invalidator,
     };
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);

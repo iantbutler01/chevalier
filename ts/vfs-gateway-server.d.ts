@@ -38,6 +38,14 @@ export interface VfsGatewayServerOptions {
     /** Per-owner product policy gate for replica-local `.git` metadata.
      *  Defaults to false, preserving the historical exclusion. */
     allowGitMetadata?: (ownerId: string) => boolean | Promise<boolean>;
+    /** Hard cap (ms) a mutation waits for live watchers to ack the published
+     *  revision before proceeding fail-open. Default 150, overridable via
+     *  `CHEVALIER_VFS_PUBLICATION_ACK_TIMEOUT_MS`. */
+    publicationAckTimeoutMs?: number;
+    /** Override (ms) for how long a silent watcher stays registered before it is
+     *  pruned. Defaults to 2x the watcher's poll timeout (capped 60s). Advanced /
+     *  test knob. */
+    publicationWatcherGraceMs?: number;
 }
 /** Build a WHATWG `(Request) => Promise<Response>` handler that serves chevalier's
  *  VFS gateway protocol, delegating storage to `resolveStore(ownerId)`. */

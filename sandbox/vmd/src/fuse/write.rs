@@ -9,7 +9,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use chevalier_sandbox::vfs::{VFS_SURFACE_KIND_VM_SHARED, VFS_SURFACE_KIND_VM_WORKSPACE};
+use chevalier_sandbox::vfs::{
+    VFS_SURFACE_KIND_VM_SHARED, VFS_SURFACE_KIND_VM_WORKSPACE, VfsPublicationSnapshotEntry,
+};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -21,6 +23,9 @@ const BATCH_DELAY: Duration = Duration::from_millis(8);
 const RETRY_DELAY_MIN: Duration = Duration::from_millis(100);
 const RETRY_DELAY_MAX: Duration = Duration::from_secs(5);
 const FLUSH_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Emit one WARN if a flush barrier parks past this before the hard timeout, so
+/// an intermittent upstream stall is visible in production without per-poll spam.
+const SLOW_FLUSH_WARN_AFTER: Duration = Duration::from_secs(10);
 const MAX_BATCH_WRITES: usize = 256;
 const MAX_BATCH_BYTES: u64 = 16 * 1024 * 1024;
 const JOURNAL_READ_BUFFER_BYTES: usize = 64 * 1024;
@@ -71,9 +76,17 @@ struct JournalState {
     /// barrier consumes only its own entry, so concurrent fsync/close waiters
     /// cannot steal another file's deferred error.
     terminal_errors: HashMap<u64, String>,
+    /// Descendant-or-equal path prefixes of an in-flight namespace delete /
+    /// rename. A content-write enqueue whose path falls under any of these
+    /// blocks until the namespace mutation completes, so the write cannot be
+    /// published server-side after the RemoveDirectory and resurrect a subtree.
+    /// Guarded by the same `state` lock as `pending`, so the barrier check and
+    /// the journal append are atomic against `install_descendant_barrier`.
+    descendant_barriers: Vec<String>,
 }
 
 type DeadLetterHook = Box<dyn Fn(&str) + Send + Sync>;
+type CommitHook = Box<dyn Fn(u64, &[WriteTarget], &[VfsPublicationSnapshotEntry]) + Send + Sync>;
 
 struct Shared {
     state: Mutex<JournalState>,
@@ -96,6 +109,24 @@ impl WriteJournal {
         journal_path: &Path,
         tokio: Handle,
         on_dead_letter: Option<DeadLetterHook>,
+    ) -> Result<Self> {
+        Self::open_with_commit_hook(
+            client,
+            scope_path,
+            journal_path,
+            tokio,
+            on_dead_letter,
+            None,
+        )
+    }
+
+    pub fn open_with_commit_hook(
+        client: RemoteVfsClient,
+        scope_path: &str,
+        journal_path: &Path,
+        tokio: Handle,
+        on_dead_letter: Option<DeadLetterHook>,
+        on_commit: Option<CommitHook>,
     ) -> Result<Self> {
         let staging_dir = journal_path.with_extension("writes");
         fs::create_dir_all(&staging_dir).with_context(|| {
@@ -127,6 +158,7 @@ impl WriteJournal {
                 last_error: None,
                 dead_letter_error: None,
                 terminal_errors: HashMap::new(),
+                descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
             journal_path: journal_path.to_path_buf(),
@@ -137,7 +169,7 @@ impl WriteJournal {
         let scope_path = scope_path.trim_matches('/').to_string();
         let worker = std::thread::Builder::new()
             .name("chevalier-vfs-writes".to_string())
-            .spawn(move || run_worker(worker_shared, client, scope_path, tokio))
+            .spawn(move || run_worker(worker_shared, client, scope_path, tokio, on_commit))
             .context("spawn vfs write journal worker")?;
         shared.changed.notify_all();
         Ok(Self {
@@ -158,6 +190,31 @@ impl WriteJournal {
             .state
             .lock()
             .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
+        // Descendant write-barrier (see `descendant_barriers`): a namespace
+        // delete/rename of an ancestor of `path` is publishing. Block until it
+        // completes so this write cannot be applied server-side after the
+        // RemoveDirectory and resurrect the subtree.
+        //
+        // Deadlock-freedom, in full. The caller may be parked here while holding
+        // a per-handle publication gate — flush_handle_locked enqueues with its
+        // handle gate held — so it is not enough that the wait releases the
+        // journal `state` lock (it does, so a parked writer never holds the
+        // write-journal lock and never wedges the flush_writes drain the
+        // installing mutation performs). It also holds because the mutation that
+        // installed the barrier never needs the parked writer's handle gate: a
+        // DeleteFile/RemoveDirectory takes no handle gate at all, and a Rename
+        // acquires every subtree publication gate BEFORE it installs its barrier
+        // and holds them across the mutation (see publication_gates_for_subtrees
+        // / lock_publication_gates in fs.rs), so a Rename can never itself be the
+        // writer parked here. The barrier therefore always clears once its
+        // bounded, synchronous mutation resolves, and this wait is bounded.
+        while path_within_any_barrier(&state.descendant_barriers, path) {
+            state = self
+                .shared
+                .changed
+                .wait(state)
+                .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
+        }
         repair_before_append(&self.shared.journal_path, &mut state)?;
         let id = state.next_id;
         state.next_id = state.next_id.saturating_add(1);
@@ -192,35 +249,33 @@ impl WriteJournal {
     }
 
     pub fn flush(&self) -> Result<()> {
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
-        state.force_flush = true;
-        self.shared.changed.notify_all();
-        let deadline = Instant::now() + FLUSH_RETRY_TIMEOUT;
-        while !state.pending.is_empty() || state.flushing {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(anyhow!(state.last_error.clone().unwrap_or_else(|| {
-                    "timed out flushing vfs write journal".to_string()
-                })));
-            }
-            let waited = self
-                .shared
-                .changed
-                .wait_timeout(state, remaining)
-                .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
-            state = waited.0;
+        flush_shared(&self.shared)
+    }
+
+    /// A cloneable handle that can drain this journal without owning the
+    /// `WriteJournal`. The namespace recovery worker holds one so it can flush
+    /// stragglers before retrying a conflicted RemoveDirectory/DeleteFile.
+    pub(crate) fn drain_handle(&self) -> WriteDrainHandle {
+        WriteDrainHandle {
+            shared: Arc::clone(&self.shared),
         }
-        if let Some(error) = state.dead_letter_error.take() {
-            return Err(anyhow!(error));
+    }
+
+    /// Bar new content-write enqueues whose path is a descendant-or-equal of any
+    /// `prefixes` entry until the returned guard drops. Installed by the
+    /// namespace publication path around a delete/rename so a racing write is
+    /// either drained ahead of the mutation or blocked behind it. Idempotent for
+    /// disjoint prefixes; each guard removes exactly the prefixes it added.
+    pub(crate) fn install_descendant_barrier(&self, prefixes: Vec<String>) -> WriteBarrierGuard {
+        if !prefixes.is_empty()
+            && let Ok(mut state) = self.shared.state.lock()
+        {
+            state.descendant_barriers.extend(prefixes.iter().cloned());
         }
-        if let Some(error) = state.last_error.clone() {
-            return Err(anyhow!(error));
+        WriteBarrierGuard {
+            shared: Arc::clone(&self.shared),
+            prefixes,
         }
-        Ok(())
     }
 
     /// Wait for one exact enqueue to resolve and report only that operation's
@@ -234,18 +289,34 @@ impl WriteJournal {
             .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
         state.force_flush = true;
         self.shared.changed.notify_all();
-        let deadline = Instant::now() + FLUSH_RETRY_TIMEOUT;
+        let start = Instant::now();
+        let deadline = start + FLUSH_RETRY_TIMEOUT;
+        let mut slow_warned = false;
         while state.pending.iter().any(|write| write.id == id) {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            let now = Instant::now();
+            if now >= deadline {
                 return Err(anyhow!(state.last_error.clone().unwrap_or_else(|| {
                     format!("timed out flushing vfs write journal operation {id}")
                 })));
             }
+            let elapsed = now.duration_since(start);
+            if !slow_warned && elapsed >= SLOW_FLUSH_WARN_AFTER {
+                slow_warned = true;
+                tracing::warn!(
+                    waited_secs = elapsed.as_secs(),
+                    operation = id,
+                    pending = state.pending.len(),
+                    "vfs write journal flush_through still waiting on a pending operation"
+                );
+            }
+            let mut wait_for = deadline.saturating_duration_since(now);
+            if !slow_warned {
+                wait_for = wait_for.min(SLOW_FLUSH_WARN_AFTER.saturating_sub(elapsed));
+            }
             let waited = self
                 .shared
                 .changed
-                .wait_timeout(state, remaining)
+                .wait_timeout(state, wait_for)
                 .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
             state = waited.0;
         }
@@ -283,7 +354,161 @@ impl Drop for WriteJournal {
     }
 }
 
-fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, tokio: Handle) {
+/// A detached drain handle over a live journal's shared state. Cloning the
+/// `Arc` keeps the journal's worker and staging directory alive for as long as
+/// any handle exists, exactly like the owning `WriteJournal`.
+pub(crate) struct WriteDrainHandle {
+    shared: Arc<Shared>,
+}
+
+impl WriteDrainHandle {
+    /// Block until the journal has drained (or the flush deadline elapses),
+    /// surfacing the same terminal/dead-letter error `WriteJournal::flush` does.
+    pub(crate) fn flush(&self) -> Result<()> {
+        flush_shared(&self.shared)
+    }
+}
+
+/// RAII guard for an installed descendant write-barrier. Dropping it removes the
+/// prefixes it added and wakes any content-write enqueue waiting behind them.
+pub(crate) struct WriteBarrierGuard {
+    shared: Arc<Shared>,
+    prefixes: Vec<String>,
+}
+
+impl Drop for WriteBarrierGuard {
+    fn drop(&mut self) {
+        if self.prefixes.is_empty() {
+            return;
+        }
+        if let Ok(mut state) = self.shared.state.lock() {
+            for prefix in &self.prefixes {
+                if let Some(index) = state
+                    .descendant_barriers
+                    .iter()
+                    .position(|active| active == prefix)
+                {
+                    state.descendant_barriers.remove(index);
+                }
+            }
+        }
+        // Wake enqueues parked on the barrier; they re-check under `state`.
+        self.shared.changed.notify_all();
+    }
+}
+
+fn flush_shared(shared: &Arc<Shared>) -> Result<()> {
+    let mut state = shared
+        .state
+        .lock()
+        .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
+    state.force_flush = true;
+    shared.changed.notify_all();
+    let start = Instant::now();
+    let deadline = start + FLUSH_RETRY_TIMEOUT;
+    let mut slow_warned = false;
+    while !state.pending.is_empty() || state.flushing {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(anyhow!(state.last_error.clone().unwrap_or_else(|| {
+                "timed out flushing vfs write journal".to_string()
+            })));
+        }
+        let elapsed = now.duration_since(start);
+        if !slow_warned && elapsed >= SLOW_FLUSH_WARN_AFTER {
+            slow_warned = true;
+            tracing::warn!(
+                waited_secs = elapsed.as_secs(),
+                pending = state.pending.len(),
+                flushing = state.flushing,
+                "vfs write journal flush still draining pending writes"
+            );
+        }
+        let mut wait_for = deadline.saturating_duration_since(now);
+        if !slow_warned {
+            wait_for = wait_for.min(SLOW_FLUSH_WARN_AFTER.saturating_sub(elapsed));
+        }
+        let waited = shared
+            .changed
+            .wait_timeout(state, wait_for)
+            .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
+        state = waited.0;
+    }
+    if let Some(error) = state.dead_letter_error.take() {
+        return Err(anyhow!(error));
+    }
+    if let Some(error) = state.last_error.clone() {
+        return Err(anyhow!(error));
+    }
+    Ok(())
+}
+
+/// Whether `path` is a descendant-or-equal of any active barrier prefix.
+fn path_within_any_barrier(barriers: &[String], path: &str) -> bool {
+    barriers
+        .iter()
+        .any(|prefix| path_within_barrier(prefix, path))
+}
+
+/// Segment-boundary descendant-or-equal match: `prefix` matches `path` itself or
+/// any path under `prefix/`, but never an unrelated sibling like `foobar` for
+/// `foo`.
+fn path_within_barrier(prefix: &str, path: &str) -> bool {
+    let prefix = prefix.trim_matches('/');
+    let path = path.trim_matches('/');
+    if prefix.is_empty() {
+        // A whole-scope barrier (empty prefix) would bar every write; the
+        // namespace layer never installs one, but treat it as scope-wide.
+        return true;
+    }
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+/// Whether `name` is a server-side write-staging temporary of the shape
+/// `.{name}.{uuid}.tmp` produced by `install_writes` (vfs/src/local.rs). Such
+/// entries are never guest-visible files, so they are safe residue to delete
+/// when reconciling a not-empty directory. Ordinary dotfiles (`.gitignore`,
+/// `.env.tmp`, `.a.b.tmp`) are rejected because their penultimate segment is
+/// not a UUID.
+pub(crate) fn is_write_staging_temp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix(".tmp") else {
+        return false;
+    };
+    let Some((inner, candidate_uuid)) = rest.rsplit_once('.') else {
+        return false;
+    };
+    !inner.is_empty() && is_uuid_like(candidate_uuid)
+}
+
+/// Whether `value` has the canonical hyphenated UUID shape (8-4-4-4-12 hex).
+/// Deliberately format-only: any v4 UUID minted by `Uuid::new_v4` matches, and
+/// no ordinary filename segment does.
+fn is_uuid_like(value: &str) -> bool {
+    if value.len() != 36 {
+        return false;
+    }
+    value.bytes().enumerate().all(|(index, byte)| {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            byte == b'-'
+        } else {
+            byte.is_ascii_hexdigit()
+        }
+    })
+}
+
+fn run_worker(
+    shared: Arc<Shared>,
+    client: RemoteVfsClient,
+    scope_path: String,
+    tokio: Handle,
+    on_commit: Option<CommitHook>,
+) {
     let mut retry_delay = RETRY_DELAY_MIN;
     loop {
         let (batch, surface) = {
@@ -375,7 +600,12 @@ fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, 
         // poisoned entry cannot wedge the journal forever.
         let resolution = match &result {
             Err(error) if rejected_request_status(error).is_some() => Some(resolve_rejected_batch(
-                &shared, &client, &tokio, &coalesced, surface,
+                &shared,
+                &client,
+                &tokio,
+                &coalesced,
+                surface,
+                on_commit.as_deref(),
             )),
             _ => None,
         };
@@ -402,7 +632,18 @@ fn run_worker(shared: Arc<Shared>, client: RemoteVfsClient, scope_path: String, 
             continue;
         }
         match result {
-            Ok(()) => {
+            Ok(publication) => {
+                if let Some(on_commit) = on_commit.as_deref() {
+                    let targets = coalesced
+                        .iter()
+                        .map(JournalWrite::target)
+                        .collect::<Vec<_>>();
+                    on_commit(
+                        publication.revision,
+                        targets.as_slice(),
+                        publication.entries.as_slice(),
+                    );
+                }
                 let recovered = state.last_error.take();
                 let pending_before = state.pending.clone();
                 for _ in 0..batch.len() {
@@ -581,6 +822,7 @@ fn resolve_rejected_batch(
     tokio: &Handle,
     coalesced: &[JournalWrite],
     surface: &'static str,
+    on_commit: Option<&(dyn Fn(u64, &[WriteTarget], &[VfsPublicationSnapshotEntry]) + Send + Sync)>,
 ) -> BatchResolution {
     let mut resolution = BatchResolution::default();
     for write in coalesced {
@@ -598,7 +840,11 @@ fn resolve_rejected_batch(
         match resolve_rejected_write(
             write,
             bytes,
-            |remote| tokio.block_on(client.write_many(vec![remote], surface)),
+            |remote| {
+                tokio
+                    .block_on(client.write_many(vec![remote], surface))
+                    .map(|_| ())
+            },
             |path| {
                 tokio.block_on(client.stat(path)).map(|metadata| {
                     metadata.map(|metadata| VisibleWriteState {
@@ -612,6 +858,9 @@ fn resolve_rejected_batch(
             },
         ) {
             RejectedWriteOutcome::Committed(content_hash) => {
+                if let Some(on_commit) = on_commit {
+                    on_commit(client.coherence_revision(), &[write.target()], &[]);
+                }
                 resolution.committed.insert(write.target(), content_hash);
             }
             RejectedWriteOutcome::Retired => {
@@ -1489,6 +1738,7 @@ mod tests {
                 last_error: None,
                 dead_letter_error: None,
                 terminal_errors: HashMap::new(),
+                descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
             journal_path,
@@ -1538,6 +1788,7 @@ mod tests {
                 last_error: Some("rewrite failed".to_string()),
                 dead_letter_error: None,
                 terminal_errors: HashMap::new(),
+                descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
             journal_path,
@@ -1577,6 +1828,34 @@ mod tests {
         })
         .context("vfs request failed: 500");
         assert_eq!(rejected_request_status(&server_error), None);
+    }
+
+    #[test]
+    fn write_staging_temp_name_matcher_accepts_only_uuid_stamped_temporaries() {
+        // Exactly the `.{name}.{uuid}.tmp` shape install_writes stages under.
+        let uuid = uuid::Uuid::new_v4();
+        assert!(is_write_staging_temp_name(&format!(".main.rs.{uuid}.tmp")));
+        assert!(is_write_staging_temp_name(&format!(".vfs.{uuid}.tmp")));
+        // A dotted original filename keeps its dots ahead of the uuid segment.
+        assert!(is_write_staging_temp_name(&format!(
+            ".archive.tar.gz.{uuid}.tmp"
+        )));
+        // Uppercase hex is still a valid uuid shape.
+        assert!(is_write_staging_temp_name(
+            ".data.AB1279EF-0000-4000-8000-0123456789AB.tmp"
+        ));
+
+        // Ordinary dotfiles and near-misses are not residue.
+        assert!(!is_write_staging_temp_name(".gitignore"));
+        assert!(!is_write_staging_temp_name(".env.tmp"));
+        assert!(!is_write_staging_temp_name(".a.b.tmp"));
+        assert!(!is_write_staging_temp_name("main.rs"));
+        assert!(!is_write_staging_temp_name(&format!("main.rs.{uuid}.tmp")));
+        assert!(!is_write_staging_temp_name(&format!(".main.rs.{uuid}.bak")));
+        // A uuid missing a hyphen boundary must not pass the shape check.
+        assert!(!is_write_staging_temp_name(
+            ".data.0123456789ab4000800001234567890abc.tmp"
+        ));
     }
 
     #[test]
@@ -1824,6 +2103,7 @@ mod tests {
                 last_error: Some("vfs request failed: 409".to_string()),
                 dead_letter_error: None,
                 terminal_errors: HashMap::new(),
+                descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
             journal_path: journal_path.clone(),
@@ -1935,6 +2215,7 @@ mod tests {
                 last_error: Some("vfs request failed: 409".to_string()),
                 dead_letter_error: None,
                 terminal_errors: HashMap::new(),
+                descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
             journal_path: journal_path.clone(),
@@ -1990,6 +2271,7 @@ mod tests {
                 last_error: Some("vfs request failed: 409".to_string()),
                 dead_letter_error: None,
                 terminal_errors: HashMap::new(),
+                descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
             journal_path: journal_path.clone(),
@@ -2041,6 +2323,7 @@ mod tests {
                 last_error: None,
                 dead_letter_error: None,
                 terminal_errors: HashMap::new(),
+                descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
             journal_path,
@@ -2085,6 +2368,7 @@ mod tests {
                     2,
                     "vfs write rejected for probe.txt".to_string(),
                 )]),
+                descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
             journal_path,
@@ -2252,6 +2536,7 @@ mod tests {
                 last_error: None,
                 dead_letter_error: None,
                 terminal_errors: HashMap::new(),
+                descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
             journal_path: journal_path.clone(),
@@ -2336,6 +2621,7 @@ mod tests {
                     last_error: None,
                     dead_letter_error: None,
                     terminal_errors: HashMap::new(),
+                    descendant_barriers: Vec::new(),
                 }),
                 changed: Condvar::new(),
                 journal_path: journal_path.clone(),
@@ -2379,6 +2665,7 @@ mod tests {
                 last_error: None,
                 dead_letter_error: None,
                 terminal_errors: HashMap::new(),
+                descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
             journal_path: journal_path.clone(),
@@ -2508,6 +2795,7 @@ mod tests {
                 last_error: None,
                 dead_letter_error: None,
                 terminal_errors: HashMap::new(),
+                descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
             journal_path: journal_path.clone(),
@@ -2585,6 +2873,7 @@ mod tests {
                     last_error: None,
                     dead_letter_error: None,
                     terminal_errors: HashMap::new(),
+                    descendant_barriers: Vec::new(),
                 }),
                 changed: Condvar::new(),
                 journal_path: journal_path.clone(),

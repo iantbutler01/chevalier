@@ -27,7 +27,7 @@ Optional:
   CHEVALIER_VFS_GIT_MATRIX_GATEWAY_BIND=0.0.0.0
   CHEVALIER_VFS_GIT_MATRIX_GATEWAY_PORT=19092
   CHEVALIER_VFS_GIT_MATRIX_BACKEND_PROFILE=openbracket-vfs-fuse
-  CHEVALIER_VFS_GIT_MATRIX_COMMAND_TIMEOUT_MS=1200000
+  CHEVALIER_VFS_GIT_MATRIX_COMMAND_TIMEOUT_MS=300000
   CHEVALIER_VFS_GIT_MATRIX_TMPDIR=/tmp
   CHEVALIER_MODULE_PATH=<repo>/ts/index.js
   CHEVALIER_SANDBOX_MODULE_PATH=<repo>/ts-sandbox/index.js
@@ -66,14 +66,21 @@ const backendProfile =
 const gatewayBind =
   process.env.CHEVALIER_VFS_GIT_MATRIX_GATEWAY_BIND?.trim() || "0.0.0.0";
 const gatewayPort = Number(process.env.CHEVALIER_VFS_GIT_MATRIX_GATEWAY_PORT ?? "19092");
+const maxCommandTimeoutMs = 300_000;
 const commandTimeoutMs = Number(
-  process.env.CHEVALIER_VFS_GIT_MATRIX_COMMAND_TIMEOUT_MS ?? "1200000",
+  process.env.CHEVALIER_VFS_GIT_MATRIX_COMMAND_TIMEOUT_MS ?? String(maxCommandTimeoutMs),
 );
 if (!Number.isInteger(gatewayPort) || gatewayPort < 1 || gatewayPort > 65535) {
   throw new Error("CHEVALIER_VFS_GIT_MATRIX_GATEWAY_PORT must be an integer in 1..65535");
 }
-if (!Number.isFinite(commandTimeoutMs) || commandTimeoutMs < 10_000) {
-  throw new Error("CHEVALIER_VFS_GIT_MATRIX_COMMAND_TIMEOUT_MS must be at least 10000");
+if (
+  !Number.isFinite(commandTimeoutMs) ||
+  commandTimeoutMs < 10_000 ||
+  commandTimeoutMs > maxCommandTimeoutMs
+) {
+  throw new Error(
+    `CHEVALIER_VFS_GIT_MATRIX_COMMAND_TIMEOUT_MS must be between 10000 and ${maxCommandTimeoutMs}`,
+  );
 }
 
 const require = createRequire(import.meta.url);
@@ -208,12 +215,12 @@ const drainExec = async (handle, label) => {
   return { code, stdout, stderr };
 };
 
-const startGuestCommand = async (session, command, timeoutSecs = 1200) =>
+const startGuestCommand = async (session, command, timeoutSecs = 300) =>
   withTimeout(
     session.exec(`set -euo pipefail\n${command}`, {
       shell: "/bin/bash",
       closeStdinOnStart: true,
-      timeoutSecs,
+      timeoutSecs: Math.min(timeoutSecs, Math.floor(commandTimeoutMs / 1_000)),
       env: {
         GIT_AUTHOR_NAME: "Chevalier Git Matrix",
         GIT_AUTHOR_EMAIL: "git-matrix@chevalier.test",
@@ -225,14 +232,14 @@ const startGuestCommand = async (session, command, timeoutSecs = 1200) =>
     `start guest command: ${command.slice(0, 120)}`,
   );
 
-const execGuestCommand = async (session, command, timeoutSecs = 1200) =>
+const execGuestCommand = async (session, command, timeoutSecs = 300) =>
   drainExec(
     await startGuestCommand(session, command, timeoutSecs),
     command.slice(0, 120),
   );
 
 const shellArg = (value) => `'${String(value).replaceAll("'", `'\"'\"'`)}'`;
-const runMode = (session, mode, args = [], timeoutSecs = 1200) =>
+const runMode = (session, mode, args = [], timeoutSecs = 300) =>
   execGuestCommand(
     session,
     `/tmp/vfs-git-matrix-guest.sh ${shellArg(mode)} ${args.map(shellArg).join(" ")}`,

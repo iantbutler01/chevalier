@@ -88,8 +88,8 @@ Checks cover:
    read/write after final pathname unlink with `st_nlink == 0` and no
    resurrection.
 5. Conventional in-worktree `.git` init/add/commit/branch/merge/rebase/stash/fsck.
-6. A 1,000-file Git workload with machine-readable add/commit/cold-status/
-   warm-status/gc/full-fsck timings.
+6. A 1,000-file Git correctness workload with a five-minute hard ceiling and
+   machine-readable add/commit/cold-status/warm-status/gc/full-fsck timings.
 7. Exact cross-mount HEAD/worktree visibility after close barriers, including
    relative, dangling, and nested `node_modules`-style symlink inodes.
 8. Callback listener interruption that must surface as an honest guest I/O
@@ -101,11 +101,69 @@ Checks cover:
 10. After discarding both prior VMs, exact sequential replacement-VM
     HEAD/worktree visibility, symlink `lstat`/`readlink` and target behavior
     without restore `EIO`, and full fsck.
+11. A separate Git usability gate over check 6's recorded workload evidence.
+    Cold status must complete within 2 seconds and warm status within 1.5
+    seconds by default. Override those budgets with
+    `CHEVALIER_VFS_HARNESS_GIT_STATUS_COLD_MAX_MS` and
+    `CHEVALIER_VFS_HARNESS_GIT_STATUS_WARM_MAX_MS`. Selecting check 11 requires
+    selecting check 6 in the same run. The five-minute ceiling is a liveness
+    gate, not a performance allowance.
+
+    The 2s/1.5s status budgets are regression ceilings, not the product bar.
+    The operative UX target (2026-07-24) is that ordinary interactive
+    commands — single-file create/read/stat/rename/unlink and warm status
+    over a normal working set — complete in **100–500ms** on a mounted
+    workspace. Optimization work is measured against that bar; the harness
+    gates only catch regressions past the ceilings.
+
+## Evidence — 2026-07-24 coherence rebuild
+
+Best full mounted runs on the rebuilt stack (corvidae harness → bismuth vmd,
+two disposable VMs): checks 1–8 and 10 pass; 1,000-file workload
+create 37.7s / add 99.7s / commit 5.9s / status cold 1682ms / warm 1594ms /
+gc 51.4s / fsck 1664ms (prior baseline: 23-minute workload, status ≈2.4s).
+Landed and regression-tested in this tree: generation-safe file identity
+(`unix:{dev}:{ino}:{birth_s}:{birth_ns}`), descendant write-barrier +
+self-healing deletion recovery, rename gate dedup, wire-backed metadata
+serves with the revision watch + revocation-acked publications
+(fsync-returns-after-observer-coherence), watch-liveness-bounded kernel
+attr/entry leases with notifier push invalidation, and removal of
+FUSE_WRITEBACK_CACHE negotiation (host-kernel size authority made sibling
+extends invisible — the root cause of the deterministic cross-mount stale
+reads).
+
+Known issue (pre-existing, outside the VFS): bismuth guest microVMs
+intermittently freeze 15–35s (guest timekeeping/vCPU tick stall;
+soft-lockups recorded on production VMs before this work). The freeze
+straddles the model torture's 30s per-command deadlines, so check 9 fails
+on timeouts and check 11's warm budget is measured pessimistically.
+Diagnostic dossier: host exonerated by PSI/schedstat/swap discrimination;
+console log flood fixed (portproxy → file logging); invtsc now exposed
+(guest no longer marks TSC unstable); in-guest backtrace capture and a
+kvm-clock vs tsc clocksource A/B are the active threads.
 
 The JSON result records both the initial and post-restart gateway protocol
 evidence, the complete seeded model trace, request counts, per-check output, and
 exact cleanup state. Redirect stdout and stderr separately to preserve a durable
 receipt:
+
+## Namespace coherence invariant
+
+Namespace read-your-writes is journal projection, not a metadata-cache
+exception. Each mount projects all queued create/mkdir/symlink/link,
+unlink/rmdir, rename, and metadata mutations over authoritative reads until a
+read observes the batch's committed server revision. Only an unprojected
+authoritative result may enter the cache shared by sibling mounts, and it must
+carry the exact revision attached to that response; sampling a newer shared
+revision after the read is invalid. The gateway publishes storage changes and
+the new revision under one per-owner write transaction, while
+list/stat/subtree reads hold the matching shared snapshot. Content writes
+continue through the separate write journal.
+
+The subtree metadata snapshot is the RTT-amortization layer for ordinary
+metadata-heavy workloads. It is revision-fenced and shared, not a Git or
+temporary-file special case. The five-minute harness timeout is only a liveness
+ceiling; check 11 independently enforces interactive Git-status latency.
 
 ```bash
 ./sandbox/scripts/run-vfs-virtiofs-git-conformance.sh \

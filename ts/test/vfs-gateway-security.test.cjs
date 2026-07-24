@@ -129,6 +129,71 @@ test("gateway rejects malformed and oversized path batches before storage", asyn
   assert.deepStrictEqual(calls, noStorageCalls);
 });
 
+test("attribute-only metadata batches preserve order and run hashless stats concurrently", async () => {
+  let active = 0;
+  let maxActive = 0;
+  const options = [];
+  const store = {
+    async stat(path, requestedOptions) {
+      options.push(requestedOptions);
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      active -= 1;
+      return {
+        path,
+        kind: "File",
+        sizeBytes: BigInt(path.length),
+        contentHash: null,
+      };
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: () => store });
+  const paths = Array.from({ length: 32 }, (_, index) => `file-${index}`);
+  const response = await handler(
+    new Request(
+      "http://local/internal/chevalier/vfs/security-owner/metadata-many?max_hash_bytes=0",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ paths }),
+      },
+    ),
+  );
+
+  assert.strictEqual(response.status, 200);
+  assert.deepStrictEqual(
+    (await response.json()).entries.map((entry) => entry.size_bytes),
+    paths.map((path) => path.length),
+  );
+  assert.deepStrictEqual(options, paths.map(() => ({ maxHashBytes: 0 })));
+  assert.ok(maxActive > 1, `expected concurrent stats, saw max concurrency ${maxActive}`);
+});
+
+test("ordinary metadata batches retain serial full-metadata semantics", async () => {
+  let active = 0;
+  let maxActive = 0;
+  const options = [];
+  const store = {
+    async stat(path, requestedOptions) {
+      options.push(requestedOptions);
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      active -= 1;
+      return { path, kind: "File", sizeBytes: 1n, contentHash: "a".repeat(64) };
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: () => store });
+  const response = await requestBody(handler, "metadata-many", {
+    paths: ["one", "two", "three"],
+  });
+
+  assert.strictEqual(response.status, 200);
+  assert.deepStrictEqual(options, [undefined, undefined, undefined]);
+  assert.strictEqual(maxActive, 1);
+});
+
 test("gateway rejects malformed and oversized write batches atomically", async () => {
   const { calls, store } = countingStore();
   const handler = createVfsGatewayServer({ resolveStore: () => store });
@@ -190,7 +255,7 @@ test("gateway accepts bounded, well-formed batches after validation", async () =
 
   assert.deepStrictEqual(calls, {
     ...noStorageCalls,
-    stat: 1,
+    stat: 2,
     read: 1,
     writeMany: 1,
   });
@@ -208,9 +273,29 @@ test("gateway validates namespace batches and malformed preconditions before mut
     null,
     [],
     {},
-    { mutations: null },
-    { mutations: [{ kind: "delete_file", path: "file.txt", ifMatch: 7 }] },
-    { mutations: oversized },
+    { operation_ids: [], mutations: null },
+    {
+      operation_ids: ["duplicate", "duplicate"],
+      mutations: [
+        { kind: "create_directory", path: "one" },
+        { kind: "create_directory", path: "two" },
+      ],
+    },
+    {
+      operation_ids: ["only-one"],
+      mutations: [
+        { kind: "create_directory", path: "one" },
+        { kind: "create_directory", path: "two" },
+      ],
+    },
+    {
+      operation_ids: ["invalid-delete"],
+      mutations: [{ kind: "delete_file", path: "file.txt", ifMatch: 7 }],
+    },
+    {
+      operation_ids: oversized.map((_, index) => `oversized-${index}`),
+      mutations: oversized,
+    },
   ];
 
   for (const body of malformedBodies) {
@@ -316,6 +401,7 @@ test("disabled Git policy case-folds every decoded path before storage", async (
   assert.strictEqual(
     (
       await requestBody(handler, "namespace-many", {
+        operation_ids: ["excluded-directory"],
         mutations: [{ kind: "create_directory", path: ".Git/objects" }],
       })
     ).status,
@@ -324,6 +410,7 @@ test("disabled Git policy case-folds every decoded path before storage", async (
   assert.strictEqual(
     (
       await requestBody(handler, "namespace-many", {
+        operation_ids: ["excluded-symlink"],
         mutations: [{ kind: "create_symlink", path: "head-link", target: ".GIT/HEAD" }],
       })
     ).status,
@@ -410,4 +497,294 @@ test("tree listings omit every mixed-case Git variant only for disabled owners",
     (await enabled.json()).map((entry) => entry.name),
     ["app.ts", "HEAD", "index", "config"],
   );
+});
+
+// ---- long-poll revision watch ---------------------------------------------
+
+const NAMESPACE_REVISION_HEADER = "x-chevalier-vfs-namespace-revision";
+
+const watchRequest = (handler, owner, query, init) =>
+  handler(
+    new Request(
+      `http://local/internal/chevalier/vfs/${owner}/watch${query === "" ? "" : `?${query}`}`,
+      { method: "GET", ...(init ?? {}) },
+    ),
+  );
+
+const putDir = (handler, owner, path) =>
+  handler(
+    new Request(`http://local/internal/chevalier/vfs/${owner}/dir?path=${path}`, {
+      method: "PUT",
+    }),
+  );
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Race a promise against a deadline so a hung watcher/mutation fails loudly
+// instead of stalling the test run.
+const withDeadline = async (promise, ms, message) => {
+  let timer;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  try {
+    return await Promise.race([promise, guard]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+test("watch answers 200 immediately when the revision already exceeds since", async () => {
+  const handler = createVfsGatewayServer({ resolveStore: () => ({}) });
+
+  const response = await watchRequest(handler, "owner-immediate", "since=0&timeout_ms=1000");
+  assert.strictEqual(response.status, 200);
+  const header = response.headers.get(NAMESPACE_REVISION_HEADER);
+  assert.ok(header !== null && Number(header) > 0, "200 stamps the current revision header");
+  const body = await response.json();
+  assert.strictEqual(body.revision, Number(header), "body revision matches the header");
+
+  // since absent/invalid is treated as 0, so this also resolves immediately.
+  const absent = await watchRequest(handler, "owner-immediate", "");
+  assert.strictEqual(absent.status, 200);
+  const garbage = await watchRequest(handler, "owner-immediate", "since=not-a-number");
+  assert.strictEqual(garbage.status, 200);
+});
+
+test("watch resolves promptly when a concurrent mutation publishes", async () => {
+  const handler = createVfsGatewayServer({ resolveStore: () => ({ async mkdir() {} }) });
+  const owner = "owner-notify";
+
+  const seed = await watchRequest(handler, owner, "since=0");
+  const baseline = (await seed.json()).revision;
+
+  // Park a watcher exactly at the baseline with a long timeout.
+  const parked = watchRequest(handler, owner, `since=${baseline}&timeout_ms=30000`);
+  await delay(20);
+
+  const mutation = await putDir(handler, owner, "folder");
+  assert.strictEqual(mutation.status, 204);
+  const mutated = Number(mutation.headers.get(NAMESPACE_REVISION_HEADER));
+  assert.ok(mutated > baseline, "mutation advances the revision");
+
+  const woke = await withDeadline(
+    parked,
+    500,
+    "parked watcher did not resolve within 500ms of the publish",
+  );
+  assert.strictEqual(woke.status, 200);
+  const body = await woke.json();
+  assert.ok(body.revision > baseline);
+  assert.strictEqual(body.revision, Number(woke.headers.get(NAMESPACE_REVISION_HEADER)));
+});
+
+test("watch answers 204 on timeout with the revision unchanged", async () => {
+  const handler = createVfsGatewayServer({ resolveStore: () => ({}) });
+
+  // since can never be exceeded, so the watcher parks and then times out at the
+  // clamped 1s floor with the revision unchanged.
+  const response = await watchRequest(
+    handler,
+    "owner-timeout",
+    `since=${Number.MAX_SAFE_INTEGER}&timeout_ms=1000`,
+  );
+  assert.strictEqual(response.status, 204);
+  const header = response.headers.get(NAMESPACE_REVISION_HEADER);
+  assert.ok(header !== null, "204 stamps the namespace-revision header");
+  assert.ok(
+    Number(header) < Number.MAX_SAFE_INTEGER,
+    "204 stamps the unchanged current revision",
+  );
+  assert.strictEqual(await response.text(), "", "204 carries no body");
+});
+
+test("a parked watch neither blocks nor slows a concurrent mutation", async () => {
+  const handler = createVfsGatewayServer({ resolveStore: () => ({ async mkdir() {} }) });
+  const owner = "owner-nonblocking";
+
+  const seed = await watchRequest(handler, owner, "since=0");
+  const baseline = (await seed.json()).revision;
+
+  // Park a watcher with a 30s timeout; it must never gate the mutation.
+  const parked = watchRequest(handler, owner, `since=${baseline}&timeout_ms=30000`);
+  await delay(20);
+
+  // A blocked mutation would stall until the 30s watch timeout; bounding it at
+  // 500ms proves the parked watcher holds no lock on the mutation path.
+  const mutation = await withDeadline(
+    putDir(handler, owner, "folder"),
+    500,
+    "a parked watcher blocked a concurrent mutation",
+  );
+  assert.strictEqual(mutation.status, 204);
+
+  // The mutation's publish drains the watcher; make sure it does not leak.
+  const woke = await withDeadline(parked, 500, "watcher did not drain after the mutation");
+  assert.strictEqual(woke.status, 200);
+});
+
+test("watch requires the same bearer auth as every other route", async () => {
+  const handler = createVfsGatewayServer({
+    resolveStore: () => ({}),
+    authToken: "secret-token",
+  });
+
+  const unauthorized = await watchRequest(handler, "owner-auth", "since=0");
+  assert.strictEqual(unauthorized.status, 401);
+
+  const wrongToken = await watchRequest(handler, "owner-auth", "since=0", {
+    headers: { authorization: "Bearer nope" },
+  });
+  assert.strictEqual(wrongToken.status, 401);
+
+  const authorized = await watchRequest(handler, "owner-auth", "since=0", {
+    headers: { authorization: "Bearer secret-token" },
+  });
+  assert.strictEqual(authorized.status, 200);
+});
+
+// ---- revocation-acked publications ----------------------------------------
+
+test("a publication blocks until a registered watcher re-polls past the new revision", async () => {
+  // A long cap makes the outcome unambiguous: the publish can finish quickly
+  // only via the ack, never via the (5s) fail-open cap.
+  const handler = createVfsGatewayServer({
+    resolveStore: () => ({ async mkdir() {} }),
+    publicationAckTimeoutMs: 5_000,
+  });
+  const owner = "ack-blocks";
+
+  const seed = await watchRequest(handler, owner, "since=0&watcher_id=obs-1");
+  const baseline = (await seed.json()).revision;
+
+  // Park the identified watcher at the baseline (entry acks baseline).
+  const parked = watchRequest(
+    handler,
+    owner,
+    `since=${baseline}&timeout_ms=30000&watcher_id=obs-1`,
+  );
+  await delay(20);
+
+  // Publish concurrently: it bumps the revision, wakes the watcher, then must
+  // wait for obs-1 to re-poll with since >= the new revision.
+  let published = null;
+  const publish = putDir(handler, owner, "folder").then((response) => {
+    published = response;
+    return response;
+  });
+
+  // The parked poll wakes with the new revision, but waking is NOT an ack.
+  const woke = await withDeadline(parked, 500, "watcher did not wake on the publish");
+  assert.strictEqual(woke.status, 200);
+  const observed = (await woke.json()).revision;
+  assert.ok(observed > baseline);
+
+  // Still blocked: the ack is the NEXT poll's since.
+  await delay(100);
+  assert.strictEqual(published, null, "publication must not answer before the ack");
+
+  // Re-poll with since = observed: THIS ack unblocks the writer.
+  const ack = watchRequest(
+    handler,
+    owner,
+    `since=${observed}&timeout_ms=1000&watcher_id=obs-1`,
+  );
+  const result = await withDeadline(publish, 1_000, "publication did not answer after the ack");
+  assert.strictEqual(result.status, 204);
+
+  // Drain the ack poll (it parks then 204s) so it does not leak.
+  await withDeadline(ack, 1_500, "ack poll did not drain");
+});
+
+test("a publication fails open at the cap when a registered watcher goes silent", async () => {
+  const cap = 200;
+  const handler = createVfsGatewayServer({
+    resolveStore: () => ({ async mkdir() {} }),
+    publicationAckTimeoutMs: cap,
+  });
+  const owner = "ack-failopen";
+
+  const seed = await watchRequest(handler, owner, "since=0&watcher_id=ghost");
+  const baseline = (await seed.json()).revision;
+
+  // Register a watcher that wakes on the publish but never re-polls.
+  const parked = watchRequest(
+    handler,
+    owner,
+    `since=${baseline}&timeout_ms=30000&watcher_id=ghost`,
+  );
+  await delay(20);
+
+  const started = Date.now();
+  const mutation = await withDeadline(
+    putDir(handler, owner, "folder"),
+    2_000,
+    "publication hung instead of failing open",
+  );
+  const elapsed = Date.now() - started;
+
+  assert.strictEqual(mutation.status, 204);
+  assert.ok(
+    elapsed >= cap,
+    `publication must wait the full cap before failing open (waited ${elapsed}ms)`,
+  );
+  assert.ok(
+    elapsed < cap + 1_500,
+    `publication must fail open near the cap, not hang (waited ${elapsed}ms)`,
+  );
+
+  const woke = await withDeadline(parked, 500, "silent watcher still woke on the publish");
+  assert.strictEqual(woke.status, 200);
+});
+
+test("an anonymous watcher never gates a publication", async () => {
+  // A registered watcher would stall the publish ~5s; an anonymous one must not.
+  const handler = createVfsGatewayServer({
+    resolveStore: () => ({ async mkdir() {} }),
+    publicationAckTimeoutMs: 5_000,
+  });
+  const owner = "ack-anon";
+
+  const seed = await watchRequest(handler, owner, "since=0");
+  const baseline = (await seed.json()).revision;
+
+  // Park an ANONYMOUS watcher (no watcher_id): notified but never ack-gating.
+  const parked = watchRequest(handler, owner, `since=${baseline}&timeout_ms=30000`);
+  await delay(20);
+
+  const mutation = await withDeadline(
+    putDir(handler, owner, "folder"),
+    500,
+    "an anonymous watcher gated a publication",
+  );
+  assert.strictEqual(mutation.status, 204);
+
+  const woke = await withDeadline(parked, 500, "anonymous watcher still woke on the publish");
+  assert.strictEqual(woke.status, 200);
+});
+
+test("a gone watcher is pruned and stops gating publications", async () => {
+  // A tiny grace lets a silent watcher lapse fast; the long cap would otherwise
+  // stall the publish ~5s if the gone watcher were still counted.
+  const handler = createVfsGatewayServer({
+    resolveStore: () => ({ async mkdir() {} }),
+    publicationAckTimeoutMs: 5_000,
+    publicationWatcherGraceMs: 100,
+  });
+  const owner = "ack-prune";
+
+  // Register the watcher via a fast-path poll, then let it go silent.
+  const seed = await watchRequest(handler, owner, "since=0&watcher_id=obs-gone");
+  assert.strictEqual(seed.status, 200);
+
+  // Wait past the 100ms grace so the silent watcher is prunable.
+  await delay(200);
+
+  // The publish must not wait the 5s cap for the pruned watcher.
+  const mutation = await withDeadline(
+    putDir(handler, owner, "folder"),
+    500,
+    "a gone watcher still gated a publication",
+  );
+  assert.strictEqual(mutation.status, 204);
 });

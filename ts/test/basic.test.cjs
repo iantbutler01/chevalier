@@ -51,6 +51,30 @@ test("vfs local round-trip", async () => {
   assert.strictEqual(attrs.contentHash, undefined);
 });
 
+test("vfs gateway advertises its implicit mutation lease mode", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "chev-implicit-lease-test-"));
+  try {
+    const handler = createVfsGatewayServer({
+      resolveStore: async () => VfsStorage.local(root),
+    });
+    const response = await handler(
+      new Request("http://local/internal/chevalier/vfs/lease-owner/lease", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path: "workspace" }),
+      }),
+    );
+
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(response.headers.get("x-chevalier-vfs-lease-mode"), "implicit");
+    const grant = await response.json();
+    assert.strictEqual(grant.resource_key, "rk:lease-owner:workspace");
+    assert.match(grant.owner_token, /^[0-9a-f-]{36}$/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test(
   "vfs local preserves exact POSIX modes across writes, mkdir, and namespace updates",
   { skip: process.platform === "win32" },
@@ -170,6 +194,173 @@ test("vfs bulk metadata preserves request order and missing entries", async () =
   assert.strictEqual(rows[0].sizeBytes, 2n);
   assert.strictEqual(rows[1], null);
   assert.strictEqual(rows[2].path, "a.txt");
+});
+
+test("vfs gateway publishes one revision-fenced subtree metadata snapshot", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "chev-subtree-gateway-test-"));
+  const store = VfsStorage.local(root);
+  await store.mkdir("repo");
+  await store.mkdir("repo/nested");
+  await store.write("repo/a.txt", Buffer.from("a"));
+  await store.write("repo/nested/b.txt", Buffer.from("bb"));
+  await store.createSymlink("repo/link", "a.txt");
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+
+  const response = await handler(
+    new Request(
+      "http://local/internal/chevalier/vfs/owner/subtree-metadata",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          prefix: "repo",
+          include_object_state: false,
+          include_token_count: false,
+          limit: 4096,
+          max_hash_bytes: 0,
+        }),
+      },
+    ),
+  );
+
+  assert.strictEqual(response.status, 200);
+  assert.match(
+    response.headers.get("x-chevalier-vfs-namespace-revision"),
+    /^\d+$/,
+  );
+  const body = await response.json();
+  assert.deepStrictEqual(
+    body.entries.map((entry) => [entry.path, entry.kind, entry.content_hash]),
+    [
+      ["repo/a.txt", "file", null],
+      ["repo/link", "symlink", null],
+      ["repo/nested/b.txt", "file", null],
+    ],
+  );
+});
+
+test("vfs gateway publishes one revision-fenced bounded subtree prefetch", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "chev-prefetch-gateway-test-"));
+  const store = VfsStorage.local(root);
+  await store.mkdir("repo");
+  await store.write("repo/a.txt", Buffer.from("a"));
+  await store.write("repo/b.txt", Buffer.from("bb"));
+  await store.write("repo/c.txt", Buffer.from("ccc"));
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+
+  const response = await handler(
+    new Request(
+      "http://local/internal/chevalier/vfs/owner/prefetch-subtree",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          prefix: "repo",
+          include_small_file_bytes: true,
+          max_entries: 2,
+          max_pack_bytes: 3,
+        }),
+      },
+    ),
+  );
+
+  assert.strictEqual(response.status, 200);
+  assert.match(
+    response.headers.get("x-chevalier-vfs-namespace-revision"),
+    /^\d+$/,
+  );
+  assert.deepStrictEqual((await response.json()).warmed_file_bytes, [
+    { path: "repo/a.txt", body: [...Buffer.from("a")] },
+    { path: "repo/b.txt", body: [...Buffer.from("bb")] },
+  ]);
+});
+
+test("slow subtree prefetch does not block a writer and retries an overlapping snapshot", async () => {
+  const entries = new Map([
+    ["repo/existing.txt", Buffer.from("existing")],
+  ]);
+  let firstPrefetchStarted;
+  const prefetchStarted = new Promise((resolve) => {
+    firstPrefetchStarted = resolve;
+  });
+  let releaseFirstPrefetch;
+  const firstPrefetchMayFinish = new Promise((resolve) => {
+    releaseFirstPrefetch = resolve;
+  });
+  let prefetchCalls = 0;
+  const store = {
+    async prefetchSubtree() {
+      prefetchCalls += 1;
+      const snapshot = [...entries].map(([path, body]) => ({ path, body }));
+      if (prefetchCalls === 1) {
+        firstPrefetchStarted();
+        await firstPrefetchMayFinish;
+      }
+      return snapshot;
+    },
+    async writeMany(writes) {
+      for (const write of writes) entries.set(write.path, Buffer.from(write.body));
+      return writes.map((write) => ({
+        path: write.path,
+        content_hash: `hash:${write.path}`,
+        previous_hash: null,
+        changed: true,
+      }));
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+  const prefetch = handler(
+    new Request(
+      "http://local/internal/chevalier/vfs/owner/prefetch-subtree",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          prefix: "repo",
+          include_small_file_bytes: true,
+        }),
+      },
+    ),
+  );
+  await prefetchStarted;
+
+  const write = await Promise.race([
+    handler(
+      new Request(
+        "http://local/internal/chevalier/vfs/owner/write-many",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            writes: [{ path: "repo/new.txt", body: [...Buffer.from("new")] }],
+          }),
+        },
+      ),
+    ),
+    new Promise((_, reject) =>
+      setTimeout(
+        () => reject(new Error("subtree prefetch blocked an independent writer")),
+        1_000,
+      ),
+    ),
+  ]);
+  assert.strictEqual(write.status, 200);
+  const committedRevision = write.headers.get(
+    "x-chevalier-vfs-namespace-revision",
+  );
+  releaseFirstPrefetch();
+
+  const response = await prefetch;
+  assert.strictEqual(response.status, 200);
+  assert.strictEqual(prefetchCalls, 2);
+  assert.strictEqual(
+    response.headers.get("x-chevalier-vfs-namespace-revision"),
+    committedRevision,
+  );
+  assert.deepStrictEqual((await response.json()).warmed_file_bytes, [
+    { path: "repo/existing.txt", body: [...Buffer.from("existing")] },
+    { path: "repo/new.txt", body: [...Buffer.from("new")] },
+  ]);
 });
 
 test("vfs gateway coordinates leased advisory locks by stable file identity", async () => {
@@ -732,6 +923,7 @@ test("vfs gateway preserves exact directory modes in namespace batches", async (
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
+        operation_ids: ["mkdir-private", "chmod-private"],
         mutations: [
           { kind: "create_directory", path: "private", mode: 0o2750 },
           { kind: "set_mode", path: "private", mode: 0o750 },
@@ -740,7 +932,7 @@ test("vfs gateway preserves exact directory modes in namespace batches", async (
     }),
   );
 
-  assert.strictEqual(response.status, 204);
+  assert.strictEqual(response.status, 200);
   assert.deepStrictEqual(seen, [
     [
       { kind: "create_directory", path: "private", mode: 0o2750 },
@@ -756,12 +948,334 @@ test("vfs gateway preserves exact directory modes in namespace batches", async (
       new Request("http://local/internal/chevalier/vfs/owner/namespace-many", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ mutations: [mutation] }),
+        body: JSON.stringify({ operation_ids: ["invalid"], mutations: [mutation] }),
       }),
     );
     assert.strictEqual(invalid.status, 400);
   }
   assert.strictEqual(seen.length, 1);
+});
+
+test("namespace publication is atomic and a second client observes every mutation at its committed revision", async () => {
+  const entries = new Map([
+    ["source", {
+      path: "source",
+      kind: "File",
+      sizeBytes: 0n,
+      fileId: "inode-source",
+      linkCount: 1n,
+      mode: 0o644,
+    }],
+    ["deleted", {
+      path: "deleted",
+      kind: "File",
+      sizeBytes: 0n,
+      fileId: "inode-deleted",
+      linkCount: 1n,
+      mode: 0o644,
+    }],
+    ["deleted-dir", {
+      path: "deleted-dir",
+      kind: "Directory",
+      sizeBytes: 0n,
+      fileId: "inode-deleted-dir",
+      linkCount: 2n,
+      mode: 0o755,
+    }],
+    ["old-name", {
+      path: "old-name",
+      kind: "File",
+      sizeBytes: 0n,
+      fileId: "inode-renamed",
+      linkCount: 1n,
+      mode: 0o644,
+    }],
+  ]);
+  let mutationStarted;
+  const started = new Promise((resolve) => {
+    mutationStarted = resolve;
+  });
+  let publish;
+  const publicationGate = new Promise((resolve) => {
+    publish = resolve;
+  });
+  const store = {
+    async stat(path) {
+      return entries.get(path) ?? null;
+    },
+    async listDir(path) {
+      assert.strictEqual(path, ".");
+      return [...entries.values()];
+    },
+    async applyNamespaceBatch(mutations) {
+      mutationStarted();
+      await publicationGate;
+      for (const mutation of mutations) {
+        switch (mutation.kind) {
+          case "create_file":
+            entries.set(mutation.path, {
+              path: mutation.path,
+              kind: "File",
+              sizeBytes: 0n,
+              fileId: `inode:${mutation.path}`,
+              linkCount: 1n,
+              mode: mutation.mode ?? 0o644,
+            });
+            break;
+          case "create_directory":
+            entries.set(mutation.path, {
+              path: mutation.path,
+              kind: "Directory",
+              sizeBytes: 0n,
+              fileId: `inode:${mutation.path}`,
+              linkCount: 2n,
+              mode: mutation.mode ?? 0o755,
+            });
+            break;
+          case "create_symlink":
+            entries.set(mutation.path, {
+              path: mutation.path,
+              kind: "Symlink",
+              sizeBytes: BigInt(mutation.target.length),
+              fileId: `inode:${mutation.path}`,
+              linkCount: 1n,
+              mode: 0o777,
+              linkTarget: mutation.target,
+            });
+            break;
+          case "create_hard_link": {
+            const source = entries.get(mutation.source_path);
+            assert.ok(source);
+            const linked = { ...source, linkCount: BigInt(Number(source.linkCount) + 1) };
+            entries.set(mutation.source_path, linked);
+            entries.set(mutation.destination_path, {
+              ...linked,
+              path: mutation.destination_path,
+            });
+            break;
+          }
+          case "delete_file":
+          case "remove_directory":
+            entries.delete(mutation.path);
+            break;
+          case "rename": {
+            const source = entries.get(mutation.from);
+            assert.ok(source);
+            entries.delete(mutation.from);
+            entries.set(mutation.to, { ...source, path: mutation.to });
+            break;
+          }
+          case "set_mode": {
+            const current = entries.get(mutation.path);
+            assert.ok(current);
+            entries.set(mutation.path, { ...current, mode: mutation.mode });
+            break;
+          }
+          default:
+            assert.fail(`unhandled mutation ${mutation.kind}`);
+        }
+      }
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+  const mutations = [
+    { kind: "create_file", path: "created", mode: 0o640 },
+    { kind: "create_directory", path: "created-dir", mode: 0o750 },
+    { kind: "create_symlink", path: "created-link", target: "source" },
+    {
+      kind: "create_hard_link",
+      source_path: "source",
+      destination_path: "source-alias",
+    },
+    { kind: "rename", from: "old-name", to: "new-name" },
+    { kind: "set_mode", path: "new-name", mode: 0o700 },
+    { kind: "delete_file", path: "deleted" },
+    { kind: "remove_directory", path: "deleted-dir" },
+    { kind: "create_file", path: "awaited-empty-probe", mode: 0o600 },
+    { kind: "delete_file", path: "awaited-empty-probe" },
+  ];
+  const mutationRequest = handler(
+    new Request("http://origin/internal/chevalier/vfs/owner/namespace-many", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        operation_ids: mutations.map((_, index) => `operation-${index}`),
+        mutations,
+      }),
+    }),
+  );
+  await started;
+  let secondClientReadCompleted = false;
+  const secondClientRead = handler(
+    new Request("http://second-mount/internal/chevalier/vfs/owner/tree?path="),
+  ).then((response) => {
+    secondClientReadCompleted = true;
+    return response;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.strictEqual(
+    secondClientReadCompleted,
+    false,
+    "listing cannot publish between the batch and its namespace revision",
+  );
+  publish();
+
+  const mutationResponse = await mutationRequest;
+  const committedRevision = mutationResponse.headers.get(
+    "x-chevalier-vfs-namespace-revision",
+  );
+  assert.strictEqual(mutationResponse.status, 200);
+  assert.match(committedRevision, /^\d+$/);
+  const mutationSnapshot = await mutationResponse.json();
+  const snapshotByPath = new Map(
+    mutationSnapshot.entries.map((entry) => [entry.path, entry.metadata]),
+  );
+  assert.strictEqual(snapshotByPath.get("created")?.file_id, "inode:created");
+  assert.strictEqual(snapshotByPath.get("source")?.link_count, 2);
+  assert.strictEqual(snapshotByPath.get("new-name")?.mode, 0o700);
+  assert.strictEqual(snapshotByPath.get("deleted"), null);
+  assert.strictEqual(snapshotByPath.get("awaited-empty-probe"), null);
+  const listingResponse = await secondClientRead;
+  assert.strictEqual(listingResponse.status, 200);
+  assert.strictEqual(
+    listingResponse.headers.get("x-chevalier-vfs-namespace-revision"),
+    committedRevision,
+  );
+  const byName = new Map((await listingResponse.json()).map((entry) => [entry.name, entry]));
+  assert.strictEqual(byName.get("created")?.mode, 0o640);
+  assert.strictEqual(byName.get("created-dir")?.kind, "directory");
+  assert.strictEqual(byName.get("created-link")?.link_target, "source");
+  assert.strictEqual(byName.get("source")?.link_count, 2);
+  assert.strictEqual(byName.get("source-alias")?.file_id, "inode-source");
+  assert.strictEqual(byName.get("new-name")?.mode, 0o700);
+  assert.strictEqual(byName.has("old-name"), false);
+  assert.strictEqual(byName.has("deleted"), false);
+  assert.strictEqual(byName.has("deleted-dir"), false);
+  assert.strictEqual(
+    byName.has("awaited-empty-probe"),
+    false,
+    "an awaited empty-file create/unlink cannot leak through the second client",
+  );
+});
+
+test("publication snapshots allow concurrent reads while preserving one stable revision", async () => {
+  let activeReads = 0;
+  let maxActiveReads = 0;
+  let startedReads = 0;
+  let releaseReads;
+  const readsMayFinish = new Promise((resolve) => {
+    releaseReads = resolve;
+  });
+  let bothReadsStarted;
+  const bothReadsAreActive = new Promise((resolve) => {
+    bothReadsStarted = resolve;
+  });
+  const store = {
+    async stat(path) {
+      activeReads += 1;
+      startedReads += 1;
+      maxActiveReads = Math.max(maxActiveReads, activeReads);
+      if (startedReads === 2) bothReadsStarted();
+      await readsMayFinish;
+      activeReads -= 1;
+      return {
+        path,
+        kind: "File",
+        sizeBytes: 0n,
+        fileId: `inode:${path}`,
+        linkCount: 1n,
+        mode: 0o644,
+      };
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+  const requests = ["first", "second"].map((path) =>
+    handler(
+      new Request(
+        `http://local/internal/chevalier/vfs/owner/stat?path=${path}`,
+      ),
+    ),
+  );
+
+  await Promise.race([
+    bothReadsAreActive,
+    new Promise((_, reject) =>
+      setTimeout(
+        () => reject(new Error("publication coordinator serialized independent reads")),
+        1_000,
+      ),
+    ),
+  ]);
+  releaseReads();
+
+  const responses = await Promise.all(requests);
+  assert.strictEqual(maxActiveReads, 2);
+  assert.strictEqual(responses[0].status, 200);
+  assert.strictEqual(responses[1].status, 200);
+  assert.strictEqual(
+    responses[0].headers.get("x-chevalier-vfs-namespace-revision"),
+    responses[1].headers.get("x-chevalier-vfs-namespace-revision"),
+  );
+});
+
+test("content publication advances the same revision observed by metadata reads", async () => {
+  const entries = new Map();
+  const store = {
+    async stat(path) {
+      return entries.get(path) ?? null;
+    },
+    async writeMany(writes) {
+      return writes.map((write) => {
+        entries.set(write.path, {
+          path: write.path,
+          kind: "File",
+          sizeBytes: BigInt(write.body.length),
+          fileId: `inode:${write.path}`,
+          linkCount: 1n,
+          contentHash: `hash:${write.path}`,
+          mode: 0o644,
+        });
+        return {
+          path: write.path,
+          content_hash: `hash:${write.path}`,
+          previous_hash: null,
+          changed: true,
+        };
+      });
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: async () => store });
+  const write = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/write-many", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        writes: [{ path: "file.txt", body: [110, 101, 120, 116] }],
+      }),
+    }),
+  );
+  assert.strictEqual(write.status, 200);
+  const committedRevision = Number(
+    write.headers.get("x-chevalier-vfs-namespace-revision"),
+  );
+  assert.ok(Number.isSafeInteger(committedRevision) && committedRevision > 0);
+  const writeSnapshot = await write.json();
+  assert.strictEqual(writeSnapshot.entries[0]?.path, "file.txt");
+  assert.strictEqual(writeSnapshot.entries[0]?.metadata?.file_id, "inode:file.txt");
+  assert.strictEqual(
+    writeSnapshot.entries[0]?.metadata?.content_hash,
+    "hash:file.txt",
+  );
+
+  const stat = await handler(
+    new Request("http://local/internal/chevalier/vfs/owner/stat?path=file.txt"),
+  );
+  assert.strictEqual(stat.status, 200);
+  assert.strictEqual(
+    Number(stat.headers.get("x-chevalier-vfs-namespace-revision")),
+    committedRevision,
+  );
+  assert.strictEqual((await stat.json()).content_hash, "hash:file.txt");
 });
 
 test("vfs gateway reports backing-store listing failures as 500, not an empty-looking 404", async () => {
@@ -1068,6 +1582,7 @@ test("vfs gateway forwards conditional namespace batches and maps CAS races to 4
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
+          operation_ids: ["delete-a", "delete-b"],
           mutations: [
             {
               kind: "delete_file",
@@ -1088,7 +1603,7 @@ test("vfs gateway forwards conditional namespace batches and maps CAS races to 4
     );
 
   const matched = await request();
-  assert.strictEqual(matched.status, 204);
+  assert.strictEqual(matched.status, 200);
   assert.deepStrictEqual(seen[0], [
     {
       kind: "delete_file",

@@ -115,6 +115,7 @@ export interface ExecEventJs {
 
 export interface ExecOpts {
   env?: Record<string, string>
+  /** Maximum seconds without stdout/stderr progress before the command is terminated. */
   timeoutSecs?: number
   detach?: boolean
   shell?: string

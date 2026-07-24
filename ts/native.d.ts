@@ -134,6 +134,8 @@ export declare class VfsStorage {
   listDir(path: string, options?: { maxHashBytes?: number | null } | null): Promise<Array<VfsMetadata>>
   /** Read metadata for an indexed set of paths in one backend request. */
   metadataMany(paths: Array<string>): Promise<Array<VfsMetadata | undefined | null>>
+  /** Warm a bounded subtree and optionally return its small file bodies. */
+  prefetchSubtree(prefix: string, options?: VfsPrefetchOptions | undefined | null): Promise<Array<VfsPrefetchFileBytes>>
   /** Create a directory, optionally with an exact POSIX mode. */
   mkdir(path: string, options?: { mode?: number | null } | null): Promise<void>
   /** Create a symbolic link. */
@@ -350,6 +352,17 @@ export interface VfsObjectState {
   packSlotOffset: bigint
   packSlotLength: bigint
   packSlotCompression: number
+}
+
+export interface VfsPrefetchFileBytes {
+  path: string
+  body: Buffer
+}
+
+export interface VfsPrefetchOptions {
+  includeSmallFileBytes?: boolean
+  maxEntries?: number
+  maxPackBytes?: number
 }
 
 /** Write options for VFS storage. */

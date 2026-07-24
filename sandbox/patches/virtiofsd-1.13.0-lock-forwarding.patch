@@ -360,6 +360,26 @@ index e6c662a..69cc59f 100644
          fn statfs(&self, ctx: Context, inode: Self::Inode) -> io::Result<libc::statvfs64>;
          fn getxattr(
              &self,
+diff --git a/src/passthrough/stat.rs b/src/passthrough/stat.rs
+index e6c1a2b..f7d3c4e 100644
+--- a/src/passthrough/stat.rs
++++ b/src/passthrough/stat.rs
+@@ -122,7 +122,14 @@ pub fn statx(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<StatExt> {
+         do_statx(
+             dir.as_raw_fd(),
+             path.as_ptr(),
+-            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
++            // Force a synchronous metadata refresh from the backing filesystem.
++            // This daemon runs over a distributed FUSE mount (RemoteFuseFs); with
++            // only the default AT_STATX_SYNC_AS_STAT the host kernel's FUSE client
++            // may answer statx() from its own attribute cache and hand us a stale
++            // size after a sibling node extended the file. Because lookup/getattr
++            // build their reply directly from this stat, that staleness would
++            // otherwise propagate verbatim into our guest-facing replies.
++            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW | libc::AT_STATX_FORCE_SYNC,
+             STATX_BASIC_STATS | STATX_MNT_ID,
+             stx_ui.as_mut_ptr(),
+         )
 diff --git a/src/seccomp.rs b/src/seccomp.rs
 index ce31412..b5b6efd 100644
 --- a/src/seccomp.rs

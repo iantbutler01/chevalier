@@ -76,9 +76,26 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Default tracing directives for the portproxy guest agent.
+///
+/// portproxy runs inside microVMs whose stdout can land on the emulated serial
+/// console (ttyS0). h2/hyper/tonic/tower emit multiple MB/min of TRACE-level
+/// frame chatter, and synchronous serial-console writes at that volume are a
+/// known guest soft-lockup trigger. So default our own spans to INFO and force
+/// the transport stack down to WARN. A caller-supplied `RUST_LOG` still
+/// overrides this completely.
+const DEFAULT_LOG_DIRECTIVES: &str = "info,h2=warn,hyper=warn,tonic=warn,tower=warn";
+
+/// Builds the daemon's [`EnvFilter`], honoring `RUST_LOG` when present and
+/// otherwise falling back to [`DEFAULT_LOG_DIRECTIVES`].
+fn build_env_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_DIRECTIVES))
+}
+
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(build_env_filter())
+        .init();
 }
 
 async fn run_server_mode(args: Args) -> anyhow::Result<()> {
@@ -344,5 +361,26 @@ mod tests {
             .insert("authorization", "Bearer secret-token".parse().unwrap());
 
         assert!(authorize_portproxy_request(request, "secret-token").is_ok());
+    }
+
+    #[test]
+    fn default_log_directives_suppress_transport_trace_flood() {
+        // The console-flood mitigation lives in these directives: our own spans
+        // stay at info while h2/hyper/tonic/tower are forced to warn. Assert each
+        // suppression directive is present so a regression here is caught before
+        // it can flood ttyS0 again.
+        for directive in ["info", "h2=warn", "hyper=warn", "tonic=warn", "tower=warn"] {
+            assert!(
+                DEFAULT_LOG_DIRECTIVES.contains(directive),
+                "default log directives must contain `{directive}`, got `{DEFAULT_LOG_DIRECTIVES}`"
+            );
+        }
+    }
+
+    #[test]
+    fn default_log_directives_parse_into_a_valid_env_filter() {
+        // build_env_filter falls back to DEFAULT_LOG_DIRECTIVES when RUST_LOG is
+        // unset; that fallback must always construct without panicking.
+        let _filter = EnvFilter::new(DEFAULT_LOG_DIRECTIVES);
     }
 }

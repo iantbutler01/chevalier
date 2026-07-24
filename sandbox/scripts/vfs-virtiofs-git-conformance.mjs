@@ -36,6 +36,9 @@ Optional:
   CHEVALIER_VFS_HARNESS_POSIX_SEED=<recorded-seed>
   CHEVALIER_VFS_HARNESS_POSIX_ONE_STEPS=64
   CHEVALIER_VFS_HARNESS_POSIX_TWO_STEPS=96
+  CHEVALIER_VFS_HARNESS_GIT_FILE_COUNT=1000
+  CHEVALIER_VFS_HARNESS_GIT_STATUS_COLD_MAX_MS=2000
+  CHEVALIER_VFS_HARNESS_GIT_STATUS_WARM_MAX_MS=1500
   CHEVALIER_MODULE_PATH=<repo>/ts/index.js
   CHEVALIER_SANDBOX_MODULE_PATH=<repo>/ts-sandbox/index.js
 
@@ -70,14 +73,21 @@ const backendProfile =
   process.env.CHEVALIER_VFS_HARNESS_BACKEND_PROFILE?.trim() || "openbracket-vfs-fuse";
 const gatewayBind = process.env.CHEVALIER_VFS_HARNESS_GATEWAY_BIND?.trim() || "0.0.0.0";
 const gatewayPort = Number(process.env.CHEVALIER_VFS_HARNESS_GATEWAY_PORT ?? "19091");
+const maxCommandTimeoutMs = 300_000;
 const commandTimeoutMs = Number(
-  process.env.CHEVALIER_VFS_HARNESS_COMMAND_TIMEOUT_MS ?? "300000",
+  process.env.CHEVALIER_VFS_HARNESS_COMMAND_TIMEOUT_MS ?? String(maxCommandTimeoutMs),
 );
 if (!Number.isInteger(gatewayPort) || gatewayPort < 1 || gatewayPort > 65535) {
   throw new Error("CHEVALIER_VFS_HARNESS_GATEWAY_PORT must be an integer in 1..65535");
 }
-if (!Number.isFinite(commandTimeoutMs) || commandTimeoutMs < 1_000) {
-  throw new Error("CHEVALIER_VFS_HARNESS_COMMAND_TIMEOUT_MS must be at least 1000");
+if (
+  !Number.isFinite(commandTimeoutMs) ||
+  commandTimeoutMs < 1_000 ||
+  commandTimeoutMs > maxCommandTimeoutMs
+) {
+  throw new Error(
+    `CHEVALIER_VFS_HARNESS_COMMAND_TIMEOUT_MS must be between 1000 and ${maxCommandTimeoutMs}`,
+  );
 }
 
 const selectedChecks = (() => {
@@ -86,7 +96,7 @@ const selectedChecks = (() => {
   return new Set(
     raw.split(",").map((part) => {
       const id = Number(part);
-      if (!Number.isInteger(id) || id < 1 || id > 10) {
+      if (!Number.isInteger(id) || id < 1 || id > 11) {
         throw new Error(`invalid CHEVALIER_VFS_HARNESS_CHECKS entry: ${part}`);
       }
       return id;
@@ -140,6 +150,23 @@ const posixModelTwoSteps = positiveIntegerEnv(
   "CHEVALIER_VFS_HARNESS_POSIX_TWO_STEPS",
   96,
 );
+const gitWorkloadFileCount = positiveIntegerEnv(
+  "CHEVALIER_VFS_HARNESS_GIT_FILE_COUNT",
+  1_000,
+);
+const gitStatusColdMaxMs = positiveIntegerEnv(
+  "CHEVALIER_VFS_HARNESS_GIT_STATUS_COLD_MAX_MS",
+  2_000,
+);
+const gitStatusWarmMaxMs = positiveIntegerEnv(
+  "CHEVALIER_VFS_HARNESS_GIT_STATUS_WARM_MAX_MS",
+  1_500,
+);
+if (selectedChecks?.has(11) && !selectedChecks.has(6)) {
+  throw new Error(
+    "CHEVALIER_VFS_HARNESS_CHECKS=11 requires correctness check 6 in the same run",
+  );
+}
 const ownerId = `chevalier-vfs-harness-${probeId}`;
 const gitDisabledOwnerId = `${ownerId}-git-disabled`;
 const scopePath = `probes/${probeId}/repo`;
@@ -154,6 +181,40 @@ const ownerEndpoint = `${gatewayPublicUrl}/internal/chevalier/vfs/${encodeURICom
 const gitDisabledOwnerEndpoint =
   `${gatewayPublicUrl}/internal/chevalier/vfs/${encodeURIComponent(gitDisabledOwnerId)}`;
 let gatewayRequestCount = 0;
+const gatewayRequestCountsByRoute = new Map();
+const gatewayPathCounts = new Map();
+const snapshotGatewayRequestCounts = () => ({
+  routes: new Map(gatewayRequestCountsByRoute),
+  paths: new Map(gatewayPathCounts),
+});
+const gatewayRequestDelta = (before) => {
+  const routes = {};
+  let total = 0;
+  for (const [route, count] of gatewayRequestCountsByRoute) {
+    const delta = count - (before.routes.get(route) ?? 0);
+    if (delta <= 0) continue;
+    routes[route] = delta;
+    total += delta;
+  }
+  const pathsByRoute = {};
+  for (const [key, count] of gatewayPathCounts) {
+    const delta = count - (before.paths.get(key) ?? 0);
+    if (delta <= 0) continue;
+    const separator = key.indexOf("\n");
+    const route = key.slice(0, separator);
+    const path = key.slice(separator + 1);
+    const summary = pathsByRoute[route] ?? { total: 0, unique: 0, top: [] };
+    summary.total += delta;
+    summary.unique += 1;
+    summary.top.push([path, delta]);
+    pathsByRoute[route] = summary;
+  }
+  for (const summary of Object.values(pathsByRoute)) {
+    summary.top.sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]));
+    summary.top = summary.top.slice(0, 20);
+  }
+  return { total, routes, pathsByRoute };
+};
 
 const withTimeout = async (promise, label, timeoutMs = commandTimeoutMs) => {
   let timer;
@@ -175,6 +236,39 @@ const readRequestBody = async (request) => {
   return Buffer.concat(chunks);
 };
 
+const recordGatewayPaths = (routeKey, requestUrl, body) => {
+  const paths = [];
+  for (const name of ["path", "from", "to"]) {
+    const value = requestUrl.searchParams.get(name);
+    if (value !== null) paths.push(value);
+  }
+  if (body !== undefined && body.length !== 0) {
+    try {
+      const decoded = JSON.parse(body.toString("utf8"));
+      for (const path of decoded.paths ?? []) {
+        if (typeof path === "string") paths.push(path);
+      }
+      for (const write of decoded.writes ?? []) {
+        if (typeof write?.path === "string") paths.push(write.path);
+      }
+      for (const mutation of decoded.mutations ?? []) {
+        for (const name of ["path", "source_path", "destination_path", "from", "to"]) {
+          if (typeof mutation?.[name] === "string") paths.push(mutation[name]);
+        }
+      }
+      if (typeof decoded.path === "string") paths.push(decoded.path);
+      if (typeof decoded.source_path === "string") paths.push(decoded.source_path);
+      if (typeof decoded.destination_path === "string") paths.push(decoded.destination_path);
+    } catch {
+      // Binary write bodies and malformed requests are still counted by route.
+    }
+  }
+  for (const path of paths) {
+    const key = `${routeKey}\n${path}`;
+    gatewayPathCounts.set(key, (gatewayPathCounts.get(key) ?? 0) + 1);
+  }
+};
+
 await Promise.all([
   mkdir(ownerRoot, { recursive: true }),
   mkdir(gitDisabledOwnerRoot, { recursive: true }),
@@ -194,9 +288,23 @@ const handleGatewayRequest = createVfsGatewayServer({
 const gatewayServer = createServer(async (incoming, outgoing) => {
   try {
     const method = incoming.method || "GET";
+    const requestUrl = new URL(
+      incoming.url || "/",
+      `http://${incoming.headers.host || "localhost"}`,
+    );
+    const routeParts = requestUrl.pathname.split("/").filter(Boolean);
+    const ownerIndex = routeParts.indexOf("vfs") + 1;
+    const operation =
+      ownerIndex > 0 ? routeParts.slice(ownerIndex + 1).join("/") : requestUrl.pathname;
+    const routeKey = `${method} /${operation}`;
+    gatewayRequestCountsByRoute.set(
+      routeKey,
+      (gatewayRequestCountsByRoute.get(routeKey) ?? 0) + 1,
+    );
     const body = method === "GET" || method === "HEAD" ? undefined : await readRequestBody(incoming);
+    recordGatewayPaths(routeKey, requestUrl, body);
     const request = new Request(
-      new URL(incoming.url || "/", `http://${incoming.headers.host || "localhost"}`),
+      requestUrl,
       {
         method,
         headers: incoming.headers,
@@ -213,6 +321,14 @@ const gatewayServer = createServer(async (incoming, outgoing) => {
     outgoing.end(error instanceof Error ? error.stack || error.message : String(error));
   }
 });
+// The vmd revision watch holds a 25s long-poll on an idle keep-alive socket.
+// Node's default keepAliveTimeout (5s) would reap that idle connection and RST
+// it, so the client's next pooled use fails with a send-class error (the watch
+// flapping this harness was built to catch). Hold connections open well past
+// the long-poll window; headersTimeout must exceed keepAliveTimeout so a slow
+// header is never mistaken for an idle reap.
+gatewayServer.keepAliveTimeout = 120_000;
+gatewayServer.headersTimeout = 125_000;
 
 let gatewayListening = false;
 const startGateway = async () => {
@@ -365,7 +481,13 @@ const collectExecAtMarkers = async (handle, label, markerSteps = []) => {
     }
   }
   if (markerIndex < markerSteps.length) {
-    throw new Error(`${label} exited without marker ${markerSteps[markerIndex].marker}`);
+    throw new Error(
+      `${label} exited without marker ${markerSteps[markerIndex].marker}\n${commandResultText({
+        code,
+        stdout,
+        stderr,
+      })}`,
+    );
   }
   return { code, stdout, stderr };
 };
@@ -382,7 +504,7 @@ const startGuest = async (
     session.exec(`set -euo pipefail\n${command}`, {
       shell: "/bin/bash",
       closeStdinOnStart: !interactive,
-      timeoutSecs,
+      timeoutSecs: Math.min(timeoutSecs, Math.floor(commandTimeoutMs / 1_000)),
       env: {
         GIT_AUTHOR_NAME: "Chevalier VFS Conformance",
         GIT_AUTHOR_EMAIL: "vfs-conformance@chevalier.test",
@@ -393,8 +515,32 @@ const startGuest = async (
     `start guest command: ${command.slice(0, 100)}`,
   );
 
-const execGuest = async (session, command, timeoutSecs = 300) =>
-  drainExec(await startGuest(session, command, timeoutSecs), command.slice(0, 100));
+let stallExecSeq = 0;
+const execGuest = async (session, command, timeoutSecs = 300) => {
+  // STALL DIAGNOSTIC (keep: low-noise): per-action wall-clock breadcrumbs so a
+  // ~30s action-boundary stall is attributable to a hop. `t0` (issue) correlates
+  // with the guest portproxy recv breadcrumb; `est` is harness->exec-established
+  // (delivery hop), `exec` is established->exit (spawn + run + completion hop).
+  const seq = ++stallExecSeq;
+  const t0 = Date.now();
+  process.stderr.write(`[stall] issue seq=${seq} t0=${t0}\n`);
+  const handle = await startGuest(session, command, timeoutSecs);
+  const t1 = Date.now();
+  const result = await drainExec(handle, command.slice(0, 100));
+  const t2 = Date.now();
+  const total = t2 - t0;
+  process.stderr.write(
+    `[stall] end seq=${seq} est=${t1 - t0}ms exec=${t2 - t1}ms total=${total}ms code=${result.code}${total > 5000 ? " SLOW" : ""}\n`,
+  );
+  return result;
+};
+
+const waitForGuestBarrier = (promise, label, timeoutMs = 60_000) =>
+  withTimeout(
+    promise,
+    label,
+    Math.min(timeoutMs, commandTimeoutMs),
+  );
 
 const execGuestAtMarkers = async (
   session,
@@ -415,7 +561,7 @@ const check = async (id, name, body) => {
     return;
   }
   const started = Date.now();
-  process.stderr.write(`[virtiofs-git] ${id}/10 ${name}...\n`);
+  process.stderr.write(`[virtiofs-git] ${id}/11 ${name}...\n`);
   try {
     const outcome = await body();
     results.push({
@@ -436,7 +582,7 @@ const check = async (id, name, body) => {
     });
   }
   process.stderr.write(
-    `[virtiofs-git] ${id}/10 ${results.at(-1).status} (${results.at(-1).durationMs} ms)\n`,
+    `[virtiofs-git] ${id}/11 ${results.at(-1).status} (${results.at(-1).durationMs} ms)\n`,
   );
 };
 
@@ -662,6 +808,85 @@ PY`,
   second = await createSession("b");
 
   await check(2, "same/cross-mount exclusive and ordinary O_CREAT convergence", async () => {
+    const namespaceOrigin = await execGuest(
+      first,
+      `python3 - <<'PY'
+import os, shutil, stat
+root = "/workspace/namespace-projection"
+shutil.rmtree(root, ignore_errors=True)
+os.mkdir(root, 0o750)
+source = root + "/source"
+fd = os.open(source, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o640)
+os.close(fd)
+os.symlink("source", root + "/source-link")
+os.link(source, root + "/source-alias")
+os.rename(root + "/source-alias", root + "/renamed-alias")
+os.chmod(source, 0o700)
+probe = root + "/awaited-empty-probe"
+fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+os.close(fd)
+assert os.path.exists(probe)
+os.unlink(probe)
+empty_dir = root + "/empty-dir"
+os.mkdir(empty_dir)
+os.rmdir(empty_dir)
+assert stat.S_IMODE(os.stat(source).st_mode) == 0o700
+assert os.stat(source).st_ino == os.stat(root + "/renamed-alias").st_ino
+assert os.readlink(root + "/source-link") == "source"
+assert not os.path.lexists(probe)
+assert not os.path.lexists(empty_dir)
+print("NAMESPACE_ORIGIN_OK")
+PY`,
+    );
+    const namespaceSecond = await execGuest(
+      second,
+      `python3 - <<'PY'
+import os, stat
+root = "/workspace/namespace-projection"
+source = root + "/source"
+renamed = root + "/renamed-alias"
+assert stat.S_IMODE(os.stat(root).st_mode) == 0o750
+assert stat.S_IMODE(os.stat(source).st_mode) == 0o700
+assert os.stat(source).st_ino == os.stat(renamed).st_ino
+assert os.stat(source).st_nlink == 2
+assert os.readlink(root + "/source-link") == "source"
+assert not os.path.lexists(root + "/source-alias")
+assert not os.path.lexists(root + "/awaited-empty-probe")
+assert not os.path.lexists(root + "/empty-dir")
+
+# Exercise the same namespace classes from the second mount, then let the
+# originating mount prove the reverse direction.
+os.chmod(source, 0o644)
+os.rename(renamed, root + "/renamed-by-second")
+os.link(source, root + "/alias-by-second")
+os.unlink(root + "/alias-by-second")
+os.symlink("source", root + "/link-by-second")
+probe = root + "/second-empty-probe"
+fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+os.close(fd)
+os.unlink(probe)
+empty_dir = root + "/second-empty-dir"
+os.mkdir(empty_dir)
+os.rmdir(empty_dir)
+print("NAMESPACE_SECOND_OK")
+PY`,
+    );
+    const namespaceReverse = await execGuest(
+      first,
+      `python3 - <<'PY'
+import os, stat
+root = "/workspace/namespace-projection"
+source = root + "/source"
+assert stat.S_IMODE(os.stat(source).st_mode) == 0o644
+assert os.stat(source).st_ino == os.stat(root + "/renamed-by-second").st_ino
+assert os.readlink(root + "/link-by-second") == "source"
+assert not os.path.lexists(root + "/renamed-alias")
+assert not os.path.lexists(root + "/alias-by-second")
+assert not os.path.lexists(root + "/second-empty-probe")
+assert not os.path.lexists(root + "/second-empty-dir")
+print("NAMESPACE_REVERSE_OK")
+PY`,
+    );
     const same = await execGuest(
       first,
       `rm -f /workspace/exclusive-same /tmp/exclusive-same-*
@@ -691,7 +916,7 @@ cat /tmp/exclusive-same-*`,
     const bothResults = new Promise((resolve) => {
       resolveResults = resolve;
     });
-    const contender = (label) => `python3 - <<'PY'
+    const contender = (label) => `cat >/tmp/exclusive-contender-${label}.py <<'PY'
 import os, stat, sys
 path = "/workspace/exclusive-cross"
 os.umask(0)
@@ -728,14 +953,15 @@ PY`;
     const runContender = (session, label) =>
       execGuestAtMarkers(
         session,
-        contender(label),
+        `${contender(label)}
+python3 /tmp/exclusive-contender-${label}.py`,
         [
           {
             marker: `EXCLUSIVE_READY:${label}`,
             onMarker: async (handle) => {
               readyCount += 1;
               if (readyCount === 2) resolveReady();
-              await bothReady;
+              await waitForGuestBarrier(bothReady, "both exclusive contenders ready");
               await handle.write(Buffer.from("go\n"));
             },
           },
@@ -744,7 +970,7 @@ PY`;
             onMarker: async (handle) => {
               resultCount += 1;
               if (resultCount === 2) resolveResults();
-              await bothResults;
+              await waitForGuestBarrier(bothResults, "both exclusive contenders resolved");
               await handle.write(Buffer.from("finish\n"));
               await handle.eof();
             },
@@ -799,7 +1025,7 @@ PY`;
     const bPublished = new Promise((resolve) => {
       resolveBPublished = resolve;
     });
-    const ordinaryCreator = (label) => `python3 - <<'PY'
+    const ordinaryCreator = (label) => `cat >/tmp/ordinary-creator-${label}.py <<'PY'
 import os, stat, sys
 path = "/workspace/create-shared"
 os.umask(0)
@@ -839,14 +1065,15 @@ PY`;
     const runOrdinaryCreator = (session, label) =>
       execGuestAtMarkers(
         session,
-        ordinaryCreator(label),
+        `${ordinaryCreator(label)}
+python3 /tmp/ordinary-creator-${label}.py`,
         [
           {
             marker: `ORDINARY_READY:${label}`,
             onMarker: async (handle) => {
               ordinaryReadyCount += 1;
               if (ordinaryReadyCount === 2) resolveOrdinaryReady();
-              await ordinaryReady;
+              await waitForGuestBarrier(ordinaryReady, "both ordinary creators ready");
               await handle.write(Buffer.from("go\n"));
             },
           },
@@ -855,11 +1082,11 @@ PY`;
             onMarker: async (handle) => {
               ordinaryOpenCount += 1;
               if (ordinaryOpenCount === 2) resolveOrdinaryOpen();
-              await ordinaryOpen;
+              await waitForGuestBarrier(ordinaryOpen, "both ordinary creators opened");
               if (label === "A") {
                 await handle.write(Buffer.from("publish\n"));
               } else {
-                await aPublished;
+                await waitForGuestBarrier(aPublished, "ordinary creator A published");
                 await handle.write(Buffer.from("observe\n"));
               }
             },
@@ -870,7 +1097,7 @@ PY`;
                   marker: "ORDINARY_A_PUBLISHED",
                   onMarker: async (handle) => {
                     resolveAPublished();
-                    await bPublished;
+                    await waitForGuestBarrier(bPublished, "ordinary creator B published");
                     await handle.write(Buffer.from("verify\n"));
                     await handle.eof();
                   },
@@ -924,6 +1151,9 @@ PY`,
     ]);
     return {
       pass:
+        namespaceOrigin.code === 0 &&
+        namespaceSecond.code === 0 &&
+        namespaceReverse.code === 0 &&
         same.code === 0 &&
         a.code === 0 &&
         b.code === 0 &&
@@ -946,6 +1176,9 @@ PY`,
         ordinaryAuthoritativeEntry.mode === 0o640 &&
         ordinaryAuthoritativeBytes.toString("utf8") === "AB",
       detail: [
+        commandResultText(namespaceOrigin),
+        commandResultText(namespaceSecond),
+        commandResultText(namespaceReverse),
         `same acquired=${sameAcquired}`,
         `cross acquired=${crossAcquired} rejected=${crossRejected} winner=${winner}`,
         commandResultText(a),
@@ -1171,7 +1404,7 @@ PY`,
     let remoteUnlink = null;
     const crossMountOpenLifetime = await execGuestAtMarkers(
       first,
-      `python3 - <<'PY'
+      `cat >/tmp/hard-remote-open-lifetime.py <<'PY'
 import os, stat, sys
 c = "/workspace/hard-c"
 renamed = "/workspace/hard-renamed"
@@ -1180,26 +1413,27 @@ assert sc.st_ino == sr.st_ino and sc.st_nlink == sr.st_nlink == 2
 fd = os.open(renamed, os.O_RDWR)
 inode = os.fstat(fd).st_ino
 print(f"HARD_REMOTE_UNLINK_READY:ino={inode}", flush=True)
-assert sys.stdin.readline() == "continue\\n"
-assert os.pread(fd, 11, 0) == b"CROSS-ALIAS"
+assert sys.stdin.readline() == "continue\\n", "marker continuation"
+assert os.pread(fd, 11, 0) == b"CROSS-ALIAS", "open descriptor bytes after remote unlink/reuse"
 os.fchmod(fd, 0o640)
 os.ftruncate(fd, 0)
 os.write(fd, b"REMOTE-OPEN")
 os.fsync(fd)
 replacement = os.stat(renamed)
 surviving = os.stat(c)
-assert replacement.st_ino != inode
-assert surviving.st_ino == inode
-assert replacement.st_nlink == surviving.st_nlink == os.fstat(fd).st_nlink == 1
-assert stat.S_IMODE(os.fstat(fd).st_mode) == 0o640
-assert stat.S_IMODE(surviving.st_mode) == 0o640
-assert stat.S_IMODE(replacement.st_mode) == 0o644
-assert os.pread(fd, 11, 0) == b"REMOTE-OPEN"
-assert open(c, "rb").read() == b"REMOTE-OPEN"
-assert open(renamed, "rb").read() == b"REPLACEMENT"
+assert replacement.st_ino != inode, "replacement inode identity"
+assert surviving.st_ino == inode, "surviving alias inode identity"
+assert replacement.st_nlink == surviving.st_nlink == os.fstat(fd).st_nlink == 1, "post-unlink link counts"
+assert stat.S_IMODE(os.fstat(fd).st_mode) == 0o640, "open descriptor mode"
+assert stat.S_IMODE(surviving.st_mode) == 0o640, "surviving alias mode"
+assert stat.S_IMODE(replacement.st_mode) == 0o644, "replacement mode"
+assert os.pread(fd, 11, 0) == b"REMOTE-OPEN", "open descriptor bytes after descriptor write"
+assert open(c, "rb").read() == b"REMOTE-OPEN", "surviving alias bytes after descriptor write"
+assert open(renamed, "rb").read() == b"REPLACEMENT", "replacement bytes"
 os.close(fd)
 print(f"HARD_REMOTE_UNLINK_REUSE_FSYNC_OK:ino={inode}:replacement={replacement.st_ino}:nlink=1")
-PY`,
+PY
+python3 /tmp/hard-remote-open-lifetime.py`,
       [
         {
           marker: "HARD_REMOTE_UNLINK_READY:",
@@ -1242,7 +1476,6 @@ print(f"HARD_REMOTE_ALIAS_REUSED:old={sc.st_ino}:replacement={replacement.st_ino
 PY`,
             );
             await handle.write(Buffer.from("continue\n"));
-            await handle.eof();
           },
         },
       ],
@@ -1388,8 +1621,20 @@ echo GIT_LIFECYCLE_OK`,
     };
   });
 
-  await check(6, "Git small-file workload, warm status, gc, and fsck", async () => {
-    const command = await execGuest(
+  let gitWorkloadEvidence = null;
+  await check(6, "Git small-file correctness with five-minute liveness ceiling", async () => {
+    const phaseLabels = [
+      "create_1000",
+      "add_1000",
+      "commit_1000",
+      "status_cold",
+      "status_warm",
+      "gc",
+      "fsck_full",
+    ];
+    let phaseRequestBaseline = snapshotGatewayRequestCounts();
+    const gatewayRequestsByPhase = {};
+    const command = await execGuestAtMarkers(
       first,
       `measure() {
   local label="$1"
@@ -1400,30 +1645,58 @@ echo GIT_LIFECYCLE_OK`,
   finished=$(date +%s%N)
   echo "GIT_TIMING_MS:\${label}:$(((finished - started) / 1000000))" >&2
 }
+started=$(date +%s%N)
 python3 - <<'PY'
 import os
 root="/workspace/worktree/many"
 os.makedirs(root, exist_ok=True)
-for i in range(1000):
+for i in range(${gitWorkloadFileCount}):
     with open(os.path.join(root, f"file-{i:04d}.txt"), "wb") as f:
         f.write((f"{i:04d}:" + "x"*4089 + "\\n").encode())
+    if (i + 1) % 100 == 0:
+        print(f"GIT_CREATE_PROGRESS:{i + 1}", flush=True)
 PY
+finished=$(date +%s%N)
+echo "GIT_TIMING_MS:create_1000:$(((finished - started) / 1000000))" >&2
+echo GIT_PHASE_DONE:create_1000
+read -r phase_continue
 measure add_1000 git -C /workspace/worktree add many
+echo GIT_PHASE_DONE:add_1000
+read -r phase_continue
 measure commit_1000 git -C /workspace/worktree commit --quiet -m many
+echo GIT_PHASE_DONE:commit_1000
+read -r phase_continue
 started=$(date +%s%N)
 ${git("status --porcelain")} >/tmp/status-first
 finished=$(date +%s%N)
 echo "GIT_TIMING_MS:status_cold:$(((finished - started) / 1000000))" >&2
+echo GIT_PHASE_DONE:status_cold
+read -r phase_continue
 started=$(date +%s%N)
 ${git("status --porcelain")} >/tmp/status-warm
 finished=$(date +%s%N)
 echo "GIT_TIMING_MS:status_warm:$(((finished - started) / 1000000))" >&2
+echo GIT_PHASE_DONE:status_warm
+read -r phase_continue
 test ! -s /tmp/status-first
 test ! -s /tmp/status-warm
 measure gc git -C /workspace/worktree gc
+echo GIT_PHASE_DONE:gc
+read -r phase_continue
 measure fsck_full git -C /workspace/worktree fsck --full
+echo GIT_PHASE_DONE:fsck_full
+read -r phase_continue
 echo GIT_WORKLOAD_OK`,
-      1200,
+      phaseLabels.map((label, index) => ({
+        marker: `GIT_PHASE_DONE:${label}`,
+        onMarker: async (handle) => {
+          gatewayRequestsByPhase[label] = gatewayRequestDelta(phaseRequestBaseline);
+          phaseRequestBaseline = snapshotGatewayRequestCounts();
+          await handle.write(Buffer.from("continue\n"));
+          if (index === phaseLabels.length - 1) await handle.eof();
+        },
+      })),
+      300,
     );
     const timingText = `${command.stdout}\n${command.stderr}`;
     const timingsMs = Object.fromEntries(
@@ -1432,21 +1705,26 @@ echo GIT_WORKLOAD_OK`,
         Number(match[2]),
       ]),
     );
+    gitWorkloadEvidence = {
+      fileCount: gitWorkloadFileCount,
+      timingsMs,
+      gatewayRequestsByPhase,
+    };
     return {
       pass:
         command.code === 0 &&
         command.stdout.includes("GIT_WORKLOAD_OK") &&
-        Object.keys(timingsMs).length === 6 &&
+        Object.keys(timingsMs).length === 7 &&
         !/input\/output error|\bEIO\b/i.test(`${command.stdout}\n${command.stderr}`),
       detail: commandResultText(command),
-      evidence: { fileCount: 1_000, timingsMs },
+      evidence: gitWorkloadEvidence,
     };
   });
 
   await check(7, "cross-mount exact HEAD and close-barrier visibility", async () => {
     const writer = await execGuest(
       first,
-      `printf barrier\\n >/workspace/worktree/barrier.txt
+      `printf 'barrier\\n' >/workspace/worktree/barrier.txt
 python3 - <<'PY'
 import os, stat
 root = "/workspace/worktree"
@@ -1683,6 +1961,30 @@ echo REPLACEMENT_OK:$actual`,
       detail: commandResultText(command),
     };
   });
+
+  await check(11, "Git status usability latency", async () => {
+    if (gitWorkloadEvidence === null) {
+      return {
+        pass: false,
+        detail: "correctness check 6 did not produce Git timing evidence",
+      };
+    }
+    const coldMs = gitWorkloadEvidence.timingsMs.status_cold;
+    const warmMs = gitWorkloadEvidence.timingsMs.status_warm;
+    const coldPass = Number.isFinite(coldMs) && coldMs <= gitStatusColdMaxMs;
+    const warmPass = Number.isFinite(warmMs) && warmMs <= gitStatusWarmMaxMs;
+    return {
+      pass: coldPass && warmPass,
+      detail:
+        `status_cold=${String(coldMs)}ms budget=${gitStatusColdMaxMs}ms ` +
+        `status_warm=${String(warmMs)}ms budget=${gitStatusWarmMaxMs}ms`,
+      evidence: {
+        fileCount: gitWorkloadEvidence.fileCount,
+        observedMs: { cold: coldMs, warm: warmMs },
+        budgetMs: { cold: gitStatusColdMaxMs, warm: gitStatusWarmMaxMs },
+      },
+    };
+  });
 } finally {
   for (const [index, session] of [...sessions].reverse().entries()) {
     try {
@@ -1745,6 +2047,11 @@ console.log(
       gatewayRestartProtocolEvidence,
       posixModelEvidence,
       gatewayRequestCount,
+      gatewayRequestCountsByRoute: Object.fromEntries(
+        [...gatewayRequestCountsByRoute].sort(([left], [right]) =>
+          left.localeCompare(right),
+        ),
+      ),
       summary: {
         passed: results.filter((result) => result.status === "pass").length,
         failed: failed.length,

@@ -1,4 +1,16 @@
 "use strict";
+var __classPrivateFieldSet = (this && this.__classPrivateFieldSet) || function (receiver, state, value, kind, f) {
+    if (kind === "m") throw new TypeError("Private method is not writable");
+    if (kind === "a" && !f) throw new TypeError("Private accessor was defined without a setter");
+    if (typeof state === "function" ? receiver !== state || !f : !state.has(receiver)) throw new TypeError("Cannot write private member to an object whose class did not declare it");
+    return (kind === "a" ? f.call(receiver, value) : f ? f.value = value : state.set(receiver, value)), value;
+};
+var __classPrivateFieldGet = (this && this.__classPrivateFieldGet) || function (receiver, state, kind, f) {
+    if (kind === "a" && !f) throw new TypeError("Private accessor was defined without a getter");
+    if (typeof state === "function" ? receiver !== state || !f : !state.has(receiver)) throw new TypeError("Cannot read private member from an object whose class did not declare it");
+    return kind === "m" ? f : kind === "a" ? f.call(receiver) : f ? f.value : state.get(receiver);
+};
+var _VfsPublicationCoordinator_instances, _VfsPublicationCoordinator_states, _VfsPublicationCoordinator_ackTimeoutMs, _VfsPublicationCoordinator_watcherGraceOverrideMs, _VfsPublicationCoordinator_state, _VfsPublicationCoordinator_acquire, _VfsPublicationCoordinator_releaseReader, _VfsPublicationCoordinator_releaseWriter, _VfsPublicationCoordinator_notifyWatchers, _VfsPublicationCoordinator_recordWatcherAck, _VfsPublicationCoordinator_unackedWatchers, _VfsPublicationCoordinator_notifyAckWaiters, _VfsPublicationCoordinator_awaitPublicationAcks, _VfsPublicationCoordinator_warnPublicationLag, _VfsPublicationCoordinator_checkpoint, _VfsPublicationCoordinator_drain;
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.createVfsGatewayServer = createVfsGatewayServer;
 // chevalier VFS gateway SERVER, in TypeScript.
@@ -24,8 +36,9 @@ exports.createVfsGatewayServer = createVfsGatewayServer;
 //   - GET  {owner}/file/raw?path=        -> 200 bytes (Range -> 206) | 404
 //   - GET  {owner}/tree?path=&name_like= -> 200 RemoteDirEntry[]
 //   - PUT  {owner}/file?path=            -> 2xx (body ignored by client); honors the
-//                                           precondition-fingerprint header, `If-Match`,
-//                                           or `ifMatch` query alias -> 409.
+//                                           typed precondition-kind +
+//                                           precondition-fingerprint headers, with
+//                                           legacy `If-Match` / `ifMatch` aliases -> 409.
 //                                           Optional identity CAS uses
 //                                           `x-chevalier-vfs-precondition-file-id`.
 //                                           Exact POSIX mode is decimal in
@@ -40,7 +53,7 @@ exports.createVfsGatewayServer = createVfsGatewayServer;
 //   - PUT  {owner}/symlink?path=&target= -> 2xx
 //   - POST {owner}/rename?from=&to=&return_metadata=true -> 200 {previous,current}
 //   - POST/DELETE {owner}/lease          -> 200 {resource_key,owner_token} / 2xx
-//   - POST {owner}/{metadata-many,read-many,write-many} -> batch (per-path loop)
+//   - POST {owner}/{metadata-many,read-many,write-many} -> batch
 //   - POST {owner}/namespace-many      -> ordered namespace mutation batch
 //   DTOs are snake_case; `kind` is exactly "file" | "directory"; errors map
 //   404->NotFound, 400->BadRequest, 409->Conflict (vfs/src/gateway.rs:1016).
@@ -49,6 +62,7 @@ const promises_1 = require("node:fs/promises");
 const node_os_1 = require("node:os");
 const node_path_1 = require("node:path");
 const DEFAULT_ROUTE_PREFIX = "/internal/chevalier/vfs";
+const PRECONDITION_KIND_HEADER = "x-chevalier-vfs-precondition-kind";
 const PRECONDITION_FINGERPRINT_HEADER = "x-chevalier-vfs-precondition-fingerprint";
 const PRECONDITION_FILE_ID_HEADER = "x-chevalier-vfs-precondition-file-id";
 const IF_MATCH_HEADER = "if-match";
@@ -57,8 +71,285 @@ const MODE_HEADER = "x-chevalier-vfs-mode";
 const EXPECTED_CONTENT_HASH_HEADER = "x-chevalier-vfs-expected-content-sha256";
 const STREAM_UPLOAD_HEADER = "x-chevalier-vfs-stream-upload";
 const RANGE_FINGERPRINT_HEADER = "x-chevalier-vfs-range-fingerprint";
+const NAMESPACE_REVISION_HEADER = "x-chevalier-vfs-namespace-revision";
+const LEASE_MODE_HEADER = "x-chevalier-vfs-lease-mode";
 const ADVISORY_LOCK_LEASE_MS = 45_000;
 const MAX_BATCH_ITEMS = 4096;
+const MAX_OPTIMISTIC_SNAPSHOT_ATTEMPTS = 3;
+class VfsSnapshotChangedError extends Error {
+}
+class VfsPublicationCoordinator {
+    constructor(options) {
+        _VfsPublicationCoordinator_instances.add(this);
+        _VfsPublicationCoordinator_states.set(this, new Map());
+        /** Hard cap (ms) a publication waits for watcher acks before failing open. */
+        _VfsPublicationCoordinator_ackTimeoutMs.set(this, void 0);
+        /** Optional fixed watcher-liveness grace (ms); null derives it per poll. */
+        _VfsPublicationCoordinator_watcherGraceOverrideMs.set(this, void 0);
+        __classPrivateFieldSet(this, _VfsPublicationCoordinator_ackTimeoutMs, options?.ackTimeoutMs ?? publicationAckTimeoutFromEnv(), "f");
+        __classPrivateFieldSet(this, _VfsPublicationCoordinator_watcherGraceOverrideMs, options?.watcherGraceMs ?? null, "f");
+    }
+    async read(ownerId, read) {
+        const state = __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_state).call(this, ownerId);
+        const release = await __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_acquire).call(this, state, "read");
+        try {
+            return { value: await read(), revision: state.revision };
+        }
+        finally {
+            release();
+        }
+    }
+    /**
+     * Run a potentially slow recursive read without excluding mutations for its
+     * duration. The two short checkpoints linearize the result only when no
+     * writer overlapped the scan; otherwise the discarded scan is retried.
+     */
+    async optimisticRead(ownerId, read) {
+        for (let attempt = 0; attempt < MAX_OPTIMISTIC_SNAPSHOT_ATTEMPTS; attempt += 1) {
+            const before = await __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_checkpoint).call(this, ownerId);
+            const value = await read();
+            const after = await __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_checkpoint).call(this, ownerId);
+            if (before.activityEpoch === after.activityEpoch) {
+                return { value, revision: after.revision };
+            }
+        }
+        throw new VfsSnapshotChangedError("namespace changed during recursive snapshot; retry");
+    }
+    async mutate(ownerId, mutate) {
+        return this.transact(ownerId, async () => ({ value: await mutate(), mutated: true }));
+    }
+    async transact(ownerId, transaction) {
+        const state = __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_state).call(this, ownerId);
+        const release = await __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_acquire).call(this, state, "write");
+        let outcome;
+        try {
+            const { value, mutated } = await transaction();
+            if (mutated) {
+                state.revision = Math.max(state.revision + 1, Date.now() * 1_000);
+            }
+            outcome = { value, revision: state.revision, mutated };
+        }
+        finally {
+            release();
+        }
+        if (outcome.mutated) {
+            // Revocation-ack: the write lock is already released and the revision
+            // published, so this holds NO lock — it purely delays the HTTP response
+            // until every live watcher has re-polled past this revision (or the cap).
+            await __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_awaitPublicationAcks).call(this, state, outcome.revision);
+        }
+        return { value: outcome.value, revision: outcome.revision };
+    }
+    /**
+     * Long-poll for the owner's revision to advance past `since`. Resolves to the
+     * current revision: immediately when it already exceeds `since`, otherwise as
+     * soon as a mutation advances it, or on `timeoutMs` with the revision
+     * unchanged (the caller distinguishes 200 vs 204 by comparing against `since`).
+     *
+     * Parking never touches the reader/writer lock, so a watch can neither block
+     * nor slow a concurrent mutation — the mutation's only added cost is the
+     * `#notifyWatchers` scan on release.
+     */
+    watch(ownerId, since, timeoutMs, watcherId) {
+        const state = __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_state).call(this, ownerId);
+        // This poll's `since` acks that revision for this watcher and unblocks any
+        // sibling publication waiting on it. Register before the fast path so a fast
+        // 200 still counts as an ack. Anonymous watchers (empty id) are not
+        // registered: they are notified but never gate a publication.
+        __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_recordWatcherAck).call(this, state, watcherId, since, timeoutMs);
+        // Fast path: reading `state.revision` and (below) registering the watcher
+        // happen with no `await` between them, so a mutation cannot slip in and be
+        // missed — JS runs this to completion before any writer's revision bump.
+        if (state.revision > since) {
+            return Promise.resolve(state.revision);
+        }
+        return new Promise((resolve) => {
+            let settled = false;
+            const watcher = {
+                since,
+                settle: (revision) => {
+                    if (settled)
+                        return;
+                    settled = true;
+                    clearTimeout(timer);
+                    const index = state.pendingWatchers.indexOf(watcher);
+                    if (index >= 0)
+                        state.pendingWatchers.splice(index, 1);
+                    resolve(revision);
+                },
+            };
+            const timer = setTimeout(() => watcher.settle(state.revision), timeoutMs);
+            state.pendingWatchers.push(watcher);
+        });
+    }
+}
+_VfsPublicationCoordinator_states = new WeakMap(), _VfsPublicationCoordinator_ackTimeoutMs = new WeakMap(), _VfsPublicationCoordinator_watcherGraceOverrideMs = new WeakMap(), _VfsPublicationCoordinator_instances = new WeakSet(), _VfsPublicationCoordinator_state = function _VfsPublicationCoordinator_state(ownerId) {
+    let state = __classPrivateFieldGet(this, _VfsPublicationCoordinator_states, "f").get(ownerId);
+    if (state === undefined) {
+        state = {
+            revision: Date.now() * 1_000,
+            activityEpoch: 0,
+            activeReaders: 0,
+            activeWriter: false,
+            queue: [],
+            pendingWatchers: [],
+            watcherAcks: new Map(),
+            pendingAckWaiters: [],
+            lastAckWarnAt: 0,
+        };
+        __classPrivateFieldGet(this, _VfsPublicationCoordinator_states, "f").set(ownerId, state);
+    }
+    return state;
+}, _VfsPublicationCoordinator_acquire = function _VfsPublicationCoordinator_acquire(state, kind) {
+    if (kind === "read" &&
+        !state.activeWriter &&
+        !state.queue.some((waiter) => waiter.kind === "write")) {
+        state.activeReaders += 1;
+        return Promise.resolve(__classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_releaseReader).call(this, state));
+    }
+    if (kind === "write" &&
+        !state.activeWriter &&
+        state.activeReaders === 0 &&
+        state.queue.length === 0) {
+        state.activeWriter = true;
+        return Promise.resolve(__classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_releaseWriter).call(this, state));
+    }
+    return new Promise((resolve) => {
+        state.queue.push({ kind, resolve });
+    });
+}, _VfsPublicationCoordinator_releaseReader = function _VfsPublicationCoordinator_releaseReader(state) {
+    let released = false;
+    return () => {
+        if (released)
+            return;
+        released = true;
+        state.activeReaders -= 1;
+        __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_drain).call(this, state);
+    };
+}, _VfsPublicationCoordinator_releaseWriter = function _VfsPublicationCoordinator_releaseWriter(state) {
+    let released = false;
+    return () => {
+        if (released)
+            return;
+        released = true;
+        state.activityEpoch += 1;
+        state.activeWriter = false;
+        // A writer just released; if it advanced the revision, wake every parked
+        // watcher whose `since` it passed. Non-mutating writers leave `revision`
+        // unchanged, so no parked watcher (all with `since >= revision`) matches.
+        __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_notifyWatchers).call(this, state);
+        __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_drain).call(this, state);
+    };
+}, _VfsPublicationCoordinator_notifyWatchers = function _VfsPublicationCoordinator_notifyWatchers(state) {
+    if (state.pendingWatchers.length === 0)
+        return;
+    const revision = state.revision;
+    // Iterate a snapshot because `settle` splices the watcher out of the live
+    // array; guard on `since < revision` so only truly-passed watchers wake.
+    for (const watcher of [...state.pendingWatchers]) {
+        if (watcher.since < revision)
+            watcher.settle(revision);
+    }
+}, _VfsPublicationCoordinator_recordWatcherAck = function _VfsPublicationCoordinator_recordWatcherAck(state, watcherId, since, timeoutMs) {
+    if (watcherId === "")
+        return;
+    const graceMs = __classPrivateFieldGet(this, _VfsPublicationCoordinator_watcherGraceOverrideMs, "f") ?? Math.min(timeoutMs * 2, 60_000);
+    const existing = state.watcherAcks.get(watcherId);
+    state.watcherAcks.set(watcherId, {
+        ackedRevision: Math.max(existing?.ackedRevision ?? 0, since),
+        expiresAt: Date.now() + graceMs,
+    });
+    __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_notifyAckWaiters).call(this, state);
+}, _VfsPublicationCoordinator_unackedWatchers = function _VfsPublicationCoordinator_unackedWatchers(state, revision) {
+    const now = Date.now();
+    for (const [id, ack] of state.watcherAcks) {
+        if (ack.expiresAt <= now)
+            state.watcherAcks.delete(id);
+    }
+    let laggards = 0;
+    for (const ack of state.watcherAcks.values()) {
+        if (ack.ackedRevision < revision)
+            laggards += 1;
+    }
+    return laggards;
+}, _VfsPublicationCoordinator_notifyAckWaiters = function _VfsPublicationCoordinator_notifyAckWaiters(state) {
+    if (state.pendingAckWaiters.length === 0)
+        return;
+    for (const waiter of [...state.pendingAckWaiters]) {
+        if (__classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_unackedWatchers).call(this, state, waiter.revision) === 0)
+            waiter.settle();
+    }
+}, _VfsPublicationCoordinator_awaitPublicationAcks = 
+/**
+ * Block until every live watcher acks `revision`, bounded by the ack cap.
+ * Returns at once when no watcher lags (single-mount / all-acked fast path).
+ * On cap expiry with laggards, resolves fail-open and logs a rate-limited WARN.
+ */
+async function _VfsPublicationCoordinator_awaitPublicationAcks(state, revision) {
+    if (__classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_unackedWatchers).call(this, state, revision) === 0)
+        return;
+    const cap = __classPrivateFieldGet(this, _VfsPublicationCoordinator_ackTimeoutMs, "f");
+    if (cap <= 0)
+        return;
+    await new Promise((resolve) => {
+        let settled = false;
+        const settle = () => {
+            if (settled)
+                return;
+            settled = true;
+            clearTimeout(timer);
+            const index = state.pendingAckWaiters.indexOf(waiter);
+            if (index >= 0)
+                state.pendingAckWaiters.splice(index, 1);
+            resolve();
+        };
+        const waiter = { revision, settle };
+        const timer = setTimeout(() => {
+            const laggards = __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_unackedWatchers).call(this, state, revision);
+            if (laggards > 0)
+                __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_warnPublicationLag).call(this, state, revision, laggards);
+            settle();
+        }, cap);
+        state.pendingAckWaiters.push(waiter);
+    });
+}, _VfsPublicationCoordinator_warnPublicationLag = function _VfsPublicationCoordinator_warnPublicationLag(state, revision, laggards) {
+    const now = Date.now();
+    if (now - state.lastAckWarnAt < 1_000)
+        return;
+    state.lastAckWarnAt = now;
+    console.warn(`vfs publication ack cap elapsed; proceeding fail-open with ${laggards} ` +
+        `unacked watcher(s) at revision ${revision}`);
+}, _VfsPublicationCoordinator_checkpoint = async function _VfsPublicationCoordinator_checkpoint(ownerId) {
+    const state = __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_state).call(this, ownerId);
+    const release = await __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_acquire).call(this, state, "read");
+    try {
+        return {
+            revision: state.revision,
+            activityEpoch: state.activityEpoch,
+        };
+    }
+    finally {
+        release();
+    }
+}, _VfsPublicationCoordinator_drain = function _VfsPublicationCoordinator_drain(state) {
+    if (state.activeWriter || state.activeReaders !== 0 || state.queue.length === 0)
+        return;
+    if (state.queue[0]?.kind === "write") {
+        const waiter = state.queue.shift();
+        if (waiter === undefined)
+            return;
+        state.activeWriter = true;
+        waiter.resolve(__classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_releaseWriter).call(this, state));
+        return;
+    }
+    while (state.queue[0]?.kind === "read") {
+        const waiter = state.queue.shift();
+        if (waiter === undefined)
+            break;
+        state.activeReaders += 1;
+        waiter.resolve(__classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_releaseReader).call(this, state));
+    }
+};
 /**
  * Coordinates leased POSIX locks independently from write authorization and
  * namespace mutation leases. Production multi-process gateways supply a shared
@@ -314,6 +605,10 @@ function lockResponse(lock) {
 function createVfsGatewayServer(opts) {
     const prefix = opts.routePrefix ?? DEFAULT_ROUTE_PREFIX;
     const advisoryLocks = new AdvisoryLockCoordinator(opts.advisoryLockState ?? new InMemoryAdvisoryLockStateStore());
+    const publications = new VfsPublicationCoordinator({
+        ackTimeoutMs: opts.publicationAckTimeoutMs,
+        watcherGraceMs: opts.publicationWatcherGraceMs,
+    });
     return async function handle(req) {
         try {
             if (opts.authToken !== undefined && opts.authToken !== "") {
@@ -331,6 +626,19 @@ function createVfsGatewayServer(opts) {
             const op = segs.join("/");
             if (ownerId === "")
                 return errorResponse(404, "missing owner_id segment");
+            // Long-poll revision watch. Handled before store resolution so a parked
+            // watch never resolves/holds a store, and it shares the bearer auth checked
+            // above with every other route.
+            if (req.method.toUpperCase() === "GET" && op === "watch") {
+                const since = parseWatchSince(url.searchParams.get("since"));
+                const timeoutMs = parseWatchTimeout(url.searchParams.get("timeout_ms"));
+                const watcherId = parseWatcherId(url.searchParams.get("watcher_id"));
+                const revision = await publications.watch(ownerId, since, timeoutMs, watcherId);
+                if (revision > since) {
+                    return withNamespaceRevision(json(200, { revision }), revision);
+                }
+                return withNamespaceRevision(new Response(null, { status: 204 }), revision);
+            }
             const allowGitMetadata = (await opts.allowGitMetadata?.(ownerId)) ?? false;
             const isExcludedPath = (path) => !allowGitMetadata && isGitExcludedPath(path);
             const store = await opts.resolveStore(ownerId);
@@ -364,86 +672,91 @@ function createVfsGatewayServer(opts) {
                 const maxHashBytes = parseOptionalNonNegativeInteger(q.get("max_hash_bytes") ?? q.get("maxHashBytes"), "max_hash_bytes");
                 if (maxHashBytes instanceof Response)
                     return maxHashBytes;
-                const md = await store.stat(relPath, maxHashBytes === null ? undefined : { maxHashBytes });
-                if (md === null)
-                    return errorResponse(404, `not found: ${relPath}`);
-                return json(200, toRemoteMetadata(md));
+                const snapshot = await publications.read(ownerId, () => store.stat(relPath, maxHashBytes === null ? undefined : { maxHashBytes }));
+                const md = snapshot.value;
+                if (md === null) {
+                    return withNamespaceRevision(errorResponse(404, `not found: ${relPath}`), snapshot.revision);
+                }
+                return withNamespaceRevision(json(200, toRemoteMetadata(md)), snapshot.revision);
             }
             if (method === "GET" && op === "file/raw") {
                 if (isExcludedPath(relPath))
                     return errorResponse(404, `not found: ${relPath}`);
-                const requestedRange = req.headers.get("range");
-                if (requestedRange !== null) {
-                    // Ranged reads are path-addressed across many requests, so they carry
-                    // a cheap (size, mtime) fingerprint instead of a content hash: the
-                    // client pins the file identity it started reading, and a replace in
-                    // between surfaces as 412 rather than a spliced old/new file. The
-                    // hashless stat also avoids re-hashing large files per range.
-                    let metadata;
+                const snapshot = await publications.read(ownerId, async () => {
+                    const requestedRange = req.headers.get("range");
+                    if (requestedRange !== null) {
+                        // Ranged reads are path-addressed across many requests, so they carry
+                        // a cheap (size, mtime) fingerprint instead of a content hash: the
+                        // client pins the file identity it started reading, and a replace in
+                        // between surfaces as 412 rather than a spliced old/new file. The
+                        // hashless stat also avoids re-hashing large files per range.
+                        let metadata;
+                        try {
+                            metadata = await store.stat(relPath, { maxHashBytes: 0 });
+                        }
+                        catch (error) {
+                            if (isVfsNotFoundError(error))
+                                return errorResponse(404, `not found: ${relPath}`);
+                            throw error;
+                        }
+                        if (metadata === null)
+                            return errorResponse(404, `not found: ${relPath}`);
+                        const fingerprint = rangeFingerprint(metadata);
+                        const expectedFingerprint = req.headers.get(RANGE_FINGERPRINT_HEADER);
+                        if (expectedFingerprint !== null && expectedFingerprint !== fingerprint) {
+                            return staleRangeResponse(relPath, fingerprint);
+                        }
+                        const size = Number(metadata.sizeBytes);
+                        const range = parseRange(requestedRange, size);
+                        if (range === null)
+                            return errorResponse(416, `invalid range for ${relPath}`);
+                        const length = range.end - range.start + 1;
+                        const streamingStore = store;
+                        const slice = typeof streamingStore.readRange === "function"
+                            ? await streamingStore.readRange(relPath, BigInt(range.start), length)
+                            : (await store.read(relPath)).subarray(range.start, range.end + 1);
+                        // Bracket the read: if the file changed while we were reading it, the
+                        // slice may mix old and new bytes. Never return it.
+                        let after;
+                        try {
+                            after = await store.stat(relPath, { maxHashBytes: 0 });
+                        }
+                        catch (error) {
+                            if (isVfsNotFoundError(error))
+                                return errorResponse(404, `not found: ${relPath}`);
+                            throw error;
+                        }
+                        if (after === null)
+                            return errorResponse(404, `not found: ${relPath}`);
+                        const afterFingerprint = rangeFingerprint(after);
+                        if (afterFingerprint !== fingerprint) {
+                            return staleRangeResponse(relPath, afterFingerprint);
+                        }
+                        return new Response(asBody(slice), {
+                            status: 206,
+                            headers: {
+                                "content-type": "application/octet-stream",
+                                "content-range": `bytes ${range.start}-${range.end}/${size}`,
+                                "content-length": String(slice.byteLength),
+                                [RANGE_FINGERPRINT_HEADER]: fingerprint,
+                            },
+                        });
+                    }
+                    let buf;
                     try {
-                        metadata = await store.stat(relPath, { maxHashBytes: 0 });
+                        buf = await store.read(relPath);
                     }
                     catch (error) {
                         if (isVfsNotFoundError(error))
                             return errorResponse(404, `not found: ${relPath}`);
                         throw error;
                     }
-                    if (metadata === null)
-                        return errorResponse(404, `not found: ${relPath}`);
-                    const fingerprint = rangeFingerprint(metadata);
-                    const expectedFingerprint = req.headers.get(RANGE_FINGERPRINT_HEADER);
-                    if (expectedFingerprint !== null && expectedFingerprint !== fingerprint) {
-                        return staleRangeResponse(relPath, fingerprint);
-                    }
-                    const size = Number(metadata.sizeBytes);
-                    const range = parseRange(requestedRange, size);
-                    if (range === null)
-                        return errorResponse(416, `invalid range for ${relPath}`);
-                    const length = range.end - range.start + 1;
-                    const streamingStore = store;
-                    const slice = typeof streamingStore.readRange === "function"
-                        ? await streamingStore.readRange(relPath, BigInt(range.start), length)
-                        : (await store.read(relPath)).subarray(range.start, range.end + 1);
-                    // Bracket the read: if the file changed while we were reading it, the
-                    // slice may mix old and new bytes. Never return it.
-                    let after;
-                    try {
-                        after = await store.stat(relPath, { maxHashBytes: 0 });
-                    }
-                    catch (error) {
-                        if (isVfsNotFoundError(error))
-                            return errorResponse(404, `not found: ${relPath}`);
-                        throw error;
-                    }
-                    if (after === null)
-                        return errorResponse(404, `not found: ${relPath}`);
-                    const afterFingerprint = rangeFingerprint(after);
-                    if (afterFingerprint !== fingerprint) {
-                        return staleRangeResponse(relPath, afterFingerprint);
-                    }
-                    return new Response(asBody(slice), {
-                        status: 206,
-                        headers: {
-                            "content-type": "application/octet-stream",
-                            "content-range": `bytes ${range.start}-${range.end}/${size}`,
-                            "content-length": String(slice.byteLength),
-                            [RANGE_FINGERPRINT_HEADER]: fingerprint,
-                        },
+                    return new Response(asBody(buf), {
+                        status: 200,
+                        headers: { "content-type": "application/octet-stream" },
                     });
-                }
-                let buf;
-                try {
-                    buf = await store.read(relPath);
-                }
-                catch (error) {
-                    if (isVfsNotFoundError(error))
-                        return errorResponse(404, `not found: ${relPath}`);
-                    throw error;
-                }
-                return new Response(asBody(buf), {
-                    status: 200,
-                    headers: { "content-type": "application/octet-stream" },
                 });
+                return withNamespaceRevision(snapshot.value, snapshot.revision);
             }
             if (method === "GET" && op === "tree") {
                 if (isExcludedPath(relPath))
@@ -452,23 +765,31 @@ function createVfsGatewayServer(opts) {
                 const maxHashBytes = parseOptionalNonNegativeInteger(q.get("max_hash_bytes") ?? q.get("maxHashBytes"), "max_hash_bytes");
                 if (maxHashBytes instanceof Response)
                     return maxHashBytes;
-                let entries;
-                try {
-                    entries = await store.listDir(dir, maxHashBytes === null ? undefined : { maxHashBytes });
-                }
-                catch (error) {
-                    if (isVfsNotFoundError(error))
-                        return errorResponse(404, `not found: ${dir}`);
-                    throw error;
+                const snapshot = await publications.read(ownerId, async () => {
+                    try {
+                        return {
+                            entries: await store.listDir(dir, maxHashBytes === null ? undefined : { maxHashBytes }),
+                            missing: false,
+                        };
+                    }
+                    catch (error) {
+                        if (isVfsNotFoundError(error)) {
+                            return { entries: [], missing: true };
+                        }
+                        throw error;
+                    }
+                });
+                if (snapshot.value.missing) {
+                    return withNamespaceRevision(errorResponse(404, `not found: ${dir}`), snapshot.revision);
                 }
                 const nameLike = q.get("name_like");
                 const nameNotLike = q.get("name_not_like");
-                const out = entries
+                const out = snapshot.value.entries
                     .filter((entry) => !isExcludedPath(entry.path))
                     .map(toRemoteDirEntry)
                     .filter((e) => (nameLike === null || e.name.includes(nameLike)))
                     .filter((e) => (nameNotLike === null || !e.name.includes(nameNotLike)));
-                return json(200, out);
+                return withNamespaceRevision(json(200, out), snapshot.revision);
             }
             // ---- leases (mutations acquire/release one; we issue a synthetic grant) --
             if (op === "lease" && method === "POST") {
@@ -476,7 +797,12 @@ function createVfsGatewayServer(opts) {
                 const leasePath = normalizePath(typeof body.path === "string" ? body.path : relPath);
                 if (isExcludedPath(leasePath))
                     return errorResponse(400, `excluded path: ${leasePath}`);
-                return json(200, { resource_key: `rk:${ownerId}:${leasePath}`, owner_token: randomToken() });
+                const response = json(200, {
+                    resource_key: `rk:${ownerId}:${leasePath}`,
+                    owner_token: randomToken(),
+                });
+                response.headers.set(LEASE_MODE_HEADER, "implicit");
+                return response;
             }
             if (op === "lease" && method === "DELETE") {
                 return new Response(null, { status: 204 });
@@ -485,11 +811,23 @@ function createVfsGatewayServer(opts) {
                 const body = await requestJsonObject(req, "namespace-many");
                 if (body instanceof Response)
                     return body;
+                const operationIds = normalizeNamespaceOperationIds(body.operation_ids);
+                if (operationIds instanceof Response)
+                    return operationIds;
                 const mutations = normalizeNamespaceMutations(body.mutations, isExcludedPath);
                 if (mutations instanceof Response)
                     return mutations;
+                if (operationIds.length !== mutations.length) {
+                    return errorResponse(400, "namespace-many requires one operation_id per mutation");
+                }
                 try {
-                    await store.applyNamespaceBatch(mutations);
+                    const publication = await publications.mutate(ownerId, async () => {
+                        await store.applyNamespaceBatch(mutations);
+                        return {
+                            entries: await snapshotMutationPaths(store, mutations),
+                        };
+                    });
+                    return withNamespaceRevision(json(200, publication.value), publication.revision);
                 }
                 catch (error) {
                     const conflict = conflictResponseFromStoreError(error, "namespace-many");
@@ -497,7 +835,6 @@ function createVfsGatewayServer(opts) {
                         return conflict;
                     throw error;
                 }
-                return new Response(null, { status: 204 });
             }
             // ---- single-file mutations -----------------------------------------
             if (method === "PUT" && op === "file") {
@@ -553,16 +890,16 @@ function createVfsGatewayServer(opts) {
                             ...preconditionOptions(precondition, expectedFileId),
                             ...writeOptions,
                         };
-                        const res = typeof streamingStore.writeFromFile === "function"
-                            ? await streamingStore.writeFromFile(relPath, stagedPath, expectedHash, options)
-                            : await store.write(relPath, await (0, promises_1.readFile)(stagedPath), options);
-                        const value = res;
-                        return json(200, {
+                        const publication = await publications.mutate(ownerId, async () => typeof streamingStore.writeFromFile === "function"
+                            ? streamingStore.writeFromFile(relPath, stagedPath, expectedHash, options)
+                            : store.write(relPath, await (0, promises_1.readFile)(stagedPath), options));
+                        const value = publication.value;
+                        return withNamespaceRevision(json(200, {
                             path: relPath,
                             content_hash: value.content_hash ?? value.contentHash ?? expectedHash,
                             previous_hash: value.previous_hash ?? null,
                             changed: value.changed ?? true,
-                        });
+                        }), publication.revision);
                     }
                     catch (error) {
                         const conflict = conflictResponseFromStoreError(error, relPath);
@@ -575,12 +912,20 @@ function createVfsGatewayServer(opts) {
                     }
                 }
                 const body = Buffer.from(await req.arrayBuffer());
-                let res;
                 try {
-                    res = (await store.write(relPath, body, {
+                    const publication = await publications.mutate(ownerId, () => store.write(relPath, body, {
                         ...preconditionOptions(precondition, expectedFileId),
                         ...writeOptions,
                     }));
+                    const res = publication.value;
+                    // The bound client ignores this body on the plain-write path and
+                    // recomputes its own result; return the real result for completeness.
+                    return withNamespaceRevision(json(200, {
+                        path: relPath,
+                        content_hash: res.content_hash ?? res.contentHash ?? null,
+                        previous_hash: res.previous_hash ?? null,
+                        changed: res.changed ?? true,
+                    }), publication.revision);
                 }
                 catch (e) {
                     const failed = conflictResponseFromStoreError(e, relPath);
@@ -588,14 +933,6 @@ function createVfsGatewayServer(opts) {
                         return failed;
                     throw e;
                 }
-                // The bound client ignores this body on the plain-write path and recomputes
-                // its own result; we return the real result for completeness.
-                return json(200, {
-                    path: relPath,
-                    content_hash: res.content_hash ?? res.contentHash ?? null,
-                    previous_hash: res.previous_hash ?? null,
-                    changed: res.changed ?? true,
-                });
             }
             if (method === "DELETE" && op === "file") {
                 if (isExcludedPath(relPath))
@@ -610,7 +947,8 @@ function createVfsGatewayServer(opts) {
                     previous = cur === null ? null : toRemoteMetadata(cur);
                 }
                 try {
-                    await store.remove(relPath, preconditionOptions(precondition));
+                    const publication = await publications.mutate(ownerId, () => store.remove(relPath, preconditionOptions(precondition)));
+                    return withNamespaceRevision(json(200, { previous }), publication.revision);
                 }
                 catch (e) {
                     const failed = conflictResponseFromStoreError(e, relPath);
@@ -618,14 +956,13 @@ function createVfsGatewayServer(opts) {
                         return failed;
                     throw e;
                 }
-                return json(200, { previous });
             }
             if (method === "PUT" && op === "dir") {
                 if (isExcludedPath(relPath))
                     return errorResponse(400, `excluded path: ${relPath}`);
                 const writeOptions = requestWriteOptions(req);
-                await store.mkdir(relPath, Object.keys(writeOptions).length === 0 ? undefined : writeOptions);
-                return new Response(null, { status: 204 });
+                const publication = await publications.mutate(ownerId, () => store.mkdir(relPath, Object.keys(writeOptions).length === 0 ? undefined : writeOptions));
+                return withNamespaceRevision(new Response(null, { status: 204 }), publication.revision);
             }
             if (method === "PUT" && op === "symlink") {
                 if (isExcludedPath(relPath))
@@ -637,26 +974,27 @@ function createVfsGatewayServer(opts) {
                     return errorResponse(400, `excluded symlink target: ${target}`);
                 }
                 try {
-                    await store.createSymlink(relPath, target);
+                    const publication = await publications.mutate(ownerId, () => store.createSymlink(relPath, target));
+                    return withNamespaceRevision(new Response(null, { status: 204 }), publication.revision);
                 }
                 catch (e) {
                     if (isVfsBadRequestError(e))
                         return errorResponse(400, e.message);
                     throw e;
                 }
-                return new Response(null, { status: 204 });
             }
             if (method === "DELETE" && op === "dir") {
                 if (isExcludedPath(relPath))
                     return errorResponse(400, `excluded path: ${relPath}`);
                 try {
-                    await store.rmdir(relPath);
+                    const publication = await publications.mutate(ownerId, () => store.rmdir(relPath));
+                    return withNamespaceRevision(new Response(null, { status: 204 }), publication.revision);
                 }
                 catch (error) {
                     if (!isVfsNotFoundError(error))
                         throw error;
+                    return new Response(null, { status: 204 });
                 }
-                return new Response(null, { status: 204 });
             }
             if (method === "POST" && op === "hard-link/v1") {
                 const body = (await req.json());
@@ -669,11 +1007,11 @@ function createVfsGatewayServer(opts) {
                     return errorResponse(400, `excluded path: ${isExcludedPath(source) ? source : destination}`);
                 }
                 try {
-                    const result = await store.createHardLink(source, destination);
-                    return json(200, {
-                        source: toRemoteMetadata(result.source),
-                        destination: toRemoteMetadata(result.destination),
-                    });
+                    const publication = await publications.mutate(ownerId, () => store.createHardLink(source, destination));
+                    return withNamespaceRevision(json(200, {
+                        source: toRemoteMetadata(publication.value.source),
+                        destination: toRemoteMetadata(publication.value.destination),
+                    }), publication.revision);
                 }
                 catch (error) {
                     const conflict = conflictResponseFromStoreError(error, destination);
@@ -690,11 +1028,16 @@ function createVfsGatewayServer(opts) {
                 if (typeof body.file_id !== "string" || body.file_id.trim() === "") {
                     return errorResponse(400, "hard-link alias resolution requires file_id");
                 }
+                const fileId = body.file_id;
                 const excludingPath = normalizePath(typeof body.excluding_path === "string" ? body.excluding_path : "");
                 if (isExcludedPath(excludingPath))
                     return errorResponse(400, `excluded path: ${excludingPath}`);
-                const path = await store.findHardLinkAlias(body.file_id, excludingPath);
-                return json(200, { path: path !== null && isExcludedPath(path) ? null : path });
+                const snapshot = await publications.read(ownerId, () => store.findHardLinkAlias(fileId, excludingPath));
+                return withNamespaceRevision(json(200, {
+                    path: snapshot.value !== null && isExcludedPath(snapshot.value)
+                        ? null
+                        : snapshot.value,
+                }), snapshot.revision);
             }
             if (method === "POST" && op === "rename") {
                 const from = normalizePath(q.get("from"));
@@ -704,16 +1047,108 @@ function createVfsGatewayServer(opts) {
                 if (isExcludedPath(from) || isExcludedPath(to)) {
                     return errorResponse(400, `excluded path: ${isExcludedPath(from) ? from : to}`);
                 }
-                const previous = q.get("return_metadata") === "true" ? await store.stat(from) : null;
-                await store.rename(from, to);
-                const current = q.get("return_metadata") === "true" ? await store.stat(to) : null;
-                return json(200, {
-                    previous: previous === null ? null : toRemoteMetadata(previous),
-                    current: current === null ? null : toRemoteMetadata(current),
+                const publication = await publications.mutate(ownerId, async () => {
+                    const previous = q.get("return_metadata") === "true" ? await store.stat(from) : null;
+                    await store.rename(from, to);
+                    const current = q.get("return_metadata") === "true" ? await store.stat(to) : null;
+                    return { previous, current };
                 });
+                return withNamespaceRevision(json(200, {
+                    previous: publication.value.previous === null
+                        ? null
+                        : toRemoteMetadata(publication.value.previous),
+                    current: publication.value.current === null
+                        ? null
+                        : toRemoteMetadata(publication.value.current),
+                }), publication.revision);
             }
             // ---- batch ops: loop the per-path primitives (matches the Rust trait's
             //      default impls; the bound TS client only uses per-path ops today) ----
+            if (method === "POST" && op === "subtree-metadata") {
+                const body = await requestJsonObject(req, "subtree-metadata");
+                if (body instanceof Response)
+                    return body;
+                const subtreePrefix = normalizePath(typeof body.prefix === "string" ? body.prefix : "");
+                if (isExcludedPath(subtreePrefix)) {
+                    return errorResponse(404, `not found: ${subtreePrefix}`);
+                }
+                const limit = parseOptionalNonNegativeInteger(typeof body.limit === "number" ? String(body.limit) : null, "limit");
+                if (limit instanceof Response)
+                    return limit;
+                const maxHashBytes = parseOptionalNonNegativeInteger(typeof body.max_hash_bytes === "number"
+                    ? String(body.max_hash_bytes)
+                    : null, "max_hash_bytes");
+                if (maxHashBytes instanceof Response)
+                    return maxHashBytes;
+                const snapshot = await publications.optimisticRead(ownerId, async () => {
+                    const entries = [];
+                    const pending = [subtreePrefix];
+                    const statOptions = maxHashBytes === null ? undefined : { maxHashBytes };
+                    while (pending.length !== 0 && (limit === null || entries.length < limit)) {
+                        const directory = pending.pop() ?? "";
+                        let children;
+                        try {
+                            children = await store.listDir(directory === "" ? "." : directory, statOptions);
+                        }
+                        catch (error) {
+                            if (isVfsNotFoundError(error))
+                                continue;
+                            throw error;
+                        }
+                        for (const child of children) {
+                            const name = child.path.split("/").filter((segment) => segment !== "").pop() ??
+                                child.path;
+                            const childPath = directory === "" ? name : node_path_1.posix.join(directory, name);
+                            if (name === "" || isExcludedPath(childPath))
+                                continue;
+                            const kind = wireKind(child.kind);
+                            if (kind === "directory") {
+                                pending.push(childPath);
+                                continue;
+                            }
+                            if (kind !== "file" && kind !== "symlink")
+                                continue;
+                            entries.push(toRemoteSubtreeMetadata(child, childPath));
+                            if (limit !== null && entries.length >= limit)
+                                break;
+                        }
+                    }
+                    entries.sort((left, right) => left.path.localeCompare(right.path));
+                    return entries;
+                });
+                return withNamespaceRevision(json(200, { entries: snapshot.value }), snapshot.revision);
+            }
+            if (method === "POST" && op === "prefetch-subtree") {
+                const body = await requestJsonObject(req, "prefetch-subtree");
+                if (body instanceof Response)
+                    return body;
+                const subtreePrefix = normalizePath(typeof body.prefix === "string" ? body.prefix : "");
+                if (isExcludedPath(subtreePrefix)) {
+                    return errorResponse(404, `not found: ${subtreePrefix}`);
+                }
+                const maxEntries = parseOptionalNonNegativeInteger(typeof body.max_entries === "number" ? String(body.max_entries) : null, "max_entries");
+                if (maxEntries instanceof Response)
+                    return maxEntries;
+                const maxPackBytes = parseOptionalNonNegativeInteger(typeof body.max_pack_bytes === "number"
+                    ? String(body.max_pack_bytes)
+                    : null, "max_pack_bytes");
+                if (maxPackBytes instanceof Response)
+                    return maxPackBytes;
+                const streamingStore = store;
+                if (typeof streamingStore.prefetchSubtree !== "function") {
+                    return errorResponse(404, "prefetch-subtree is unavailable");
+                }
+                const snapshot = await publications.optimisticRead(ownerId, () => streamingStore.prefetchSubtree(subtreePrefix, {
+                    includeSmallFileBytes: body.include_small_file_bytes === true,
+                    ...(maxEntries === null ? {} : { maxEntries }),
+                    ...(maxPackBytes === null ? {} : { maxPackBytes }),
+                }));
+                return withNamespaceRevision(json(200, {
+                    warmed_file_bytes: snapshot.value
+                        .filter((entry) => !isExcludedPath(entry.path))
+                        .map((entry) => ({ path: entry.path, body: [...entry.body] })),
+                }), snapshot.revision);
+            }
             if (method === "POST" && op === "metadata-many") {
                 const body = await requestJsonObject(req, "metadata-many");
                 if (body instanceof Response)
@@ -721,12 +1156,23 @@ function createVfsGatewayServer(opts) {
                 const paths = normalizePathBatch(body.paths, "metadata-many");
                 if (paths instanceof Response)
                     return paths;
-                const entries = [];
-                for (const path of paths) {
-                    const md = isExcludedPath(path) ? null : await store.stat(path);
-                    entries.push(md === null ? null : toRemoteMetadata(md));
-                }
-                return json(200, { entries });
+                const maxHashBytes = parseOptionalNonNegativeInteger(q.get("max_hash_bytes") ?? q.get("maxHashBytes"), "max_hash_bytes");
+                if (maxHashBytes instanceof Response)
+                    return maxHashBytes;
+                const snapshot = await publications.read(ownerId, async () => {
+                    const entries = [];
+                    const statOptions = maxHashBytes === null ? undefined : { maxHashBytes };
+                    const concurrency = maxHashBytes === null ? 1 : 64;
+                    for (let offset = 0; offset < paths.length; offset += concurrency) {
+                        const batch = await Promise.all(paths.slice(offset, offset + concurrency).map(async (path) => {
+                            const md = isExcludedPath(path) ? null : await store.stat(path, statOptions);
+                            return md === null ? null : toRemoteMetadata(md);
+                        }));
+                        entries.push(...batch);
+                    }
+                    return entries;
+                });
+                return withNamespaceRevision(json(200, { entries: snapshot.value }), snapshot.revision);
             }
             if (method === "POST" && op === "read-many") {
                 const body = await requestJsonObject(req, "read-many");
@@ -735,24 +1181,27 @@ function createVfsGatewayServer(opts) {
                 const paths = normalizePathBatch(body.paths, "read-many");
                 if (paths instanceof Response)
                     return paths;
-                const entries = [];
-                for (const path of paths) {
-                    if (isExcludedPath(path)) {
-                        entries.push(null);
-                        continue;
-                    }
-                    try {
-                        const buf = await store.read(path);
-                        entries.push([...buf]);
-                    }
-                    catch (error) {
-                        if (isVfsNotFoundError(error))
+                const snapshot = await publications.read(ownerId, async () => {
+                    const entries = [];
+                    for (const path of paths) {
+                        if (isExcludedPath(path)) {
                             entries.push(null);
-                        else
-                            throw error;
+                            continue;
+                        }
+                        try {
+                            const buf = await store.read(path);
+                            entries.push([...buf]);
+                        }
+                        catch (error) {
+                            if (isVfsNotFoundError(error))
+                                entries.push(null);
+                            else
+                                throw error;
+                        }
                     }
-                }
-                return json(200, { entries });
+                    return entries;
+                });
+                return withNamespaceRevision(json(200, { entries: snapshot.value }), snapshot.revision);
             }
             if (method === "POST" && op === "write-many") {
                 const body = await requestJsonObject(req, "write-many");
@@ -763,11 +1212,12 @@ function createVfsGatewayServer(opts) {
                     return writes;
                 const streamingStore = store;
                 if (typeof streamingStore.writeMany === "function") {
+                    const writeMany = streamingStore.writeMany.bind(streamingStore);
                     const normalizedWrites = writes.map((write) => {
                         const precondition = writeItemPrecondition(write);
                         const expectedFileId = writeItemExpectedFileId(write);
                         const wirePrecondition = {
-                            ...(precondition.present ? { fingerprint: precondition.fingerprint } : {}),
+                            ...(precondition.present ? { predicate: precondition.predicate } : {}),
                             ...(expectedFileId === undefined
                                 ? {}
                                 : { expected_file_id: expectedFileId }),
@@ -781,15 +1231,22 @@ function createVfsGatewayServer(opts) {
                         };
                     });
                     try {
-                        const results = await streamingStore.writeMany(normalizedWrites);
-                        return json(200, {
-                            results: results.map((result) => ({
+                        const publication = await publications.mutate(ownerId, async () => {
+                            const results = await writeMany(normalizedWrites);
+                            return {
+                                results,
+                                entries: await snapshotPaths(store, normalizedWrites.map((write) => write.path)),
+                            };
+                        });
+                        return withNamespaceRevision(json(200, {
+                            results: publication.value.results.map((result) => ({
                                 path: result.path,
                                 content_hash: result.content_hash ?? result.contentHash ?? "",
                                 previous_hash: result.previous_hash ?? result.previousHash ?? null,
                                 changed: result.changed,
                             })),
-                        });
+                            entries: publication.value.entries,
+                        }), publication.revision);
                     }
                     catch (error) {
                         const conflict = conflictResponseFromStoreError(error, "write-many");
@@ -798,45 +1255,61 @@ function createVfsGatewayServer(opts) {
                         throw error;
                     }
                 }
-                // Atomic-ish: check all preconditions first, then apply. Any mismatch -> 409.
-                for (const write of writes) {
-                    const failed = await enforceFingerprintPrecondition(store, write.path, writeItemPrecondition(write));
-                    if (failed !== null)
-                        return failed;
-                }
-                const results = [];
-                for (const write of writes) {
-                    const p = write.path;
-                    const cur = await store.stat(p);
-                    const prev = cur?.contentHash ?? null;
-                    const precondition = writeItemPrecondition(write);
-                    const expectedFileId = writeItemExpectedFileId(write);
-                    let res;
-                    try {
-                        res = (await store.write(p, Buffer.from(write.body), preconditionOptions(precondition, expectedFileId)));
-                    }
-                    catch (e) {
-                        const failed = conflictResponseFromStoreError(e, p);
+                const publication = await publications.transact(ownerId, async () => {
+                    // Atomic-ish: check all preconditions while publication is excluded,
+                    // then apply. Any mismatch returns without advancing the revision.
+                    for (const write of writes) {
+                        const failed = await enforceFingerprintPrecondition(store, write.path, writeItemPrecondition(write));
                         if (failed !== null)
-                            return failed;
-                        throw e;
+                            return { value: failed, mutated: false };
                     }
-                    const hash = res.content_hash ?? res.contentHash ?? "";
-                    const previousHash = res.previous_hash ?? res.previousHash ?? prev;
-                    results.push({
-                        path: p,
-                        content_hash: hash,
-                        previous_hash: previousHash,
-                        changed: res.changed ?? previousHash !== hash,
-                    });
+                    const results = [];
+                    for (const write of writes) {
+                        const p = write.path;
+                        const cur = await store.stat(p);
+                        const prev = cur?.contentHash ?? null;
+                        const precondition = writeItemPrecondition(write);
+                        const expectedFileId = writeItemExpectedFileId(write);
+                        let res;
+                        try {
+                            res = (await store.write(p, Buffer.from(write.body), preconditionOptions(precondition, expectedFileId)));
+                        }
+                        catch (e) {
+                            const failed = conflictResponseFromStoreError(e, p);
+                            if (failed !== null)
+                                return { value: failed, mutated: false };
+                            throw e;
+                        }
+                        const hash = res.content_hash ?? res.contentHash ?? "";
+                        const previousHash = res.previous_hash ?? res.previousHash ?? prev;
+                        results.push({
+                            path: p,
+                            content_hash: hash,
+                            previous_hash: previousHash,
+                            changed: res.changed ?? previousHash !== hash,
+                        });
+                    }
+                    return {
+                        value: json(200, {
+                            results,
+                            entries: await snapshotPaths(store, writes.map((write) => write.path)),
+                        }),
+                        mutated: true,
+                    };
+                });
+                if (!publication.value.ok) {
+                    return publication.value;
                 }
-                return json(200, { results });
+                return withNamespaceRevision(publication.value, publication.revision);
             }
             return errorResponse(404, `unhandled route: ${method} ${op}`);
         }
         catch (e) {
             if (isVfsBadRequestError(e))
                 return errorResponse(400, e.message);
+            if (e instanceof VfsSnapshotChangedError) {
+                return errorResponse(409, e.message);
+            }
             return errorResponse(500, `gateway server error: ${e.message}`);
         }
     };
@@ -944,18 +1417,47 @@ function normalizeFingerprint(raw) {
     return next;
 }
 function preconditionFromRaw(raw) {
-    return { present: true, fingerprint: normalizeFingerprint(raw) };
+    const fingerprint = normalizeFingerprint(raw);
+    return {
+        present: true,
+        predicate: fingerprint === null
+            ? { kind: "absent" }
+            : { kind: "content_fingerprint", fingerprint },
+    };
 }
 function queryIfMatch(query) {
     return query.get("ifMatch") ?? query.get("if_match");
 }
 function requestPrecondition(req, query) {
+    const kind = req.headers.get(PRECONDITION_KIND_HEADER);
     const raw = req.headers.get(PRECONDITION_FINGERPRINT_HEADER) ??
         req.headers.get(IF_MATCH_HEADER) ??
         queryIfMatch(query);
+    if (kind === "absent") {
+        if (raw !== null)
+            throw badPrecondition("absent precondition cannot include a fingerprint");
+        return { present: true, predicate: { kind: "absent" } };
+    }
+    if (kind === "content_fingerprint") {
+        if (raw === null)
+            throw badPrecondition("content_fingerprint precondition requires a fingerprint");
+        const normalized = normalizeFingerprint(raw);
+        if (normalized === null) {
+            throw badPrecondition("content_fingerprint precondition requires a non-empty fingerprint");
+        }
+        return {
+            present: true,
+            predicate: { kind: "content_fingerprint", fingerprint: normalized },
+        };
+    }
+    if (kind !== null)
+        throw badPrecondition(`unsupported precondition kind: ${kind}`);
     if (raw !== null)
         return preconditionFromRaw(raw);
     return { present: false };
+}
+function badPrecondition(message) {
+    return Object.assign(new Error(message), { code: "VFS_BAD_REQUEST", status: 400 });
 }
 function parseExpectedFileId(raw, source) {
     if (raw === undefined || raw === null)
@@ -1010,7 +1512,13 @@ function preconditionOptions(precondition, expectedFileId) {
     if (!precondition.present && expectedFileId === undefined)
         return undefined;
     return {
-        ...(precondition.present ? { ifMatch: precondition.fingerprint } : {}),
+        ...(precondition.present
+            ? {
+                ifMatch: precondition.predicate.kind === "absent"
+                    ? null
+                    : precondition.predicate.fingerprint,
+            }
+            : {}),
         ...(expectedFileId === undefined ? {} : { expectedFileId }),
     };
 }
@@ -1054,6 +1562,82 @@ function normalizeWriteManyItems(value, isExcludedPath) {
     }
     return writes;
 }
+function mutationPaths(mutation) {
+    switch (mutation.kind) {
+        case "create_hard_link":
+            return [mutation.source_path, mutation.destination_path];
+        case "rename":
+            return [mutation.from, mutation.to];
+        default:
+            return [mutation.path];
+    }
+}
+function immediateParent(path) {
+    const parent = node_path_1.posix.dirname(normalizePath(path));
+    return parent === "." ? "" : normalizePath(parent);
+}
+async function snapshotPaths(store, requestedPaths) {
+    const paths = [...new Set(requestedPaths.map(normalizePath))];
+    if (paths.length === 0)
+        return [];
+    const stat = store.stat;
+    let metadata;
+    if (typeof store.metadataMany === "function") {
+        metadata = await store.metadataMany(paths);
+    }
+    else if (typeof stat === "function") {
+        metadata = await Promise.all(paths.map(async (path) => {
+            try {
+                return await stat.call(store, path);
+            }
+            catch (error) {
+                if (isVfsNotFoundError(error))
+                    return null;
+                throw error;
+            }
+        }));
+    }
+    else {
+        return [];
+    }
+    if (metadata.length !== paths.length) {
+        throw new Error(`publication snapshot returned ${metadata.length} entries for ${paths.length} paths`);
+    }
+    return paths.map((path, index) => ({
+        path,
+        metadata: metadata[index] == null ? null : toRemoteMetadata(metadata[index]),
+    }));
+}
+async function snapshotMutationPaths(store, mutations) {
+    const paths = [];
+    for (const mutation of mutations) {
+        for (const path of mutationPaths(mutation)) {
+            paths.push(path, immediateParent(path));
+        }
+    }
+    return snapshotPaths(store, paths);
+}
+function normalizeNamespaceOperationIds(value) {
+    if (!Array.isArray(value)) {
+        return errorResponse(400, "namespace-many requires operation_ids[]");
+    }
+    if (value.length > MAX_BATCH_ITEMS) {
+        return errorResponse(400, `namespace-many accepts at most ${MAX_BATCH_ITEMS} operation_ids`);
+    }
+    const ids = [];
+    const seen = new Set();
+    for (const id of value) {
+        if (typeof id !== "string" || id.trim() === "") {
+            return errorResponse(400, "namespace operation_id must be a non-empty string");
+        }
+        if (seen.has(id)) {
+            return errorResponse(400, `duplicate namespace operation_id: ${id}`);
+        }
+        seen.add(id);
+        ids.push(id);
+    }
+    return ids;
+}
 function normalizeNamespaceMutations(value, isExcludedPath = isGitExcludedPath) {
     if (!Array.isArray(value))
         return errorResponse(400, "namespace-many requires mutations[]");
@@ -1067,6 +1651,24 @@ function normalizeNamespaceMutations(value, isExcludedPath = isGitExcludedPath) 
         }
         const mutation = item;
         const kind = mutation.kind;
+        if (kind === "create_hard_link") {
+            const sourcePath = normalizePath(typeof mutation.source_path === "string" ? mutation.source_path : null);
+            const destinationPath = normalizePath(typeof mutation.destination_path === "string"
+                ? mutation.destination_path
+                : null);
+            if (sourcePath === "" || destinationPath === "") {
+                return errorResponse(400, "create_hard_link requires source_path + destination_path");
+            }
+            if (isExcludedPath(sourcePath) || isExcludedPath(destinationPath)) {
+                return errorResponse(400, "excluded hard-link path");
+            }
+            out.push({
+                kind,
+                source_path: sourcePath,
+                destination_path: destinationPath,
+            });
+            continue;
+        }
         if (kind === "rename") {
             const from = normalizePath(typeof mutation.from === "string" ? mutation.from : null);
             const to = normalizePath(typeof mutation.to === "string" ? mutation.to : null);
@@ -1082,25 +1684,33 @@ function normalizeNamespaceMutations(value, isExcludedPath = isGitExcludedPath) 
             return errorResponse(400, `invalid namespace path: ${path}`);
         if (kind === "delete_file") {
             let precondition;
+            let expectedFileId;
             try {
                 precondition = writeItemPrecondition(mutation);
+                expectedFileId = writeItemExpectedFileId(mutation);
             }
             catch (error) {
                 return errorResponse(400, error instanceof Error ? error.message : String(error));
             }
+            const wirePrecondition = {
+                ...(precondition.present ? { predicate: precondition.predicate } : {}),
+                ...(expectedFileId === undefined
+                    ? {}
+                    : { expected_file_id: expectedFileId }),
+            };
             out.push({
                 kind,
                 path,
-                ...(precondition.present
-                    ? { precondition: { fingerprint: precondition.fingerprint } }
+                ...(Object.keys(wirePrecondition).length > 0
+                    ? { precondition: wirePrecondition }
                     : {}),
             });
             continue;
         }
-        if (kind === "create_directory") {
+        if (kind === "create_file" || kind === "create_directory") {
             let mode;
             try {
-                mode = parseMode(mutation.mode, "create_directory mode");
+                mode = parseMode(mutation.mode, `${kind} mode`);
             }
             catch (error) {
                 return errorResponse(400, error instanceof Error ? error.message : String(error));
@@ -1145,6 +1755,27 @@ function ownValue(obj, key) {
     return obj[key];
 }
 function writeItemPrecondition(write) {
+    const predicate = ownValue(write.precondition, "predicate");
+    if (predicate !== undefined) {
+        if (typeof predicate !== "object" || predicate === null || Array.isArray(predicate)) {
+            throw new Error("invalid write precondition: predicate must be an object");
+        }
+        const kind = ownValue(predicate, "kind");
+        if (kind === "absent") {
+            return { present: true, predicate: { kind: "absent" } };
+        }
+        if (kind === "content_fingerprint") {
+            const fingerprint = ownValue(predicate, "fingerprint");
+            if (typeof fingerprint !== "string" || fingerprint.length === 0) {
+                throw new Error("invalid write precondition: content_fingerprint requires a non-empty fingerprint");
+            }
+            return {
+                present: true,
+                predicate: { kind: "content_fingerprint", fingerprint },
+            };
+        }
+        throw new Error(`invalid write precondition kind: ${String(kind)}`);
+    }
     let raw = ownValue(write.precondition, "fingerprint");
     if (raw === undefined)
         raw = ownValue(write.precondition, "ifMatch");
@@ -1182,13 +1813,60 @@ function parseOptionalNonNegativeInteger(raw, name) {
     }
     return value;
 }
+const WATCH_TIMEOUT_MIN_MS = 1_000;
+const WATCH_TIMEOUT_MAX_MS = 30_000;
+const WATCH_TIMEOUT_DEFAULT_MS = 25_000;
+/** `since` absent/invalid -> 0 (so the fast path answers with the current
+ *  revision). Decimal-only, matching the Rust gateway's `u64` parse. */
+function parseWatchSince(raw) {
+    if (raw === null)
+        return 0;
+    const text = raw.trim();
+    if (!/^\d+$/.test(text))
+        return 0;
+    const value = Number(text);
+    return Number.isSafeInteger(value) ? value : 0;
+}
+/** `timeout_ms` clamps to [1000, 30000]; absent or non-integer -> 25000. */
+function parseWatchTimeout(raw) {
+    if (raw === null)
+        return WATCH_TIMEOUT_DEFAULT_MS;
+    const text = raw.trim();
+    if (!/^-?\d+$/.test(text))
+        return WATCH_TIMEOUT_DEFAULT_MS;
+    const value = Number(text);
+    if (!Number.isFinite(value))
+        return WATCH_TIMEOUT_DEFAULT_MS;
+    return Math.min(WATCH_TIMEOUT_MAX_MS, Math.max(WATCH_TIMEOUT_MIN_MS, value));
+}
+/** Trimmed, non-empty `watcher_id`, or "" for an anonymous (unregistered)
+ *  watcher that is notified but never gates a publication. */
+function parseWatcherId(raw) {
+    return raw === null ? "" : raw.trim();
+}
+const PUBLICATION_ACK_TIMEOUT_DEFAULT_MS = 150;
+/** Hard cap (ms) a publication waits for watcher acks before failing open.
+ *  Overridable via `CHEVALIER_VFS_PUBLICATION_ACK_TIMEOUT_MS`; default 150. */
+function publicationAckTimeoutFromEnv() {
+    const raw = process.env.CHEVALIER_VFS_PUBLICATION_ACK_TIMEOUT_MS;
+    if (raw === undefined)
+        return PUBLICATION_ACK_TIMEOUT_DEFAULT_MS;
+    const text = raw.trim();
+    if (!/^\d+$/.test(text))
+        return PUBLICATION_ACK_TIMEOUT_DEFAULT_MS;
+    const value = Number(text);
+    return Number.isSafeInteger(value) ? value : PUBLICATION_ACK_TIMEOUT_DEFAULT_MS;
+}
 async function enforceFingerprintPrecondition(store, path, precondition) {
     if (!precondition.present)
         return null;
     const cur = await store.stat(path);
     const curHash = mutationFingerprint(cur);
-    if (precondition.fingerprint === curHash)
+    if ((precondition.predicate.kind === "absent" && cur === null) ||
+        (precondition.predicate.kind === "content_fingerprint" &&
+            precondition.predicate.fingerprint === curHash)) {
         return null;
+    }
     // CAS mismatch -> 409 Conflict; the file is NOT touched (no clobber).
     return errorResponse(409, `precondition failed for ${path}`);
 }
@@ -1243,6 +1921,25 @@ function toRemoteDirEntry(md) {
         updated_at: md.updatedAt ?? null,
     };
 }
+function toRemoteSubtreeMetadata(md, path) {
+    const metadata = toRemoteMetadata(md);
+    const objectState = md.objectState;
+    return {
+        path,
+        ...metadata,
+        token_count: md.tokenCount ?? null,
+        version: md.version ?? null,
+        object_state: objectState === undefined
+            ? null
+            : {
+                size_bytes: Number(objectState.sizeBytes),
+                pack_key: objectState.packKey,
+                pack_slot_offset: Number(objectState.packSlotOffset),
+                pack_slot_length: Number(objectState.packSlotLength),
+                pack_slot_compression: objectState.packSlotCompression,
+            },
+    };
+}
 /** Cheap file-identity fingerprint for pinning ranged reads. Epoch millis is
  *  the canonical form on both sides — the Rust FUSE client mirrors this in
  *  `range_fingerprint` (sandbox/vmd/src/fuse/fs.rs); keep them identical. */
@@ -1277,6 +1974,10 @@ function json(status, body) {
         status,
         headers: { "content-type": "application/json" },
     });
+}
+function withNamespaceRevision(response, revision) {
+    response.headers.set(NAMESPACE_REVISION_HEADER, String(revision));
+    return response;
 }
 function errorResponse(status, message) {
     return new Response(message, { status, headers: { "content-type": "text/plain" } });

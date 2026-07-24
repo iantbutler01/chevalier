@@ -806,6 +806,7 @@ dependencies = [
  "axum 0.8.8",
  "futures",
  "pin-project-lite",
+ "reqwest",
  "rmcp",
  "serde",
  "serde_json",
@@ -854,10 +855,14 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "http-body 1.0.1",
+ "http-body-util",
+ "libc",
  "serde",
  "sha2",
  "thiserror 2.0.17",
  "tokio",
+ "tokio-util",
  "uuid",
  "zstd",
 ]
@@ -1890,9 +1895,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
-version = "0.2.176"
+version = "0.2.177"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58f929b4d672ea937a23a1ab494143d968337a5f47e56d0815df1e0890ddf174"
+checksum = "2874a2af47a2325c2001a6e6fad9b16a53b802102b528163885171cf92b15976"
 
 [[package]]
 name = "libloading"
@@ -2582,7 +2587,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.32",
- "socket2 0.5.10",
+ "socket2 0.6.0",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -2619,9 +2624,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.0",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

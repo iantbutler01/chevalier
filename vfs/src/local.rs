@@ -40,6 +40,8 @@ use crate::{
     pack::{SlotCompression, hex_hash},
 };
 
+const LOCAL_PREFETCH_SMALL_FILE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct LocalVfsStorage {
     root: PathBuf,
@@ -1444,72 +1446,7 @@ impl OptimizedVfsStorage for LocalVfsStorage {
             .lock_write_paths([source.clone(), destination.clone()])
             .await;
         self.run_blocking(move |storage| {
-            let source_abs = storage.abs_path(&source)?;
-            let destination_abs = storage.abs_path(&destination)?;
-            storage.assert_no_symlink_ancestor(&source_abs)?;
-            storage.assert_no_symlink_ancestor(&destination_abs)?;
-            let source_before = fs::symlink_metadata(&source_abs).map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    VfsStorageError::NotFound(source.clone())
-                } else {
-                    VfsStorageError::Internal(error.to_string())
-                }
-            })?;
-            if !source_before.is_file() {
-                return Err(VfsStorageError::BadRequest(format!(
-                    "vfs hard-link source {source} is not a regular file"
-                )));
-            }
-            if let Ok(destination_before) = fs::symlink_metadata(&destination_abs) {
-                if !destination_before.is_file()
-                    || local_file_id(&source_before) != local_file_id(&destination_before)
-                    || local_file_id(&source_before).is_none()
-                {
-                    return Err(VfsStorageError::Conflict(format!(
-                        "vfs hard-link destination already exists: {destination}"
-                    )));
-                }
-                sync_directory_chains(&storage, destination_abs.parent().map(Path::to_path_buf))?;
-                let source = storage.metadata_for_abs(&source_abs)?.ok_or_else(|| {
-                    VfsStorageError::Internal(
-                        "hard-link source disappeared during replay".to_string(),
-                    )
-                })?;
-                let destination = storage.metadata_for_abs(&destination_abs)?.ok_or_else(|| {
-                    VfsStorageError::Internal(
-                        "hard-link destination disappeared during replay".to_string(),
-                    )
-                })?;
-                return Ok(VfsStorageHardLinkResult {
-                    source,
-                    destination,
-                });
-            }
-            if let Some(parent) = destination_abs.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
-            }
-            fs::hard_link(&source_abs, &destination_abs).map_err(|error| match error.kind() {
-                std::io::ErrorKind::AlreadyExists => VfsStorageError::Conflict(format!(
-                    "vfs hard-link destination already exists: {destination}"
-                )),
-                std::io::ErrorKind::NotFound => VfsStorageError::NotFound(source.clone()),
-                _ => VfsStorageError::Internal(error.to_string()),
-            })?;
-            sync_directory_chains(&storage, destination_abs.parent().map(Path::to_path_buf))?;
-            storage.invalidate_hash_identity(&source_before);
-            let source = storage.metadata_for_abs(&source_abs)?.ok_or_else(|| {
-                VfsStorageError::Internal("hard-link source disappeared after link".to_string())
-            })?;
-            let destination = storage.metadata_for_abs(&destination_abs)?.ok_or_else(|| {
-                VfsStorageError::Internal(
-                    "hard-link destination disappeared after link".to_string(),
-                )
-            })?;
-            Ok(VfsStorageHardLinkResult {
-                source,
-                destination,
-            })
+            create_hard_link_locked(&storage, source.as_str(), destination.as_str())
         })
         .await
     }
@@ -1697,6 +1634,31 @@ impl OptimizedVfsStorage for LocalVfsStorage {
             let mut touched_directories = HashSet::new();
             for mutation in mutations {
                 match mutation {
+                    VfsStorageNamespaceMutation::CreateFile { path, mode } => {
+                        install_writes_with_options(
+                            &storage,
+                            vec![(
+                                VfsStorageWrite {
+                                    path: path.clone(),
+                                    bytes: Bytes::new(),
+                                    token_count: None,
+                                    precondition: Some(VfsStorageWritePrecondition::absent()),
+                                },
+                                Some(VfsStorageWriteOptions {
+                                    executable: mode.is_some_and(|mode| mode & 0o111 != 0),
+                                    mode,
+                                }),
+                            )],
+                        )?;
+                        let abs_path = storage.abs_path(path.as_str())?;
+                        if let Some(parent) = abs_path.parent() {
+                            collect_directory_chain(
+                                &storage.root,
+                                parent,
+                                &mut touched_directories,
+                            )?;
+                        }
+                    }
                     VfsStorageNamespaceMutation::CreateDirectory { path, mode } => {
                         let abs_path = storage.abs_path(path.as_str())?;
                         storage.assert_no_symlink_ancestor(&abs_path)?;
@@ -1756,6 +1718,24 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                             }
                         }
                         if let Some(parent) = abs_path.parent() {
+                            collect_directory_chain(
+                                &storage.root,
+                                parent,
+                                &mut touched_directories,
+                            )?;
+                        }
+                    }
+                    VfsStorageNamespaceMutation::CreateHardLink {
+                        source_path,
+                        destination_path,
+                    } => {
+                        create_hard_link_locked(
+                            &storage,
+                            source_path.as_str(),
+                            destination_path.as_str(),
+                        )?;
+                        let destination = storage.abs_path(destination_path.as_str())?;
+                        if let Some(parent) = destination.parent() {
                             collect_directory_chain(
                                 &storage.root,
                                 parent,
@@ -1896,10 +1876,58 @@ impl OptimizedVfsStorage for LocalVfsStorage {
 
     async fn prefetch_subtree(
         &self,
-        _prefix: &str,
-        _options: VfsStoragePrefetchOptions,
+        prefix: &str,
+        options: VfsStoragePrefetchOptions,
     ) -> VfsStorageResult<VfsStoragePrefetchResult> {
-        Ok(VfsStoragePrefetchResult::default())
+        let prefix = prefix.to_string();
+        let _locks = self.lock_read_paths([prefix.clone()]).await;
+        self.run_blocking(move |storage| {
+            let root = storage.abs_path(&prefix)?;
+            storage.assert_no_symlink_ancestor(&root)?;
+            let mut stack = vec![root];
+            let mut files = Vec::new();
+            while let Some(path) = stack.pop() {
+                let metadata = match fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(VfsStorageError::Internal(error.to_string())),
+                };
+                if metadata.is_dir() {
+                    for entry in fs::read_dir(&path)
+                        .map_err(|error| VfsStorageError::Internal(error.to_string()))?
+                    {
+                        stack.push(
+                            entry
+                                .map_err(|error| VfsStorageError::Internal(error.to_string()))?
+                                .path(),
+                        );
+                    }
+                } else if metadata.is_file() {
+                    files.push((storage.logical_path_for(&path)?, path, metadata.len()));
+                }
+            }
+            files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            if let Some(limit) = options.max_entries {
+                files.truncate(limit.max(0) as usize);
+            }
+            if !options.include_small_file_bytes {
+                return Ok(VfsStoragePrefetchResult::default());
+            }
+
+            let mut remaining_bytes = options.max_pack_bytes.unwrap_or(u64::MAX);
+            let mut warmed_file_bytes = Vec::new();
+            for (logical_path, absolute_path, size_bytes) in files {
+                if size_bytes > LOCAL_PREFETCH_SMALL_FILE_MAX_BYTES || size_bytes > remaining_bytes
+                {
+                    continue;
+                }
+                let bytes = Bytes::from(read_file(&absolute_path)?);
+                remaining_bytes = remaining_bytes.saturating_sub(bytes.len() as u64);
+                warmed_file_bytes.push((logical_path, bytes));
+            }
+            Ok(VfsStoragePrefetchResult { warmed_file_bytes })
+        })
+        .await
     }
 }
 
@@ -1911,6 +1939,72 @@ fn install_writes(
         storage,
         writes.into_iter().map(|write| (write, None)).collect(),
     )
+}
+
+fn create_hard_link_locked(
+    storage: &LocalVfsStorage,
+    source: &str,
+    destination: &str,
+) -> VfsStorageResult<VfsStorageHardLinkResult> {
+    let source_abs = storage.abs_path(source)?;
+    let destination_abs = storage.abs_path(destination)?;
+    storage.assert_no_symlink_ancestor(&source_abs)?;
+    storage.assert_no_symlink_ancestor(&destination_abs)?;
+    let source_before = fs::symlink_metadata(&source_abs).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            VfsStorageError::NotFound(source.to_string())
+        } else {
+            VfsStorageError::Internal(error.to_string())
+        }
+    })?;
+    if !source_before.is_file() {
+        return Err(VfsStorageError::BadRequest(format!(
+            "vfs hard-link source {source} is not a regular file"
+        )));
+    }
+    if let Ok(destination_before) = fs::symlink_metadata(&destination_abs) {
+        if !destination_before.is_file()
+            || local_file_id(&source_before) != local_file_id(&destination_before)
+            || local_file_id(&source_before).is_none()
+        {
+            return Err(VfsStorageError::Conflict(format!(
+                "vfs hard-link destination already exists: {destination}"
+            )));
+        }
+        sync_directory_chains(storage, destination_abs.parent().map(Path::to_path_buf))?;
+        let source = storage.metadata_for_abs(&source_abs)?.ok_or_else(|| {
+            VfsStorageError::Internal("hard-link source disappeared during replay".to_string())
+        })?;
+        let destination = storage.metadata_for_abs(&destination_abs)?.ok_or_else(|| {
+            VfsStorageError::Internal("hard-link destination disappeared during replay".to_string())
+        })?;
+        return Ok(VfsStorageHardLinkResult {
+            source,
+            destination,
+        });
+    }
+    if let Some(parent) = destination_abs.parent() {
+        fs::create_dir_all(parent).map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+    }
+    fs::hard_link(&source_abs, &destination_abs).map_err(|error| match error.kind() {
+        std::io::ErrorKind::AlreadyExists => VfsStorageError::Conflict(format!(
+            "vfs hard-link destination already exists: {destination}"
+        )),
+        std::io::ErrorKind::NotFound => VfsStorageError::NotFound(source.to_string()),
+        _ => VfsStorageError::Internal(error.to_string()),
+    })?;
+    sync_directory_chains(storage, destination_abs.parent().map(Path::to_path_buf))?;
+    storage.invalidate_hash_identity(&source_before);
+    let source = storage.metadata_for_abs(&source_abs)?.ok_or_else(|| {
+        VfsStorageError::Internal("hard-link source disappeared after link".to_string())
+    })?;
+    let destination = storage.metadata_for_abs(&destination_abs)?.ok_or_else(|| {
+        VfsStorageError::Internal("hard-link destination disappeared after link".to_string())
+    })?;
+    Ok(VfsStorageHardLinkResult {
+        source,
+        destination,
+    })
 }
 
 struct ExactWriteReplay {
@@ -1972,7 +2066,12 @@ fn partition_conditional_write_replays(
 }
 
 fn precondition_allows_exact_replay(precondition: Option<&VfsStorageWritePrecondition>) -> bool {
-    precondition.is_some_and(|precondition| precondition.effective_predicate().is_some())
+    precondition.is_some_and(|precondition| {
+        matches!(
+            precondition.effective_predicate(),
+            Some(VfsStorageCasPredicate::ContentFingerprint { .. })
+        )
+    })
 }
 
 fn precondition_expects_absent(precondition: Option<&VfsStorageWritePrecondition>) -> bool {
@@ -2950,9 +3049,36 @@ fn is_excluded_listing_kind(kind: VfsStorageEntryKind) -> bool {
     matches!(kind, VfsStorageEntryKind::Special)
 }
 
+/// Stable identity for a local inode, safe across renames and hard links.
+///
+/// `dev` + `ino` alone aliases recycled inodes: after an unlink the filesystem
+/// (ext4 notably) may reissue that inode number to a brand-new file, so a
+/// cached `unix:{dev}:{ino}` can silently match an unrelated inode on a sibling
+/// mount. The inode birth time (statx btime / APFS birthtime, already present
+/// in the fetched metadata, so no extra syscall) pins the inode generation and
+/// defeats that aliasing. When the filesystem cannot supply a birth time we
+/// advertise no identity at all rather than an unsafe one; downstream compares
+/// treat `None` conservatively.
 #[cfg(unix)]
 fn local_file_id(metadata: &fs::Metadata) -> Option<String> {
-    Some(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
+    let birth = metadata
+        .created()
+        .ok()
+        .and_then(|birth| birth.duration_since(SystemTime::UNIX_EPOCH).ok());
+    compose_local_file_id(metadata.dev(), metadata.ino(), birth)
+}
+
+/// Assemble the identity string from its inode coordinates and birth time,
+/// held apart from metadata I/O so the generation property stays unit-testable.
+/// No birth time yields no identity.
+#[cfg(unix)]
+fn compose_local_file_id(dev: u64, ino: u64, birth: Option<Duration>) -> Option<String> {
+    let birth = birth?;
+    Some(format!(
+        "unix:{dev}:{ino}:{}:{}",
+        birth.as_secs(),
+        birth.subsec_nanos()
+    ))
 }
 
 #[cfg(not(unix))]
@@ -4675,6 +4801,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn namespace_batch_applies_every_projected_mutation_atomically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        storage
+            .apply_namespace_batch(vec![
+                VfsStorageNamespaceMutation::CreateFile {
+                    path: "source".to_string(),
+                    mode: Some(0o640),
+                },
+                VfsStorageNamespaceMutation::CreateDirectory {
+                    path: "empty-dir".to_string(),
+                    mode: Some(0o750),
+                },
+                VfsStorageNamespaceMutation::CreateSymlink {
+                    path: "source-link".to_string(),
+                    target: "source".to_string(),
+                },
+                VfsStorageNamespaceMutation::CreateHardLink {
+                    source_path: "source".to_string(),
+                    destination_path: "source-alias".to_string(),
+                },
+                VfsStorageNamespaceMutation::Rename {
+                    from: "source-alias".to_string(),
+                    to: "renamed-alias".to_string(),
+                },
+                VfsStorageNamespaceMutation::SetMode {
+                    path: "source".to_string(),
+                    mode: 0o700,
+                },
+                VfsStorageNamespaceMutation::CreateFile {
+                    path: "awaited-empty-probe".to_string(),
+                    mode: Some(0o600),
+                },
+                VfsStorageNamespaceMutation::DeleteFile {
+                    path: "awaited-empty-probe".to_string(),
+                    precondition: None,
+                },
+                VfsStorageNamespaceMutation::DeleteFile {
+                    path: "renamed-alias".to_string(),
+                    precondition: None,
+                },
+                VfsStorageNamespaceMutation::RemoveDirectory {
+                    path: "empty-dir".to_string(),
+                },
+            ])
+            .await
+            .expect("apply complete namespace batch");
+
+        let source = storage
+            .stat("source")
+            .await
+            .expect("stat source")
+            .expect("source exists");
+        assert_eq!(source.mode, Some(0o700));
+        assert_eq!(source.link_count, 1);
+        let symlink = storage
+            .stat("source-link")
+            .await
+            .expect("stat symlink")
+            .expect("symlink exists");
+        assert_eq!(symlink.kind.as_str(), "symlink");
+        assert_eq!(symlink.link_target.as_deref(), Some("source"));
+        for absent in [
+            "awaited-empty-probe",
+            "source-alias",
+            "renamed-alias",
+            "empty-dir",
+        ] {
+            assert!(
+                storage.stat(absent).await.expect("stat absent").is_none(),
+                "{absent} must not survive the committed batch"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn namespace_rename_replay_converges_identical_directory_trees() {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = LocalVfsStorage::new(dir.path());
@@ -4951,6 +5153,45 @@ mod tests {
                 .map(|entry| entry.path)
                 .collect::<Vec<_>>(),
             vec!["root/a.txt".to_string(), "root/child/b.md".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn local_prefetch_returns_bounded_small_file_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        storage.mkdir("root/child").await.expect("mkdir");
+        storage
+            .write("root/a.txt", Bytes::from_static(b"a"), None)
+            .await
+            .expect("write a");
+        storage
+            .write("root/child/b.txt", Bytes::from_static(b"bb"), None)
+            .await
+            .expect("write b");
+        storage
+            .write("root/child/c.txt", Bytes::from_static(b"ccc"), None)
+            .await
+            .expect("write c");
+
+        let prefetched = storage
+            .prefetch_subtree(
+                "root",
+                VfsStoragePrefetchOptions {
+                    include_small_file_bytes: true,
+                    max_entries: Some(2),
+                    max_pack_bytes: Some(3),
+                },
+            )
+            .await
+            .expect("prefetch");
+
+        assert_eq!(
+            prefetched.warmed_file_bytes,
+            vec![
+                ("root/a.txt".to_string(), Bytes::from_static(b"a")),
+                ("root/child/b.txt".to_string(), Bytes::from_static(b"bb")),
+            ]
         );
     }
 
@@ -6608,6 +6849,126 @@ mod tests {
         assert_eq!(
             storage.read("destination").await.unwrap(),
             Bytes::from_static(b"source body")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_file_identity_survives_rename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        storage
+            .write("origin", Bytes::from_static(b"body"), None)
+            .await
+            .expect("write origin");
+        let before = storage
+            .stat("origin")
+            .await
+            .expect("stat origin")
+            .expect("origin metadata")
+            .file_id
+            .expect("stable identity");
+
+        storage
+            .rename_with_metadata("origin", "moved")
+            .await
+            .expect("rename");
+
+        assert!(storage.stat("origin").await.expect("stat gap").is_none());
+        let after = storage
+            .stat("moved")
+            .await
+            .expect("stat moved")
+            .expect("moved metadata")
+            .file_id
+            .expect("stable identity");
+        assert_eq!(
+            before, after,
+            "renaming an inode must not change its generation-safe identity"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_file_identity_survives_hard_link() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        storage
+            .write("objects/source", Bytes::from_static(b"body"), None)
+            .await
+            .expect("write source");
+        let linked = storage
+            .create_hard_link("objects/source", "aliases/destination")
+            .await
+            .expect("create hard link");
+        let source_id = linked.source.file_id.expect("source identity");
+        let destination_id = linked.destination.file_id.expect("destination identity");
+        assert_eq!(
+            source_id, destination_id,
+            "hard links share one inode and must report one identity"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_recreated_path_reports_fresh_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        storage
+            .write("recycled", Bytes::from_static(b"first"), None)
+            .await
+            .expect("first create");
+        let first = storage
+            .stat("recycled")
+            .await
+            .expect("stat first")
+            .expect("first metadata")
+            .file_id
+            .expect("stable identity");
+
+        storage
+            .delete_file_with_metadata("recycled", None)
+            .await
+            .expect("delete");
+        assert!(storage.stat("recycled").await.expect("stat gap").is_none());
+
+        storage
+            .write("recycled", Bytes::from_static(b"second"), None)
+            .await
+            .expect("recreate");
+        let second = storage
+            .stat("recycled")
+            .await
+            .expect("stat second")
+            .expect("second metadata")
+            .file_id
+            .expect("stable identity");
+
+        assert_ne!(
+            first, second,
+            "a path recreated after unlink must not inherit the old inode's identity"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compose_local_file_id_pins_inode_generation() {
+        let birth = Duration::new(1_700_000_000, 123);
+        let base = compose_local_file_id(7, 9, Some(birth)).expect("birth yields identity");
+        let same = compose_local_file_id(7, 9, Some(birth)).expect("birth yields identity");
+        assert_eq!(base, same, "identical inputs must produce identical ids");
+
+        let reborn = compose_local_file_id(7, 9, Some(Duration::new(1_700_000_000, 456)))
+            .expect("birth yields identity");
+        assert_ne!(
+            base, reborn,
+            "the same dev+ino with a different birth time must not alias"
+        );
+
+        assert_eq!(
+            compose_local_file_id(7, 9, None),
+            None,
+            "a missing birth time must advertise no identity"
         );
     }
 

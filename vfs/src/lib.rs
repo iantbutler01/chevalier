@@ -321,6 +321,11 @@ pub struct VfsStorageHardLinkResult {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VfsStorageNamespaceMutation {
+    CreateFile {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<u32>,
+    },
     CreateDirectory {
         path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -329,6 +334,10 @@ pub enum VfsStorageNamespaceMutation {
     CreateSymlink {
         path: String,
         target: String,
+    },
+    CreateHardLink {
+        source_path: String,
+        destination_path: String,
     },
     DeleteFile {
         path: String,
@@ -351,11 +360,16 @@ pub enum VfsStorageNamespaceMutation {
 impl VfsStorageNamespaceMutation {
     pub fn paths(&self) -> [&str; 2] {
         match self {
-            Self::CreateDirectory { path, .. }
+            Self::CreateFile { path, .. }
+            | Self::CreateDirectory { path, .. }
             | Self::CreateSymlink { path, .. }
             | Self::DeleteFile { path, .. }
             | Self::RemoveDirectory { path }
             | Self::SetMode { path, .. } => [path.as_str(), ""],
+            Self::CreateHardLink {
+                source_path,
+                destination_path,
+            } => [source_path.as_str(), destination_path.as_str()],
             Self::Rename { from, to } => [from.as_str(), to.as_str()],
         }
     }
@@ -552,11 +566,30 @@ pub trait OptimizedVfsStorage: Send + Sync {
     ) -> VfsStorageResult<()> {
         for mutation in mutations {
             match mutation {
+                VfsStorageNamespaceMutation::CreateFile { path, mode } => {
+                    self.write_with_options(
+                        path.as_str(),
+                        Bytes::new(),
+                        Some(VfsStorageWritePrecondition::absent()),
+                        Some(VfsStorageWriteOptions {
+                            executable: mode.is_some_and(|mode| mode & 0o111 != 0),
+                            mode,
+                        }),
+                    )
+                    .await?;
+                }
                 VfsStorageNamespaceMutation::CreateDirectory { path, mode } => {
                     self.mkdir_with_mode(path.as_str(), mode).await?;
                 }
                 VfsStorageNamespaceMutation::CreateSymlink { path, target } => {
                     self.create_symlink(path.as_str(), target.as_str()).await?;
+                }
+                VfsStorageNamespaceMutation::CreateHardLink {
+                    source_path,
+                    destination_path,
+                } => {
+                    self.create_hard_link(source_path.as_str(), destination_path.as_str())
+                        .await?;
                 }
                 VfsStorageNamespaceMutation::DeleteFile { path, precondition } => {
                     self.delete_file_with_metadata(path.as_str(), precondition)

@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn registry_key_uses_configured_prefix_and_node_id() {
-        assert_eq!(registry_key(&test_config()), "/sandbox/nodes/node-a");
+        assert_eq!(registry_key(&test_config()), "/chevalier-sandbox/nodes/node-a");
     }
 
     #[test]

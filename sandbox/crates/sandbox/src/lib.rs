@@ -74,7 +74,8 @@ use proto::vmd::v1::{
 
 const PCI_CAPABILITY_HEADER: &str = "x-chevalier-pci-token";
 const DURABLE_VOLUME_LIST_TIMEOUT: Duration = Duration::from_secs(2);
-const PORTPROXY_FILE_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_PORTPROXY_FILE_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_PORTPROXY_WRITE_FILE_RPC_TIMEOUT: Duration = Duration::from_secs(120);
 
 const META_SESSION_ID: &str = "chevalier.session_id";
 const META_PARENT_SESSION_ID: &str = "chevalier.parent_session_id";
@@ -1205,8 +1206,25 @@ impl Session {
             };
             let recovery_endpoint = self.current_node_endpoint().await;
 
-            let mut client = match ShellExecClient::connect(access.endpoint.clone()).await {
-                Ok(client) => client,
+            // An unbounded connect parks silently while the guest wakes or the
+            // forwarder accepts; bound it so the establish loop can retry fast.
+            // connect_timeout only — the exec stream itself is long-lived.
+            let exec_endpoint = Endpoint::from_shared(access.endpoint.clone())
+                .map_err(|err| SandboxError::InvalidEndpoint(err.to_string()))?
+                .connect_timeout(self.sandbox.inner.cfg.connect_timeout);
+            let connect_started = Instant::now();
+            let mut client = match exec_endpoint.connect().await {
+                Ok(channel) => {
+                    let connect_elapsed = connect_started.elapsed();
+                    if connect_elapsed > Duration::from_secs(2) {
+                        tracing::warn!(
+                            elapsed_ms = connect_elapsed.as_millis() as u64,
+                            attempt = establish_attempt,
+                            "slow exec transport establishment"
+                        );
+                    }
+                    ShellExecClient::new(channel)
+                }
                 Err(err) => {
                     let err = SandboxError::Transport(err);
                     if is_rebind_candidate_error(&err) && establish_attempt < 2 {
@@ -2150,7 +2168,10 @@ impl Session {
                     path: path.to_string(),
                 },
                 access.auth_header.as_ref(),
-                PORTPROXY_FILE_RPC_TIMEOUT,
+                configured_portproxy_timeout(
+                    "CHEVALIER_PORTPROXY_READ_FILE_TIMEOUT_MS",
+                    DEFAULT_PORTPROXY_FILE_RPC_TIMEOUT,
+                )?,
             ))
             .await?
             .into_inner();
@@ -2172,7 +2193,10 @@ impl Session {
                     create_parents: true,
                 },
                 access.auth_header.as_ref(),
-                PORTPROXY_FILE_RPC_TIMEOUT,
+                configured_portproxy_timeout(
+                    "CHEVALIER_PORTPROXY_WRITE_FILE_TIMEOUT_MS",
+                    DEFAULT_PORTPROXY_WRITE_FILE_RPC_TIMEOUT,
+                )?,
             ))
             .await?;
         Ok(())
@@ -2194,7 +2218,10 @@ impl Session {
                     path: path.to_string(),
                 },
                 access.auth_header.as_ref(),
-                PORTPROXY_FILE_RPC_TIMEOUT,
+                configured_portproxy_timeout(
+                    "CHEVALIER_PORTPROXY_LIST_DIRECTORY_TIMEOUT_MS",
+                    DEFAULT_PORTPROXY_FILE_RPC_TIMEOUT,
+                )?,
             ))
             .await?
             .into_inner();
@@ -2214,7 +2241,10 @@ impl Session {
                     path: path.to_string(),
                 },
                 access.auth_header.as_ref(),
-                PORTPROXY_FILE_RPC_TIMEOUT,
+                configured_portproxy_timeout(
+                    "CHEVALIER_PORTPROXY_DELETE_PATH_TIMEOUT_MS",
+                    DEFAULT_PORTPROXY_FILE_RPC_TIMEOUT,
+                )?,
             ))
             .await?;
         Ok(())
@@ -4882,9 +4912,17 @@ async fn probe_shell_exec_ready(
     establish_timeout: Duration,
     auth_header: Option<&MetadataValue<Ascii>>,
 ) -> bool {
-    let Ok(mut client) = ShellExecClient::connect(endpoint.to_string()).await else {
+    let Ok(probe_endpoint) = Endpoint::from_shared(endpoint.to_string()) else {
         return false;
     };
+    let Ok(channel) = probe_endpoint
+        .connect_timeout(establish_timeout)
+        .connect()
+        .await
+    else {
+        return false;
+    };
+    let mut client = ShellExecClient::new(channel);
 
     let (req_tx, req_rx) = mpsc::channel(2);
     if req_tx
@@ -5028,6 +5066,22 @@ fn request_with_optional_auth_timeout<T>(
     let mut request = request_with_optional_auth(message, auth_header);
     request.set_timeout(timeout);
     request
+}
+
+fn configured_portproxy_timeout(name: &str, default: Duration) -> Result<Duration> {
+    let Ok(raw) = std::env::var(name) else {
+        return Ok(default);
+    };
+    let millis = raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|err| SandboxError::InvalidConfig(format!("invalid {name}: {err}")))?;
+    if millis == 0 {
+        return Err(SandboxError::InvalidConfig(format!(
+            "invalid {name}: timeout must be greater than zero"
+        )));
+    }
+    Ok(Duration::from_millis(millis))
 }
 
 fn normalize_endpoint(raw: &str) -> Result<String> {

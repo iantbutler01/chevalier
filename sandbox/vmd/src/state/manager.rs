@@ -79,7 +79,12 @@ const MAX_VM_DISK_GB: i32 = 100;
 const VM_RUNNING_TIMEOUT: Duration = Duration::from_secs(60);
 const INCOMING_RESTORE_TOTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const INCOMING_RESTORE_STALL_TIMEOUT: Duration = Duration::from_secs(90);
-const AMD64_QEMU_RUNTIME_FINGERPRINT: &str = "qemu-amd64-apic-vapic-off-v1";
+// @dive: Bumped v1 -> v2 when the amd64 KVM `-cpu` line gained `+invtsc,migratable=off`.
+//        The CPU feature set is migration-sensitive, and our RAM snapshots are QEMU
+//        migration streams restored via `-incoming`; a pre-invtsc stream restored into
+//        an invtsc CPU is not compatible, so the version bump invalidates stale snapshots
+//        (they fall back to a cold boot) instead of corrupting a restore.
+const AMD64_QEMU_RUNTIME_FINGERPRINT: &str = "qemu-amd64-apic-vapic-off-invtsc-v2";
 const ARM64_BIOS_CANDIDATES: [&str; 6] = [
     "/usr/share/qemu/edk2-aarch64-code.fd",
     "/usr/share/AAVMF/AAVMF_CODE.fd",
@@ -4592,6 +4597,35 @@ impl Manager {
     }
 }
 
+/// Selects the QEMU `(machine, cpu)` pair for an amd64 guest.
+///
+/// Pure over the host/OS booleans so the CPU-flag policy is unit-testable without
+/// depending on the OS the test runs under.
+///
+/// On the Linux/KVM path (the production `bismuth` host) we expose the host's
+/// invariant TSC via `+invtsc`. Without it, guests intermittently declare "TSC
+/// unstable" and fall back to kvm-clock, and that timekeeping/tick stall is the
+/// root of the observed 15-35s guest freezes / soft lockups. `invtsc` is not a
+/// migration-safe feature, so QEMU only exposes it when `migratable=off`; our RAM
+/// snapshots are same-host restores and `AMD64_QEMU_RUNTIME_FINGERPRINT` is bumped
+/// so pre-invtsc snapshots are invalidated rather than restored into a mismatched CPU.
+///
+/// HVF (macOS dev) keeps plain `host`, and the TCG fallback keeps `qemu64`; invtsc
+/// is only meaningful (and only supported) on the KVM passthrough path.
+fn select_amd64_machine_cpu(
+    host_arch: &str,
+    running_on_linux: bool,
+    running_on_macos: bool,
+) -> (&'static str, &'static str) {
+    if host_arch == ARCH_AMD64 && running_on_linux {
+        ("q35,accel=kvm:tcg", "host,+invtsc,migratable=off")
+    } else if host_arch == ARCH_AMD64 && running_on_macos {
+        ("q35,accel=hvf:tcg", "host")
+    } else {
+        ("q35,accel=tcg", "qemu64")
+    }
+}
+
 fn build_qemu_args(
     meta: &VmMetadata,
     vm_dir: &Path,
@@ -4629,13 +4663,8 @@ fn build_qemu_args(
 
     let (machine, cpu, bios) = match guest_arch {
         ARCH_AMD64 => {
-            let (machine_base, cpu) = if host_arch == ARCH_AMD64 && running_on_linux {
-                ("q35,accel=kvm:tcg", "host")
-            } else if host_arch == ARCH_AMD64 && running_on_macos {
-                ("q35,accel=hvf:tcg", "host")
-            } else {
-                ("q35,accel=tcg", "qemu64")
-            };
+            let (machine_base, cpu) =
+                select_amd64_machine_cpu(host_arch, running_on_linux, running_on_macos);
             (
                 format!("{machine_base}{memory_backend_suffix}"),
                 cpu.to_string(),
@@ -7873,6 +7902,58 @@ mod tests {
         assert!(
             fingerprint.contains(AMD64_QEMU_RUNTIME_FINGERPRINT),
             "amd64 RAM snapshots must be invalidated when migration-sensitive QEMU args change"
+        );
+    }
+
+    #[test]
+    fn select_amd64_machine_cpu_exposes_invariant_tsc_on_kvm() {
+        // Linux/KVM (production bismuth) must expose the invariant TSC so guests
+        // keep a stable clocksource; invtsc requires migratable=off to be exposed.
+        let (machine, cpu) = select_amd64_machine_cpu(ARCH_AMD64, true, false);
+        assert_eq!(machine, "q35,accel=kvm:tcg");
+        assert_eq!(cpu, "host,+invtsc,migratable=off");
+    }
+
+    #[test]
+    fn select_amd64_machine_cpu_keeps_plain_host_off_kvm() {
+        // HVF (macOS dev) keeps plain host; invtsc is KVM-only.
+        assert_eq!(
+            select_amd64_machine_cpu(ARCH_AMD64, false, true),
+            ("q35,accel=hvf:tcg", "host")
+        );
+        // Cross-arch TCG emulation keeps the portable qemu64 model.
+        assert_eq!(
+            select_amd64_machine_cpu(ARCH_ARM64, false, false),
+            ("q35,accel=tcg", "qemu64")
+        );
+    }
+
+    #[test]
+    fn build_qemu_args_pins_invariant_tsc_flag_into_cpu_arg() {
+        // End-to-end: the -cpu value carried into the QEMU argv exposes invtsc on
+        // the KVM path. build_qemu_args selects the accelerator from the runtime
+        // OS, so only assert the flag when this test itself runs on Linux.
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let meta = qemu_test_metadata("vm-invtsc");
+        let args = build_qemu_args(
+            &meta,
+            Path::new("/tmp/vm-invtsc"),
+            Path::new("/tmp/vm-invtsc/qmp.sock"),
+            Path::new("/tmp/vm-invtsc/qemu.pid"),
+            ARCH_AMD64,
+            Some(&test_tap_spec(&meta.id)),
+            &[],
+        )
+        .expect("build qemu args");
+        let cpu_idx = args
+            .iter()
+            .position(|arg| arg == "-cpu")
+            .expect("missing -cpu");
+        assert_eq!(
+            args.get(cpu_idx + 1).map(String::as_str),
+            Some("host,+invtsc,migratable=off")
         );
     }
 

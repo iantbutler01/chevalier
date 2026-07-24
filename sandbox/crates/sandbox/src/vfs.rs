@@ -18,6 +18,12 @@ pub const CHEVALIER_VFS_OPERATION_HEADER: &str = "x-chevalier-vfs-operation";
 pub const CHEVALIER_VFS_REASON_HEADER: &str = "x-chevalier-vfs-reason";
 pub const CHEVALIER_VFS_RESOURCE_KEY_HEADER: &str = "x-chevalier-vfs-resource-key";
 pub const CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER: &str = "x-chevalier-vfs-lock-owner-token";
+/// Advertises how a gateway serializes mutations. `implicit` means the
+/// mutation endpoint itself owns serialization and lease acquire/release are
+/// compatibility no-ops; clients may elide those two HTTP round trips only
+/// after observing this header from a successful lease acquisition.
+pub const CHEVALIER_VFS_LEASE_MODE_HEADER: &str = "x-chevalier-vfs-lease-mode";
+pub const CHEVALIER_VFS_LEASE_MODE_IMPLICIT: &str = "implicit";
 pub const CHEVALIER_VFS_PRECONDITION_KIND_HEADER: &str = "x-chevalier-vfs-precondition-kind";
 pub const CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER: &str =
     "x-chevalier-vfs-precondition-fingerprint";
@@ -26,6 +32,7 @@ pub const CHEVALIER_VFS_PRECONDITION_SECONDARY_FINGERPRINT_HEADER: &str =
 pub const CHEVALIER_VFS_PRECONDITION_FILE_ID_HEADER: &str = "x-chevalier-vfs-precondition-file-id";
 pub const CHEVALIER_VFS_EXECUTABLE_HEADER: &str = "x-chevalier-vfs-executable";
 pub const CHEVALIER_VFS_MODE_HEADER: &str = "x-chevalier-vfs-mode";
+pub const CHEVALIER_VFS_NAMESPACE_REVISION_HEADER: &str = "x-chevalier-vfs-namespace-revision";
 
 pub const VFS_COMPONENT_VM_RUNTIME: &str = "vm_runtime";
 pub const VFS_ENTRY_KIND_FILE: &str = "file";
@@ -183,12 +190,23 @@ pub struct VfsHardLinkAliasResponse {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct VfsNamespaceMutationBatchBody {
+    pub operation_ids: Vec<String>,
     pub mutations: Vec<VfsNamespaceMutation>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VfsNamespaceMutation {
+    CreateFile {
+        path: String,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_vfs_mode",
+            serialize_with = "serialize_vfs_mode"
+        )]
+        mode: Option<u32>,
+    },
     CreateDirectory {
         path: String,
         #[serde(
@@ -202,6 +220,10 @@ pub enum VfsNamespaceMutation {
     CreateSymlink {
         path: String,
         target: String,
+    },
+    CreateHardLink {
+        source_path: String,
+        destination_path: String,
     },
     DeleteFile {
         path: String,
@@ -228,11 +250,16 @@ pub enum VfsNamespaceMutation {
 impl VfsNamespaceMutation {
     pub fn paths(&self) -> [&str; 2] {
         match self {
-            Self::CreateDirectory { path, .. }
+            Self::CreateFile { path, .. }
+            | Self::CreateDirectory { path, .. }
             | Self::CreateSymlink { path, .. }
             | Self::DeleteFile { path, .. }
             | Self::RemoveDirectory { path }
             | Self::SetMode { path, .. } => [path.as_str(), ""],
+            Self::CreateHardLink {
+                source_path,
+                destination_path,
+            } => [source_path.as_str(), destination_path.as_str()],
             Self::Rename { from, to } => [from.as_str(), to.as_str()],
         }
     }
@@ -411,6 +438,25 @@ pub struct VfsWriteManyResult {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct VfsWriteManyResponse {
     pub results: Vec<VfsWriteManyResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsPublicationSnapshotEntry {
+    pub path: String,
+    pub metadata: Option<VfsMetadata>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsNamespaceMutationBatchResponse {
+    #[serde(default)]
+    pub entries: Vec<VfsPublicationSnapshotEntry>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsWriteManyPublicationResponse {
+    pub results: Vec<VfsWriteManyResult>,
+    #[serde(default)]
+    pub entries: Vec<VfsPublicationSnapshotEntry>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -627,9 +673,18 @@ pub fn parse_vfs_range_header(value: &str, total_size: u64) -> VfsResult<VfsRead
 
 #[cfg(feature = "vfs-server")]
 mod server {
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
     use async_trait::async_trait;
     use axum::{
-        Json, Router,
+        Extension, Json, Router,
         body::{Body, Bytes},
         extract::{DefaultBodyLimit, FromRef, Path, Query, State},
         http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -642,8 +697,9 @@ mod server {
     use super::{
         CHEVALIER_VFS_COMPONENT_HEADER, CHEVALIER_VFS_EXECUTABLE_HEADER,
         CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, CHEVALIER_VFS_MODE_HEADER,
-        CHEVALIER_VFS_OPERATION_HEADER, CHEVALIER_VFS_PRECONDITION_FILE_ID_HEADER,
-        CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER, CHEVALIER_VFS_PRECONDITION_KIND_HEADER,
+        CHEVALIER_VFS_NAMESPACE_REVISION_HEADER, CHEVALIER_VFS_OPERATION_HEADER,
+        CHEVALIER_VFS_PRECONDITION_FILE_ID_HEADER, CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER,
+        CHEVALIER_VFS_PRECONDITION_KIND_HEADER,
         CHEVALIER_VFS_PRECONDITION_SECONDARY_FINGERPRINT_HEADER, CHEVALIER_VFS_REASON_HEADER,
         CHEVALIER_VFS_RESOURCE_KEY_HEADER, CHEVALIER_VFS_ROUTE_PREFIX, CHEVALIER_VFS_RUN_ID_HEADER,
         CHEVALIER_VFS_SURFACE_KIND_HEADER, DEFAULT_VFS_BODY_LIMIT_BYTES, VFS_COMPONENT_VM_RUNTIME,
@@ -655,13 +711,286 @@ mod server {
         VfsHeaderAliases, VfsLeaseAcquire, VfsLeaseAcquireRequest, VfsLeaseGrant,
         VfsLeaseReleaseRequest, VfsListDirOptions, VfsMetadata, VfsMetadataManyRequest,
         VfsMetadataManyResponse, VfsNamespaceMutation, VfsNamespaceMutationBatchBody,
-        VfsNamespaceMutationBatchRequest, VfsNamespaceMutationRequest, VfsPrefetchSubtreeRequest,
-        VfsPrefetchSubtreeResponse, VfsReadManyRequest, VfsReadManyResponse, VfsReadRange,
+        VfsNamespaceMutationBatchRequest, VfsNamespaceMutationBatchResponse,
+        VfsNamespaceMutationRequest, VfsPrefetchSubtreeRequest, VfsPrefetchSubtreeResponse,
+        VfsPublicationSnapshotEntry, VfsReadManyRequest, VfsReadManyResponse, VfsReadRange,
         VfsRenameMetadataResponse, VfsRenameRequest, VfsResult, VfsSubtreeMetadataEntry,
         VfsSubtreeMetadataRequest, VfsSubtreeMetadataResponse, VfsSymlinkRequest, VfsWriteHeaders,
-        VfsWriteManyBody, VfsWriteManyRequest, VfsWriteManyResponse, VfsWriteManyResult,
+        VfsWriteManyBody, VfsWriteManyPublicationResponse, VfsWriteManyRequest,
+        VfsWriteManyResult,
         VfsWritePrecondition, VfsWriteRequest, VfsWriteScope, parse_vfs_range_header,
     };
+
+    pub(super) struct VfsPublicationCoordinator {
+        owners: Mutex<HashMap<String, Arc<OwnerState>>>,
+        /// Hard cap every publication waits for watcher acks before proceeding
+        /// fail-open. Read from the environment at construction and threaded
+        /// onto each lazily created `OwnerState`.
+        ack_timeout: Duration,
+    }
+
+    impl Default for VfsPublicationCoordinator {
+        fn default() -> Self {
+            Self::with_ack_timeout(publication_ack_timeout_from_env())
+        }
+    }
+
+    impl VfsPublicationCoordinator {
+        /// Construct a coordinator with an explicit publication-ack cap. Tests
+        /// inject a deterministic cap here; production goes through `default()`
+        /// which reads `CHEVALIER_VFS_PUBLICATION_ACK_TIMEOUT_MS`.
+        pub(super) fn with_ack_timeout(ack_timeout: Duration) -> Self {
+            Self {
+                owners: Mutex::new(HashMap::new()),
+                ack_timeout,
+            }
+        }
+
+        pub(super) fn owner(&self, owner_id: &str) -> Arc<OwnerState> {
+            let mut owners = self
+                .owners
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            Arc::clone(
+                owners
+                    .entry(owner_id.to_string())
+                    .or_insert_with(|| Arc::new(OwnerState::new(self.ack_timeout))),
+            )
+        }
+    }
+
+    /// Hard cap on how long a publication waits for its active watchers to ack
+    /// the new revision before proceeding fail-open. Overridable via
+    /// `CHEVALIER_VFS_PUBLICATION_ACK_TIMEOUT_MS`; default 150ms. Read once per
+    /// coordinator (one per router), never per publication.
+    fn publication_ack_timeout_from_env() -> Duration {
+        let millis = std::env::var("CHEVALIER_VFS_PUBLICATION_ACK_TIMEOUT_MS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(150);
+        Duration::from_millis(millis)
+    }
+
+    /// A single active watcher's ack progress: the highest revision it has
+    /// observed (its most recent poll's `since`) plus a liveness deadline after
+    /// which, absent a fresh poll, it is pruned so it can never gate publications
+    /// forever.
+    struct WatcherAck {
+        acked_revision: u64,
+        expires_at: tokio::time::Instant,
+    }
+
+    /// Per-owner publication state: the serialized namespace revision, a `watch`
+    /// side-channel that wakes long-poll `watch` requests, and the ack registry
+    /// that makes publications revocation-acked.
+    ///
+    /// The revision `RwLock` preserves the existing reader/writer publication
+    /// gate untouched, so every handler keeps calling `publication.read()` /
+    /// `publication.write()` exactly as before. `revision_tx` is a pure
+    /// side-channel wake for parked watchers. The ack registry gates a
+    /// publication's *HTTP response* (never any lock): a mutation bumps and
+    /// publishes the revision under the write guard, releases it, then delays its
+    /// response until every registered watcher has re-polled with `since >=` the
+    /// new revision (an ack that a fail-closed observer emits only after it has
+    /// advanced its fence and cleared its cache).
+    pub(super) struct OwnerState {
+        revision: tokio::sync::RwLock<u64>,
+        revision_tx: tokio::sync::watch::Sender<u64>,
+        /// watcher_id -> ack progress. A watcher with no `watcher_id` is
+        /// anonymous and never inserted here: it is notified but never gates a
+        /// publication.
+        acks: Mutex<HashMap<String, WatcherAck>>,
+        /// Monotonic counter bumped whenever a watcher records an ack; parked
+        /// publications subscribe and re-evaluate on every advance.
+        ack_progress_tx: tokio::sync::watch::Sender<u64>,
+        /// Micros-since-epoch of the last fail-open WARN, to rate-limit the log
+        /// to at most once per second per owner.
+        last_ack_warn_us: AtomicU64,
+        /// Hard cap for the ack wait, inherited from the coordinator.
+        ack_timeout: Duration,
+    }
+
+    impl OwnerState {
+        fn new(ack_timeout: Duration) -> Self {
+            let initial = namespace_revision_now();
+            let (revision_tx, _) = tokio::sync::watch::channel(initial);
+            let (ack_progress_tx, _) = tokio::sync::watch::channel(0u64);
+            Self {
+                revision: tokio::sync::RwLock::new(initial),
+                revision_tx,
+                acks: Mutex::new(HashMap::new()),
+                ack_progress_tx,
+                last_ack_warn_us: AtomicU64::new(0),
+                ack_timeout,
+            }
+        }
+
+        /// Acquire a shared read snapshot of the current revision. The name and
+        /// signature mirror the previous `RwLock<u64>` so existing call sites
+        /// (`publication.read().await`) are unchanged.
+        pub(super) async fn read(&self) -> tokio::sync::RwLockReadGuard<'_, u64> {
+            self.revision.read().await
+        }
+
+        /// Acquire the exclusive publication guard used by every mutation.
+        pub(super) async fn write(&self) -> tokio::sync::RwLockWriteGuard<'_, u64> {
+            self.revision.write().await
+        }
+
+        /// Announce a freshly bumped revision to any parked watchers. `send_replace`
+        /// keeps the stored value authoritative even when no watcher is currently
+        /// subscribed, and never fails or blocks the caller.
+        pub(super) fn publish(&self, revision: u64) {
+            self.revision_tx.send_replace(revision);
+        }
+
+        /// Subscribe to revision advances. The receiver observes the current
+        /// version, so a publish that races between a watcher's fast-path check
+        /// and its await is still delivered (no lost wakeups).
+        pub(super) fn watch(&self) -> tokio::sync::watch::Receiver<u64> {
+            self.revision_tx.subscribe()
+        }
+
+        /// Consume the write guard to publish a mutation with revocation-ack
+        /// semantics: bump the revision, wake parked watchers, RELEASE the guard,
+        /// then delay (bounded) until every registered watcher acks the new
+        /// revision. The guard is dropped before the wait so the wait holds no
+        /// lock — the revision and storage are already published, so this purely
+        /// delays the HTTP response (design point 1c). Returns the published
+        /// revision for the response header.
+        pub(super) async fn commit_and_await_acks(
+            &self,
+            mut guard: tokio::sync::RwLockWriteGuard<'_, u64>,
+        ) -> u64 {
+            *guard = (*guard + 1).max(namespace_revision_now());
+            let published = *guard;
+            self.publish(published);
+            // Release the publication lock BEFORE parking on acks: same-owner
+            // ordering stays correct because the revision + storage are already
+            // committed, and other owners/readers are never touched by the wait.
+            drop(guard);
+            self.await_publication_acks(published).await;
+            published
+        }
+
+        /// Record that `watcher_id` has observed (acked) revision `since` and
+        /// refresh its liveness deadline (2x its poll timeout, capped at 60s).
+        /// Anonymous watchers (empty id) are never registered. Wakes any
+        /// publication parked on ack progress.
+        pub(super) fn record_watcher_ack(&self, watcher_id: &str, since: u64, timeout: Duration) {
+            if watcher_id.is_empty() {
+                return;
+            }
+            let grace = timeout.saturating_mul(2).min(Duration::from_secs(60));
+            let expires_at = tokio::time::Instant::now() + grace;
+            {
+                let mut acks = self.acks.lock().unwrap_or_else(|error| error.into_inner());
+                let entry = acks.entry(watcher_id.to_string()).or_insert(WatcherAck {
+                    acked_revision: since,
+                    expires_at,
+                });
+                entry.acked_revision = entry.acked_revision.max(since);
+                entry.expires_at = expires_at;
+            }
+            // Non-blocking wake: watch always marks changed on send, so a parked
+            // publication's `changed()` fires and it re-counts laggards.
+            self.ack_progress_tx.send_modify(|counter| {
+                *counter = counter.wrapping_add(1);
+            });
+        }
+
+        /// Count registered watchers that have not yet acked `revision`, pruning
+        /// any past their liveness deadline first. Zero means every active
+        /// watcher has observed the revision (or there are none).
+        pub(super) fn unacked_watchers(&self, revision: u64) -> usize {
+            let mut acks = self.acks.lock().unwrap_or_else(|error| error.into_inner());
+            let now = tokio::time::Instant::now();
+            acks.retain(|_, watcher| watcher.expires_at > now);
+            acks.values()
+                .filter(|watcher| watcher.acked_revision < revision)
+                .count()
+        }
+
+        /// Block until every registered watcher acks `revision`, bounded by the
+        /// coordinator's cap. Returns immediately when no watcher lags (the
+        /// single-mount / all-acked fast path). On cap expiry with laggards,
+        /// returns fail-open and logs one rate-limited WARN.
+        async fn await_publication_acks(&self, revision: u64) {
+            // Subscribe before the first count: an ack landing between the count
+            // and the await still marks the channel changed, so no wake is lost.
+            let mut progress = self.ack_progress_tx.subscribe();
+            if self.unacked_watchers(revision) == 0 {
+                return;
+            }
+            if self.ack_timeout.is_zero() {
+                return;
+            }
+            let deadline = tokio::time::Instant::now() + self.ack_timeout;
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    self.warn_publication_lag(revision);
+                    return;
+                }
+                match tokio::time::timeout(remaining, progress.changed()).await {
+                    Ok(Ok(())) => {
+                        if self.unacked_watchers(revision) == 0 {
+                            return;
+                        }
+                    }
+                    // Sender dropped with the owner state: nothing left to wait on.
+                    Ok(Err(_)) => return,
+                    // Cap elapsed with the revision still unacked: fail open.
+                    Err(_) => {
+                        self.warn_publication_lag(revision);
+                        return;
+                    }
+                }
+            }
+        }
+
+        /// Emit at most one WARN per second naming how many watchers failed to
+        /// ack in time. Re-counts (and prunes) first so a laggard that acked or
+        /// departed at the deadline does not produce a spurious warning.
+        fn warn_publication_lag(&self, revision: u64) {
+            let laggards = self.unacked_watchers(revision);
+            if laggards == 0 {
+                return;
+            }
+            let now_us = namespace_revision_now();
+            let last = self.last_ack_warn_us.load(Ordering::Relaxed);
+            if now_us.saturating_sub(last) < 1_000_000 {
+                return;
+            }
+            if self
+                .last_ack_warn_us
+                .compare_exchange(last, now_us, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                tracing::warn!(
+                    revision,
+                    laggards,
+                    "vfs publication ack cap elapsed; proceeding fail-open with unacked watchers"
+                );
+            }
+        }
+    }
+
+    fn namespace_revision_now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_micros().min(u64::MAX as u128) as u64)
+            .unwrap_or_default()
+    }
+
+    fn with_namespace_revision(mut response: Response, revision: u64) -> Response {
+        if let Ok(value) = HeaderValue::from_str(revision.to_string().as_str()) {
+            response
+                .headers_mut()
+                .insert(CHEVALIER_VFS_NAMESPACE_REVISION_HEADER, value);
+        }
+        response
+    }
 
     #[async_trait]
     pub trait VfsGatewayBackend: Clone + Send + Sync + 'static {
@@ -806,6 +1135,24 @@ mod server {
         ) -> VfsResult<()> {
             for mutation in request.mutations {
                 match mutation {
+                    VfsNamespaceMutation::CreateFile { path, mode } => {
+                        let mut headers = request.headers.clone();
+                        headers.mode = mode.map(|mode| mode & 0o7777).or(headers.mode);
+                        self.write_file(VfsWriteRequest {
+                            owner_id: request.owner_id.clone(),
+                            path,
+                            body: Bytes::new(),
+                            headers,
+                            scope: request.scope.clone(),
+                            precondition: Some(VfsWritePrecondition {
+                                predicate: Some(VfsCasPredicate::Absent),
+                                fingerprint: None,
+                                secondary_fingerprint: None,
+                                expected_file_id: None,
+                            }),
+                        })
+                        .await?;
+                    }
                     VfsNamespaceMutation::CreateDirectory { path, mode } => {
                         let mut headers = request.headers.clone();
                         headers.mode = mode.map(|mode| mode & 0o7777).or(headers.mode);
@@ -823,6 +1170,19 @@ mod server {
                             owner_id: request.owner_id.clone(),
                             path,
                             target,
+                            headers: request.headers.clone(),
+                            scope: request.scope.clone(),
+                        })
+                        .await?;
+                    }
+                    VfsNamespaceMutation::CreateHardLink {
+                        source_path,
+                        destination_path,
+                    } => {
+                        self.create_hard_link(VfsHardLinkRequest {
+                            owner_id: request.owner_id.clone(),
+                            source_path,
+                            destination_path,
                             headers: request.headers.clone(),
                             scope: request.scope.clone(),
                         })
@@ -895,6 +1255,23 @@ mod server {
         S: Clone + Send + Sync + 'static,
         B: VfsGatewayBackend + FromRef<S>,
     {
+        vfs_routes_with_coordinator::<S, B>(
+            owner_route_prefix,
+            Arc::new(VfsPublicationCoordinator::default()),
+        )
+    }
+
+    /// Build the owner-scoped VFS routes over an explicit publication
+    /// coordinator. Production goes through `vfs_routes` (env-configured cap);
+    /// tests use this to inject a deterministic ack cap.
+    pub(super) fn vfs_routes_with_coordinator<S, B>(
+        owner_route_prefix: &str,
+        publications: Arc<VfsPublicationCoordinator>,
+    ) -> Router<S>
+    where
+        S: Clone + Send + Sync + 'static,
+        B: VfsGatewayBackend + FromRef<S>,
+    {
         let prefix = normalize_route_prefix(owner_route_prefix);
         Router::new()
             .route(
@@ -908,6 +1285,10 @@ mod server {
             .route(
                 &format!("{prefix}/{{owner_id}}/stat"),
                 get(get_stat::<S, B>),
+            )
+            .route(
+                &format!("{prefix}/{{owner_id}}/watch"),
+                get(get_watch::<S, B>),
             )
             .route(
                 &format!("{prefix}/{{owner_id}}/metadata-many"),
@@ -961,6 +1342,7 @@ mod server {
                 &format!("{prefix}/{{owner_id}}/lease"),
                 post(post_lease::<S, B>).delete(delete_lease::<S, B>),
             )
+            .layer(Extension(publications))
             .layer(DefaultBodyLimit::max(DEFAULT_VFS_BODY_LIMIT_BYTES))
     }
 
@@ -1032,112 +1414,274 @@ mod server {
         }
     }
 
+    const WATCH_TIMEOUT_MIN_MS: i64 = 1_000;
+    const WATCH_TIMEOUT_MAX_MS: i64 = 30_000;
+    const WATCH_TIMEOUT_DEFAULT_MS: u64 = 25_000;
+
+    #[derive(Debug, Deserialize)]
+    struct WatchQuery {
+        since: Option<String>,
+        timeout_ms: Option<String>,
+        /// Opaque, stable per-observer identity. Present -> the poll's `since`
+        /// acks that revision and the watcher is registered for ack-blocking.
+        /// Absent -> the watcher is anonymous: notified, never ack-gating.
+        watcher_id: Option<String>,
+    }
+
+    /// Trimmed, non-empty `watcher_id`, or "" for an anonymous (unregistered)
+    /// watcher.
+    fn watch_watcher_id(raw: Option<&str>) -> &str {
+        raw.map(str::trim).filter(|text| !text.is_empty()).unwrap_or("")
+    }
+
+    #[derive(Serialize)]
+    struct WatchResponse {
+        revision: u64,
+    }
+
+    /// `since` absent/invalid -> 0 (so the fast path answers immediately with the
+    /// current revision). Parsed as a plain decimal `u64` to match the wire type.
+    fn watch_since(raw: Option<&str>) -> u64 {
+        raw.map(str::trim)
+            .filter(|text| !text.is_empty())
+            .and_then(|text| text.parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
+    /// `timeout_ms` clamps to [1000, 30000]; absent or non-integer -> 25000.
+    fn watch_timeout(raw: Option<&str>) -> std::time::Duration {
+        let millis = raw
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .and_then(|text| text.parse::<i64>().ok())
+            .map(|value| value.clamp(WATCH_TIMEOUT_MIN_MS, WATCH_TIMEOUT_MAX_MS) as u64)
+            .unwrap_or(WATCH_TIMEOUT_DEFAULT_MS);
+        std::time::Duration::from_millis(millis)
+    }
+
+    fn watch_hit(revision: u64) -> Response {
+        with_namespace_revision(
+            (StatusCode::OK, Json(WatchResponse { revision })).into_response(),
+            revision,
+        )
+    }
+
+    fn watch_idle(revision: u64) -> Response {
+        with_namespace_revision(StatusCode::NO_CONTENT.into_response(), revision)
+    }
+
+    /// Long-poll until the owner's namespace revision advances past `since`.
+    ///
+    /// Fast path: when the current revision already exceeds `since`, answer 200
+    /// immediately with `{"revision": <current>}`. Otherwise park on the owner's
+    /// watch channel and answer 200 the moment any mutation advances the revision,
+    /// or 204 once `timeout_ms` elapses with the revision still <= `since`. Both
+    /// responses stamp the standard namespace-revision header. The watcher only
+    /// holds the read guard for the microsecond revision peek on each turn and is
+    /// otherwise parked on the watch channel, so it never slows a concurrent
+    /// mutation (whose sole added cost is the publisher's `publish` notify).
+    async fn get_watch<S, B>(
+        Extension(publications): Extension<Arc<VfsPublicationCoordinator>>,
+        Path(owner_id): Path<String>,
+        Query(params): Query<WatchQuery>,
+    ) -> Response
+    where
+        B: VfsGatewayBackend + FromRef<S>,
+        S: Clone + Send + Sync + 'static,
+    {
+        let since = watch_since(params.since.as_deref());
+        let timeout = watch_timeout(params.timeout_ms.as_deref());
+        let watcher_id = watch_watcher_id(params.watcher_id.as_deref());
+        let publication = publications.owner(owner_id.as_str());
+        // This poll's `since` is an ack that this watcher has observed (and, on
+        // the client, already fence-advanced + cache-cleared through) `since`.
+        // Register it at entry so a concurrent publication that is waiting for
+        // this watcher unblocks the moment the re-poll lands.
+        publication.record_watcher_ack(watcher_id, since, timeout);
+        // Subscribe BEFORE the first revision read: a publish landing between the
+        // read and the await still bumps the watch version, so `changed()` fires
+        // immediately rather than being lost.
+        let mut receiver = publication.watch();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let current = *publication.read().await;
+            if current > since {
+                return watch_hit(current);
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return watch_idle(current);
+            }
+            match tokio::time::timeout(remaining, receiver.changed()).await {
+                Ok(Ok(())) => {
+                    // A publisher advanced the revision; loop to re-read the
+                    // authoritative value under the read guard.
+                    receiver.borrow_and_update();
+                }
+                Ok(Err(_)) => {
+                    // The owner state (hence the sender) was dropped; report the
+                    // last known revision as an idle result.
+                    return watch_idle(*publication.read().await);
+                }
+                Err(_) => {
+                    // timeout_ms elapsed with the revision still <= since.
+                    return watch_idle(*publication.read().await);
+                }
+            }
+        }
+    }
+
     async fn get_tree<S, B>(
         State(backend): State<B>,
+        Extension(publications): Extension<Arc<VfsPublicationCoordinator>>,
         Path(owner_id): Path<String>,
         Query(params): Query<TreeQuery>,
-    ) -> VfsResult<Json<Vec<VfsDirEntry>>>
+    ) -> Response
     where
         B: VfsGatewayBackend + FromRef<S>,
         S: Clone + Send + Sync + 'static,
     {
         let path = params.path.as_deref().unwrap_or_default();
-        backend
+        let publication = publications.owner(owner_id.as_str());
+        let revision = publication.read().await;
+        let response = backend
             .list_dir_with_options(owner_id.as_str(), path, params.options())
             .await
             .map(Json)
+            .map(IntoResponse::into_response)
+            .unwrap_or_else(IntoResponse::into_response);
+        with_namespace_revision(response, *revision)
     }
 
     async fn get_stat<S, B>(
         State(backend): State<B>,
+        Extension(publications): Extension<Arc<VfsPublicationCoordinator>>,
         Path(owner_id): Path<String>,
         Query(params): Query<PathQuery>,
-    ) -> VfsResult<Json<VfsMetadata>>
+    ) -> Response
     where
         B: VfsGatewayBackend + FromRef<S>,
         S: Clone + Send + Sync + 'static,
     {
         let path = params.path.as_deref().unwrap_or_default();
-        backend.stat(owner_id.as_str(), path).await.map(Json)
+        let publication = publications.owner(owner_id.as_str());
+        let revision = publication.read().await;
+        let response = backend
+            .stat(owner_id.as_str(), path)
+            .await
+            .map(Json)
+            .map(IntoResponse::into_response)
+            .unwrap_or_else(IntoResponse::into_response);
+        with_namespace_revision(response, *revision)
     }
 
     async fn post_metadata_many<S, B>(
         State(backend): State<B>,
+        Extension(publications): Extension<Arc<VfsPublicationCoordinator>>,
         Path(owner_id): Path<String>,
         Json(body): Json<VfsMetadataManyRequest>,
-    ) -> VfsResult<Json<VfsMetadataManyResponse>>
+    ) -> Response
     where
         B: VfsGatewayBackend + FromRef<S>,
         S: Clone + Send + Sync + 'static,
     {
-        let entries = backend
+        let publication = publications.owner(owner_id.as_str());
+        let revision = publication.read().await;
+        let response = backend
             .metadata_many(owner_id.as_str(), body.paths.as_slice())
-            .await?;
-        Ok(Json(VfsMetadataManyResponse { entries }))
+            .await
+            .map(|entries| Json(VfsMetadataManyResponse { entries }))
+            .map(IntoResponse::into_response)
+            .unwrap_or_else(IntoResponse::into_response);
+        with_namespace_revision(response, *revision)
     }
 
     async fn post_read_many<S, B>(
         State(backend): State<B>,
+        Extension(publications): Extension<Arc<VfsPublicationCoordinator>>,
         Path(owner_id): Path<String>,
         Json(body): Json<VfsReadManyRequest>,
-    ) -> VfsResult<Json<VfsReadManyResponse>>
+    ) -> VfsResult<Response>
     where
         B: VfsGatewayBackend + FromRef<S>,
         S: Clone + Send + Sync + 'static,
     {
+        let publication = publications.owner(owner_id.as_str());
+        let revision = publication.read().await;
         let entries = backend
             .read_many(owner_id.as_str(), body.paths.as_slice())
             .await?
             .into_iter()
             .map(|entry| entry.map(|bytes| bytes.to_vec()))
             .collect();
-        Ok(Json(VfsReadManyResponse { entries }))
+        Ok(with_namespace_revision(
+            Json(VfsReadManyResponse { entries }).into_response(),
+            *revision,
+        ))
     }
 
     async fn post_subtree_metadata<S, B>(
         State(backend): State<B>,
+        Extension(publications): Extension<Arc<VfsPublicationCoordinator>>,
         Path(owner_id): Path<String>,
         Json(body): Json<VfsSubtreeMetadataRequest>,
-    ) -> VfsResult<Json<VfsSubtreeMetadataResponse>>
+    ) -> VfsResult<Response>
     where
         B: VfsGatewayBackend + FromRef<S>,
         S: Clone + Send + Sync + 'static,
     {
+        let publication = publications.owner(owner_id.as_str());
+        let revision = publication.read().await;
         let entries = backend
             .list_subtree_file_metadata(owner_id.as_str(), body)
             .await?;
-        Ok(Json(VfsSubtreeMetadataResponse { entries }))
+        Ok(with_namespace_revision(
+            Json(VfsSubtreeMetadataResponse { entries }).into_response(),
+            *revision,
+        ))
     }
 
     async fn post_prefetch_subtree<S, B>(
         State(backend): State<B>,
+        Extension(publications): Extension<Arc<VfsPublicationCoordinator>>,
         Path(owner_id): Path<String>,
         Json(body): Json<VfsPrefetchSubtreeRequest>,
-    ) -> VfsResult<Json<VfsPrefetchSubtreeResponse>>
+    ) -> VfsResult<Response>
     where
         B: VfsGatewayBackend + FromRef<S>,
         S: Clone + Send + Sync + 'static,
     {
-        backend
-            .prefetch_subtree(owner_id.as_str(), body)
-            .await
-            .map(Json)
+        let publication = publications.owner(owner_id.as_str());
+        let revision = publication.read().await;
+        let response = backend.prefetch_subtree(owner_id.as_str(), body).await?;
+        Ok(with_namespace_revision(
+            Json(response).into_response(),
+            *revision,
+        ))
     }
 
     async fn post_write_many<S, B>(
         State(backend): State<B>,
+        Extension(publications): Extension<Arc<VfsPublicationCoordinator>>,
         Path(owner_id): Path<String>,
         headers: HeaderMap,
         Json(body): Json<VfsWriteManyBody>,
-    ) -> VfsResult<Json<VfsWriteManyResponse>>
+    ) -> VfsResult<Response>
     where
         B: VfsGatewayBackend + FromRef<S>,
         S: Clone + Send + Sync + 'static,
     {
         if body.writes.is_empty() {
-            return Ok(Json(VfsWriteManyResponse {
-                results: Vec::new(),
-            }));
+            let publication = publications.owner(owner_id.as_str());
+            let revision = publication.read().await;
+            return Ok(with_namespace_revision(
+                Json(VfsWriteManyPublicationResponse {
+                    results: Vec::new(),
+                    entries: Vec::new(),
+                })
+                .into_response(),
+                *revision,
+            ));
         }
         let first_path = required_path(Some(body.writes[0].path.as_str()))?;
         let first_scope = backend
@@ -1160,29 +1704,60 @@ mod server {
             VFS_OPERATION_WRITE_THROUGH,
         )?;
         validate_declared_resource_key(&headers, &aliases, first_scope.resource_key.as_str())?;
+        let publication = publications.owner(owner_id.as_str());
+        let revision = publication.write().await;
+        let snapshot_paths = body
+            .writes
+            .iter()
+            .map(|write| write.path.clone())
+            .collect::<Vec<_>>();
         let results = backend
             .write_many_atomic(VfsWriteManyRequest {
-                owner_id,
+                owner_id: owner_id.clone(),
                 writes: body.writes,
                 headers: write_headers,
                 scope: first_scope,
             })
             .await?;
-        Ok(Json(VfsWriteManyResponse { results }))
+        let entries = publication_snapshot(&backend, owner_id.as_str(), snapshot_paths).await?;
+        let published = publication.commit_and_await_acks(revision).await;
+        Ok(with_namespace_revision(
+            Json(VfsWriteManyPublicationResponse { results, entries }).into_response(),
+            published,
+        ))
     }
 
     async fn post_namespace_many<S, B>(
         State(backend): State<B>,
+        Extension(publications): Extension<Arc<VfsPublicationCoordinator>>,
         Path(owner_id): Path<String>,
         headers: HeaderMap,
         Json(body): Json<VfsNamespaceMutationBatchBody>,
-    ) -> VfsResult<StatusCode>
+    ) -> VfsResult<Response>
     where
         B: VfsGatewayBackend + FromRef<S>,
         S: Clone + Send + Sync + 'static,
     {
+        if body.operation_ids.len() != body.mutations.len() {
+            return Err(VfsGatewayError::BadRequest(
+                "namespace-many requires one operation_id per mutation".to_string(),
+            ));
+        }
+        let mut operation_ids = HashSet::with_capacity(body.operation_ids.len());
+        for operation_id in &body.operation_ids {
+            if operation_id.trim().is_empty() || !operation_ids.insert(operation_id) {
+                return Err(VfsGatewayError::BadRequest(
+                    "namespace-many operation_ids must be non-empty and unique".to_string(),
+                ));
+            }
+        }
+        let publication = publications.owner(owner_id.as_str());
+        let revision = publication.write().await;
         if body.mutations.is_empty() {
-            return Ok(StatusCode::NO_CONTENT);
+            return Ok(with_namespace_revision(
+                StatusCode::NO_CONTENT.into_response(),
+                *revision,
+            ));
         }
         if body.mutations.len() > 4096 {
             return Err(VfsGatewayError::BadRequest(
@@ -1220,19 +1795,71 @@ mod server {
             VFS_OPERATION_NAMESPACE_BATCH,
         )?;
         validate_declared_resource_key(&headers, &aliases, first_scope.resource_key.as_str())?;
+        let snapshot_paths = namespace_snapshot_paths(body.mutations.as_slice());
         backend
             .apply_namespace_batch(VfsNamespaceMutationBatchRequest {
-                owner_id,
+                owner_id: owner_id.clone(),
                 mutations: body.mutations,
                 headers: write_headers,
                 scope: first_scope,
             })
             .await?;
-        Ok(StatusCode::NO_CONTENT)
+        let entries = publication_snapshot(&backend, owner_id.as_str(), snapshot_paths).await?;
+        let published = publication.commit_and_await_acks(revision).await;
+        Ok(with_namespace_revision(
+            Json(VfsNamespaceMutationBatchResponse { entries }).into_response(),
+            published,
+        ))
+    }
+
+    fn namespace_snapshot_paths(mutations: &[VfsNamespaceMutation]) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut paths = Vec::new();
+        for mutation in mutations {
+            for path in mutation.paths().into_iter().filter(|path| !path.is_empty()) {
+                for candidate in [path.to_string(), immediate_parent(path)] {
+                    if seen.insert(candidate.clone()) {
+                        paths.push(candidate);
+                    }
+                }
+            }
+        }
+        paths
+    }
+
+    fn immediate_parent(path: &str) -> String {
+        path.trim_matches('/')
+            .rsplit_once('/')
+            .map(|(parent, _)| parent.to_string())
+            .unwrap_or_default()
+    }
+
+    async fn publication_snapshot<B>(
+        backend: &B,
+        owner_id: &str,
+        paths: Vec<String>,
+    ) -> VfsResult<Vec<VfsPublicationSnapshotEntry>>
+    where
+        B: VfsGatewayBackend,
+    {
+        let metadata = backend.metadata_many(owner_id, paths.as_slice()).await?;
+        if metadata.len() != paths.len() {
+            return Err(VfsGatewayError::Internal(format!(
+                "publication snapshot returned {} entries for {} paths",
+                metadata.len(),
+                paths.len()
+            )));
+        }
+        Ok(paths
+            .into_iter()
+            .zip(metadata)
+            .map(|(path, metadata)| VfsPublicationSnapshotEntry { path, metadata })
+            .collect())
     }
 
     async fn get_file_raw<S, B>(
         State(backend): State<B>,
+        Extension(publications): Extension<Arc<VfsPublicationCoordinator>>,
         Path(owner_id): Path<String>,
         Query(params): Query<PathQuery>,
         headers: HeaderMap,
@@ -1242,6 +1869,8 @@ mod server {
         S: Clone + Send + Sync + 'static,
     {
         let path = required_path(params.path.as_deref())?;
+        let publication = publications.owner(owner_id.as_str());
+        let revision = publication.read().await;
         let metadata = backend.stat_for_raw_read(owner_id.as_str(), path).await?;
         if metadata.kind != VFS_ENTRY_KIND_FILE {
             return Err(VfsGatewayError::BadRequest(format!(
@@ -1276,16 +1905,17 @@ mod server {
                 .map_err(|err| VfsGatewayError::Internal(err.to_string()))?,
             );
         }
-        Ok(response)
+        Ok(with_namespace_revision(response, *revision))
     }
 
     async fn put_file<S, B>(
         State(backend): State<B>,
+        Extension(publications): Extension<Arc<VfsPublicationCoordinator>>,
         Path(owner_id): Path<String>,
         Query(params): Query<PathQuery>,
         headers: HeaderMap,
         body: Bytes,
-    ) -> VfsResult<StatusCode>
+    ) -> VfsResult<Response>
     where
         B: VfsGatewayBackend + FromRef<S>,
         S: Clone + Send + Sync + 'static,
@@ -1303,6 +1933,8 @@ mod server {
             &backend.header_aliases(),
             scope.resource_key.as_str(),
         )?;
+        let publication = publications.owner(owner_id.as_str());
+        let revision = publication.write().await;
         backend
             .write_file(VfsWriteRequest {
                 owner_id,
@@ -1313,11 +1945,16 @@ mod server {
                 precondition: parse_write_precondition_headers(&headers)?,
             })
             .await?;
-        Ok(StatusCode::NO_CONTENT)
+        let published = publication.commit_and_await_acks(revision).await;
+        Ok(with_namespace_revision(
+            StatusCode::NO_CONTENT.into_response(),
+            published,
+        ))
     }
 
     async fn delete_file<S, B>(
         State(backend): State<B>,
+        Extension(publications): Extension<Arc<VfsPublicationCoordinator>>,
         Path(owner_id): Path<String>,
         Query(params): Query<PathQuery>,
         headers: HeaderMap,
@@ -1334,21 +1971,26 @@ mod server {
             VFS_OPERATION_UNLINK,
         )
         .await?;
-        if params.return_metadata.unwrap_or(false) {
+        let publication = publications.owner(request.owner_id.as_str());
+        let revision = publication.write().await;
+        let response = if params.return_metadata.unwrap_or(false) {
             let response = backend.delete_file_with_metadata(request).await?;
-            Ok((StatusCode::OK, Json(response)).into_response())
+            (StatusCode::OK, Json(response)).into_response()
         } else {
             backend.delete_file(request).await?;
-            Ok(StatusCode::NO_CONTENT.into_response())
-        }
+            StatusCode::NO_CONTENT.into_response()
+        };
+        let published = publication.commit_and_await_acks(revision).await;
+        Ok(with_namespace_revision(response, published))
     }
 
     async fn put_dir<S, B>(
         State(backend): State<B>,
+        Extension(publications): Extension<Arc<VfsPublicationCoordinator>>,
         Path(owner_id): Path<String>,
         Query(params): Query<PathQuery>,
         headers: HeaderMap,
-    ) -> VfsResult<StatusCode>
+    ) -> VfsResult<Response>
     where
         B: VfsGatewayBackend + FromRef<S>,
         S: Clone + Send + Sync + 'static,
@@ -1361,16 +2003,23 @@ mod server {
             VFS_OPERATION_MKDIR,
         )
         .await?;
+        let publication = publications.owner(request.owner_id.as_str());
+        let revision = publication.write().await;
         backend.mkdir(request).await?;
-        Ok(StatusCode::NO_CONTENT)
+        let published = publication.commit_and_await_acks(revision).await;
+        Ok(with_namespace_revision(
+            StatusCode::NO_CONTENT.into_response(),
+            published,
+        ))
     }
 
     async fn put_symlink<S, B>(
         State(backend): State<B>,
+        Extension(publications): Extension<Arc<VfsPublicationCoordinator>>,
         Path(owner_id): Path<String>,
         Query(params): Query<SymlinkQuery>,
         headers: HeaderMap,
-    ) -> VfsResult<StatusCode>
+    ) -> VfsResult<Response>
     where
         B: VfsGatewayBackend + FromRef<S>,
         S: Clone + Send + Sync + 'static,
@@ -1390,6 +2039,8 @@ mod server {
             VFS_OPERATION_SYMLINK,
         )?;
         validate_declared_resource_key(&headers, &aliases, scope.resource_key.as_str())?;
+        let publication = publications.owner(owner_id.as_str());
+        let revision = publication.write().await;
         backend
             .create_symlink(VfsSymlinkRequest {
                 owner_id,
@@ -1399,15 +2050,20 @@ mod server {
                 scope,
             })
             .await?;
-        Ok(StatusCode::NO_CONTENT)
+        let published = publication.commit_and_await_acks(revision).await;
+        Ok(with_namespace_revision(
+            StatusCode::NO_CONTENT.into_response(),
+            published,
+        ))
     }
 
     async fn delete_dir<S, B>(
         State(backend): State<B>,
+        Extension(publications): Extension<Arc<VfsPublicationCoordinator>>,
         Path(owner_id): Path<String>,
         Query(params): Query<PathQuery>,
         headers: HeaderMap,
-    ) -> VfsResult<StatusCode>
+    ) -> VfsResult<Response>
     where
         B: VfsGatewayBackend + FromRef<S>,
         S: Clone + Send + Sync + 'static,
@@ -1420,16 +2076,23 @@ mod server {
             VFS_OPERATION_RMDIR,
         )
         .await?;
+        let publication = publications.owner(request.owner_id.as_str());
+        let revision = publication.write().await;
         backend.rmdir(request).await?;
-        Ok(StatusCode::NO_CONTENT)
+        let published = publication.commit_and_await_acks(revision).await;
+        Ok(with_namespace_revision(
+            StatusCode::NO_CONTENT.into_response(),
+            published,
+        ))
     }
 
     async fn post_hard_link<S, B>(
         State(backend): State<B>,
+        Extension(publications): Extension<Arc<VfsPublicationCoordinator>>,
         Path(owner_id): Path<String>,
         headers: HeaderMap,
         Json(body): Json<VfsHardLinkBody>,
-    ) -> VfsResult<Json<VfsHardLinkMetadataResponse>>
+    ) -> VfsResult<Response>
     where
         B: VfsGatewayBackend + FromRef<S>,
         S: Clone + Send + Sync + 'static,
@@ -1455,7 +2118,9 @@ mod server {
             VFS_OPERATION_LINK,
         )?;
         validate_declared_resource_key(&headers, &aliases, source_scope.resource_key.as_str())?;
-        backend
+        let publication = publications.owner(owner_id.as_str());
+        let revision = publication.write().await;
+        let response = backend
             .create_hard_link(VfsHardLinkRequest {
                 owner_id,
                 source_path: source_path.to_string(),
@@ -1463,15 +2128,20 @@ mod server {
                 headers: write_headers,
                 scope: source_scope,
             })
-            .await
-            .map(Json)
+            .await?;
+        let published = publication.commit_and_await_acks(revision).await;
+        Ok(with_namespace_revision(
+            Json(response).into_response(),
+            published,
+        ))
     }
 
     async fn post_hard_link_alias<S, B>(
         State(backend): State<B>,
+        Extension(publications): Extension<Arc<VfsPublicationCoordinator>>,
         Path(owner_id): Path<String>,
         Json(body): Json<VfsHardLinkAliasBody>,
-    ) -> VfsResult<Json<VfsHardLinkAliasResponse>>
+    ) -> VfsResult<Response>
     where
         B: VfsGatewayBackend + FromRef<S>,
         S: Clone + Send + Sync + 'static,
@@ -1481,6 +2151,8 @@ mod server {
                 "hard-link alias resolution requires file_id".to_string(),
             ));
         }
+        let publication = publications.owner(owner_id.as_str());
+        let revision = publication.read().await;
         let path = backend
             .find_hard_link_alias(
                 owner_id.as_str(),
@@ -1488,7 +2160,10 @@ mod server {
                 body.excluding_path.as_str(),
             )
             .await?;
-        Ok(Json(VfsHardLinkAliasResponse { path }))
+        Ok(with_namespace_revision(
+            Json(VfsHardLinkAliasResponse { path }).into_response(),
+            *revision,
+        ))
     }
 
     async fn namespace_mutation_request<B>(
@@ -1581,6 +2256,7 @@ mod server {
 
     async fn post_rename<S, B>(
         State(backend): State<B>,
+        Extension(publications): Extension<Arc<VfsPublicationCoordinator>>,
         Path(owner_id): Path<String>,
         Query(params): Query<RenameQuery>,
         headers: HeaderMap,
@@ -1616,13 +2292,17 @@ mod server {
             headers: write_headers,
             scope: from_scope,
         };
-        if return_metadata {
+        let publication = publications.owner(request.owner_id.as_str());
+        let revision = publication.write().await;
+        let response = if return_metadata {
             let response = backend.rename_with_metadata(request).await?;
-            Ok((StatusCode::OK, Json(response)).into_response())
+            (StatusCode::OK, Json(response)).into_response()
         } else {
             backend.rename(request).await?;
-            Ok(StatusCode::NO_CONTENT.into_response())
-        }
+            StatusCode::NO_CONTENT.into_response()
+        };
+        let published = publication.commit_and_await_acks(revision).await;
+        Ok(with_namespace_revision(response, published))
     }
 
     async fn post_lease<S, B>(
@@ -2047,7 +2727,10 @@ mod tests {
 #[cfg(all(test, feature = "vfs-server"))]
 mod server_tests {
     use std::collections::{HashMap, HashSet};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
 
     use async_trait::async_trait;
     use axum::body::{Body, Bytes, to_bytes};
@@ -2055,16 +2738,21 @@ mod server_tests {
     use tower::ServiceExt;
     use uuid::Uuid;
 
+    use std::time::Duration;
+
+    use super::server::{VfsPublicationCoordinator, vfs_routes_with_coordinator};
     use super::{
         CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, CHEVALIER_VFS_MODE_HEADER,
-        CHEVALIER_VFS_OPERATION_HEADER, CHEVALIER_VFS_PRECONDITION_FILE_ID_HEADER,
-        CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER,
+        CHEVALIER_VFS_NAMESPACE_REVISION_HEADER, CHEVALIER_VFS_OPERATION_HEADER,
+        CHEVALIER_VFS_PRECONDITION_FILE_ID_HEADER, CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER,
         CHEVALIER_VFS_PRECONDITION_SECONDARY_FINGERPRINT_HEADER, CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+        CHEVALIER_VFS_ROUTE_PREFIX,
         VFS_ENTRY_KIND_DIRECTORY, VFS_ENTRY_KIND_FILE, VFS_OPERATION_SETATTR_SIZE,
         VFS_SURFACE_KIND_VM_WORKSPACE, VfsDirEntry, VfsGatewayBackend, VfsGatewayError,
         VfsLeaseAcquire, VfsLeaseGrant, VfsLeaseReleaseRequest, VfsMetadata,
         VfsMetadataManyResponse, VfsNamespaceMutation, VfsNamespaceMutationBatchRequest,
-        VfsNamespaceMutationRequest, VfsReadManyResponse, VfsReadRange, VfsRenameRequest,
+        VfsNamespaceMutationBatchResponse, VfsNamespaceMutationRequest, VfsReadManyResponse,
+        VfsReadRange, VfsRenameRequest,
         VfsResult, VfsSymlinkRequest, VfsWriteManyRequest, VfsWriteManyResponse,
         VfsWriteManyResult, VfsWritePrecondition, VfsWriteRequest, VfsWriteScope,
         chevalier_vfs_routes,
@@ -2092,6 +2780,613 @@ mod server_tests {
         valid_tokens: HashSet<Uuid>,
         stat_calls: usize,
         raw_read_stat_calls: usize,
+    }
+
+    #[tokio::test]
+    async fn publication_coordinator_allows_concurrent_read_snapshots() {
+        let coordinator = VfsPublicationCoordinator::default();
+        let publication = coordinator.owner("owner");
+        let first = publication.read().await;
+        let second =
+            tokio::time::timeout(std::time::Duration::from_millis(100), publication.read())
+                .await
+                .expect("a second reader must not wait behind the first");
+        assert_eq!(*first, *second);
+
+        let writer_publication = Arc::clone(&publication);
+        let (acquired_tx, mut acquired_rx) = tokio::sync::oneshot::channel();
+        let writer = tokio::spawn(async move {
+            let _guard = writer_publication.write().await;
+            let _ = acquired_tx.send(());
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut acquired_rx)
+                .await
+                .is_err(),
+            "a writer must wait until every stable read snapshot completes"
+        );
+        drop(second);
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_millis(100), writer)
+            .await
+            .expect("the publication gate must release after readers complete")
+            .expect("writer task must complete");
+        acquired_rx
+            .await
+            .expect("writer must acquire the publication gate");
+    }
+
+    fn namespace_revision(response: &axum::http::Response<Body>) -> u64 {
+        response
+            .headers()
+            .get(CHEVALIER_VFS_NAMESPACE_REVISION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("namespace revision header must be present and numeric")
+    }
+
+    #[tokio::test]
+    async fn watch_returns_immediately_when_revision_exceeds_since() {
+        let backend = MemoryBackend::default();
+        let app = chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend);
+
+        // A fresh owner starts at a large microsecond revision, so since=0 must
+        // resolve immediately with the current revision in both body and header.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/chevalier/vfs/owner-1/watch?since=0&timeout_ms=1000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let revision = namespace_revision(&response);
+        assert!(revision > 0, "fresh owner revision must exceed since=0");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["revision"].as_u64(), Some(revision));
+    }
+
+    #[tokio::test]
+    async fn watch_resolves_promptly_when_a_mutation_publishes() {
+        let backend = MemoryBackend::default();
+        let app = chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend);
+
+        // Read the baseline revision so the watcher can park exactly at it.
+        let seed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/chevalier/vfs/owner-1/tree?path=")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let baseline = namespace_revision(&seed);
+
+        // Park a watcher at the baseline with a generous timeout.
+        let watch_app = app.clone();
+        let watcher = tokio::spawn(async move {
+            watch_app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/internal/chevalier/vfs/owner-1/watch?since={baseline}&timeout_ms=30000"
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+
+        // Let the watcher reach its parked state before publishing.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let owner_token = Uuid::new_v4();
+        let mutation = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/internal/chevalier/vfs/owner-1/dir?path=folder")
+                    .header(CHEVALIER_VFS_RESOURCE_KEY_HEADER, "owner:owner-1:workspace")
+                    .header(CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, owner_token.to_string())
+                    .header(CHEVALIER_VFS_MODE_HEADER, 0o750.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mutation.status(), StatusCode::NO_CONTENT);
+        let mutated = namespace_revision(&mutation);
+        assert!(mutated > baseline, "mutation must advance the revision");
+
+        // The parked watcher must resolve promptly after the publish.
+        let response = tokio::time::timeout(std::time::Duration::from_millis(500), watcher)
+            .await
+            .expect("parked watcher must resolve within 500ms of the publish")
+            .expect("watch task must not panic");
+        assert_eq!(response.status(), StatusCode::OK);
+        let woke_revision = namespace_revision(&response);
+        assert!(woke_revision > baseline);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["revision"].as_u64(), Some(woke_revision));
+    }
+
+    #[tokio::test]
+    async fn watch_times_out_with_204_when_revision_is_unchanged() {
+        let backend = MemoryBackend::default();
+        let app = chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend);
+
+        // since=u64::MAX can never be exceeded, so the watcher parks and then
+        // times out at the clamped 1s floor with the revision still unchanged.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/internal/chevalier/vfs/owner-1/watch\
+                         ?since=18446744073709551615&timeout_ms=1000",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let revision = namespace_revision(&response);
+        assert!(
+            revision < u64::MAX,
+            "204 must stamp the unchanged current revision"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(body.is_empty(), "a 204 response carries no body");
+    }
+
+    #[tokio::test]
+    async fn watch_does_not_block_a_concurrent_mutation() {
+        let backend = MemoryBackend::default();
+        let app = chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend);
+
+        let seed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/chevalier/vfs/owner-1/tree?path=")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let baseline = namespace_revision(&seed);
+
+        // Park a watcher with a 30s timeout; it must never gate the mutation.
+        let watch_app = app.clone();
+        let watcher = tokio::spawn(async move {
+            watch_app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/internal/chevalier/vfs/owner-1/watch?since={baseline}&timeout_ms=30000"
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // A blocked mutation would stall until the 30s watch timeout; bounding it
+        // at 500ms proves the parked watcher does not hold the publication gate.
+        let owner_token = Uuid::new_v4();
+        let mutation = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            app.clone().oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/internal/chevalier/vfs/owner-1/dir?path=folder")
+                    .header(CHEVALIER_VFS_RESOURCE_KEY_HEADER, "owner:owner-1:workspace")
+                    .header(CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, owner_token.to_string())
+                    .header(CHEVALIER_VFS_MODE_HEADER, 0o750.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("a parked watcher must not block a concurrent mutation")
+        .unwrap();
+        assert_eq!(mutation.status(), StatusCode::NO_CONTENT);
+
+        // Drain the watcher (the publish wakes it) so the task does not leak.
+        let woke = tokio::time::timeout(std::time::Duration::from_millis(500), watcher)
+            .await
+            .expect("watcher resolves after the mutation")
+            .expect("watch task must not panic");
+        assert_eq!(woke.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn watch_shares_the_owner_scoped_router_surface_as_siblings() {
+        // NOTE: the `mod server` VFS router carries no bearer/token auth of its
+        // own; every route (watch included) is authenticated by the deployment
+        // that mounts `chevalier_vfs_routes`. This test pins the invariant that
+        // makes "identical auth to siblings" hold: watch is reachable ONLY on the
+        // owner-scoped surface, so it can never bypass that wrapper.
+        let backend = MemoryBackend::default();
+        let app = chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend);
+
+        let unscoped = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/watch?since=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            unscoped.status(),
+            StatusCode::NOT_FOUND,
+            "watch outside the owner-scoped prefix must not be routed"
+        );
+
+        let scoped = app
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/chevalier/vfs/owner-1/watch?since=0&timeout_ms=1000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scoped.status(), StatusCode::OK);
+    }
+
+    // ---- revocation-acked publications ------------------------------------
+
+    /// Build the owner-scoped router over a coordinator with an explicit
+    /// publication-ack cap so ack-blocking outcomes are timing-unambiguous.
+    fn ack_app(cap: Duration) -> axum::Router {
+        vfs_routes_with_coordinator::<MemoryBackend, MemoryBackend>(
+            CHEVALIER_VFS_ROUTE_PREFIX,
+            Arc::new(VfsPublicationCoordinator::with_ack_timeout(cap)),
+        )
+        .with_state(MemoryBackend::default())
+    }
+
+    async fn watch_poll(
+        app: &axum::Router,
+        owner: &str,
+        query: &str,
+    ) -> axum::http::Response<Body> {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/internal/chevalier/vfs/{owner}/watch?{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn seed_revision(app: &axum::Router, owner: &str) -> u64 {
+        let seed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/internal/chevalier/vfs/{owner}/tree?path="))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        namespace_revision(&seed)
+    }
+
+    fn mkdir_request(owner: &str, path: &str) -> Request<Body> {
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/internal/chevalier/vfs/{owner}/dir?path={path}"))
+            .header(
+                CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+                format!("owner:{owner}:workspace"),
+            )
+            .header(
+                CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                Uuid::new_v4().to_string(),
+            )
+            .header(CHEVALIER_VFS_MODE_HEADER, format!("{}", 0o750))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn publication_blocks_until_a_registered_watcher_acks_the_new_revision() {
+        // A generous cap makes the outcome unambiguous: the publish can finish
+        // quickly only via the ack, never via the (5s) fail-open cap.
+        let app = ack_app(Duration::from_secs(5));
+        let owner = "ack-blocks";
+        let baseline = seed_revision(&app, owner).await;
+
+        // Park an identified watcher at the baseline; entry registers ack(baseline).
+        let parked = tokio::spawn({
+            let app = app.clone();
+            let owner = owner.to_string();
+            let query = format!("since={baseline}&timeout_ms=30000&watcher_id=obs-1");
+            async move { watch_poll(&app, &owner, &query).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Publish concurrently: bumps the revision, wakes the parked watcher,
+        // then must WAIT for obs-1 to re-poll with since >= the new revision.
+        let mut publish = tokio::spawn({
+            let app = app.clone();
+            let owner = owner.to_string();
+            async move { app.oneshot(mkdir_request(&owner, "folder")).await.unwrap() }
+        });
+
+        // The parked poll wakes with the new revision, but waking is NOT an ack:
+        // the ack is the NEXT poll's `since`.
+        let woke = tokio::time::timeout(Duration::from_millis(500), parked)
+            .await
+            .expect("parked watcher wakes on the publish")
+            .expect("watch task must not panic");
+        assert_eq!(woke.status(), StatusCode::OK);
+        let observed = namespace_revision(&woke);
+        assert!(observed > baseline);
+
+        // Still parked on the ack (cap is 5s away).
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut publish)
+                .await
+                .is_err(),
+            "publication must not answer before the watcher acks the new revision"
+        );
+
+        // The observer re-polls with since = observed: THIS ack unblocks the
+        // writer. It then parks; abort it after the publish answers.
+        let ack = tokio::spawn({
+            let app = app.clone();
+            let owner = owner.to_string();
+            let query = format!("since={observed}&timeout_ms=1000&watcher_id=obs-1");
+            async move { watch_poll(&app, &owner, &query).await }
+        });
+
+        let published = tokio::time::timeout(Duration::from_millis(1000), publish)
+            .await
+            .expect("publication answers once the watcher acks")
+            .expect("publish task must not panic");
+        assert_eq!(published.status(), StatusCode::NO_CONTENT);
+        assert!(namespace_revision(&published) >= observed);
+        ack.abort();
+    }
+
+    #[tokio::test]
+    async fn publication_fails_open_when_a_registered_watcher_goes_silent() {
+        // A short cap keeps the fail-open fast.
+        let cap = Duration::from_millis(200);
+        let app = ack_app(cap);
+        let owner = "ack-failopen";
+        let baseline = seed_revision(&app, owner).await;
+
+        // Register a watcher that wakes on the publish but never re-polls.
+        let parked = tokio::spawn({
+            let app = app.clone();
+            let owner = owner.to_string();
+            let query = format!("since={baseline}&timeout_ms=30000&watcher_id=ghost");
+            async move { watch_poll(&app, &owner, &query).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The publish must proceed at the cap rather than hang on the laggard.
+        let started = tokio::time::Instant::now();
+        let publish = app.oneshot(mkdir_request(owner, "folder")).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(publish.status(), StatusCode::NO_CONTENT);
+        assert!(namespace_revision(&publish) > baseline);
+        assert!(
+            elapsed >= cap,
+            "publication must wait the full cap before failing open (waited {elapsed:?})"
+        );
+        assert!(
+            elapsed < cap + Duration::from_secs(2),
+            "publication must fail open at the cap, not hang (waited {elapsed:?})"
+        );
+
+        // Drain the woken watcher so its task does not leak.
+        let woke = tokio::time::timeout(Duration::from_millis(500), parked)
+            .await
+            .expect("silent watcher still woke on the publish")
+            .expect("watch task must not panic");
+        assert_eq!(woke.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_watcher_never_gates_a_publication() {
+        // Long cap: a registered watcher would stall the publish ~5s. An
+        // anonymous one (no watcher_id) must not, so the publish returns at once.
+        let app = ack_app(Duration::from_secs(5));
+        let owner = "ack-anon";
+        let baseline = seed_revision(&app, owner).await;
+
+        let parked = tokio::spawn({
+            let app = app.clone();
+            let owner = owner.to_string();
+            let query = format!("since={baseline}&timeout_ms=30000");
+            async move { watch_poll(&app, &owner, &query).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let publish = tokio::time::timeout(
+            Duration::from_millis(500),
+            app.oneshot(mkdir_request(owner, "folder")),
+        )
+        .await
+        .expect("an anonymous watcher must not gate a publication")
+        .unwrap();
+        assert_eq!(publish.status(), StatusCode::NO_CONTENT);
+
+        let woke = tokio::time::timeout(Duration::from_millis(500), parked)
+            .await
+            .expect("anonymous watcher still wakes on the publish")
+            .expect("watch task must not panic");
+        assert_eq!(woke.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_publication_waits_for_every_registered_watcher() {
+        let app = ack_app(Duration::from_secs(5));
+        let owner = "ack-multi";
+        let baseline = seed_revision(&app, owner).await;
+
+        // Park two identified watchers.
+        let mut parked = Vec::new();
+        for id in ["obs-a", "obs-b"] {
+            let app = app.clone();
+            let owner = owner.to_string();
+            let query = format!("since={baseline}&timeout_ms=30000&watcher_id={id}");
+            parked.push(tokio::spawn(
+                async move { watch_poll(&app, &owner, &query).await },
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut publish = tokio::spawn({
+            let app = app.clone();
+            let owner = owner.to_string();
+            async move { app.oneshot(mkdir_request(&owner, "folder")).await.unwrap() }
+        });
+
+        // Drain both woken polls to learn the published revision.
+        let mut observed = baseline;
+        for handle in parked {
+            let woke = tokio::time::timeout(Duration::from_millis(500), handle)
+                .await
+                .expect("watcher wakes on the publish")
+                .expect("watch task must not panic");
+            assert_eq!(woke.status(), StatusCode::OK);
+            observed = observed.max(namespace_revision(&woke));
+        }
+
+        // Ack only the FIRST watcher; the publish must still block on the second.
+        let ack_a = tokio::spawn({
+            let app = app.clone();
+            let owner = owner.to_string();
+            let query = format!("since={observed}&timeout_ms=1000&watcher_id=obs-a");
+            async move { watch_poll(&app, &owner, &query).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut publish)
+                .await
+                .is_err(),
+            "publication must keep blocking until every watcher acks"
+        );
+
+        // Ack the second watcher; now the publish may proceed.
+        let ack_b = tokio::spawn({
+            let app = app.clone();
+            let owner = owner.to_string();
+            let query = format!("since={observed}&timeout_ms=1000&watcher_id=obs-b");
+            async move { watch_poll(&app, &owner, &query).await }
+        });
+        let published = tokio::time::timeout(Duration::from_millis(1000), publish)
+            .await
+            .expect("publication answers once every watcher acks")
+            .expect("publish task must not panic");
+        assert_eq!(published.status(), StatusCode::NO_CONTENT);
+        ack_a.abort();
+        ack_b.abort();
+    }
+
+    #[tokio::test]
+    async fn gone_watchers_are_pruned_and_stop_gating_publications() {
+        let coordinator = VfsPublicationCoordinator::with_ack_timeout(Duration::from_secs(5));
+        let owner = coordinator.owner("owner");
+
+        // A watcher with a tiny grace (2x its 20ms timeout) lags now...
+        owner.record_watcher_ack("obs-gone", 10, Duration::from_millis(20));
+        assert_eq!(
+            owner.unacked_watchers(100),
+            1,
+            "a fresh watcher below the revision is a laggard"
+        );
+
+        // ...but past its grace it is pruned and no longer gates the revision.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            owner.unacked_watchers(100),
+            0,
+            "a watcher past its liveness grace is pruned"
+        );
+
+        // An anonymous ack (empty id) is never registered, so it gates nothing.
+        owner.record_watcher_ack("", 10, Duration::from_secs(30));
+        assert_eq!(
+            owner.unacked_watchers(100),
+            0,
+            "anonymous watchers are never registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_publish_returns_only_after_the_observer_is_coherent() {
+        // End-to-end shape against the real server: a writer's mutation must not
+        // return until every observer has become coherent through (acked) the
+        // published revision, so a read issued the instant the write returns is
+        // fresh. The observer models the client's exact ack protocol: on a 200 it
+        // advances its coherence fence BEFORE re-polling (the re-poll's `since`
+        // is the ack) — the same fence->(cache)->re-poll order the real client
+        // guarantees.
+        let app = ack_app(Duration::from_secs(5));
+        let owner = "ack-e2e";
+        let baseline = seed_revision(&app, owner).await;
+
+        let observer_fence = Arc::new(AtomicU64::new(baseline));
+        let stop = Arc::new(AtomicBool::new(false));
+        let observer = tokio::spawn({
+            let app = app.clone();
+            let owner = owner.to_string();
+            let fence = Arc::clone(&observer_fence);
+            let stop = Arc::clone(&stop);
+            async move {
+                while !stop.load(Ordering::Acquire) {
+                    let since = fence.load(Ordering::Acquire);
+                    let query = format!("since={since}&timeout_ms=1000&watcher_id=obs-e2e");
+                    let response = watch_poll(&app, &owner, &query).await;
+                    if response.status() == StatusCode::OK {
+                        // Fence advance strictly BEFORE the next poll (the ack),
+                        // mirroring the client's coherence-before-ack ordering.
+                        fence.fetch_max(namespace_revision(&response), Ordering::AcqRel);
+                    }
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let published = app.oneshot(mkdir_request(owner, "folder")).await.unwrap();
+        assert_eq!(published.status(), StatusCode::NO_CONTENT);
+        let revision = namespace_revision(&published);
+        assert!(revision > baseline);
+
+        // The observer set its fence to the published revision before issuing the
+        // ack that unblocked the writer, so it is already coherent here.
+        assert!(
+            observer_fence.load(Ordering::Acquire) >= revision,
+            "writer publish returned before the observer became coherent through it"
+        );
+
+        stop.store(true, Ordering::Release);
+        observer.abort();
     }
 
     #[async_trait]
@@ -2250,7 +3545,36 @@ mod server_tests {
             &self,
             request: VfsNamespaceMutationBatchRequest,
         ) -> VfsResult<()> {
-            self.inner.lock().unwrap().namespace_batches.push(request);
+            let mut inner = self.inner.lock().unwrap();
+            // Mirror the production/TS store: apply each mutation to the backing
+            // namespace so the handler's post-apply publication snapshot observes
+            // the resulting state (e.g. a freshly created directory stats `Some`,
+            // while a path deleted at the end of the batch stats `None`).
+            for mutation in &request.mutations {
+                match mutation {
+                    VfsNamespaceMutation::CreateFile { path, .. } => {
+                        inner.files.entry(path.clone()).or_insert_with(Bytes::new);
+                    }
+                    VfsNamespaceMutation::CreateDirectory { path, .. } => {
+                        inner.dirs.insert(path.clone());
+                    }
+                    VfsNamespaceMutation::DeleteFile { path, .. } => {
+                        inner.files.remove(path.as_str());
+                    }
+                    VfsNamespaceMutation::RemoveDirectory { path } => {
+                        inner.dirs.remove(path.as_str());
+                    }
+                    VfsNamespaceMutation::Rename { from, to } => {
+                        if let Some(bytes) = inner.files.remove(from.as_str()) {
+                            inner.files.insert(to.clone(), bytes);
+                        }
+                    }
+                    VfsNamespaceMutation::SetMode { .. }
+                    | VfsNamespaceMutation::CreateSymlink { .. }
+                    | VfsNamespaceMutation::CreateHardLink { .. } => {}
+                }
+            }
+            inner.namespace_batches.push(request);
             Ok(())
         }
 
@@ -2408,6 +3732,7 @@ mod server_tests {
         let app = chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -2451,6 +3776,7 @@ mod server_tests {
         let app = chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -2484,6 +3810,7 @@ mod server_tests {
             chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -2517,6 +3844,12 @@ mod server_tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        let committed_revision = response
+            .headers()
+            .get(CHEVALIER_VFS_NAMESPACE_REVISION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("committed write revision");
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let response: VfsWriteManyResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(response.results.len(), 2);
@@ -2553,6 +3886,25 @@ mod server_tests {
         assert!(inner.write_many[0].writes[1].precondition.is_none());
         assert_eq!(inner.files.get("first.txt").unwrap().as_ref(), b"one");
         assert_eq!(inner.files.get("second.txt").unwrap().as_ref(), b"two");
+        drop(inner);
+
+        let stat = app
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/chevalier/vfs/owner-1/stat?path=first.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stat.status(), StatusCode::OK);
+        assert_eq!(
+            stat.headers()
+                .get(CHEVALIER_VFS_NAMESPACE_REVISION_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok()),
+            Some(committed_revision),
+        );
     }
 
     #[tokio::test]
@@ -2563,6 +3915,7 @@ mod server_tests {
             chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -2575,6 +3928,12 @@ mod server_tests {
                     )
                     .body(Body::from(
                         serde_json::to_vec(&serde_json::json!({
+                            "operation_ids": [
+                                "mkdir-tree",
+                                "rename-result",
+                                "chmod-result",
+                                "delete-result"
+                            ],
                             "mutations": [
                                 {"kind": "create_directory", "path": "tree", "mode": 509},
                                 {"kind": "rename", "from": "source.txt", "to": "tree/result.txt"},
@@ -2593,7 +3952,27 @@ mod server_tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::OK);
+        let committed_revision = response
+            .headers()
+            .get(CHEVALIER_VFS_NAMESPACE_REVISION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("committed namespace revision");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let snapshot: VfsNamespaceMutationBatchResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.path == "tree" && entry.metadata.is_some())
+        );
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.path == "tree/result.txt" && entry.metadata.is_none())
+        );
         let inner = backend.inner.lock().unwrap();
         assert_eq!(inner.namespace_batches.len(), 1);
         assert_eq!(
@@ -2621,6 +4000,26 @@ mod server_tests {
                     }),
                 },
             ]
+        );
+        drop(inner);
+
+        let listing = app
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/chevalier/vfs/owner-1/tree?path=")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listing.status(), StatusCode::OK);
+        assert_eq!(
+            listing
+                .headers()
+                .get(CHEVALIER_VFS_NAMESPACE_REVISION_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok()),
+            Some(committed_revision),
         );
     }
 

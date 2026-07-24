@@ -1,13 +1,127 @@
-use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use chevalier_sandbox::vfs::{VfsDirEntry as RemoteDirEntry, VfsMetadata as RemoteMetadata};
+use chevalier_sandbox::vfs::{
+    VfsDirEntry as RemoteDirEntry, VfsMetadata as RemoteMetadata, VfsNamespaceMutation,
+    VfsPublicationSnapshotEntry,
+};
 
 const FILE_TTL: Duration = Duration::from_secs(60);
 const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_FILES: usize = 16_384;
+const SUBTREE_LOAD_MISS_THRESHOLD: u32 = 8;
+pub(super) const SUBTREE_LOAD_REVISION_QUIET_PERIOD: Duration = Duration::from_millis(250);
+
+/// The exact set of entries one locally observed publication superseded,
+/// returned by the `observe_*` publication hooks so the caller can mirror the
+/// eviction into each sibling mount's *kernel* attribute/entry cache. The FUSE
+/// layer hands the kernel positive attr/entry leases only while the revision
+/// watch is live (see `fs::ATTR_ENTRY_LEASE_TTL`); those leases stay coherent
+/// precisely because every publication revokes exactly this set in the kernel
+/// before the publication is acked (the revocation-ack ordering invariant).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct PublicationInvalidation {
+    /// Exact paths whose attrs/dentry the publication changed (each changed
+    /// path plus its parent directory).
+    pub(super) paths: Vec<String>,
+    /// Directory prefixes whose entire subtree the publication changed
+    /// (`RemoveDirectory` / `Rename`). Every descendant the kernel cached under
+    /// the prefix must be invalidated, not just the prefix itself.
+    pub(super) subtrees: Vec<String>,
+    /// Stable identities (hard-link inodes) the publication changed. An alias
+    /// the kernel cached under a name *other* than the written path is reached
+    /// through the shared identity rather than the path.
+    pub(super) identities: Vec<String>,
+}
+
+impl PublicationInvalidation {
+    /// True when the publication superseded nothing this mount could have handed
+    /// a kernel, so no invalidation is needed.
+    pub(super) fn is_empty(&self) -> bool {
+        self.paths.is_empty() && self.subtrees.is_empty() && self.identities.is_empty()
+    }
+}
+
+/// One mount's hook into its kernel FUSE session's invalidation channel.
+/// Implemented by the fs layer (which owns the fuser notifier and inode table);
+/// the cache and revision watch drive it without depending on those types, so
+/// the coherence stack stays decoupled from the FUSE wiring.
+pub(super) trait KernelInvalidator: Send + Sync {
+    /// Drop the kernel's cached attrs/dentries for exactly the superseded set.
+    fn invalidate(&self, invalidation: &PublicationInvalidation);
+    /// Drop every attr/dentry this mount handed the kernel. Used for a remote
+    /// (cross-process) publication whose exact path set this process never
+    /// learned — the watch 200 carries only a revision.
+    fn invalidate_all(&self);
+}
+
+/// Per-registry set of live mount kernel-invalidation hooks, keyed by the same
+/// coherence key as the shared cache. A local publication's commit hook and the
+/// revision watch both fan out over every mount of the registry in this process,
+/// so a sibling observer's kernel is revoked in lockstep with the shared cache
+/// (a same-process observer has no other notification channel: the single shared
+/// watch loop only acks cross-process publications through the gateway).
+#[derive(Default)]
+pub(super) struct MountInvalidators {
+    inner: Mutex<Vec<Weak<dyn KernelInvalidator>>>,
+}
+
+impl MountInvalidators {
+    pub(super) fn shared(key: &str) -> Arc<Self> {
+        static REGISTRIES: OnceLock<Mutex<HashMap<String, Weak<MountInvalidators>>>> =
+            OnceLock::new();
+        let mut registries = REGISTRIES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(registry) = registries.get(key).and_then(Weak::upgrade) {
+            return registry;
+        }
+        let registry = Arc::new(Self::default());
+        registries.insert(key.to_string(), Arc::downgrade(&registry));
+        registry
+    }
+
+    /// Register one mount's kernel-invalidation hook. Dead (unmounted) hooks are
+    /// pruned opportunistically so the registry never grows across remounts.
+    pub(super) fn register(&self, invalidator: Weak<dyn KernelInvalidator>) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.retain(|existing| existing.strong_count() > 0);
+        guard.push(invalidator);
+    }
+
+    pub(super) fn invalidate(&self, invalidation: &PublicationInvalidation) {
+        if invalidation.is_empty() {
+            return;
+        }
+        for invalidator in self.live() {
+            invalidator.invalidate(invalidation);
+        }
+    }
+
+    pub(super) fn invalidate_all(&self) {
+        for invalidator in self.live() {
+            invalidator.invalidate_all();
+        }
+    }
+
+    /// Snapshot the live hooks and release the registry lock before invoking any
+    /// of them: an invalidator performs blocking `writev`s into `/dev/fuse`,
+    /// which must never run under the registry mutex.
+    fn live(&self) -> Vec<Arc<dyn KernelInvalidator>> {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.retain(|existing| existing.strong_count() > 0);
+        guard.iter().filter_map(Weak::upgrade).collect()
+    }
+}
 
 #[derive(Clone)]
 struct CachedFile {
@@ -19,20 +133,63 @@ struct CachedFile {
     last_access: Instant,
 }
 
+#[derive(Clone)]
+struct CachedMetadata {
+    metadata: RemoteMetadata,
+    revision: u64,
+}
+
+#[derive(Clone)]
+struct CachedDirectory {
+    entries: Vec<RemoteDirEntry>,
+    revision: u64,
+}
+
 #[derive(Default)]
 struct CacheState {
+    /// Latest authoritative gateway revision reflected by `metadata`.
+    ///
+    /// Revisions are opaque monotonic tokens, not contiguous counters: the
+    /// gateway may advance from `R` to `max(R + 1, Date.now() * 1000)`.
+    /// Known local publications may therefore retag entries from this exact
+    /// prior revision without requiring `revision == R + 1`. An unclassified
+    /// authoritative read at a newer revision remains fail-closed and drops
+    /// metadata from the prior revision.
+    metadata_revision: u64,
     file_bytes: usize,
     files: HashMap<String, CachedFile>,
     identity_paths: HashMap<String, std::collections::HashSet<String>>,
+    metadata: HashMap<String, CachedMetadata>,
+    missing_metadata: HashMap<String, u64>,
+    directories: HashMap<String, CachedDirectory>,
+    subtree_revisions: HashMap<String, u64>,
+    subtree_loads: HashSet<String>,
+    subtree_misses: HashMap<String, (u64, u32, Instant)>,
+    subtree_disabled: bool,
     directory_generation: u64,
 }
 
 #[derive(Default)]
 pub struct RemoteFuseCache {
     inner: Mutex<CacheState>,
+    subtree_changed: Condvar,
 }
 
 impl RemoteFuseCache {
+    pub fn shared(key: &str) -> Arc<Self> {
+        static CACHES: OnceLock<Mutex<HashMap<String, Weak<RemoteFuseCache>>>> = OnceLock::new();
+        let mut caches = CACHES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cache) = caches.get(key).and_then(Weak::upgrade) {
+            return cache;
+        }
+        let cache = Arc::new(Self::default());
+        caches.insert(key.to_string(), Arc::downgrade(&cache));
+        cache
+    }
+
     pub fn get_file_matching(&self, path: &str, metadata: &RemoteMetadata) -> Option<Vec<u8>> {
         let mut inner = self.lock_inner();
         let entry = inner.files.get_mut(path)?;
@@ -61,48 +218,29 @@ impl RemoteFuseCache {
     }
 
     pub fn put_file(&self, path: &str, bytes: Vec<u8>, metadata: Option<RemoteMetadata>) {
-        if bytes.len() > MAX_FILE_BYTES {
-            return;
-        }
         let mut inner = self.lock_inner();
-        remove_file_locked(&mut inner, path);
         let now = Instant::now();
-        inner.file_bytes += bytes.len();
-        inner.files.insert(
-            path.to_string(),
-            CachedFile {
-                bytes,
-                metadata,
-                expires_at: now + FILE_TTL,
-                last_access: now,
-            },
-        );
-        if let Some(file_id) = inner
-            .files
-            .get(path)
-            .and_then(|entry| entry.metadata.as_ref())
-            .and_then(|metadata| metadata.file_id.as_ref())
-            .cloned()
-        {
-            inner
-                .identity_paths
-                .entry(file_id)
-                .or_default()
-                .insert(path.to_string());
-        }
+        put_file_locked(&mut inner, path.to_string(), bytes, metadata, now);
         enforce_file_limits_locked(&mut inner, now, MAX_FILES, MAX_TOTAL_BYTES);
     }
 
-    /// Directory and attribute responses are never retained. A different VM
-    /// can publish through another virtiofsd/FUSE session, and this process has
-    /// no remote invalidation channel that can make a positive TTL coherent.
-    pub fn get_dir(&self, _path: &str) -> Option<Vec<RemoteDirEntry>> {
-        None
+    pub fn get_dir(&self, path: &str, revision: u64) -> Option<Vec<RemoteDirEntry>> {
+        if revision == 0 {
+            return None;
+        }
+        let mut inner = self.lock_inner();
+        observe_authoritative_revision_locked(&mut inner, revision);
+        let entry = inner.directories.get(path)?;
+        if entry.revision != revision {
+            inner.directories.remove(path);
+            return None;
+        }
+        Some(entry.entries.clone())
     }
 
-    pub fn put_dir(&self, path: &str, entries: Vec<RemoteDirEntry>) {
+    pub fn put_dir(&self, path: &str, entries: Vec<RemoteDirEntry>, revision: u64) {
         let generation = self.directory_generation(path);
-        let _ = self.put_dir_if_generation(path, generation, entries);
+        let _ = self.put_dir_if_generation(path, generation, entries, revision);
     }
 
     pub fn directory_generation(&self, _path: &str) -> u64 {
@@ -110,22 +248,323 @@ impl RemoteFuseCache {
     }
 
     /// Accept a listing only if no concurrent local namespace mutation
-    /// invalidated it while the authoritative request was in flight. The
-    /// listing itself is deliberately not retained.
+    /// invalidated it while the authoritative request was in flight and the
+    /// response still matches the shared coherence revision.
     pub fn put_dir_if_generation(
         &self,
-        _path: &str,
+        path: &str,
         generation: u64,
-        _entries: Vec<RemoteDirEntry>,
+        entries: Vec<RemoteDirEntry>,
+        revision: u64,
     ) -> bool {
-        self.lock_inner().directory_generation == generation
+        if revision == 0 {
+            return false;
+        }
+        let mut inner = self.lock_inner();
+        observe_authoritative_revision_locked(&mut inner, revision);
+        if inner.directory_generation != generation || inner.metadata_revision != revision {
+            return false;
+        }
+        inner
+            .directories
+            .insert(path.to_string(), CachedDirectory { entries, revision });
+        true
     }
 
-    pub fn get_metadata(&self, _path: &str) -> Option<RemoteMetadata> {
-        None
+    pub fn get_metadata(&self, path: &str, revision: u64) -> Option<RemoteMetadata> {
+        // A rolling-upgrade/legacy gateway response without a publication
+        // revision cannot fence cached metadata against remote mutations.
+        if revision == 0 {
+            return None;
+        }
+        let mut inner = self.lock_inner();
+        observe_authoritative_revision_locked(&mut inner, revision);
+        let entry = inner.metadata.get(path)?;
+        if entry.revision != revision {
+            inner.metadata.remove(path);
+            return None;
+        }
+        Some(entry.metadata.clone())
     }
 
-    pub fn put_metadata(&self, _path: &str, _metadata: RemoteMetadata) {}
+    pub fn put_metadata(&self, path: &str, metadata: RemoteMetadata, revision: u64) {
+        if revision == 0 {
+            return;
+        }
+        let mut inner = self.lock_inner();
+        observe_authoritative_revision_locked(&mut inner, revision);
+        if inner.metadata_revision == revision {
+            let metadata = inner
+                .metadata
+                .get(path)
+                .filter(|entry| entry.revision == revision)
+                .map(|entry| preserve_stronger_metadata(&entry.metadata, metadata.clone()))
+                .unwrap_or(metadata);
+            inner
+                .metadata
+                .insert(path.to_string(), CachedMetadata { metadata, revision });
+            inner.missing_metadata.remove(path);
+        }
+    }
+
+    pub fn is_known_missing(&self, path: &str, revision: u64) -> bool {
+        if revision == 0 {
+            return false;
+        }
+        let mut inner = self.lock_inner();
+        observe_authoritative_revision_locked(&mut inner, revision);
+        inner.missing_metadata.get(path).copied() == Some(revision)
+    }
+
+    pub fn put_missing_metadata(&self, path: &str, revision: u64) {
+        if revision == 0 {
+            return;
+        }
+        let mut inner = self.lock_inner();
+        observe_authoritative_revision_locked(&mut inner, revision);
+        if inner.metadata_revision == revision {
+            inner.metadata.remove(path);
+            remove_file_locked(&mut inner, path);
+            inner.missing_metadata.insert(path.to_string(), revision);
+        }
+    }
+
+    /// Fail-closed entry for an authoritative revision observed out of band
+    /// (a revision-watch publication). An unclassified newer token may carry
+    /// another process's publication, so metadata/dirs/missing from the prior
+    /// token are dropped; an older or equal token is ignored. This adds no new
+    /// invalidation semantics — it is the same audited path the read routes
+    /// take when they observe a newer revision.
+    pub fn observe_authoritative_revision(&self, revision: u64) {
+        let mut inner = self.lock_inner();
+        observe_authoritative_revision_locked(&mut inner, revision);
+    }
+
+    /// Advance cache entries across one locally observed publication. The
+    /// publishing client knows the exact paths and stable identities changed
+    /// by this revision, so unrelated metadata can remain coherent. A skipped
+    /// revision means an unknown writer may have changed anything and remains
+    /// fail-closed.
+    pub(super) fn observe_namespace_publication(
+        &self,
+        revision: u64,
+        mutations: &[VfsNamespaceMutation],
+    ) -> PublicationInvalidation {
+        let mut inner = self.lock_inner();
+        let mut affected_paths = HashSet::new();
+        let mut affected_subtrees = HashSet::new();
+        let mut affected_identities = HashSet::new();
+        for mutation in mutations {
+            let affects_descendants = matches!(
+                mutation,
+                VfsNamespaceMutation::RemoveDirectory { .. } | VfsNamespaceMutation::Rename { .. }
+            );
+            for path in mutation.paths().into_iter().filter(|path| !path.is_empty()) {
+                collect_affected_path(
+                    &inner,
+                    path,
+                    affects_descendants,
+                    true,
+                    &mut affected_paths,
+                    &mut affected_subtrees,
+                    &mut affected_identities,
+                );
+            }
+        }
+        advance_known_revision_locked(
+            &mut inner,
+            revision,
+            &affected_paths,
+            &affected_subtrees,
+            &affected_identities,
+        );
+        publication_invalidation(affected_paths, affected_subtrees, affected_identities)
+    }
+
+    pub(super) fn observe_namespace_publication_snapshot(
+        &self,
+        revision: u64,
+        mutations: &[VfsNamespaceMutation],
+        entries: &[VfsPublicationSnapshotEntry],
+    ) -> PublicationInvalidation {
+        let invalidation = self.observe_namespace_publication(revision, mutations);
+        self.install_publication_snapshot(revision, entries);
+        invalidation
+    }
+
+    /// Content publication changes the named inode and every cached hard-link
+    /// alias of its stable identity, but not unrelated namespace entries.
+    pub(super) fn observe_write_publication(
+        &self,
+        revision: u64,
+        writes: &[(String, Option<String>)],
+    ) -> PublicationInvalidation {
+        let mut inner = self.lock_inner();
+        let mut affected_paths = HashSet::new();
+        let mut affected_subtrees = HashSet::new();
+        let mut affected_identities = HashSet::new();
+        for (path, expected_file_id) in writes {
+            collect_affected_path(
+                &inner,
+                path,
+                false,
+                true,
+                &mut affected_paths,
+                &mut affected_subtrees,
+                &mut affected_identities,
+            );
+            if let Some(file_id) = expected_file_id {
+                affected_identities.insert(file_id.clone());
+            }
+        }
+        advance_known_revision_locked(
+            &mut inner,
+            revision,
+            &affected_paths,
+            &affected_subtrees,
+            &affected_identities,
+        );
+        publication_invalidation(affected_paths, affected_subtrees, affected_identities)
+    }
+
+    pub(super) fn observe_write_publication_snapshot(
+        &self,
+        revision: u64,
+        writes: &[(String, Option<String>)],
+        entries: &[VfsPublicationSnapshotEntry],
+    ) -> PublicationInvalidation {
+        let invalidation = self.observe_write_publication(revision, writes);
+        self.install_publication_snapshot(revision, entries);
+        invalidation
+    }
+
+    fn install_publication_snapshot(&self, revision: u64, entries: &[VfsPublicationSnapshotEntry]) {
+        for entry in entries {
+            match entry.metadata.clone() {
+                Some(metadata) => self.put_metadata(entry.path.as_str(), metadata, revision),
+                None => self.put_missing_metadata(entry.path.as_str(), revision),
+            }
+        }
+    }
+
+    /// Coalesce one server-side subtree snapshot per prefix and stable
+    /// coherence revision across every mount in this vmd process. A stream of
+    /// namespace mutations advances the revision after each point lookup; do
+    /// not turn that into a growing full-tree scan after every create. Once
+    /// several misses observe a genuinely quiet revision, the workload is
+    /// read-heavy enough to amortize one metadata/content prefetch.
+    pub fn begin_subtree_load(&self, prefix: &str, revision: u64) -> bool {
+        self.begin_subtree_load_at(prefix, revision, Instant::now())
+    }
+
+    fn begin_subtree_load_at(&self, prefix: &str, revision: u64, now: Instant) -> bool {
+        let mut inner = self.lock_inner();
+        // Sync the cache's authoritative revision to the coherence fence before
+        // accounting a miss. A later get/put that first advances
+        // metadata_revision clears subtree_misses (fail-closed on a revision
+        // change); doing it up front keeps a miss recorded here from being
+        // retroactively wiped within the same dispatch, so a genuine revision
+        // change still amortizes into one snapshot instead of stalling an extra
+        // miss short of the threshold.
+        observe_authoritative_revision_locked(&mut inner, revision);
+        loop {
+            if inner.subtree_disabled {
+                return false;
+            }
+            if revision != 0 && inner.subtree_revisions.get(prefix).copied() == Some(revision) {
+                return false;
+            }
+            if inner.subtree_loads.contains(prefix) {
+                inner = self
+                    .subtree_changed
+                    .wait(inner)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                continue;
+            }
+            let misses = inner
+                .subtree_misses
+                .entry(prefix.to_string())
+                .or_insert((revision, 0, now));
+            if misses.0 != revision {
+                *misses = (revision, 0, now);
+            }
+            misses.1 = misses.1.saturating_add(1);
+            if misses.1 < SUBTREE_LOAD_MISS_THRESHOLD
+                || now.saturating_duration_since(misses.2) < SUBTREE_LOAD_REVISION_QUIET_PERIOD
+            {
+                return false;
+            }
+            if inner.subtree_loads.insert(prefix.to_string()) {
+                return true;
+            }
+        }
+    }
+
+    pub fn finish_subtree_load(
+        &self,
+        prefix: &str,
+        revision: u64,
+        entries: Vec<(String, RemoteMetadata)>,
+    ) {
+        let mut inner = self.lock_inner();
+        if revision != 0 {
+            observe_authoritative_revision_locked(&mut inner, revision);
+            if inner.metadata_revision == revision {
+                for (path, metadata) in entries {
+                    inner
+                        .metadata
+                        .insert(path, CachedMetadata { metadata, revision });
+                }
+                inner.subtree_revisions.insert(prefix.to_string(), revision);
+                inner.subtree_misses.remove(prefix);
+            }
+        }
+        inner.subtree_loads.remove(prefix);
+        self.subtree_changed.notify_all();
+    }
+
+    pub fn finish_subtree_load_with_files(
+        &self,
+        prefix: &str,
+        revision: u64,
+        entries: Vec<(String, RemoteMetadata)>,
+        files: Vec<(String, Vec<u8>, RemoteMetadata)>,
+    ) {
+        let mut inner = self.lock_inner();
+        if revision != 0 {
+            observe_authoritative_revision_locked(&mut inner, revision);
+            if inner.metadata_revision == revision {
+                for (path, metadata) in entries {
+                    inner
+                        .metadata
+                        .insert(path, CachedMetadata { metadata, revision });
+                }
+                let now = Instant::now();
+                for (path, bytes, metadata) in files {
+                    put_file_locked(&mut inner, path, bytes, Some(metadata), now);
+                }
+                enforce_file_limits_locked(&mut inner, now, MAX_FILES, MAX_TOTAL_BYTES);
+                inner.subtree_revisions.insert(prefix.to_string(), revision);
+                inner.subtree_misses.remove(prefix);
+            }
+        }
+        inner.subtree_loads.remove(prefix);
+        self.subtree_changed.notify_all();
+    }
+
+    pub fn abort_subtree_load(&self, prefix: &str) {
+        let mut inner = self.lock_inner();
+        inner.subtree_loads.remove(prefix);
+        self.subtree_changed.notify_all();
+    }
+
+    pub fn disable_subtree_loads(&self, prefix: &str) {
+        let mut inner = self.lock_inner();
+        inner.subtree_disabled = true;
+        inner.subtree_loads.remove(prefix);
+        inner.subtree_misses.clear();
+        self.subtree_changed.notify_all();
+    }
 
     pub fn invalidate(&self, path: &str) {
         let mut inner = self.lock_inner();
@@ -159,10 +598,207 @@ impl RemoteFuseCache {
 
 fn invalidate_path_locked(inner: &mut CacheState, path: &str) {
     remove_file_locked(inner, path);
+    inner.metadata.remove(path);
+    inner.missing_metadata.remove(path);
+    inner.directories.remove(path);
     bump_directory_generation(inner, path);
     if let Some(parent) = parent_path(path) {
+        inner.directories.remove(parent.as_str());
         bump_directory_generation(inner, parent.as_str());
     }
+}
+
+fn collect_affected_path(
+    inner: &CacheState,
+    path: &str,
+    affects_descendants: bool,
+    affects_parent: bool,
+    affected_paths: &mut HashSet<String>,
+    affected_subtrees: &mut HashSet<String>,
+    affected_identities: &mut HashSet<String>,
+) {
+    let path = path.trim_matches('/').to_string();
+    affected_paths.insert(path.clone());
+    if affects_descendants {
+        affected_subtrees.insert(path.clone());
+    }
+    if affects_parent {
+        if let Some(parent) = parent_path(path.as_str()) {
+            affected_paths.insert(parent);
+        }
+    }
+    if let Some(file_id) = inner
+        .metadata
+        .get(path.as_str())
+        .and_then(|entry| entry.metadata.file_id.clone())
+    {
+        affected_identities.insert(file_id);
+    }
+}
+
+/// Collect the affected sets computed for one publication into the
+/// invalidation record handed back to the kernel-invalidation fan-out. This is
+/// exactly what the shared cache just evicted, so the kernel drops precisely the
+/// same set — no more (unrelated leases stay warm) and no less (the superseded
+/// set is revoked before the publication is acked).
+fn publication_invalidation(
+    affected_paths: HashSet<String>,
+    affected_subtrees: HashSet<String>,
+    affected_identities: HashSet<String>,
+) -> PublicationInvalidation {
+    PublicationInvalidation {
+        paths: affected_paths.into_iter().collect(),
+        subtrees: affected_subtrees.into_iter().collect(),
+        identities: affected_identities.into_iter().collect(),
+    }
+}
+
+fn advance_known_revision_locked(
+    inner: &mut CacheState,
+    revision: u64,
+    affected_paths: &HashSet<String>,
+    affected_subtrees: &HashSet<String>,
+    affected_identities: &HashSet<String>,
+) {
+    if revision == 0 {
+        inner.metadata_revision = 0;
+        inner.metadata.clear();
+        inner.missing_metadata.clear();
+        inner.directories.clear();
+        inner.subtree_revisions.clear();
+        return;
+    }
+    let previous_revision = inner.metadata_revision;
+    let stale_paths = inner
+        .metadata
+        .iter_mut()
+        .filter_map(|(path, entry)| {
+            let affected = path_or_identity_is_affected(
+                path,
+                entry.metadata.file_id.as_deref(),
+                affected_paths,
+                affected_subtrees,
+                affected_identities,
+            );
+            if affected {
+                Some(path.clone())
+            } else if revision <= previous_revision {
+                None
+            } else if previous_revision == 0 || entry.revision != previous_revision {
+                Some(path.clone())
+            } else {
+                entry.revision = revision;
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    for path in stale_paths {
+        invalidate_path_locked(inner, path.as_str());
+    }
+    let stale_missing = inner
+        .missing_metadata
+        .iter_mut()
+        .filter_map(|(path, entry_revision)| {
+            if path_or_identity_is_affected(
+                path,
+                None,
+                affected_paths,
+                affected_subtrees,
+                affected_identities,
+            ) || previous_revision == 0
+                || *entry_revision != previous_revision
+            {
+                Some(path.clone())
+            } else {
+                *entry_revision = revision;
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    for path in stale_missing {
+        inner.missing_metadata.remove(path.as_str());
+    }
+    let stale_directories = inner
+        .directories
+        .iter_mut()
+        .filter_map(|(path, entry)| {
+            if path_or_identity_is_affected(
+                path,
+                None,
+                affected_paths,
+                affected_subtrees,
+                affected_identities,
+            ) || previous_revision == 0
+                || entry.revision != previous_revision
+            {
+                Some(path.clone())
+            } else {
+                entry.revision = revision;
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    for path in stale_directories {
+        inner.directories.remove(path.as_str());
+    }
+    let affected_files = inner
+        .files
+        .iter()
+        .filter_map(|(path, entry)| {
+            path_or_identity_is_affected(
+                path,
+                entry
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.file_id.as_deref()),
+                affected_paths,
+                affected_subtrees,
+                affected_identities,
+            )
+            .then(|| path.clone())
+        })
+        .collect::<Vec<_>>();
+    for path in affected_files {
+        remove_file_locked(inner, path.as_str());
+    }
+    inner.metadata_revision = inner.metadata_revision.max(revision);
+    inner.subtree_revisions.clear();
+}
+
+/// Observe a revision whose exact mutation set is not available to this cache.
+/// A newer token may include a publication from another process or mount, so
+/// retaining metadata from the prior token would violate cross-mount
+/// coherence. Older in-flight reads are ignored instead of rolling the cache
+/// backwards.
+fn observe_authoritative_revision_locked(inner: &mut CacheState, revision: u64) {
+    if revision == 0 || revision <= inner.metadata_revision {
+        return;
+    }
+    if inner.metadata_revision != 0 {
+        inner.metadata.clear();
+        inner.missing_metadata.clear();
+        inner.directories.clear();
+        inner.subtree_revisions.clear();
+        inner.subtree_misses.clear();
+    }
+    inner.metadata_revision = revision;
+}
+
+fn path_or_identity_is_affected(
+    path: &str,
+    file_id: Option<&str>,
+    affected_paths: &HashSet<String>,
+    affected_subtrees: &HashSet<String>,
+    affected_identities: &HashSet<String>,
+) -> bool {
+    affected_paths.contains(path)
+        || affected_subtrees.iter().any(|affected_path| {
+            !affected_path.is_empty()
+                && path
+                    .strip_prefix(affected_path)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+        || file_id.is_some_and(|file_id| affected_identities.contains(file_id))
 }
 
 fn remove_file_locked(inner: &mut CacheState, path: &str) {
@@ -178,6 +814,39 @@ fn remove_file_locked(inner: &mut CacheState, path: &str) {
         if remove_identity {
             inner.identity_paths.remove(&file_id);
         }
+    }
+}
+
+fn put_file_locked(
+    inner: &mut CacheState,
+    path: String,
+    bytes: Vec<u8>,
+    metadata: Option<RemoteMetadata>,
+    now: Instant,
+) {
+    if bytes.len() > MAX_FILE_BYTES {
+        return;
+    }
+    remove_file_locked(inner, path.as_str());
+    inner.file_bytes += bytes.len();
+    let file_id = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.file_id.clone());
+    inner.files.insert(
+        path.clone(),
+        CachedFile {
+            bytes,
+            metadata,
+            expires_at: now + FILE_TTL,
+            last_access: now,
+        },
+    );
+    if let Some(file_id) = file_id {
+        inner
+            .identity_paths
+            .entry(file_id)
+            .or_default()
+            .insert(path);
     }
 }
 
@@ -205,6 +874,25 @@ fn cached_metadata_matches(cached: Option<&RemoteMetadata>, current: &RemoteMeta
         }
         _ => false,
     }
+}
+
+fn preserve_stronger_metadata(
+    cached: &RemoteMetadata,
+    mut current: RemoteMetadata,
+) -> RemoteMetadata {
+    if current.content_hash.is_none()
+        && cached.content_hash.is_some()
+        && cached.kind == current.kind
+        && cached.size_bytes == current.size_bytes
+        && cached.file_id == current.file_id
+        && cached.link_count == current.link_count
+        && cached.link_target == current.link_target
+        && cached.executable == current.executable
+        && cached.mode == current.mode
+    {
+        current.content_hash.clone_from(&cached.content_hash);
+    }
+    current
 }
 
 fn enforce_file_limits_locked(
@@ -278,8 +966,14 @@ fn parent_path(path: &str) -> Option<String> {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{CacheState, CachedFile, MAX_FILES, RemoteFuseCache, enforce_file_limits_locked};
-    use chevalier_sandbox::vfs::{VfsDirEntry as RemoteDirEntry, VfsMetadata as RemoteMetadata};
+    use super::{
+        CacheState, CachedFile, MAX_FILES, RemoteFuseCache, SUBTREE_LOAD_MISS_THRESHOLD,
+        SUBTREE_LOAD_REVISION_QUIET_PERIOD, enforce_file_limits_locked,
+    };
+    use chevalier_sandbox::vfs::{
+        VfsDirEntry as RemoteDirEntry, VfsMetadata as RemoteMetadata, VfsNamespaceMutation,
+        VfsPublicationSnapshotEntry,
+    };
 
     fn entry(name: &str) -> RemoteDirEntry {
         RemoteDirEntry {
@@ -311,13 +1005,233 @@ mod tests {
     }
 
     #[test]
-    fn directory_and_metadata_responses_are_never_retained() {
+    fn known_namespace_publication_advances_only_unaffected_metadata() {
         let cache = RemoteFuseCache::default();
-        cache.put_dir("tree", vec![entry("file")]);
-        cache.put_metadata("tree/file", metadata("hash", 4));
+        cache.put_metadata("tree/changed", metadata("old", 3), 17);
+        cache.put_metadata("tree/stable", metadata("stable", 6), 17);
 
-        assert!(cache.get_dir("tree").is_none());
-        assert!(cache.get_metadata("tree/file").is_none());
+        cache.observe_namespace_publication(
+            1_800_000,
+            &[VfsNamespaceMutation::CreateFile {
+                path: "tree/changed".to_string(),
+                mode: Some(0o644),
+            }],
+        );
+
+        assert!(cache.get_metadata("tree/changed", 1_800_000).is_none());
+        assert_eq!(
+            cache.get_metadata("tree/stable", 1_800_000),
+            Some(metadata("stable", 6))
+        );
+        cache.observe_namespace_publication(
+            1_800_000,
+            &[VfsNamespaceMutation::CreateFile {
+                path: "tree/changed".to_string(),
+                mode: Some(0o644),
+            }],
+        );
+        assert_eq!(
+            cache.get_metadata("tree/stable", 1_800_000),
+            Some(metadata("stable", 6)),
+            "replayed publication callbacks must be idempotent"
+        );
+
+        cache.put_metadata("other/read", metadata("remote", 6), 2_000_000);
+        assert!(
+            cache.get_metadata("tree/stable", 2_000_000).is_none(),
+            "a newer authoritative read without a known mutation set must remain fail-closed"
+        );
+    }
+
+    #[test]
+    fn publication_snapshot_seeds_exact_changed_and_missing_metadata() {
+        let cache = RemoteFuseCache::default();
+        cache.put_metadata("tree/new", metadata("stale", 9), 17);
+        cache.put_metadata("tree/deleted", metadata("old", 3), 17);
+        cache.put_metadata("tree/stable", metadata("stable", 6), 17);
+        let current = metadata("new", 4);
+
+        cache.observe_namespace_publication_snapshot(
+            18,
+            &[
+                VfsNamespaceMutation::CreateFile {
+                    path: "tree/new".to_string(),
+                    mode: Some(0o644),
+                },
+                VfsNamespaceMutation::DeleteFile {
+                    path: "tree/deleted".to_string(),
+                    precondition: None,
+                },
+            ],
+            &[
+                VfsPublicationSnapshotEntry {
+                    path: "tree/new".to_string(),
+                    metadata: Some(current.clone()),
+                },
+                VfsPublicationSnapshotEntry {
+                    path: "tree/deleted".to_string(),
+                    metadata: None,
+                },
+            ],
+        );
+
+        assert_eq!(cache.get_metadata("tree/new", 18), Some(current));
+        assert!(cache.is_known_missing("tree/deleted", 18));
+        assert_eq!(
+            cache.get_metadata("tree/stable", 18),
+            Some(metadata("stable", 6))
+        );
+    }
+
+    #[test]
+    fn write_publication_snapshot_seeds_exact_written_metadata() {
+        let cache = RemoteFuseCache::default();
+        let mut old = metadata("old", 3);
+        old.file_id = Some("inode-1".to_string());
+        cache.put_metadata("tree/file", old, 17);
+        let mut current = metadata("new", 4);
+        current.file_id = Some("inode-1".to_string());
+
+        cache.observe_write_publication_snapshot(
+            18,
+            &[("tree/file".to_string(), Some("inode-1".to_string()))],
+            &[VfsPublicationSnapshotEntry {
+                path: "tree/file".to_string(),
+                metadata: Some(current.clone()),
+            }],
+        );
+
+        assert_eq!(cache.get_metadata("tree/file", 18), Some(current));
+    }
+
+    #[test]
+    fn known_write_publication_invalidates_every_cached_alias() {
+        let cache = RemoteFuseCache::default();
+        let mut alias = metadata("old", 3);
+        alias.file_id = Some("inode-1".to_string());
+        cache.put_metadata("tree/a", alias.clone(), 17);
+        cache.put_metadata("tree/b", alias, 17);
+        cache.put_file("tree/b", b"old".to_vec(), cache.get_metadata("tree/b", 17));
+        cache.put_metadata("tree/stable", metadata("stable", 6), 17);
+
+        cache.observe_write_publication(18, &[("tree/a".to_string(), Some("inode-1".to_string()))]);
+
+        assert!(cache.get_metadata("tree/a", 18).is_none());
+        assert!(cache.get_metadata("tree/b", 18).is_none());
+        assert!(cache.get_committed_file_metadata("tree/b").is_none());
+        assert_eq!(
+            cache.get_metadata("tree/stable", 18),
+            Some(metadata("stable", 6))
+        );
+    }
+
+    #[test]
+    fn metadata_is_retained_only_for_its_authoritative_revision() {
+        let cache = RemoteFuseCache::default();
+        cache.put_dir("tree", vec![entry("file")], 17);
+        cache.put_metadata("tree/file", metadata("hash", 4), 17);
+
+        assert_eq!(cache.get_dir("tree", 17), Some(vec![entry("file")]));
+        assert_eq!(
+            cache.get_metadata("tree/file", 17),
+            Some(metadata("hash", 4))
+        );
+        assert!(cache.get_metadata("tree/file", 18).is_none());
+        assert!(cache.get_dir("tree", 18).is_none());
+    }
+
+    #[test]
+    fn weaker_same_revision_metadata_preserves_content_hash() {
+        let cache = RemoteFuseCache::default();
+        let strong = metadata("hash", 4);
+        let mut attributes_only = strong.clone();
+        attributes_only.content_hash = None;
+
+        cache.put_metadata("tree/file", strong.clone(), 17);
+        cache.put_metadata("tree/file", attributes_only, 17);
+
+        assert_eq!(cache.get_metadata("tree/file", 17), Some(strong));
+    }
+
+    #[test]
+    fn known_missing_metadata_is_revision_fenced_and_retagged_by_unrelated_publications() {
+        let cache = RemoteFuseCache::default();
+        cache.put_missing_metadata("tree/missing", 17);
+        assert!(cache.is_known_missing("tree/missing", 17));
+
+        cache.observe_namespace_publication(
+            18,
+            &[VfsNamespaceMutation::CreateFile {
+                path: "other/new".to_string(),
+                mode: Some(0o644),
+            }],
+        );
+        assert!(cache.is_known_missing("tree/missing", 18));
+
+        cache.observe_namespace_publication(
+            19,
+            &[VfsNamespaceMutation::CreateFile {
+                path: "tree/missing".to_string(),
+                mode: Some(0o644),
+            }],
+        );
+        assert!(!cache.is_known_missing("tree/missing", 19));
+    }
+
+    #[test]
+    fn sibling_mounts_share_one_revision_fenced_cache() {
+        let key = format!("cache-test-{}", uuid::Uuid::new_v4());
+        let first = RemoteFuseCache::shared(&key);
+        let second = RemoteFuseCache::shared(&key);
+        first.put_metadata("tree/file", metadata("hash", 4), 17);
+
+        assert_eq!(
+            second.get_metadata("tree/file", 17),
+            Some(metadata("hash", 4))
+        );
+        assert!(second.get_metadata("tree/file", 18).is_none());
+    }
+
+    #[test]
+    fn subtree_snapshot_is_shared_and_reloads_only_for_a_new_revision() {
+        let key = format!("subtree-cache-test-{}", uuid::Uuid::new_v4());
+        let first = RemoteFuseCache::shared(&key);
+        let second = RemoteFuseCache::shared(&key);
+        let now = Instant::now();
+
+        for _ in 1..SUBTREE_LOAD_MISS_THRESHOLD {
+            assert!(!first.begin_subtree_load_at("", 17, now));
+        }
+        assert!(!first.begin_subtree_load_at("", 17, now));
+        assert!(first.begin_subtree_load_at("", 17, now + SUBTREE_LOAD_REVISION_QUIET_PERIOD));
+        first.finish_subtree_load("", 17, vec![("tree/file".to_string(), metadata("hash", 4))]);
+
+        assert!(!second.begin_subtree_load_at("", 17, now + SUBTREE_LOAD_REVISION_QUIET_PERIOD));
+        assert_eq!(
+            second.get_metadata("tree/file", 17),
+            Some(metadata("hash", 4))
+        );
+        for _ in 1..SUBTREE_LOAD_MISS_THRESHOLD {
+            assert!(!second.begin_subtree_load_at("", 18, now));
+        }
+        assert!(!second.begin_subtree_load_at("", 18, now));
+        assert!(second.begin_subtree_load_at("", 18, now + SUBTREE_LOAD_REVISION_QUIET_PERIOD));
+        second.abort_subtree_load("");
+        assert!(first.get_metadata("tree/file", 18).is_none());
+    }
+
+    #[test]
+    fn advancing_revisions_never_trigger_a_growing_subtree_reload() {
+        let cache = RemoteFuseCache::default();
+        let now = Instant::now();
+
+        for revision in 1..=100 {
+            assert!(!cache.begin_subtree_load_at(
+                "",
+                revision,
+                now + SUBTREE_LOAD_REVISION_QUIET_PERIOD
+            ));
+        }
     }
 
     #[test]
@@ -421,8 +1335,8 @@ mod tests {
         let mut shared = metadata("hash", 4);
         shared.file_id = Some("inode-1".to_string());
         shared.link_count = 2;
-        cache.put_dir("left", vec![entry("a")]);
-        cache.put_dir("right", vec![entry("b")]);
+        cache.put_dir("left", vec![entry("a")], 17);
+        cache.put_dir("right", vec![entry("b")], 17);
         cache.put_file("left/a", b"body".to_vec(), Some(shared.clone()));
         cache.put_file("right/b", b"body".to_vec(), Some(shared.clone()));
 
@@ -430,8 +1344,8 @@ mod tests {
 
         assert!(cache.get_file_matching("left/a", &shared).is_none());
         assert!(cache.get_file_matching("right/b", &shared).is_none());
-        assert!(cache.get_dir("left").is_none());
-        assert!(cache.get_dir("right").is_none());
+        assert!(cache.get_dir("left", 17).is_none());
+        assert!(cache.get_dir("right", 17).is_none());
         assert!(cache.aliases_for_identity("inode-1").is_empty());
     }
 
@@ -457,11 +1371,11 @@ mod tests {
         let cache = RemoteFuseCache::default();
         let generation = cache.directory_generation("tree");
         cache.invalidate("tree/new");
-        assert!(!cache.put_dir_if_generation("tree", generation, vec![entry("stale")]));
-        assert!(cache.get_dir("tree").is_none());
+        assert!(!cache.put_dir_if_generation("tree", generation, vec![entry("stale")], 17));
+        assert!(cache.get_dir("tree", 17).is_none());
 
         let current = cache.directory_generation("tree");
-        assert!(cache.put_dir_if_generation("tree", current, vec![entry("current")]));
-        assert!(cache.get_dir("tree").is_none());
+        assert!(cache.put_dir_if_generation("tree", current, vec![entry("current")], 17));
+        assert_eq!(cache.get_dir("tree", 17), Some(vec![entry("current")]));
     }
 }

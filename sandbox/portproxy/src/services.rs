@@ -5,9 +5,10 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::ExitStatus;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::Stream;
 use portable_pty::PtySize;
@@ -47,6 +48,13 @@ type AttachDaemonResponseStream =
 const DEFAULT_EXEC_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const DEFAULT_EXEC_HOME: &str = "/root";
 
+// STALL DIAGNOSTIC (keep: low-noise): thresholds that elevate the exec timing
+// breadcrumbs from debug to WARN. Sized to surface the ~30s action-boundary
+// stalls and any >1s received->spawn gap (the delivery-vs-spawn discriminator)
+// without narrating healthy sub-second execs.
+const EXEC_SLOW_TOTAL: Duration = Duration::from_millis(5_000);
+const EXEC_SLOW_SPAWN: Duration = Duration::from_millis(1_000);
+
 pub struct GuardedStream<S> {
     _guard: tokio::sync::OwnedMutexGuard<()>,
     inner: S,
@@ -76,6 +84,55 @@ where
 const READ_BUFFER: usize = 4096;
 const MAX_FILE_RPC_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 10_000;
+static ATOMIC_WRITE_NONCE: AtomicU64 = AtomicU64::new(1);
+
+struct AtomicWriteTemp {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl Drop for AtomicWriteTemp {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let path = self.path.clone();
+        tokio::spawn(async move {
+            let _ = fs::remove_file(path).await;
+        });
+    }
+}
+
+async fn write_file_atomic(path: &std::path::Path, data: &[u8]) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let nonce = ATOMIC_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+    let temp_path = parent.join(format!(
+        ".{file_name}.openbracket-write-{}-{nonce}",
+        std::process::id()
+    ));
+    let mut temp = AtomicWriteTemp {
+        path: temp_path.clone(),
+        committed: false,
+    };
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp_path)
+        .await?;
+    file.write_all(data).await?;
+    file.flush().await?;
+    drop(file);
+    if let Ok(metadata) = fs::metadata(path).await {
+        fs::set_permissions(&temp_path, metadata.permissions()).await?;
+    }
+    fs::rename(&temp_path, path).await?;
+    temp.committed = true;
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct ShellExecService {
@@ -112,6 +169,15 @@ impl ShellExec for ShellExecService {
 
         let args = validate_args(&start)?;
 
+        // STALL DIAGNOSTIC (keep: low-noise): timestamp the moment we hold the
+        // command so the recv->spawn->exit hops can be timed and correlated. The
+        // recv breadcrumb's log timestamp vs the harness action timestamp is the
+        // delivery gap; spawn_delay below is the received->spawn gap.
+        let recv_at = Instant::now();
+        let argv_hash = argv_fingerprint(&args);
+        let argc = args.len();
+        debug!(argv_hash, argc, "portproxy exec recv");
+
         let mut command = Command::new(&args[0]);
         if args.len() > 1 {
             command.args(&args[1..]);
@@ -136,6 +202,25 @@ impl ShellExec for ShellExecService {
                 return Err(Status::internal("spawned command without pid"));
             }
         };
+        // STALL DIAGNOSTIC (keep: low-noise): received->spawn latency. A >1s gap
+        // here is the key spawn-stall discriminator (guest fork/exec cost); a
+        // delivery-stall instead lands before recv_at above.
+        let spawn_delay = recv_at.elapsed();
+        if spawn_delay > EXEC_SLOW_SPAWN {
+            warn!(
+                pid,
+                argv_hash,
+                spawn_delay_ms = spawn_delay.as_millis() as u64,
+                "portproxy exec spawn slow"
+            );
+        } else {
+            debug!(
+                pid,
+                argv_hash,
+                spawn_delay_ms = spawn_delay.as_millis() as u64,
+                "portproxy exec spawn"
+            );
+        }
         let mut stdin = match child.stdin.take() {
             Some(stdin) => stdin,
             None => {
@@ -161,16 +246,25 @@ impl ShellExec for ShellExecService {
 
         let (tx, rx) = mpsc::channel(32);
 
-        let stdout_reader = spawn_reader(stdout, tx.clone(), |data| ExecResponse {
-            response: Some(
-                crate::pb::bracket::portproxy::v1::exec_response::Response::StdoutData(data),
-            ),
+        // The timeout is an inactivity deadline. Reader activity is coalesced
+        // through a bounded channel so high-volume output cannot build a second
+        // unbounded queue merely to renew the deadline.
+        let (activity_tx, mut activity_rx) = mpsc::channel(1);
+        let stdout_reader = spawn_reader(stdout, tx.clone(), activity_tx.clone(), |data| {
+            ExecResponse {
+                response: Some(
+                    crate::pb::bracket::portproxy::v1::exec_response::Response::StdoutData(data),
+                ),
+            }
         });
-        let stderr_reader = spawn_reader(stderr, tx.clone(), |data| ExecResponse {
-            response: Some(
-                crate::pb::bracket::portproxy::v1::exec_response::Response::StderrData(data),
-            ),
+        let stderr_reader = spawn_reader(stderr, tx.clone(), activity_tx.clone(), |data| {
+            ExecResponse {
+                response: Some(
+                    crate::pb::bracket::portproxy::v1::exec_response::Response::StderrData(data),
+                ),
+            }
         });
+        drop(activity_tx);
 
         tokio::spawn(async move {
             loop {
@@ -200,15 +294,37 @@ impl ShellExec for ShellExecService {
         });
 
         tokio::spawn(async move {
-            if let Some(duration) = timeout {
-                match tokio::time::timeout(duration, child.wait()).await {
-                    Ok(Ok(exit)) => {
-                        drain_exec_readers(stdout_reader, stderr_reader).await;
-                        finalize_exec_status(pid, tx, exit).await;
+            // STALL DIAGNOSTIC (keep: low-noise): thread the reported exit code
+            // out of every terminal branch so the exit breadcrumb below can time
+            // the whole action (recv -> exit) and flag ~30s boundary stalls.
+            let reported_code = if let Some(duration) = timeout {
+                let inactivity = tokio::time::sleep(duration);
+                tokio::pin!(inactivity);
+                let mut readers_open = true;
+                let outcome = loop {
+                    tokio::select! {
+                        biased;
+                        status = child.wait() => break Some(status),
+                        activity = activity_rx.recv(), if readers_open => {
+                            if activity.is_some() {
+                                inactivity.as_mut().reset(tokio::time::Instant::now() + duration);
+                            } else {
+                                readers_open = false;
+                            }
+                        }
+                        () = &mut inactivity => break None,
                     }
-                    Ok(Err(err)) => finalize_exec_wait_error(pid, tx, err).await,
-                    Err(_) => {
-                        debug!("command timed out, killing process group for pid {pid}");
+                };
+                match outcome {
+                    Some(Ok(exit)) => {
+                        drain_exec_readers(stdout_reader, stderr_reader).await;
+                        finalize_exec_status(pid, tx, exit).await
+                    }
+                    Some(Err(err)) => finalize_exec_wait_error(pid, tx, err).await,
+                    None => {
+                        debug!(
+                            "command inactive past timeout, killing process group for pid {pid}"
+                        );
                         kill_process_group_or_child(pid, &mut child);
                         drain_exec_readers(stdout_reader, stderr_reader).await;
                         let _ = tx
@@ -222,17 +338,40 @@ impl ShellExec for ShellExecService {
                             .await;
 
                         let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-                        finalize_exec_with_code(pid, tx, 124).await;
+                        finalize_exec_with_code(pid, tx, 124).await
                     }
                 }
             } else {
                 match child.wait().await {
                     Ok(exit) => {
                         drain_exec_readers(stdout_reader, stderr_reader).await;
-                        finalize_exec_status(pid, tx, exit).await;
+                        finalize_exec_status(pid, tx, exit).await
                     }
                     Err(err) => finalize_exec_wait_error(pid, tx, err).await,
                 }
+            };
+            // STALL DIAGNOSTIC (keep: low-noise): action-boundary exit breadcrumb.
+            // total_ms is recv->exit; a >5s total or >1s spawn_delay is the ~30s
+            // stall we are hunting, so it rises to WARN; healthy execs stay debug.
+            let total = recv_at.elapsed();
+            if total > EXEC_SLOW_TOTAL || spawn_delay > EXEC_SLOW_SPAWN {
+                warn!(
+                    pid,
+                    code = reported_code,
+                    argv_hash,
+                    total_ms = total.as_millis() as u64,
+                    spawn_delay_ms = spawn_delay.as_millis() as u64,
+                    "portproxy exec exit slow"
+                );
+            } else {
+                debug!(
+                    pid,
+                    code = reported_code,
+                    argv_hash,
+                    total_ms = total.as_millis() as u64,
+                    spawn_delay_ms = spawn_delay.as_millis() as u64,
+                    "portproxy exec exit"
+                );
             }
         });
 
@@ -533,7 +672,7 @@ impl PortProxy for PortProxyService {
                 }
             }
         }
-        if let Err(err) = fs::write(&path, req.data).await {
+        if let Err(err) = write_file_atomic(&path, &req.data).await {
             return Err(Status::internal(format!(
                 "failed to write {:?}: {err}",
                 path
@@ -978,6 +1117,7 @@ async fn read_file_bounded(path: &PathBuf) -> io::Result<Vec<u8>> {
 fn spawn_reader<R, F>(
     mut reader: R,
     tx: mpsc::Sender<Result<ExecResponse, Status>>,
+    activity: mpsc::Sender<()>,
     build: F,
 ) -> JoinHandle<()>
 where
@@ -990,6 +1130,7 @@ where
             match reader.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
+                    let _ = activity.try_send(());
                     if tx.send(Ok(build(buf[..n].to_vec()))).await.is_err() {
                         break;
                     }
@@ -1008,20 +1149,30 @@ async fn drain_exec_readers(stdout_reader: JoinHandle<()>, stderr_reader: JoinHa
     let _ = stderr_reader.await;
 }
 
+// STALL DIAGNOSTIC (keep: low-noise): a stable, low-cardinality fingerprint of
+// argv so the exec timing breadcrumbs can correlate the same command across the
+// recv/spawn/exit hops without ever logging the (possibly sensitive) argv.
+fn argv_fingerprint(args: &[String]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    args.hash(&mut hasher);
+    hasher.finish()
+}
+
 async fn finalize_exec_status(
     pid: i32,
     tx: mpsc::Sender<Result<ExecResponse, Status>>,
     status: ExitStatus,
-) {
+) -> i32 {
     let code = status.code().or_else(|| status.signal()).unwrap_or(-1);
-    finalize_exec_with_code(pid, tx, code).await;
+    finalize_exec_with_code(pid, tx, code).await
 }
 
 async fn finalize_exec_wait_error(
     pid: i32,
     tx: mpsc::Sender<Result<ExecResponse, Status>>,
     err: impl std::fmt::Display,
-) {
+) -> i32 {
     error!("failed waiting for child pid {pid}: {err}");
     let _ = tx
         .send(Ok(ExecResponse {
@@ -1032,14 +1183,14 @@ async fn finalize_exec_wait_error(
             ),
         }))
         .await;
-    finalize_exec_with_code(pid, tx, -1).await;
+    finalize_exec_with_code(pid, tx, -1).await
 }
 
 async fn finalize_exec_with_code(
     pid: i32,
     tx: mpsc::Sender<Result<ExecResponse, Status>>,
     code: i32,
-) {
+) -> i32 {
     if tx
         .send(Ok(ExecResponse {
             response: Some(
@@ -1051,12 +1202,13 @@ async fn finalize_exec_with_code(
     {
         debug!("failed to send exit code for pid {}", pid);
     }
+    code
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use futures::stream;
     use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
@@ -1075,6 +1227,137 @@ mod tests {
     use crate::pb::bracket::portproxy::v1::{
         AttachDaemonStart, attach_daemon_request, attach_daemon_response,
     };
+
+    #[tokio::test]
+    async fn whole_file_write_replaces_atomically_without_leaving_temp_files() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("unix time should be monotonic")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("chevalier-atomic-write-{nonce}"));
+        let path = dir.join("plan.html");
+        fs::create_dir_all(&dir)
+            .await
+            .expect("test directory should be created");
+        fs::write(&path, b"old content")
+            .await
+            .expect("old destination should be created");
+
+        write_file_atomic(&path, b"complete replacement")
+            .await
+            .expect("atomic replacement should succeed");
+
+        expect_file_contents(&path, b"complete replacement").await;
+        let mut entries = fs::read_dir(&dir)
+            .await
+            .expect("test directory should list");
+        let mut names = Vec::new();
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .expect("directory entry should read")
+        {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        assert_eq!(names, vec!["plan.html"]);
+        fs::remove_dir_all(dir)
+            .await
+            .expect("test directory should clean up");
+    }
+
+    async fn expect_file_contents(path: &std::path::Path, expected: &[u8]) {
+        let actual = fs::read(path).await.expect("test destination should read");
+        assert_eq!(actual, expected);
+    }
+
+    async fn run_test_exec(command: &str, timeout_secs: i32) -> (String, i32) {
+        let tracker = ChildTracker::new();
+        spawn_test_child_reaper(tracker.clone());
+        let service = ShellExecService::new(tracker);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().expect("listener has local addr");
+        let incoming = stream::unfold(listener, |listener| async {
+            Some((listener.accept().await.map(|(stream, _)| stream), listener))
+        });
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(ShellExecServer::new(service))
+                .serve_with_incoming(incoming)
+                .await
+                .expect("test shell exec server should run");
+        });
+
+        let mut client = ShellExecClient::connect(format!("http://{addr}"))
+            .await
+            .expect("client should connect");
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(ExecRequest {
+            request: Some(
+                crate::pb::bracket::portproxy::v1::exec_request::Request::Start(ExecStart {
+                    args: vec!["sh".to_string(), "-lc".to_string(), command.to_string()],
+                    env: HashMap::new(),
+                    timeout: Some(timeout_secs),
+                    detach: false,
+                }),
+            ),
+        })
+        .await
+        .expect("start frame should enqueue");
+        drop(tx);
+
+        let mut stream = client
+            .exec(Request::new(ReceiverStream::new(rx)))
+            .await
+            .expect("exec should start")
+            .into_inner();
+        let mut output = Vec::new();
+        let exit_code = loop {
+            let next = tokio::time::timeout(Duration::from_secs(5), stream.message())
+                .await
+                .expect("exec stream should not hang")
+                .expect("exec stream should not error");
+            let Some(frame) = next else {
+                panic!("exec stream ended without an exit code");
+            };
+            match frame.response {
+                Some(crate::pb::bracket::portproxy::v1::exec_response::Response::StdoutData(
+                    bytes,
+                ))
+                | Some(crate::pb::bracket::portproxy::v1::exec_response::Response::StderrData(
+                    bytes,
+                )) => output.extend(bytes),
+                Some(crate::pb::bracket::portproxy::v1::exec_response::Response::ExitCode(
+                    code,
+                )) => break code,
+                _ => {}
+            }
+        };
+        server.abort();
+        (String::from_utf8_lossy(&output).into_owned(), exit_code)
+    }
+
+    #[tokio::test]
+    async fn exec_timeout_renews_while_output_advances() {
+        let started = Instant::now();
+        let (output, exit_code) = run_test_exec(
+            "printf one; sleep 0.6; printf two; sleep 0.6; printf three",
+            1,
+        )
+        .await;
+
+        assert!(started.elapsed() >= Duration::from_millis(1_100));
+        assert_eq!(output, "onetwothree");
+        assert_eq!(exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn exec_timeout_still_terminates_a_silent_command() {
+        let (output, exit_code) = run_test_exec("sleep 2", 1).await;
+        assert!(output.contains("(Command timed out)"));
+        assert_eq!(exit_code, 124);
+    }
 
     #[tokio::test]
     async fn exec_command_finishes_when_client_closes_stream_after_start() {

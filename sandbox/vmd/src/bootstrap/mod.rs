@@ -177,15 +177,16 @@ After=network.target
 
 [Service]
 Type=simple
-Environment=RUST_LOG=trace
+Environment=RUST_LOG=info,h2=warn,hyper=warn,tonic=warn,tower=warn
 EnvironmentFile=-/etc/chevalier/portproxy.env
 ExecStartPre=/usr/local/sbin/chevalier-apply-tap-network.sh
+ExecStartPre=/bin/sh -c 'mkdir -p /var/log; : > /var/log/portproxy.log || true'
 ExecStartPre=/bin/sh -c 'echo "portproxy.service preflight: $(date -Iseconds) starting /usr/sbin/portproxy --server"'
 ExecStart=/usr/sbin/portproxy --server
 Restart=on-failure
 RestartSec=2
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=append:/var/log/portproxy.log
+StandardError=append:/var/log/portproxy.log
 
 [Install]
 WantedBy=multi-user.target
@@ -204,6 +205,8 @@ systemctl is-enabled portproxy.service || true
 systemctl is-active portproxy.service || true
 systemctl --no-pager -l status portproxy.service || true
 journalctl --no-pager -u portproxy.service -n 200 || true
+echo "portproxy-diag: tail /var/log/portproxy.log"
+tail -n 200 /var/log/portproxy.log 2>/dev/null || true
 ss -ltnp || true
 echo "portproxy-diag: $(date -Iseconds) end"
 EOF
@@ -1223,6 +1226,11 @@ mod tests {
             entries.contains(&"SHARED-MOUNTS.TSV;1".to_string()),
             "shared mounts manifest missing"
         );
+        // PROXY_BIN outlives this test's TempDir; a stale value sends later
+        // portproxy::binary lookups to the deleted path.
+        unsafe {
+            std::env::remove_var("PROXY_BIN");
+        }
         Ok(())
     }
 
@@ -1356,6 +1364,35 @@ mod tests {
         let script = build_init_script("vm-test", None, None, None, false);
         assert!(script.contains("After=network.target"));
         assert!(!script.contains("network-online.target"));
+    }
+
+    #[test]
+    fn init_script_keeps_portproxy_logs_off_the_serial_console() {
+        let script = build_init_script("vm-test", None, None, None, false);
+        // The portproxy.service unit must not copy its (potentially multi-MB/min)
+        // stdout/stderr to the serial console — that flood is a guest soft-lockup
+        // trigger. Route both streams to a file on the guest disk instead.
+        assert!(
+            !script.contains("StandardOutput=journal+console"),
+            "portproxy stdout must not be teed to the serial console"
+        );
+        assert!(
+            !script.contains("StandardError=journal+console"),
+            "portproxy stderr must not be teed to the serial console"
+        );
+        assert!(script.contains("StandardOutput=append:/var/log/portproxy.log"));
+        assert!(script.contains("StandardError=append:/var/log/portproxy.log"));
+        // Truncate-on-start size guard (no rotation).
+        assert!(script.contains(": > /var/log/portproxy.log"));
+        // Default the transport stack down to WARN at the source; still
+        // overridable via RUST_LOG in the EnvironmentFile.
+        assert!(script.contains(
+            "Environment=RUST_LOG=info,h2=warn,hyper=warn,tonic=warn,tower=warn"
+        ));
+        assert!(
+            !script.contains("Environment=RUST_LOG=trace"),
+            "portproxy must not default to trace-level logging"
+        );
     }
 
     #[test]

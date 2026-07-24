@@ -11,8 +11,8 @@ use chevalier_vfs::local::LocalVfsStorage;
 use chevalier_vfs::{
     OptimizedVfsStorage, VFS_POSIX_MODE_MASK, VfsStorageCasPredicate, VfsStorageDirListFilter,
     VfsStorageEntryKind, VfsStorageError, VfsStorageMetadata, VfsStorageMetadataFields,
-    VfsStorageNamespaceMutation, VfsStorageObjectState, VfsStorageWrite, VfsStorageWriteOptions,
-    VfsStorageWritePrecondition,
+    VfsStorageNamespaceMutation, VfsStorageObjectState, VfsStoragePrefetchOptions, VfsStorageWrite,
+    VfsStorageWriteOptions, VfsStorageWritePrecondition,
 };
 use napi::bindgen_prelude::{BigInt, Buffer};
 use napi_derive::napi;
@@ -344,6 +344,19 @@ pub struct VfsWriteOptions {
     pub mode: Option<u32>,
 }
 
+#[napi(object)]
+pub struct VfsPrefetchOptions {
+    pub include_small_file_bytes: Option<bool>,
+    pub max_entries: Option<i32>,
+    pub max_pack_bytes: Option<u32>,
+}
+
+#[napi(object)]
+pub struct VfsPrefetchFileBytes {
+    pub path: String,
+    pub body: Buffer,
+}
+
 #[derive(Deserialize)]
 struct VfsWriteManyInput {
     path: String,
@@ -521,6 +534,40 @@ impl VfsStorage {
         Ok(items
             .into_iter()
             .map(|item| item.map(VfsMetadata::from))
+            .collect())
+    }
+
+    /// Warm a bounded subtree and optionally return its small file bodies.
+    #[napi]
+    pub async fn prefetch_subtree(
+        &self,
+        prefix: String,
+        options: Option<VfsPrefetchOptions>,
+    ) -> napi::Result<Vec<VfsPrefetchFileBytes>> {
+        let options = options.unwrap_or(VfsPrefetchOptions {
+            include_small_file_bytes: None,
+            max_entries: None,
+            max_pack_bytes: None,
+        });
+        let result = self
+            .inner
+            .prefetch_subtree(
+                &prefix,
+                VfsStoragePrefetchOptions {
+                    include_small_file_bytes: options.include_small_file_bytes.unwrap_or(false),
+                    max_entries: options.max_entries.map(i64::from),
+                    max_pack_bytes: options.max_pack_bytes.map(u64::from),
+                },
+            )
+            .await
+            .map_err(vfs_err)?;
+        Ok(result
+            .warmed_file_bytes
+            .into_iter()
+            .map(|(path, body)| VfsPrefetchFileBytes {
+                path,
+                body: Buffer::from(body.to_vec()),
+            })
             .collect())
     }
 

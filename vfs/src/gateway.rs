@@ -9,8 +9,16 @@ use http_body::Frame;
 use http_body_util::StreamBody;
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use tokio_util::io::ReaderStream;
+use uuid::Uuid;
 
 use crate::{
     OptimizedVfsStorage, VfsStorageCasPredicate, VfsStorageDeleteResult, VfsStorageDirListFilter,
@@ -28,6 +36,8 @@ const REASON_HEADER: &str = "x-chevalier-vfs-reason";
 const RESOURCE_KEY_HEADER: &str = "x-chevalier-vfs-resource-key";
 const SURFACE_KIND_HEADER: &str = "x-chevalier-vfs-surface-kind";
 const LOCK_OWNER_TOKEN_HEADER: &str = "x-chevalier-vfs-lock-owner-token";
+const LEASE_MODE_HEADER: &str = "x-chevalier-vfs-lease-mode";
+const LEASE_MODE_IMPLICIT: &str = "implicit";
 const PRECONDITION_KIND_HEADER: &str = "x-chevalier-vfs-precondition-kind";
 const PRECONDITION_FINGERPRINT_HEADER: &str = "x-chevalier-vfs-precondition-fingerprint";
 const PRECONDITION_FILE_ID_HEADER: &str = "x-chevalier-vfs-precondition-file-id";
@@ -100,6 +110,7 @@ impl GatewayVfsStorageConfig {
 pub struct GatewayVfsStorage {
     cfg: GatewayVfsStorageConfig,
     client: Client,
+    implicit_leases: Arc<AtomicBool>,
 }
 
 impl GatewayVfsStorage {
@@ -111,11 +122,16 @@ impl GatewayVfsStorage {
                 .timeout(DEFAULT_REQUEST_TIMEOUT)
                 .build()
                 .expect("default VFS gateway HTTP client must build"),
+            implicit_leases: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn with_client(cfg: GatewayVfsStorageConfig, client: Client) -> Self {
-        Self { cfg, client }
+        Self {
+            cfg,
+            client,
+            implicit_leases: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     fn url(&self, suffix: &str) -> String {
@@ -171,6 +187,12 @@ impl GatewayVfsStorage {
         mutation_count: i32,
         reason: &str,
     ) -> VfsStorageResult<GatewayLeaseGrant> {
+        if self.implicit_leases.load(Ordering::Acquire) {
+            return Ok(GatewayLeaseGrant {
+                resource_key: format!("implicit:{}", self.path_arg(path)),
+                owner_token: uuid::Uuid::nil().to_string(),
+            });
+        }
         let response = self
             .send(
                 self.client
@@ -184,6 +206,14 @@ impl GatewayVfsStorage {
                     }),
             )
             .await?;
+        if response
+            .headers()
+            .get(LEASE_MODE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            == Some(LEASE_MODE_IMPLICIT)
+        {
+            self.implicit_leases.store(true, Ordering::Release);
+        }
         response
             .json()
             .await
@@ -191,6 +221,9 @@ impl GatewayVfsStorage {
     }
 
     async fn release_lease(&self, lease: &GatewayLeaseGrant) -> VfsStorageResult<()> {
+        if self.implicit_leases.load(Ordering::Acquire) {
+            return Ok(());
+        }
         self.send(
             self.client
                 .delete(self.url("/lease"))
@@ -984,7 +1017,12 @@ impl OptimizedVfsStorage for GatewayVfsStorage {
                 self.cfg.mutation_reason.as_str(),
             )
             .await?;
+        let operation_ids = mutations
+            .iter()
+            .map(|_| Uuid::new_v4().to_string())
+            .collect();
         let body = NamespaceBatchBody {
+            operation_ids,
             mutations: mutations
                 .into_iter()
                 .map(|mutation| NamespaceMutation::from_storage(mutation, self))
@@ -1037,12 +1075,18 @@ struct PathBatchRequest {
 
 #[derive(Serialize)]
 struct NamespaceBatchBody {
+    operation_ids: Vec<String>,
     mutations: Vec<NamespaceMutation>,
 }
 
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum NamespaceMutation {
+    CreateFile {
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<u32>,
+    },
     CreateDirectory {
         path: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1051,6 +1095,10 @@ enum NamespaceMutation {
     CreateSymlink {
         path: String,
         target: String,
+    },
+    CreateHardLink {
+        source_path: String,
+        destination_path: String,
     },
     DeleteFile {
         path: String,
@@ -1073,6 +1121,10 @@ enum NamespaceMutation {
 impl NamespaceMutation {
     fn from_storage(mutation: VfsStorageNamespaceMutation, storage: &GatewayVfsStorage) -> Self {
         match mutation {
+            VfsStorageNamespaceMutation::CreateFile { path, mode } => Self::CreateFile {
+                path: storage.path_arg(path.as_str()),
+                mode: mode.map(normalize_vfs_mode),
+            },
             VfsStorageNamespaceMutation::CreateDirectory { path, mode } => Self::CreateDirectory {
                 path: storage.path_arg(path.as_str()),
                 mode: mode.map(normalize_vfs_mode),
@@ -1080,6 +1132,13 @@ impl NamespaceMutation {
             VfsStorageNamespaceMutation::CreateSymlink { path, target } => Self::CreateSymlink {
                 path: storage.path_arg(path.as_str()),
                 target,
+            },
+            VfsStorageNamespaceMutation::CreateHardLink {
+                source_path,
+                destination_path,
+            } => Self::CreateHardLink {
+                source_path: storage.path_arg(source_path.as_str()),
+                destination_path: storage.path_arg(destination_path.as_str()),
             },
             VfsStorageNamespaceMutation::DeleteFile { path, precondition } => Self::DeleteFile {
                 path: storage.path_arg(path.as_str()),
