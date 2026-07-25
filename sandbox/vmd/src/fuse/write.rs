@@ -14,7 +14,6 @@ use chevalier_sandbox::vfs::{
 };
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
 
 use super::client::{RemoteVfsClient, RemoteWrite, rejected_request_status};
@@ -1096,7 +1095,7 @@ fn stream_exact_file(
     let source_file = File::open(source)
         .with_context(|| format!("open rejected vfs write {}", source.display()))?;
     let mut source_reader = source_file.take(expected_size.saturating_add(1));
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     let mut buffer = [0u8; JOURNAL_READ_BUFFER_BYTES];
     let mut copied = 0u64;
     loop {
@@ -1121,7 +1120,7 @@ fn stream_exact_file(
             expected_size,
         ));
     }
-    Ok(hex_encode(hasher.finalize().as_ref()))
+    Ok(hex_encode(hasher.finalize().as_bytes()))
 }
 
 fn remove_dead_letter_temporary(path: &Path) -> Result<()> {
@@ -1182,10 +1181,14 @@ fn rebase_pending_after_commit(
     }
 }
 
+/// VFS content identity. Must stay byte-identical to `hash_regular_file` in
+/// chevalier-vfs `local.rs` — vmd sends these as CAS preconditions and the
+/// gateway compares them against its own stored hashes, so a divergence here
+/// fails every precondition-bearing write and surfaces in the guest as EIO.
 fn content_hash_for_bytes(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     hasher.update(bytes);
-    hex_encode(hasher.finalize().as_ref())
+    hex_encode(hasher.finalize().as_bytes())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -1705,11 +1708,19 @@ mod tests {
         );
     }
 
+    /// Pins the same vector as `pack.rs` in chevalier-vfs. If the gateway ever
+    /// changes content-hash algorithm without vmd following, this fails instead
+    /// of every mounted delete/overwrite failing at runtime.
     #[test]
-    fn content_hash_matches_sha256_hex() {
+    fn content_hash_matches_blake3_hex() {
         assert_eq!(
             content_hash_for_bytes(b""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+        );
+        assert_ne!(
+            content_hash_for_bytes(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "content hash must not regress to sha256"
         );
     }
 

@@ -15,6 +15,8 @@ anyhow = "1.0.100"
 async-nats = "0.39.0"
 async-trait = "0.1.89"
 axum = "0.8.6"
+# VFS content identity; must match chevalier-vfs (see content_hash_for_bytes).
+blake3 = "1"
 chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.51", features = ["derive"] }
 etcd-client = "0.14.1"

@@ -18,7 +18,6 @@ use fuser::{
     ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen,
     ReplyWrite, TimeOrNow,
 };
-use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
 use uuid::Uuid;
 
@@ -4039,10 +4038,14 @@ fn range_fingerprint(metadata: &RemoteMetadata) -> String {
     format!("{}:{millis}", metadata.size_bytes)
 }
 
+/// VFS content identity. Must stay byte-identical to `hash_regular_file` in
+/// chevalier-vfs `local.rs` — vmd sends these as CAS preconditions and the
+/// gateway compares them against its own stored hashes, so a divergence here
+/// fails every precondition-bearing write and surfaces in the guest as EIO.
 fn content_hash_for_bytes(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     hasher.update(bytes);
-    hex_encode(hasher.finalize().as_ref())
+    hex_encode(hasher.finalize().as_bytes())
 }
 
 /// Descendant write-barrier prefixes for a namespace mutation: the subtree(s) a
@@ -7721,11 +7724,19 @@ mod tests {
         assert!(!content_hash_conflicts(None, None));
     }
 
+    /// Pins the same vector as `pack.rs` in chevalier-vfs. If the gateway ever
+    /// changes content-hash algorithm without vmd following, this fails instead
+    /// of every mounted delete/overwrite failing at runtime.
     #[test]
-    fn content_hash_for_bytes_matches_sha256_hex() {
+    fn content_hash_for_bytes_matches_blake3_hex() {
         assert_eq!(
             content_hash_for_bytes(b""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+        );
+        assert_ne!(
+            content_hash_for_bytes(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "content hash must not regress to sha256"
         );
     }
 
