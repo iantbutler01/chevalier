@@ -350,6 +350,12 @@ impl VfsIndexEntryWithManifest {
             token_count,
             version: self.entry.current_version,
             updated_at: self.entry.updated_at,
+            // Index-backed metadata is reconstructed from stored rows, not from a
+            // live stat, so there is no filesystem mtime/ctime to witness. `None`
+            // is the honest answer and the safe one: it reads as "unknown", which
+            // callers must treat as a reason to re-hash rather than to trust.
+            mtime_ns: None,
+            ctime_ns: None,
             object_state,
         }
     }

@@ -526,6 +526,8 @@ impl LocalVfsStorage {
             token_count: None,
             version: None,
             updated_at: modified_at(&metadata),
+            mtime_ns: i64::try_from(metadata_mtime_ns(&metadata)).ok(),
+            ctime_ns: i64::try_from(metadata_change_ns(&metadata)).ok(),
             object_state,
         }))
     }
@@ -5930,6 +5932,50 @@ mod tests {
             storage.hash_read_count(),
             after_first,
             "second walk over an unchanged tree must read no file contents",
+        );
+    }
+
+    /// The persisted stat witness is only trustworthy if ctime is carried
+    /// alongside mtime: a metadata-only change leaves content and mtime alone but
+    /// always moves ctime, and ctime cannot be set directly from userspace, so it
+    /// still moves when a writer preserves or backdates mtime. Without it a stored
+    /// hash could be reused across a change the witness never saw.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_metadata_carries_nanosecond_mtime_and_ctime_witness() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("witness.txt");
+        fs::write(&path, b"contents").expect("write");
+        let storage = LocalVfsStorage::new(dir.path());
+
+        let before = storage
+            .stat("witness.txt")
+            .await
+            .expect("stat")
+            .expect("present");
+        assert!(before.mtime_ns.is_some(), "mtime witness must be populated");
+        assert!(before.ctime_ns.is_some(), "ctime witness must be populated");
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        let after = storage
+            .stat("witness.txt")
+            .await
+            .expect("stat")
+            .expect("present");
+        assert_eq!(
+            after.content_hash, before.content_hash,
+            "chmod must not change content",
+        );
+        assert_eq!(
+            after.mtime_ns, before.mtime_ns,
+            "chmod must not move mtime -- which is exactly why mtime alone is insufficient",
+        );
+        assert_ne!(
+            after.ctime_ns, before.ctime_ns,
+            "chmod must move ctime so the witness observes the change",
         );
     }
 

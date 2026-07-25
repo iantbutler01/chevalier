@@ -101,6 +101,21 @@ pub struct VfsStorageMetadata {
     pub token_count: Option<i32>,
     pub version: Option<String>,
     pub updated_at: Option<DateTime<Utc>>,
+    /// Nanosecond mtime/ctime, carried as exact integers so a persisted stat
+    /// witness can be compared without depending on timestamp fidelity through
+    /// serialization. `updated_at` remains the human/display projection of mtime.
+    ///
+    /// ctime matters independently of mtime: it cannot be set directly from
+    /// userspace, so it still moves when a writer preserves or backdates mtime
+    /// (tar extraction, `rsync --times`, `touch -t`). That is what makes a
+    /// stored content hash safe to reuse without re-reading the file, and it is
+    /// the same pairing git's index, restic, and borg rely on. Backends that
+    /// cannot supply them return `None`, which callers must treat as "unknown"
+    /// and therefore as a reason to re-hash rather than to trust a cached value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime_ns: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctime_ns: Option<i64>,
     pub object_state: Option<VfsStorageObjectState>,
 }
 
@@ -119,6 +134,8 @@ impl Default for VfsStorageMetadata {
             token_count: None,
             version: None,
             updated_at: None,
+            mtime_ns: None,
+            ctime_ns: None,
             object_state: None,
         }
     }
