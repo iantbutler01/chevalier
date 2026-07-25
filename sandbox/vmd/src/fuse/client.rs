@@ -1459,10 +1459,19 @@ impl RemoteVfsClient {
                 }
                 let body = response.text().await.unwrap_or_default();
                 let error = anyhow!("vfs read failed: {status} {body}");
+                // CONFLICT on a READ is the gateway's optimistic-snapshot retry
+                // signal, not a rejection: `optimisticRead` runs a recursive read
+                // without excluding mutations and returns 409 when a writer
+                // overlapped every attempt. The correct response is to retry, which
+                // is precisely what this loop exists to do. Treating it as terminal
+                // turned a "try again" into a hard failure for /subtree-metadata and
+                // /prefetch-subtree under sustained write churn.
                 if status.is_server_error()
                     || matches!(
                         status,
-                        StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT
+                        StatusCode::TOO_MANY_REQUESTS
+                            | StatusCode::REQUEST_TIMEOUT
+                            | StatusCode::CONFLICT
                     )
                 {
                     Err(ReadFailure::transient(error))
