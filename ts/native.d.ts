@@ -128,6 +128,20 @@ export declare class VfsStorage {
   write(path: string, data: Buffer, options?: VfsWriteOptions | null): Promise<any>
   /** Atomically install a host-local staged file with bounded memory. */
   writeFromFile(path: string, sourcePath: string, expectedContentHash: string, options?: VfsWriteOptions | null): Promise<any>
+  /**
+   * Prime the local content-hash cache from durably stored witnesses.
+   *
+   * The cache is per-process, so a restart otherwise forces the next scan to
+   * re-read and re-hash the whole tree. Feeding back previously persisted
+   * rows skips that. Every seeded entry is still revalidated against a live
+   * stat before it is reused, so a stale seed can only waste a slot, never
+   * cause a wrong hash to be served. Entries with unparseable numbers or a
+   * malformed hash are skipped rather than failing the batch.
+   *
+   * Returns the number of entries accepted. Backends without a local hash
+   * cache (gateway, object-backed) accept none.
+   */
+  seedHashCache(entries: Array<VfsSeededHash>): number
   /** Stat a path; returns typed metadata (`sizeBytes` is a `bigint`) or null. */
   stat(path: string, options?: { maxHashBytes?: number | null } | null): Promise<VfsMetadata | null>
   /** List a directory's entries with typed metadata. */
@@ -341,6 +355,15 @@ export interface VfsMetadata {
   version?: string
   /** RFC 3339 timestamp. */
   updatedAt?: string
+  /**
+   * `bigint` nanosecond mtime/ctime witnessing that `contentHash` is current,
+   * so a caller can revalidate a stored hash without re-reading the file.
+   * `bigint` for the same reason as `sizeBytes`: ~1.75e18 ns since the epoch is
+   * far above 2^53, so a JS `number` would round it and two distinct writes
+   * could compare equal. Absent means "unknown" -- re-hash, never reuse.
+   */
+  mtimeNs?: bigint
+  ctimeNs?: bigint
   objectState?: VfsObjectState
 }
 
@@ -363,6 +386,22 @@ export interface VfsPrefetchOptions {
   includeSmallFileBytes?: boolean
   maxEntries?: number
   maxPackBytes?: number
+}
+
+/**
+ * One durably-stored content hash plus the stat witness proving it was current
+ * when recorded. Numeric fields are decimal strings because nanosecond
+ * timestamps (~1.75e18) exceed `Number.MAX_SAFE_INTEGER`, and this is the exact
+ * shape the replica index already persists.
+ */
+export interface VfsSeededHash {
+  /** Logical (storage-relative) path. */
+  path: string
+  sizeBytes: string
+  mtimeNs: string
+  ctimeNs: string
+  /** Lowercase hex sha256. */
+  contentHash: string
 }
 
 /** Write options for VFS storage. */

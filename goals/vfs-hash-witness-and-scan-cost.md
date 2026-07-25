@@ -1,0 +1,132 @@
+# VFS hash witness, scan cost, and the large-file edges
+
+Written 2026-07-25 after landing the durable stat witness. Records what was
+measured, what was fixed, and what is deliberately left open, so the next
+session does not have to re-derive it.
+
+## The problem, as measured
+
+The replica index was maintained by re-hashing the tree. On a measured owner
+(74,142 files / 826 MB) this drove gateway latency:
+
+| operation | before | after |
+| --- | --- | --- |
+| `subtree-metadata` (root, cold process) | 16,814–22,290 ms | 394 ms |
+| `metadata-many` | 9,524 ms | 1.3–1.7 ms warm |
+| `/stat` warm | ~1 ms | ~0.8 ms |
+| slow-request log lines after a restart | many | 0 |
+
+A 1,234-sample latency run against `/stat` had 20 samples over 100 ms and 8 over
+1 s, max 7.94 s, with every slow sample inside the scan window.
+
+## What was actually wrong
+
+Three independent defects, none of which was the one originally assumed.
+
+1. **The witness-validated hash cache existed and was unusable.**
+   `local.rs` already compared `size + mtime + ctime` before reusing a hash, with
+   a recency guard and a trusted-write flag. But `HASH_CACHE_MAX_AGE` was 30 s
+   against a 600 s scan interval — every entry was guaranteed expired before the
+   next scan reached it — and `MAX_HASH_CACHE_ENTRIES` was 16,384 against 74,142
+   files, with oldest-first eviction, which is exactly pessimal for a sequential
+   directory walk. Structural 100 % miss.
+
+2. **The cache was per-process, so restarts paid full price.** Fixed by
+   persisting the witness (`mtime_ns`, `ctime_ns` beside `content_hash` in
+   `vfs_replica_entries`) and seeding the in-process cache from it on store
+   creation. This is what git's index, restic's parent metadata, and borg's files
+   cache all do; ours was the only one that was memory-only.
+
+3. **`metadata-many` took the blocking lock.** It used `publications.read` while
+   the far heavier `subtree-metadata` and `prefetch-subtree` use
+   `optimisticRead`, so a single-path batch queued behind the writer backlog.
+
+## Design notes worth keeping
+
+- **Why ctime and not just mtime.** ctime cannot be set from userspace, so it
+  still moves when a writer preserves or backdates mtime (`tar -x`,
+  `rsync --times`, `touch -t`) and on metadata-only changes. A witness without it
+  can be defeated by a same-size edit that restores mtime. Test:
+  `local_storage_detects_same_size_out_of_band_edit_with_restored_mtime` — it
+  fails if the ctime comparison is neutralised.
+- **Only complete witnesses are ever stored or trusted.** A half-known pair is
+  dropped at parse time; absent reads as "unknown" and forces a re-hash. Rows
+  predating the columns therefore self-heal rather than lying.
+- **Witness is not part of `replicaEntryIndexFingerprint`**, so carrying it
+  cannot trigger spurious repairs or change-feed rows.
+- **Nanoseconds are TEXT, not INTEGER.** ~1.75e18 exceeds
+  `Number.MAX_SAFE_INTEGER`, and `node:sqlite` *rejects* such an INTEGER outright
+  ("Value is too large to be represented as a JavaScript number") rather than
+  rounding. The napi boundary carries them as `bigint` for the same reason
+  `sizeBytes` does.
+- **409 on a read is a retry signal**, not a rejection — `optimisticRead` returns
+  it after `MAX_OPTIMISTIC_SNAPSHOT_ATTEMPTS` contended attempts. vmd previously
+  classified it terminal, which made `subtree-metadata` and `prefetch-subtree`
+  able to fail hard under sustained write churn. That was a latent bug, fixed
+  before `metadata-many` was moved onto the same path.
+
+## Open work
+
+### 1. Unranged whole-file reads buffer entire files
+`file/raw` without a `Range` header does `buf = await store.read(relPath)`,
+materialising the whole file in the API process. Ranged reads already use
+`readRange` and are bounded, and the FUSE mount always issues ranged reads — so
+working against a large file *through the mount* is fine. The exposure is the
+unranged API path used by sync/copy flows. This is the one edge that turns
+absent-minded large-file use into an OOM rather than a slowdown. Fix by
+streaming; it does not require chunking.
+
+### 2. Metadata operations cannot bound hashing
+`max_hash_bytes` exists and is plumbed, but `scanVfsReplicaFilesystem` requires a
+valid sha256 per file (`/^[a-f0-9]{64}$/`), so large files cannot be opted out of
+hashing without breaking the scan. Teach the scan to tolerate an absent hash,
+then a stat on a multi-GB file need not pay a full read.
+
+### 3. Scan is still a full tree walk
+The hashing is gone from the steady state, but the walk and its per-entry DB work
+remain; `/stat` p99 during a scan was still ~2.5 s in the last steady-state
+sample. The intended shape is Ceph's split: a frequent light pass (stat-only,
+compare against the persisted witness) and a rare, throttled deep pass that
+re-hashes to catch bit rot. Note that fixing the cache *removed* the incidental
+bit-rot detection that constant re-hashing was providing, so the deep pass is a
+replacement for a property that was silently being relied on, not new polish.
+
+### 4. ~3,159 rows never receive a witness
+Of 28,668 hashed entries, 25,509 are witnessed and the count is stable across
+generations. The remainder have a stored `content_hash` that does not match what
+the scan observes, so the backfill correctly declines to witness them. Root cause
+not established; they simply re-hash.
+
+### 5. Chunking (CDC) — evaluated, not recommended yet
+Identity is the whole-file hash, so any edit costs a full re-hash and full
+re-transfer. Content-defined chunking (restic: Rabin-Karp, 512 KiB–8 MiB; borg:
+BuzHash64) fixes that. Reasons it is not the next step:
+- It does not fix open item 1; that is a buffering bug, not a chunking one.
+- CDC's advantage over fixed-size blocks is *insertion resilience*. Dataset
+  workloads tend to append or rewrite wholesale — append is served fine by fixed
+  blocks, and a wholesale rewrite defeats both.
+- Identity, sync convergence, and the witness all key off the whole-file hash;
+  chunking means a chunk store, chunk GC, and a transfer protocol.
+Revisit if in-place edits of large files prove to be a real workload. Price
+fixed-size blocks before CDC. (CDC also has a known side channel: chunk
+boundaries can leak chunker parameters — arxiv 2504.02095.)
+
+## Process notes
+
+Three stale-artifact incidents in one session, all the same root — a timestamp or
+link standing in for "is this current", which is the same question the witness
+answers:
+- `rsync -a` preserved local mtimes, so a synced source looked older than the
+  artifact built from it and cargo skipped the rebuild. The deploy reported
+  success while running a four-hour-old binary. Fixed by syncing chevalier by
+  content (`--checksum --no-times`).
+- `mv`-restoring a file gave it an mtime older than the compiled test binary, so
+  cargo reused a stale build and three "failures" were measuring old code.
+- `native.d.ts` is generated from the Rust crate. Changing `ts/src/*.rs` without
+  rebuilding meant `tsc` typechecked against a binding that lacked the new
+  method. `napi build` writes a new inode, breaking pnpm's hardlink into its
+  store, so the `.node` must be copied into `node_modules` explicitly; the
+  generated `.d.ts`/`.js` stay linked and propagate on their own.
+
+Also: `vitest` runs through esbuild and does not typecheck. Passing tests are not
+a substitute for `tsc -p` on an edited package — that gap cost two deploy cycles.
