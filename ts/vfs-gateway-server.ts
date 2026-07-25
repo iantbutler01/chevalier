@@ -1687,7 +1687,12 @@ export function createVfsGatewayServer(
           "max_hash_bytes",
         );
         if (maxHashBytes instanceof Response) return maxHashBytes;
-        const snapshot = await publications.read(ownerId, async () => {
+        // Optimistic, like the heavier recursive reads: a batch stat must not
+        // queue behind the writer backlog. This route previously took the
+        // blocking read and a single-path batch was measured at 9,524ms while
+        // subtree-metadata -- which walks the whole tree -- returned in 394ms.
+        // Safe only because a 409 retry signal is now transient for vmd reads.
+        const snapshot = await publications.optimisticRead(ownerId, async () => {
           const entries: (ReturnType<typeof toRemoteMetadata> | null)[] = [];
           const statOptions = maxHashBytes === null ? undefined : { maxHashBytes };
           const concurrency = maxHashBytes === null ? 1 : 64;
