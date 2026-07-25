@@ -101,7 +101,17 @@ if (!vfsStorageProto[VFS_ERROR_PATCHED]) {
   Object.defineProperty(vfsStorageProto, VFS_ERROR_PATCHED, { value: true });
 }
 
-export { McpClient, McpServer, VfsStorage, version } from "./native.js";
+export {
+  McpClient,
+  McpServer,
+  VfsStorage,
+  /** Incremental VFS content hash (BLAKE3). Must be used wherever a caller needs
+   *  the same digest the storage layer computes. */
+  VfsContentHasher,
+  /** One-shot VFS content hash (BLAKE3). */
+  vfsContentHash,
+  version,
+} from "./native.js";
 // The TS implementation of chevalier's VFS gateway SERVER (the missing third
 // corner — the Rust server + Rust/TS clients already exist). A pure-Node
 // `Request -> Response` handler that speaks the gateway wire protocol, backed by

@@ -61,6 +61,7 @@ const node_crypto_1 = require("node:crypto");
 const promises_1 = require("node:fs/promises");
 const node_os_1 = require("node:os");
 const node_path_1 = require("node:path");
+const native_js_1 = require("./native.js");
 const DEFAULT_ROUTE_PREFIX = "/internal/chevalier/vfs";
 const PRECONDITION_KIND_HEADER = "x-chevalier-vfs-precondition-kind";
 const PRECONDITION_FINGERPRINT_HEADER = "x-chevalier-vfs-precondition-fingerprint";
@@ -970,7 +971,10 @@ function createVfsGatewayServer(opts) {
                     const stagedPath = (0, node_path_1.join)(stagedDir, "payload");
                     try {
                         const staged = await (0, promises_1.open)(stagedPath, "wx", 0o600);
-                        const hasher = (0, node_crypto_1.createHash)("sha256");
+                        // Must be the same digest the storage layer computes (BLAKE3, see
+                        // pack::hex_hash). This verifies the client's declared hash, so a
+                        // mismatch in algorithm would fail every upload's integrity check.
+                        const hasher = new native_js_1.VfsContentHasher();
                         let received = 0;
                         try {
                             const reader = req.body?.getReader();
@@ -981,7 +985,7 @@ function createVfsGatewayServer(opts) {
                                         break;
                                     if (value.byteLength === 0)
                                         continue;
-                                    hasher.update(value);
+                                    hasher.update(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
                                     await staged.write(value);
                                     received += value.byteLength;
                                 }
@@ -994,7 +998,7 @@ function createVfsGatewayServer(opts) {
                         if (declaredLength !== null && received !== declaredLength) {
                             return errorResponse(400, `streamed upload length mismatch for ${relPath}`);
                         }
-                        if (hasher.digest("hex") !== expectedHash) {
+                        if (hasher.digest() !== expectedHash) {
                             return errorResponse(409, `streamed upload hash mismatch for ${relPath}`);
                         }
                         const streamingStore = store;
@@ -1271,7 +1275,12 @@ function createVfsGatewayServer(opts) {
                 const maxHashBytes = parseOptionalNonNegativeInteger(q.get("max_hash_bytes") ?? q.get("maxHashBytes"), "max_hash_bytes");
                 if (maxHashBytes instanceof Response)
                     return maxHashBytes;
-                const snapshot = await publications.read(ownerId, async () => {
+                // Optimistic, like the heavier recursive reads: a batch stat must not
+                // queue behind the writer backlog. This route previously took the
+                // blocking read and a single-path batch was measured at 9,524ms while
+                // subtree-metadata -- which walks the whole tree -- returned in 394ms.
+                // Safe only because a 409 retry signal is now transient for vmd reads.
+                const snapshot = await publications.optimisticRead(ownerId, async () => {
                     const entries = [];
                     const statOptions = maxHashBytes === null ? undefined : { maxHashBytes };
                     const concurrency = maxHashBytes === null ? 1 : 64;

@@ -39,8 +39,8 @@
   "scripts": {
     "build:native": "napi build --platform --release --js native.js --dts native.d.ts",
     "build:native:debug": "napi build --platform --js native.js --dts native.d.ts",
-    "build:ts": "tsc -p tsconfig.json",
-    "build": "napi build --platform --release --js native.js --dts native.d.ts && tsc -p tsconfig.json",
+    "build:ts": "tsc -p tsconfig.json && node scripts/generate-esm-shim.mjs",
+    "build": "napi build --platform --release --js native.js --dts native.d.ts && tsc -p tsconfig.json && node scripts/generate-esm-shim.mjs",
     "test": "node --test --test-force-exit"
   },
   "dependencies": {

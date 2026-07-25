@@ -22,7 +22,6 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use sha2::Digest;
 use tokio::sync::{
     OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock as AsyncRwLock,
     Semaphore,
@@ -1322,7 +1321,7 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                     .create_new(true)
                     .open(&tmp_path)
                     .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
-                let mut hasher = sha2::Sha256::new();
+                let mut hasher = blake3::Hasher::new();
                 let mut buffer = vec![0_u8; 1024 * 1024];
                 loop {
                     let read = source
@@ -1331,12 +1330,12 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                     if read == 0 {
                         break;
                     }
-                    hasher.update(&buffer[..read]);
+                    hasher.update_rayon(&buffer[..read]);
                     staged
                         .write_all(&buffer[..read])
                         .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
                 }
-                let content_hash = format!("{:x}", hasher.finalize());
+                let content_hash = hasher.finalize().to_hex().to_string();
                 if expected_content_hash
                     .as_deref()
                     .is_some_and(|expected| expected != content_hash)
@@ -2934,7 +2933,10 @@ fn hash_regular_file(path: &Path) -> VfsStorageResult<String> {
 fn hash_open_file(file: &mut fs::File) -> VfsStorageResult<String> {
     file.seek(SeekFrom::Start(0))
         .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
-    let mut hasher = sha2::Sha256::new();
+    // BLAKE3: see pack::hex_hash for the measurements. update_rayon lets a large
+    // file use the machine's cores instead of one, which is what turns hashing
+    // from the bottleneck into something the disk outruns.
+    let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let read = file
@@ -2943,9 +2945,9 @@ fn hash_open_file(file: &mut fs::File) -> VfsStorageResult<String> {
         if read == 0 {
             break;
         }
-        hasher.update(&buffer[..read]);
+        hasher.update_rayon(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn open_regular_file(path: &Path) -> VfsStorageResult<fs::File> {

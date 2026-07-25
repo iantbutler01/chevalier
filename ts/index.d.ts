@@ -12,7 +12,12 @@ export type McpClientConfig = {
     env?: Record<string, string>;
     cwd?: string;
 };
-export { McpClient, McpServer, VfsStorage, version } from "./native.js";
+export { McpClient, McpServer, VfsStorage, 
+/** Incremental VFS content hash (BLAKE3). Must be used wherever a caller needs
+ *  the same digest the storage layer computes. */
+VfsContentHasher, 
+/** One-shot VFS content hash (BLAKE3). */
+vfsContentHash, version, } from "./native.js";
 export { createVfsGatewayServer } from "./vfs-gateway-server.js";
 export type { VfsAdvisoryLock, VfsAdvisoryLockKind, VfsAdvisoryLockNamespace, VfsAdvisoryLockStateStore, VfsAdvisoryLockTransactionResult, VfsGatewayServerOptions, } from "./vfs-gateway-server.js";
 /** Error thrown by Chevalier, carrying a machine-readable `code` and a

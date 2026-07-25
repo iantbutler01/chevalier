@@ -740,3 +740,48 @@ impl VfsStorage {
         to_json(result)
     }
 }
+
+/// Incremental hasher producing the VFS content hash.
+///
+/// Exposed so JavaScript can compute the SAME digest the storage layer does.
+/// The gateway hashes streamed uploads to verify the client's declared hash, and
+/// if the two sides disagree on the algorithm every upload fails its integrity
+/// check -- so this must track `pack::hex_hash`, which is BLAKE3.
+///
+/// It lives here rather than as an npm dependency deliberately: the Rust side
+/// already has the implementation, and a JS crypto package would add
+/// supply-chain surface for a digest we can hand across the existing boundary.
+#[napi]
+pub struct VfsContentHasher {
+    inner: blake3::Hasher,
+}
+
+#[napi]
+impl VfsContentHasher {
+    #[napi(constructor)]
+    pub fn new() -> Self {
+        Self {
+            inner: blake3::Hasher::new(),
+        }
+    }
+
+    /// Feed the next chunk. Uses the multi-threaded path, which is what makes a
+    /// large upload disk-bound rather than hash-bound.
+    #[napi]
+    pub fn update(&mut self, chunk: Buffer) {
+        self.inner.update_rayon(&chunk);
+    }
+
+    /// Lowercase hex digest. Does not consume the hasher.
+    #[napi]
+    pub fn digest(&self) -> String {
+        self.inner.finalize().to_hex().to_string()
+    }
+}
+
+/// One-shot content hash of a buffer, identical to feeding it to
+/// `VfsContentHasher` in a single update.
+#[napi]
+pub fn vfs_content_hash(bytes: Buffer) -> String {
+    blake3::hash(&bytes).to_hex().to_string()
+}

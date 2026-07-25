@@ -112,6 +112,29 @@ export declare class StreamHandle {
 }
 
 /**
+ * Incremental hasher producing the VFS content hash.
+ *
+ * Exposed so JavaScript can compute the SAME digest the storage layer does.
+ * The gateway hashes streamed uploads to verify the client's declared hash, and
+ * if the two sides disagree on the algorithm every upload fails its integrity
+ * check -- so this must track `pack::hex_hash`, which is BLAKE3.
+ *
+ * It lives here rather than as an npm dependency deliberately: the Rust side
+ * already has the implementation, and a JS crypto package would add
+ * supply-chain surface for a digest we can hand across the existing boundary.
+ */
+export declare class VfsContentHasher {
+  constructor()
+  /**
+   * Feed the next chunk. Uses the multi-threaded path, which is what makes a
+   * large upload disk-bound rather than hash-bound.
+   */
+  update(chunk: Buffer): void
+  /** Lowercase hex digest. Does not consume the hasher. */
+  digest(): string
+}
+
+/**
  * A virtual filesystem. Construct via `VfsStorage.local(root)` or
  * `VfsStorage.gateway(opts)`.
  */
@@ -330,6 +353,12 @@ export interface ToolSchemaJs {
 
 /** The chevalier-node binding version. */
 export declare function version(): string
+
+/**
+ * One-shot content hash of a buffer, identical to feeding it to
+ * `VfsContentHasher` in a single update.
+ */
+export declare function vfsContentHash(bytes: Buffer): string
 
 export interface VfsHardLinkResult {
   source: VfsMetadata

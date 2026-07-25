@@ -46,6 +46,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, open, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
+import { VfsContentHasher } from "./native.js";
 import type { VfsStorage, VfsMetadata } from "./native.js";
 
 const DEFAULT_ROUTE_PREFIX = "/internal/chevalier/vfs";
@@ -1328,7 +1329,10 @@ export function createVfsGatewayServer(
           const stagedPath = join(stagedDir, "payload");
           try {
             const staged = await open(stagedPath, "wx", 0o600);
-            const hasher = createHash("sha256");
+            // Must be the same digest the storage layer computes (BLAKE3, see
+            // pack::hex_hash). This verifies the client's declared hash, so a
+            // mismatch in algorithm would fail every upload's integrity check.
+            const hasher = new VfsContentHasher();
             let received = 0;
             try {
               const reader = req.body?.getReader();
@@ -1337,7 +1341,7 @@ export function createVfsGatewayServer(
                   const { done, value } = await reader.read();
                   if (done) break;
                   if (value.byteLength === 0) continue;
-                  hasher.update(value);
+                  hasher.update(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
                   await staged.write(value);
                   received += value.byteLength;
                 }
@@ -1349,7 +1353,7 @@ export function createVfsGatewayServer(
             if (declaredLength !== null && received !== declaredLength) {
               return errorResponse(400, `streamed upload length mismatch for ${relPath}`);
             }
-            if (hasher.digest("hex") !== expectedHash) {
+            if (hasher.digest() !== expectedHash) {
               return errorResponse(409, `streamed upload hash mismatch for ${relPath}`);
             }
             const streamingStore = store as StreamingVfsStorage;

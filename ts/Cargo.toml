@@ -10,6 +10,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
+blake3 = { version = "1", features = ["rayon"] }
 napi = { version = "3", default-features = false, features = ["napi8", "async", "tokio_rt", "serde-json"] }
 napi-derive = "3"
 

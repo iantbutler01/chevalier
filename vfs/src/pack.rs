@@ -377,13 +377,28 @@ pub fn extract_slot(
     })
 }
 
-/// Compute the hex-encoded sha256 of the given bytes. This is the logical-file hash used by
-/// downstream manifest/content_hash columns; it is not a whole-pack object hash.
+/// Compute the hex-encoded content hash of the given bytes. This is the
+/// logical-file hash used by downstream manifest/content_hash columns; it is not
+/// a whole-pack object hash.
+///
+/// BLAKE3, not SHA-256. Hashing is the floor on large-file cost and SHA-256 is
+/// 2.6-10x slower depending on whether the host has SHA-NI: measured 2536 MB/s
+/// on a Ryzen with the extension, 579 MB/s on Apple Silicon where the sha2 crate
+/// falls back to software, against 6668 and 2450 MB/s for single-threaded
+/// BLAKE3. Self-hosted fleets make that gap the common case -- Intel only gained
+/// SHA-NI with Ice Lake (2019) / Rocket Lake (2021), while BLAKE3's baseline is
+/// AVX2 (2013). See benches/hash_throughput.rs.
+///
+/// Both digests are 32 bytes and print as 64 hex characters, so a stored value
+/// is NOT self-describing: anything persisted before this change is SHA-256 and
+/// indistinguishable by shape. Callers comparing against stored hashes must
+/// treat a mismatch as "re-derive", never as "content changed".
 pub fn hex_hash(bytes: &[u8]) -> String {
-    let hash = sha256_of(bytes);
-    hex_encode(&hash)
+    hex_encode(blake3::hash(bytes).as_bytes())
 }
 
+/// SHA-256 of the given bytes, retained for pack-format compatibility where the
+/// on-disk layout pins the digest.
 fn sha256_of(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -541,8 +556,16 @@ mod tests {
 
     #[test]
     fn hex_hash_matches_known_value() {
-        // sha256("") is e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        // BLAKE3("") per the reference vectors. Pinning this is what makes an
+        // accidental digest change loud: both BLAKE3 and SHA-256 are 32 bytes and
+        // print as 64 hex characters, so nothing else about a stored value
+        // reveals which algorithm produced it.
         assert_eq!(
+            hex_hash(b""),
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+        );
+        // The previous SHA-256 value, kept as a guard against silently reverting.
+        assert_ne!(
             hex_hash(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );

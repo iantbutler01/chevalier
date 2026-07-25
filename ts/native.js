@@ -591,5 +591,7 @@ module.exports.McpClient = nativeBinding.McpClient
 module.exports.McpServer = nativeBinding.McpServer
 module.exports.Runtime = nativeBinding.Runtime
 module.exports.StreamHandle = nativeBinding.StreamHandle
+module.exports.VfsContentHasher = nativeBinding.VfsContentHasher
 module.exports.VfsStorage = nativeBinding.VfsStorage
 module.exports.version = nativeBinding.version
+module.exports.vfsContentHash = nativeBinding.vfsContentHash
