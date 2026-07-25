@@ -1232,15 +1232,23 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         self.run_blocking(move |storage| {
             assert_supported_read_target(&source_path)?;
             if precondition.is_some() {
-                let desired_hash = hash_regular_file(&source_path)?;
-                if expected_content_hash
-                    .as_deref()
-                    .is_some_and(|expected| expected != desired_hash)
-                {
-                    return Err(VfsStorageError::Conflict(format!(
-                        "staged VFS upload hash mismatch for {path}"
-                    )));
-                }
+                // Reuse the caller's hash rather than re-reading the source.
+                //
+                // The install below copies the source into place and hashes it in
+                // the SAME pass, then rejects the write outright if that hash
+                // disagrees with `expected_content_hash`. So this value is only a
+                // provisional label for the replay record: a wrong one cannot be
+                // committed, it can only fail the write. Re-reading here just to
+                // learn what the caller already told us cost a second full pass
+                // over the file -- ~2s per GB, so ~5s on a 2.5GB upload, on top of
+                // the copy that was going to hash it anyway.
+                //
+                // Without a supplied hash there is nothing to label the replay
+                // with before the copy runs, so that path still pays the read.
+                let desired_hash = match expected_content_hash.as_deref() {
+                    Some(expected) => expected.to_string(),
+                    None => hash_regular_file(&source_path)?,
+                };
                 let replay = ExactWriteReplay {
                     destination: storage.abs_path(&path)?,
                     path: path.clone(),
@@ -6585,6 +6593,47 @@ mod tests {
             b"identical",
         );
         assert_eq!(path_mode(&dir.path().join("created")), 0o640);
+    }
+
+    /// The staged-upload path trusts the caller's declared hash instead of
+    /// re-reading the source (that second full pass cost ~2s per GB). It is only
+    /// safe because the copy hashes the bytes it actually writes and rejects the
+    /// write on disagreement. Prove a wrong declaration still cannot commit.
+    #[tokio::test]
+    async fn local_storage_rejects_a_staged_upload_whose_declared_hash_is_wrong() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staging = tempfile::tempdir().expect("staging tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        let original = storage
+            .write("claimed.bin", Bytes::from_static(b"original"), None)
+            .await
+            .expect("initial write");
+        let source = staging.path().join("payload");
+        fs::write(&source, b"actual contents").expect("stage payload");
+        let lie = hex_hash(b"entirely different bytes");
+
+        let result = storage
+            .write_from_local_file(
+                "claimed.bin",
+                &source,
+                Some(&lie),
+                Some(VfsStorageWritePrecondition {
+                    predicate: None,
+                    fingerprint: Some(original.content_hash.clone()),
+                    secondary_fingerprint: None,
+                    expected_file_id: None,
+                }),
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(VfsStorageError::Conflict(_))),
+            "a declared hash that does not match the bytes must not commit: {result:?}",
+        );
+        // And the destination must be untouched by the rejected write.
+        let after = storage.stat("claimed.bin").await.expect("stat").expect("present");
+        assert_eq!(after.content_hash, Some(original.content_hash));
     }
 
     #[tokio::test]
