@@ -132,14 +132,26 @@ enum PathLockMode {
 }
 
 const HASH_CACHE_RECENCY_GUARD: Duration = Duration::from_secs(2);
-const HASH_CACHE_MAX_AGE: Duration = Duration::from_secs(30);
+// Entry validity is proven by the witness compared below (size + mtime + ctime,
+// plus the recency guard); `cached_at` age is only a backstop against exotic
+// clock/timestamp behaviour, so it does not need to be short. It DOES need to
+// exceed the replica full-scan interval (600s by default, see
+// OPENBRACKET_SYNC_FULL_SNAPSHOT_INTERVAL_MS): at the previous 30s every entry
+// was guaranteed expired before the next scan reached it, giving the scan a
+// structural 100% miss rate and re-hashing the whole tree every cycle.
+const HASH_CACHE_MAX_AGE: Duration = Duration::from_secs(3_600);
 const MAX_PARALLEL_FILE_SYNCS: usize = 8;
 const MAX_PARALLEL_LOCAL_MUTATIONS: usize = MAX_PARALLEL_FILE_SYNCS;
-// A 10k-file Git working set must fit without a sequential status scan evicting
-// the entries that the same scan is about to revisit. The cache remains
+// A working set must fit without a sequential scan evicting the entries that the
+// same scan is about to revisit — eviction is oldest-first, which is exactly
+// pessimal for a directory walk. The previous 16k ceiling was sized for a 10k-file
+// Git working set and could hold only ~22% of a measured 74k-file replica tree, so
+// each pass evicted what the next pass needed. Entries are only materialised for
+// files actually visited, so this is a ceiling and not an allocation; at roughly
+// 250-300 bytes per entry a fully-populated store holds ~35MB. The cache remains
 // hard-bounded; the torture test below reports its observed payload and a
 // projected full-capacity footprint.
-const MAX_HASH_CACHE_ENTRIES: usize = 16_384;
+const MAX_HASH_CACHE_ENTRIES: usize = 131_072;
 
 impl std::fmt::Debug for PathLockTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -5883,6 +5895,42 @@ mod tests {
 
         assert_eq!(storage.hash_read_count(), 1);
         assert_eq!(first[0].content_hash, second[0].content_hash);
+    }
+
+    /// A replica full scan walks the whole tree in one pass. While the cache
+    /// ceiling sat below the tree size, eviction (oldest-first) discarded exactly
+    /// the entries the next pass would revisit, so every scan re-read and re-hashed
+    /// every file: a measured 74k-file tree re-hashed 826MB every 600s. Guard the
+    /// property that matters -- a second walk over a tree larger than the previous
+    /// 16_384 ceiling reads no file contents at all.
+    #[tokio::test]
+    async fn local_storage_reuses_hashes_across_a_tree_larger_than_the_legacy_ceiling() {
+        const FILES: usize = 20_000;
+        let dir = tempfile::tempdir().expect("tempdir");
+        for index in 0..FILES {
+            let path = dir.path().join(format!("file-{index:05}.txt"));
+            fs::write(&path, format!("contents-{index}").as_bytes()).expect("write");
+            // Clear the recency guard so these count as settled observed files.
+            set_old_mtime(&path);
+        }
+        let storage = LocalVfsStorage::new(dir.path());
+
+        storage
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .expect("first list");
+        let after_first = storage.hash_read_count();
+        assert_eq!(after_first, FILES, "first walk must hash every file once");
+
+        storage
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .expect("second list");
+        assert_eq!(
+            storage.hash_read_count(),
+            after_first,
+            "second walk over an unchanged tree must read no file contents",
+        );
     }
 
     #[tokio::test]
