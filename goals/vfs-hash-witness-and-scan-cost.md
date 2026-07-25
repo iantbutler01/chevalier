@@ -111,6 +111,53 @@ Revisit if in-place edits of large files prove to be a real workload. Price
 fixed-size blocks before CDC. (CDC also has a known side channel: chunk
 boundaries can leak chunker parameters — arxiv 2504.02095.)
 
+## The BLAKE3 mount outage (2026-07-25)
+
+Moving the content hash to BLAKE3 broke the mount: guest writes to
+`/workspace/<repo>` returned EIO and terminal creation failed on its write
+probe. Two independent defects, found in this order.
+
+**1. vmd still hashed with SHA-256.** vmd sends a content fingerprint as a CAS
+precondition (`base_content_hash` → `x-chevalier-vfs-precondition-fingerprint`).
+It computes that itself, in `sandbox/vmd/src/fuse/{fs,write}.rs`, and **vmd does
+not depend on the `chevalier-vfs` crate at all** — its only chevalier dependency
+is `chevalier-sandbox`. So changing `vfs/src/local.rs` did not change vmd, and
+every precondition-bearing write compared SHA-256 against a stored BLAKE3 hash
+and 409'd. Creates use an `absent` precondition, so they still worked; that made
+the symptom read as "creates fail" when the failure was actually on delete and
+overwrite.
+
+Both pinning tests asserted the SHA-256 empty vector, so they tracked the drift
+rather than catching it. They now pin the same BLAKE3 vector as
+`vfs/src/pack.rs` plus an `assert_ne!` against SHA-256.
+
+**2. `create_hard_link` had no case in OpenBracket's namespace path filter.**
+`namespaceMutationPaths` (`packages/api/src/runtime/vfs-git-filter.ts`) fell
+through to `mutation.path`, which that variant lacks — it carries `source_path`
+and `destination_path`. `undefined` reached a path normalizer and threw
+`Cannot read properties of undefined (reading 'replace')`, returned as a 500.
+git hard-links every object it writes, so ordinary git activity triggered it.
+vmd cannot retire a failing namespace batch, so it retained and retried
+forever; the pending batch made every namespace barrier fail, and unlink/rmdir
+then blocked 30 s apiece. Observed as `rm -rf` hung with **zero** entries
+removed in 40 s.
+
+`applyNamespaceBatch` is typed `any` at the napi boundary, so reading a
+nonexistent field compiled cleanly — `tsc` could not have caught it.
+
+Worth keeping:
+- **Any digest is defined in three places** — `vfs/src/local.rs`, the napi
+  `VfsContentHasher`, and vmd's own copy. A one-sided change is not a wrong
+  number, it is a dead mount. SHA-256 remains correct for VM images, portproxy
+  assets, tap-name derivation, and `pack.rs::sha256_of` (on-disk format).
+- **vmd's FUSE mount also exists on the host**, inside the container at
+  `/var/lib/chevalier/vms/<vm-id>/fuse-mounts/<scope>`. Reproducing there with
+  `docker exec` removes the VM, virtiofsd, and the guest from the loop, and is
+  what separated "creates fail" from "deletes fail" in minutes.
+- **A stuck namespace batch presents as a filesystem hang, not an error.** The
+  30 s barrier waits are the tell; `WARN vfs namespace journal replay failed`
+  names the offending mutation and the gateway's error text.
+
 ## Process notes
 
 Three stale-artifact incidents in one session, all the same root — a timestamp or
