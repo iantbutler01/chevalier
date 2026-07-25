@@ -404,9 +404,38 @@ pub struct VfsStoragePrefetchResult {
     pub warmed_file_bytes: Vec<(String, Bytes)>,
 }
 
+/// A durably-stored hash plus the stat witness proving it was current when
+/// recorded. Fed back into the in-process cache after a restart so a scan does
+/// not have to re-read the tree to rediscover what it already knew.
+#[derive(Clone, Debug)]
+pub struct SeededFileHash {
+    /// Logical (storage-relative) path.
+    pub path: String,
+    pub size_bytes: u64,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
+    /// Lowercase hex sha256; malformed values are rejected by the seeder.
+    pub content_hash: String,
+}
+
 #[async_trait::async_trait]
 pub trait OptimizedVfsStorage: Send + Sync {
     fn backend_name(&self) -> &'static str;
+
+    /// Prime any in-process content-hash cache from durably stored witnesses.
+    ///
+    /// Backends that hash locally lose that work on every restart and otherwise
+    /// re-read the whole tree to recover it. Handing back previously persisted
+    /// `(size, mtime_ns, ctime_ns) -> hash` rows avoids that. Entries are always
+    /// revalidated against a live stat before reuse, so a stale seed cannot cause
+    /// a wrong hash to be served.
+    ///
+    /// Backends with no local hash cache (gateway, object-backed) legitimately
+    /// accept nothing. Returns the number of entries accepted.
+    fn seed_hash_cache(&self, entries: Vec<SeededFileHash>) -> VfsStorageResult<usize> {
+        let _ = entries;
+        Ok(0)
+    }
 
     async fn stat(&self, path: &str) -> VfsStorageResult<Option<VfsStorageMetadata>>;
 

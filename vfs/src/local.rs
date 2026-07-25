@@ -30,7 +30,7 @@ use tokio::sync::{
 use uuid::Uuid;
 
 use crate::{
-    OptimizedVfsStorage, VfsStorageCasPredicate, VfsStorageDeleteResult, VfsStorageDirListFilter,
+    OptimizedVfsStorage, SeededFileHash, VfsStorageCasPredicate, VfsStorageDeleteResult, VfsStorageDirListFilter,
     VfsStorageDirListOrder, VfsStorageEntryKind, VfsStorageError, VfsStorageHardLinkResult,
     VfsStorageMetadata, VfsStorageMetadataFields, VfsStorageNamespaceMutation,
     VfsStorageObjectState, VfsStoragePrefetchOptions, VfsStoragePrefetchResult,
@@ -812,6 +812,63 @@ impl LocalVfsStorage {
         }
     }
 
+    /// Seed the witness-validated hash cache from durable storage.
+    ///
+    /// The cache is per-process, so every restart otherwise re-reads and re-hashes
+    /// the whole tree before it can answer anything from memory -- measured at
+    /// 16.8-22.3s for a 74k-file owner versus 279-591ms once warm. Callers that
+    /// persist `(size, mtime_ns, ctime_ns) -> content_hash` alongside their index
+    /// can hand it back here and skip that entirely.
+    ///
+    /// Seeded entries are deliberately NOT marked as trusted writes: this process
+    /// did not perform them, so they must clear the same recency guard as any other
+    /// observed file. Every entry is still revalidated against the live stat before
+    /// it is reused, so a stale or hostile seed cannot cause a wrong hash to be
+    /// served -- at worst it wastes the slot. Malformed hashes are rejected.
+    ///
+    /// Returns the number of entries accepted.
+    fn seed_hash_cache_impl(
+        &self,
+        entries: impl IntoIterator<Item = SeededFileHash>,
+    ) -> VfsStorageResult<usize> {
+        let mut cache = self
+            .hash_cache
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let now = SystemTime::now();
+        let mut accepted = 0usize;
+        for entry in entries {
+            if entry.content_hash.len() != 64
+                || !entry
+                    .content_hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                continue;
+            }
+            let Ok(abs_path) = self.abs_path(&entry.path) else {
+                continue;
+            };
+            if cache.len() >= MAX_HASH_CACHE_ENTRIES {
+                break;
+            }
+            cache.insert(
+                abs_path,
+                CachedFileHash {
+                    file_id: None,
+                    size_bytes: entry.size_bytes,
+                    mtime_ns: entry.mtime_ns as i128,
+                    change_ns: entry.ctime_ns as i128,
+                    cached_at: now,
+                    hash: entry.content_hash,
+                    trusted_write: false,
+                },
+            );
+            accepted += 1;
+        }
+        Ok(accepted)
+    }
+
     fn invalidate_hash(&self, path: &Path) {
         self.hash_cache
             .lock()
@@ -855,6 +912,10 @@ impl LocalVfsStorage {
 impl OptimizedVfsStorage for LocalVfsStorage {
     fn backend_name(&self) -> &'static str {
         "local"
+    }
+
+    fn seed_hash_cache(&self, entries: Vec<SeededFileHash>) -> VfsStorageResult<usize> {
+        self.seed_hash_cache_impl(entries)
     }
 
     async fn stat(&self, path: &str) -> VfsStorageResult<Option<VfsStorageMetadata>> {
@@ -6029,6 +6090,78 @@ mod tests {
         assert_ne!(
             after.content_hash, first.content_hash,
             "a same-size out-of-band edit must not be masked by a cached hash",
+        );
+    }
+
+    /// A restart empties the per-process cache, so the first scan re-hashes the
+    /// whole tree. Seeding from durable rows must make that first pass read no file
+    /// contents at all -- and must still not mask a file that changed while the
+    /// process was down.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_storage_seeded_hashes_survive_a_cold_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let unchanged = dir.path().join("unchanged.txt");
+        let edited = dir.path().join("edited.txt");
+        fs::write(&unchanged, b"stable").expect("write");
+        fs::write(&edited, b"before").expect("write");
+        set_old_mtime(&unchanged);
+        set_old_mtime(&edited);
+
+        // First process: observe both files and capture what a durable index would store.
+        let warm = LocalVfsStorage::new(dir.path());
+        let observed = warm
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .expect("list");
+        assert_eq!(warm.hash_read_count(), 2);
+        let durable: Vec<SeededFileHash> = observed
+            .iter()
+            .map(|m| SeededFileHash {
+                path: m.path.clone(),
+                size_bytes: m.size_bytes,
+                mtime_ns: m.mtime_ns.expect("mtime witness"),
+                ctime_ns: m.ctime_ns.expect("ctime witness"),
+                content_hash: m.content_hash.clone().expect("hash"),
+            })
+            .collect();
+
+        // The process restarts, and one file is edited while it is down.
+        fs::write(&edited, b"after!").expect("out-of-band edit");
+        set_old_mtime(&edited);
+
+        let cold = LocalVfsStorage::new(dir.path());
+        assert_eq!(cold.seed_hash_cache_impl(durable).expect("seed"), 2);
+        let after = cold
+            .list_dir_with_metadata("", VfsStorageDirListFilter::default())
+            .await
+            .expect("list");
+
+        // Only the changed file is read; the untouched one is served from the seed.
+        assert_eq!(
+            cold.hash_read_count(),
+            1,
+            "a cold process must re-read only what actually changed",
+        );
+        let hash_of = |name: &str| {
+            after
+                .iter()
+                .find(|m| m.path.ends_with(name))
+                .and_then(|m| m.content_hash.clone())
+                .expect("metadata")
+        };
+        let warm_hash_of = |name: &str| {
+            observed
+                .iter()
+                .find(|m| m.path.ends_with(name))
+                .and_then(|m| m.content_hash.clone())
+                .expect("metadata")
+        };
+        assert_eq!(hash_of("unchanged.txt"), warm_hash_of("unchanged.txt"));
+        assert_ne!(
+            hash_of("edited.txt"),
+            warm_hash_of("edited.txt"),
+            "an edit made while the process was down must not be masked by the seed",
         );
     }
 

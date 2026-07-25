@@ -8,6 +8,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use chevalier_vfs::gateway::{GatewayVfsStorage, GatewayVfsStorageConfig};
 use chevalier_vfs::local::LocalVfsStorage;
+use chevalier_vfs::SeededFileHash;
 use chevalier_vfs::{
     OptimizedVfsStorage, VFS_POSIX_MODE_MASK, VfsStorageCasPredicate, VfsStorageDirListFilter,
     VfsStorageEntryKind, VfsStorageError, VfsStorageMetadata, VfsStorageMetadataFields,
@@ -286,6 +287,13 @@ pub struct VfsMetadata {
     pub version: Option<String>,
     /// RFC 3339 timestamp.
     pub updated_at: Option<String>,
+    /// `bigint` nanosecond mtime/ctime witnessing that `contentHash` is current,
+    /// so a caller can revalidate a stored hash without re-reading the file.
+    /// `bigint` for the same reason as `sizeBytes`: ~1.75e18 ns since the epoch is
+    /// far above 2^53, so a JS `number` would round it and two distinct writes
+    /// could compare equal. Absent means "unknown" -- re-hash, never reuse.
+    pub mtime_ns: Option<BigInt>,
+    pub ctime_ns: Option<BigInt>,
     pub object_state: Option<VfsObjectState>,
 }
 
@@ -317,6 +325,8 @@ impl From<VfsStorageMetadata> for VfsMetadata {
             token_count: m.token_count,
             version: m.version,
             updated_at: m.updated_at.map(|d| d.to_rfc3339()),
+            mtime_ns: m.mtime_ns.map(BigInt::from),
+            ctime_ns: m.ctime_ns.map(BigInt::from),
             object_state: m.object_state.map(VfsObjectState::from),
         }
     }
@@ -363,6 +373,21 @@ struct VfsWriteManyInput {
     body: Vec<u8>,
     #[serde(default)]
     precondition: Option<VfsStorageWritePrecondition>,
+}
+
+/// One durably-stored content hash plus the stat witness proving it was current
+/// when recorded. Numeric fields are decimal strings because nanosecond
+/// timestamps (~1.75e18) exceed `Number.MAX_SAFE_INTEGER`, and this is the exact
+/// shape the replica index already persists.
+#[napi(object)]
+pub struct VfsSeededHash {
+    /// Logical (storage-relative) path.
+    pub path: String,
+    pub size_bytes: String,
+    pub mtime_ns: String,
+    pub ctime_ns: String,
+    /// Lowercase hex sha256.
+    pub content_hash: String,
 }
 
 /// A virtual filesystem. Construct via `VfsStorage.local(root)` or
@@ -486,6 +511,35 @@ impl VfsStorage {
             .await
             .map_err(vfs_err)?;
         to_json(result)
+    }
+
+    /// Prime the local content-hash cache from durably stored witnesses.
+    ///
+    /// The cache is per-process, so a restart otherwise forces the next scan to
+    /// re-read and re-hash the whole tree. Feeding back previously persisted
+    /// rows skips that. Every seeded entry is still revalidated against a live
+    /// stat before it is reused, so a stale seed can only waste a slot, never
+    /// cause a wrong hash to be served. Entries with unparseable numbers or a
+    /// malformed hash are skipped rather than failing the batch.
+    ///
+    /// Returns the number of entries accepted. Backends without a local hash
+    /// cache (gateway, object-backed) accept none.
+    #[napi]
+    pub fn seed_hash_cache(&self, entries: Vec<VfsSeededHash>) -> napi::Result<u32> {
+        let seeded: Vec<SeededFileHash> = entries
+            .into_iter()
+            .filter_map(|entry| {
+                Some(SeededFileHash {
+                    path: entry.path,
+                    size_bytes: entry.size_bytes.parse().ok()?,
+                    mtime_ns: entry.mtime_ns.parse().ok()?,
+                    ctime_ns: entry.ctime_ns.parse().ok()?,
+                    content_hash: entry.content_hash,
+                })
+            })
+            .collect();
+        let accepted = self.inner.seed_hash_cache(seeded).map_err(vfs_err)?;
+        Ok(accepted as u32)
     }
 
     /// Stat a path; returns typed metadata (`sizeBytes` is a `bigint`) or null.
