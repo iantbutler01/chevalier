@@ -5979,6 +5979,59 @@ mod tests {
         );
     }
 
+    /// The worst case for a stat witness: content replaced out of band with the
+    /// SAME length, and mtime restored afterwards so the two cheapest fields both
+    /// look untouched. Only ctime still moves, and it cannot be set directly from
+    /// userspace. Reusing a cached hash here would mean silently serving the wrong
+    /// content hash for changed bytes, which is worse than any stall -- so this is
+    /// the property that lets a stored hash be trusted without re-reading the file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_storage_detects_same_size_out_of_band_edit_with_restored_mtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+        storage
+            .write("drift.txt", Bytes::from_static(b"aaaa"), None)
+            .await
+            .expect("write");
+        let path = dir.path().join("drift.txt");
+
+        let first = storage
+            .stat("drift.txt")
+            .await
+            .expect("stat")
+            .expect("present");
+        let original_mtime = fs::metadata(&path).expect("metadata").modified().expect("mtime");
+
+        // Out-of-band replacement: identical length, mtime put back afterwards.
+        fs::write(&path, b"bbbb").expect("out-of-band write");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("reopen")
+            .set_modified(original_mtime)
+            .expect("restore mtime");
+
+        let after = storage
+            .stat("drift.txt")
+            .await
+            .expect("stat")
+            .expect("present");
+
+        assert_eq!(
+            after.size_bytes, first.size_bytes,
+            "precondition: the edit must be size-preserving",
+        );
+        assert_eq!(
+            after.mtime_ns, first.mtime_ns,
+            "precondition: mtime must have been restored, so mtime cannot be what detects this",
+        );
+        assert_ne!(
+            after.content_hash, first.content_hash,
+            "a same-size out-of-band edit must not be masked by a cached hash",
+        );
+    }
+
     #[tokio::test]
     async fn local_storage_reuses_trusted_write_hash_immediately() {
         let dir = tempfile::tempdir().expect("tempdir");
