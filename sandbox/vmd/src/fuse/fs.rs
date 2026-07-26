@@ -4435,7 +4435,12 @@ mod tests {
                     "file_id": "stable-new-file",
                     "link_count": 1,
                     "link_target": null,
-                    "content_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    // The empty-file content hash, which must track whatever
+                    // `content_hash_for_bytes` computes: this stands in for the
+                    // remote's view of the same zero bytes the mount holds, so a
+                    // stale digest here reads as a conflicting concurrent write
+                    // and fails the publish with EIO.
+                    "content_hash": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
                     "executable": false,
                     "mode": 416,
                     "updated_at": null

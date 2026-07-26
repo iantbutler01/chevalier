@@ -53,6 +53,15 @@ const REVISION_WATCH_TIMEOUT_MS: u64 = 25_000;
 /// timeout so a held-open watch is never mistaken for a stuck mutation.
 const REVISION_WATCH_ATTEMPT_TIMEOUT: Duration =
     Duration::from_millis(REVISION_WATCH_TIMEOUT_MS + 5_000);
+/// Long-poll window for the FIRST poll after a failure, used only to re-establish
+/// liveness. `watch_live` is asserted when a poll RETURNS, and an idle long poll
+/// does not return until its deadline — so re-establishing with the normal
+/// window costs a full `REVISION_WATCH_TIMEOUT_MS` of `TTL=0` serving after even
+/// a momentary blip, on a connection that recovered immediately. A short first
+/// poll confirms the same thing (gateway reachable, `since` fence current)
+/// against the same endpoint, only sooner. `WATCH_TIMEOUT_MIN_MS` in the gateway
+/// is the floor for this value; going lower is clamped there, not honoured here.
+const REVISION_WATCH_REESTABLISH_TIMEOUT_MS: u64 = 1_000;
 /// Reconnect backoff floor after a watch failure; rides out a gateway restart.
 const REVISION_WATCH_BACKOFF_MIN: Duration = Duration::from_millis(500);
 /// Reconnect backoff ceiling. The watch is down and serves fail closed to
@@ -1697,12 +1706,13 @@ async fn poll_revision_watch(
     auth_token: &str,
     watcher_id: &str,
     since: u64,
+    timeout_ms: u64,
 ) -> Result<RevisionWatchPoll, RevisionWatchError> {
     let response = http
         .get(format!("{endpoint}/watch"))
         .query(&[
             ("since", since.to_string()),
-            ("timeout_ms", REVISION_WATCH_TIMEOUT_MS.to_string()),
+            ("timeout_ms", timeout_ms.to_string()),
             // The stable identity that lets the gateway treat this poll's `since`
             // as an ack of that revision and gate sibling publications on it.
             ("watcher_id", watcher_id.to_string()),
@@ -1750,14 +1760,15 @@ async fn poll_revision_watch_resilient(
     auth_token: &str,
     watcher_id: &str,
     since: u64,
+    timeout_ms: u64,
 ) -> Result<RevisionWatchPoll, RevisionWatchError> {
-    match poll_revision_watch(http, endpoint, auth_token, watcher_id, since).await {
+    match poll_revision_watch(http, endpoint, auth_token, watcher_id, since, timeout_ms).await {
         Err(RevisionWatchError::Transport(first)) => {
             tracing::debug!(
                 error = %first,
                 "vfs revision watch transport blip; retrying once on a fresh connection"
             );
-            poll_revision_watch(http, endpoint, auth_token, watcher_id, since).await
+            poll_revision_watch(http, endpoint, auth_token, watcher_id, since, timeout_ms).await
         }
         other => other,
     }
@@ -1779,6 +1790,11 @@ async fn run_revision_watch(
 ) {
     let mut health = WatchHealth::default();
     let mut backoff = REVISION_WATCH_BACKOFF_MIN;
+    // Set after a failure so the next poll re-establishes liveness on a short
+    // window instead of blocking `watch_live` behind a full idle long poll.
+    // Cleared as soon as a poll succeeds, so the steady state keeps the long
+    // window and its request cadence exactly as before.
+    let mut reestablishing = false;
     // Capture the stable watcher identity once. It never changes for the life of
     // the registry, and every poll must present it so the gateway can key ack
     // progress to this watcher.
@@ -1793,9 +1809,23 @@ async fn run_revision_watch(
             Some(state) => state.coherence.load(Ordering::Acquire),
             None => return,
         };
-        match poll_revision_watch_resilient(&http, &endpoint, &auth_token, &watcher_id, since).await
+        let timeout_ms = if reestablishing {
+            REVISION_WATCH_REESTABLISH_TIMEOUT_MS
+        } else {
+            REVISION_WATCH_TIMEOUT_MS
+        };
+        match poll_revision_watch_resilient(
+            &http,
+            &endpoint,
+            &auth_token,
+            &watcher_id,
+            since,
+            timeout_ms,
+        )
+        .await
         {
             Ok(poll) => {
+                reestablishing = false;
                 let Some(state) = revisions.upgrade() else {
                     return;
                 };
@@ -1920,6 +1950,13 @@ async fn run_revision_watch(
                         state.watch_live.store(false, Ordering::Release);
                         drop(state);
                         tokio::time::sleep(ATTR_ENTRY_LEASE_TTL).await;
+                        // The lease-expiry hold above is the fail-closed part and
+                        // is unchanged. Re-establish on the short window after it:
+                        // the ack is sent when the next poll is ISSUED, not when it
+                        // returns, so the window cannot move the ack — it only
+                        // decides whether liveness returns in ~1s or sits at TTL=0
+                        // for a full idle long poll after a 1s hold.
+                        reestablishing = true;
                         continue;
                     }
                 }
@@ -1937,6 +1974,7 @@ async fn run_revision_watch(
                 // ack latency is ~RTT + apply cost, not RTT + a backoff.
             }
             Err(error) => {
+                reestablishing = true;
                 if let Some(state) = revisions.upgrade() {
                     state.watch_live.store(false, Ordering::Release);
                 }
