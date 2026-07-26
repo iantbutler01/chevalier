@@ -158,6 +158,34 @@ Worth keeping:
   30 s barrier waits are the tell; `WARN vfs namespace journal replay failed`
   names the offending mutation and the gateway's error text.
 
+## Watch liveness and the 25s cache outage (2026-07-26)
+
+`reply_ttl()` hands the kernel a positive attribute lease only while
+`revision_watch_live()` is true; otherwise TTL=0 and every getattr/lookup is a
+wire round trip. Liveness was asserted when a watch poll RETURNED — but an idle
+long poll does not return until `REVISION_WATCH_TIMEOUT_MS` (25 s). So one
+transport blip cost 500 ms backoff + a full idle long poll ≈ **25.5 s of
+uncached serving on an already-healthy connection**. Measured: 9 flaps in 2 h,
+each 25.5 s, against a 1.13 ms RTT.
+
+Fixed by re-establishing on a 1 s window after a failure (same endpoint, same
+`since` fence, so the same thing is confirmed, only sooner), reverting to the
+25 s window on success. Steady-state cadence and load are unchanged. The gateway
+floors `timeout_ms` at `WATCH_TIMEOUT_MIN_MS` (1 s), so no gateway change was
+needed. Verified: outage 25.5 s → **1.51 s**, with warm `git status` and guest
+`stat` unchanged.
+
+What remains unexplained is what causes the blip. It recurs on a ~10 min cadence
+matching `scanIntervalMs` (600 000 ms). During a stall the API's main thread is
+parked in `futex_wait_queue_me` with **zero** threads in R or D and ~14 % of one
+core — so it is blocked on a lock whose holder is awaiting I/O, not compute.
+`/health` is a pure sync handler behind sync-only middleware, so a 28 s response
+means the event loop never advanced. Ruled out by measurement: swap (none
+configured), sqlite (this deployment is Postgres, zero `.db` fds), V8 GC (no
+`node-V8Worker` running during stalls), Rust CPU (no `tokio-rt-worker` running),
+and `seedHashCache` (0 invocations across a full cycle; startup only).
+Identifying the lock needs a profile or instrumentation from inside the process.
+
 ## Process notes
 
 Three stale-artifact incidents in one session, all the same root — a timestamp or
