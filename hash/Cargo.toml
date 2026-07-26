@@ -1,0 +1,15 @@
+[package]
+name = "chevalier-vfs-hash"
+version = "0.1.0"
+edition = "2024"
+
+# The VFS content-hash algorithm, in ONE place. Every component that computes a
+# content hash (the vfs crate, the napi bindings, vmd) depends on this crate
+# rather than reaching for a digest directly, because they compare each other's
+# hashes across a wire: vmd sends them as CAS preconditions and the gateway
+# compares them against its own. A one-sided change is not a wrong number, it is
+# a dead mount.
+
+[dependencies]
+blake3 = { version = "1", features = ["rayon"] }
+sha2 = "0.10.9"

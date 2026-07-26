@@ -15,8 +15,10 @@ anyhow = "1.0.100"
 async-nats = "0.39.0"
 async-trait = "0.1.89"
 axum = "0.8.6"
-# VFS content identity; must match chevalier-vfs (see content_hash_for_bytes).
-blake3 = "1"
+# VFS content identity. Shared with chevalier-vfs and the napi bindings so the
+# algorithm cannot diverge between the mount and the gateway -- vmd sends these
+# as CAS preconditions, so a one-sided change is a dead mount, not a wrong hash.
+chevalier-vfs-hash = { version = "0.1.0", path = "../../hash" }
 chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.51", features = ["derive"] }
 etcd-client = "0.14.1"

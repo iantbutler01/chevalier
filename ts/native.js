@@ -595,3 +595,4 @@ module.exports.VfsContentHasher = nativeBinding.VfsContentHasher
 module.exports.VfsStorage = nativeBinding.VfsStorage
 module.exports.version = nativeBinding.version
 module.exports.vfsContentHash = nativeBinding.vfsContentHash
+module.exports.vfsContentHashAlgorithm = nativeBinding.vfsContentHashAlgorithm

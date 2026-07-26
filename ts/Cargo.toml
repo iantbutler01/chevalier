@@ -10,7 +10,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-blake3 = { version = "1", features = ["rayon"] }
+chevalier-vfs-hash = { version = "0.1.0", path = "../hash" }
 napi = { version = "3", default-features = false, features = ["napi8", "async", "tokio_rt", "serde-json"] }
 napi-derive = "3"
 

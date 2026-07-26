@@ -753,7 +753,7 @@ impl VfsStorage {
 /// supply-chain surface for a digest we can hand across the existing boundary.
 #[napi]
 pub struct VfsContentHasher {
-    inner: blake3::Hasher,
+    inner: chevalier_vfs_hash::ContentHasher,
 }
 
 #[napi]
@@ -761,21 +761,21 @@ impl VfsContentHasher {
     #[napi(constructor)]
     pub fn new() -> Self {
         Self {
-            inner: blake3::Hasher::new(),
+            inner: chevalier_vfs_hash::ContentHasher::new(),
         }
     }
 
-    /// Feed the next chunk. Uses the multi-threaded path, which is what makes a
-    /// large upload disk-bound rather than hash-bound.
+    /// Feed the next chunk. Under BLAKE3 this uses the multi-threaded path,
+    /// which is what makes a large upload disk-bound rather than hash-bound.
     #[napi]
     pub fn update(&mut self, chunk: Buffer) {
-        self.inner.update_rayon(&chunk);
+        self.inner.update(&chunk);
     }
 
     /// Lowercase hex digest. Does not consume the hasher.
     #[napi]
     pub fn digest(&self) -> String {
-        self.inner.finalize().to_hex().to_string()
+        self.inner.digest()
     }
 }
 
@@ -783,5 +783,13 @@ impl VfsContentHasher {
 /// `VfsContentHasher` in a single update.
 #[napi]
 pub fn vfs_content_hash(bytes: Buffer) -> String {
-    blake3::hash(&bytes).to_hex().to_string()
+    chevalier_vfs_hash::hash_bytes(&bytes)
+}
+
+/// The content-hash algorithm this process resolved, so a host can log or
+/// verify it rather than inferring it from a 64-hex string that both algorithms
+/// could have produced.
+#[napi]
+pub fn vfs_content_hash_algorithm() -> String {
+    chevalier_vfs_hash::algorithm().as_str().to_string()
 }

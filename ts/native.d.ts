@@ -126,8 +126,8 @@ export declare class StreamHandle {
 export declare class VfsContentHasher {
   constructor()
   /**
-   * Feed the next chunk. Uses the multi-threaded path, which is what makes a
-   * large upload disk-bound rather than hash-bound.
+   * Feed the next chunk. Under BLAKE3 this uses the multi-threaded path,
+   * which is what makes a large upload disk-bound rather than hash-bound.
    */
   update(chunk: Buffer): void
   /** Lowercase hex digest. Does not consume the hasher. */
@@ -359,6 +359,13 @@ export declare function version(): string
  * `VfsContentHasher` in a single update.
  */
 export declare function vfsContentHash(bytes: Buffer): string
+
+/**
+ * The content-hash algorithm this process resolved, so a host can log or
+ * verify it rather than inferring it from a 64-hex string that both algorithms
+ * could have produced.
+ */
+export declare function vfsContentHashAlgorithm(): string
 
 export interface VfsHardLinkResult {
   source: VfsMetadata

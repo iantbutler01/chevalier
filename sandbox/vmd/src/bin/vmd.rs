@@ -407,6 +407,17 @@ async fn main() -> Result<()> {
     };
 
     let _tracing_guard = init_tracing(&cfg.log_level)?;
+    // The mount and the gateway must hash with the SAME algorithm: vmd sends
+    // content hashes as CAS preconditions and the gateway compares them against
+    // hashes it computed itself. A stored hash is 64 hex characters under either
+    // algorithm, so a skew is invisible in the data and surfaces only as every
+    // precondition-bearing write failing with EIO inside the guest. Log it once
+    // here so confirming both sides agree is a grep, not an investigation.
+    tracing::info!(
+        algorithm = chevalier_vfs_hash::algorithm().as_str(),
+        env = chevalier_vfs_hash::HASH_ALGORITHM_ENV,
+        "vfs content hash algorithm resolved"
+    );
     app::run_server(cfg).await
 }
 

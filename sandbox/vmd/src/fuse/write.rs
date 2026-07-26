@@ -1095,7 +1095,7 @@ fn stream_exact_file(
     let source_file = File::open(source)
         .with_context(|| format!("open rejected vfs write {}", source.display()))?;
     let mut source_reader = source_file.take(expected_size.saturating_add(1));
-    let mut hasher = blake3::Hasher::new();
+    let mut hasher = chevalier_vfs_hash::ContentHasher::new();
     let mut buffer = [0u8; JOURNAL_READ_BUFFER_BYTES];
     let mut copied = 0u64;
     loop {
@@ -1120,7 +1120,7 @@ fn stream_exact_file(
             expected_size,
         ));
     }
-    Ok(hex_encode(hasher.finalize().as_bytes()))
+    Ok(hasher.finalize())
 }
 
 fn remove_dead_letter_temporary(path: &Path) -> Result<()> {
@@ -1181,24 +1181,12 @@ fn rebase_pending_after_commit(
     }
 }
 
-/// VFS content identity. Must stay byte-identical to `hash_regular_file` in
-/// chevalier-vfs `local.rs` — vmd sends these as CAS preconditions and the
-/// gateway compares them against its own stored hashes, so a divergence here
-/// fails every precondition-bearing write and surfaces in the guest as EIO.
+/// VFS content identity, from the crate chevalier-vfs hashes with. vmd sends
+/// these as CAS preconditions and the gateway compares them against its own
+/// hashes, so sharing the implementation is what keeps a divergence from
+/// failing every precondition-bearing write as EIO in the guest.
 fn content_hash_for_bytes(bytes: &[u8]) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(bytes);
-    hex_encode(hasher.finalize().as_bytes())
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
+    chevalier_vfs_hash::hash_bytes(bytes)
 }
 
 fn path_surface(scope_path: &str, path: &str) -> &'static str {
@@ -1712,15 +1700,11 @@ mod tests {
     /// changes content-hash algorithm without vmd following, this fails instead
     /// of every mounted delete/overwrite failing at runtime.
     #[test]
-    fn content_hash_matches_blake3_hex() {
+    fn content_hash_matches_the_configured_algorithms_vector() {
         assert_eq!(
             content_hash_for_bytes(b""),
-            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
-        );
-        assert_ne!(
-            content_hash_for_bytes(b""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            "content hash must not regress to sha256"
+            chevalier_vfs_hash::algorithm().empty_vector(),
+            "the mount must hash with the algorithm the gateway is configured for"
         );
     }
 

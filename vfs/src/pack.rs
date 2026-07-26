@@ -381,20 +381,23 @@ pub fn extract_slot(
 /// logical-file hash used by downstream manifest/content_hash columns; it is not
 /// a whole-pack object hash.
 ///
-/// BLAKE3, not SHA-256. Hashing is the floor on large-file cost and SHA-256 is
-/// 2.6-10x slower depending on whether the host has SHA-NI: measured 2536 MB/s
-/// on a Ryzen with the extension, 579 MB/s on Apple Silicon where the sha2 crate
-/// falls back to software, against 6668 and 2450 MB/s for single-threaded
-/// BLAKE3. Self-hosted fleets make that gap the common case -- Intel only gained
-/// SHA-NI with Ice Lake (2019) / Rocket Lake (2021), while BLAKE3's baseline is
-/// AVX2 (2013). See benches/hash_throughput.rs.
+/// Configurable, defaulting to SHA-256 — see `chevalier_vfs_hash`. BLAKE3 is
+/// available as an opt-in because hashing is the floor on large-file cost and
+/// SHA-256 is 2.6-10x slower depending on whether the host has SHA-NI: measured
+/// 2536 MB/s on a Ryzen with the extension, 579 MB/s on Apple Silicon where the
+/// sha2 crate falls back to software, against 6668 and 2450 MB/s for
+/// single-threaded BLAKE3. Self-hosted fleets make that gap the common case --
+/// Intel only gained SHA-NI with Ice Lake (2019) / Rocket Lake (2021), while
+/// BLAKE3's baseline is AVX2 (2013). See benches/hash_throughput.rs.
 ///
-/// Both digests are 32 bytes and print as 64 hex characters, so a stored value
-/// is NOT self-describing: anything persisted before this change is SHA-256 and
-/// indistinguishable by shape. Callers comparing against stored hashes must
-/// treat a mismatch as "re-derive", never as "content changed".
+/// The default is SHA-256 because both digests are 32 bytes and print as 64 hex
+/// characters, so a stored value is NOT self-describing: existing deployments
+/// hold SHA-256 and it is indistinguishable by shape. Switching algorithms
+/// re-derives every stored hash, so it is an explicit opt-in. Callers comparing
+/// against stored hashes must still treat a mismatch as "re-derive", never as
+/// "content changed".
 pub fn hex_hash(bytes: &[u8]) -> String {
-    hex_encode(blake3::hash(bytes).as_bytes())
+    chevalier_vfs_hash::hash_bytes(bytes)
 }
 
 /// SHA-256 of the given bytes, retained for pack-format compatibility where the
@@ -406,16 +409,6 @@ fn sha256_of(bytes: &[u8]) -> [u8; 32] {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&out);
     arr
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -554,21 +547,32 @@ mod tests {
         assert!(matches!(err, VfsStorageError::Internal(_)));
     }
 
+    /// Pins the empty-input vector for whichever algorithm this process is
+    /// configured with. Pinning is what makes an accidental digest change loud:
+    /// both BLAKE3 and SHA-256 are 32 bytes and print as 64 hex characters, so
+    /// nothing else about a stored value reveals which produced it. The vectors
+    /// themselves live in `chevalier_vfs_hash` so every component pins the same
+    /// pair.
     #[test]
-    fn hex_hash_matches_known_value() {
-        // BLAKE3("") per the reference vectors. Pinning this is what makes an
-        // accidental digest change loud: both BLAKE3 and SHA-256 are 32 bytes and
-        // print as 64 hex characters, so nothing else about a stored value
-        // reveals which algorithm produced it.
-        assert_eq!(
-            hex_hash(b""),
-            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
-        );
-        // The previous SHA-256 value, kept as a guard against silently reverting.
+    fn hex_hash_matches_the_configured_algorithms_known_value() {
+        let algorithm = chevalier_vfs_hash::algorithm();
+        assert_eq!(hex_hash(b""), algorithm.empty_vector());
+        // Whatever is configured, the two algorithms must not collapse onto one
+        // value -- that would make this guard vacuous.
         assert_ne!(
-            hex_hash(b""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            chevalier_vfs_hash::SHA256_EMPTY,
+            chevalier_vfs_hash::BLAKE3_EMPTY
         );
+    }
+
+    /// The default must remain SHA-256 so an existing deployment that sets
+    /// nothing keeps reading its stored hashes as the algorithm that wrote them.
+    #[test]
+    fn hex_hash_defaults_to_sha256_when_unconfigured() {
+        if std::env::var(chevalier_vfs_hash::HASH_ALGORITHM_ENV).is_ok() {
+            return; // the suite was explicitly pointed at an algorithm
+        }
+        assert_eq!(hex_hash(b""), chevalier_vfs_hash::SHA256_EMPTY);
     }
 
     #[test]

@@ -1321,7 +1321,7 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                     .create_new(true)
                     .open(&tmp_path)
                     .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
-                let mut hasher = blake3::Hasher::new();
+                let mut hasher = chevalier_vfs_hash::ContentHasher::new();
                 let mut buffer = vec![0_u8; 1024 * 1024];
                 loop {
                     let read = source
@@ -1330,12 +1330,12 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                     if read == 0 {
                         break;
                     }
-                    hasher.update_rayon(&buffer[..read]);
+                    hasher.update(&buffer[..read]);
                     staged
                         .write_all(&buffer[..read])
                         .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
                 }
-                let content_hash = hasher.finalize().to_hex().to_string();
+                let content_hash = hasher.finalize();
                 if expected_content_hash
                     .as_deref()
                     .is_some_and(|expected| expected != content_hash)
@@ -2933,10 +2933,11 @@ fn hash_regular_file(path: &Path) -> VfsStorageResult<String> {
 fn hash_open_file(file: &mut fs::File) -> VfsStorageResult<String> {
     file.seek(SeekFrom::Start(0))
         .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
-    // BLAKE3: see pack::hex_hash for the measurements. update_rayon lets a large
-    // file use the machine's cores instead of one, which is what turns hashing
-    // from the bottleneck into something the disk outruns.
-    let mut hasher = blake3::Hasher::new();
+    // Configured algorithm; see pack::hex_hash for the measurements. Under
+    // BLAKE3 the shared hasher uses update_rayon, so a large file spreads over
+    // the machine's cores instead of one -- that is what turns hashing from the
+    // bottleneck into something the disk outruns.
+    let mut hasher = chevalier_vfs_hash::ContentHasher::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let read = file
@@ -2945,9 +2946,9 @@ fn hash_open_file(file: &mut fs::File) -> VfsStorageResult<String> {
         if read == 0 {
             break;
         }
-        hasher.update_rayon(&buffer[..read]);
+        hasher.update(&buffer[..read]);
     }
-    Ok(hasher.finalize().to_hex().to_string())
+    Ok(hasher.finalize())
 }
 
 fn open_regular_file(path: &Path) -> VfsStorageResult<fs::File> {

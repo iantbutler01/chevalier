@@ -190,8 +190,8 @@ name = "chevalier-vfs"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "blake3",
  "bytes",
+ "chevalier-vfs-hash",
  "chrono",
  "futures",
  "http-body",
@@ -211,6 +211,14 @@ dependencies = [
  "urlencoding",
  "uuid",
  "zstd",
+]
+
+[[package]]
+name = "chevalier-vfs-hash"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "sha2",
 ]
 
 [[package]]
