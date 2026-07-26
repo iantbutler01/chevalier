@@ -1536,7 +1536,13 @@ export function createVfsGatewayServer(
           typeof body.excluding_path === "string" ? body.excluding_path : "",
         );
         if (isExcludedPath(excludingPath)) return errorResponse(400, `excluded path: ${excludingPath}`);
-        const snapshot = await publications.read(ownerId, () =>
+        // optimisticRead, not read: alias resolution runs on the unlink path, so
+        // taking the blocking publication lock queued every delete behind the
+        // writer backlog — the same defect already fixed for `metadata-many`. A
+        // 409 here is a retry signal, and the answer is re-derived per call
+        // rather than cached, so an optimistic snapshot cannot go stale in a way
+        // a blocking read would have prevented.
+        const snapshot = await publications.optimisticRead(ownerId, () =>
           store.findHardLinkAlias(fileId, excludingPath),
         );
         return withNamespaceRevision(

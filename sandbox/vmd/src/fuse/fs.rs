@@ -10470,6 +10470,12 @@ impl RemoteFuseFs {
                 }
             }
             let surviving_route = match file_id.as_deref() {
+                // A surviving alias only exists if some OTHER name held this inode,
+                // so a link count of one answers the question without asking the
+                // gateway. That lookup is a remote round trip per deleted file — on
+                // a bulk `rm` of thousands of single-linked files it was the
+                // dominant cost, and it could never return anything.
+                Some(_) if metadata.link_count <= 1 => None,
                 Some(file_id) => match self.authoritative_file_route(&path, file_id)? {
                     StableFileRoute::Linked(route) => Some(route),
                     StableFileRoute::Unlinked => None,
