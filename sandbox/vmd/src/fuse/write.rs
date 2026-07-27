@@ -16,7 +16,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
-use super::client::{RemoteVfsClient, RemoteWrite, rejected_request_status};
+use super::client::{RemotePublication, RemoteVfsClient, RemoteWrite, rejected_request_status};
 
 const BATCH_DELAY: Duration = Duration::from_millis(8);
 const RETRY_DELAY_MIN: Duration = Duration::from_millis(100);
@@ -45,6 +45,16 @@ struct JournalWrite {
     /// decode this as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_file_id: Option<String>,
+    /// POSIX mode to apply if this write CREATES the path.
+    ///
+    /// Set when a creation is folded into the write that follows it, so the
+    /// pair costs one publication instead of two. Durable for the same reason
+    /// `expected_file_id` is: the journal line is the only record that survives
+    /// a restart between enqueue and publication, and losing the mode would
+    /// strip the executable bit off a file the guest already saw as executable.
+    /// Old journals decode this as `None`, which means "do not set mode".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    create_mode: Option<u32>,
 }
 
 type WriteTarget = (String, Option<String>);
@@ -184,6 +194,20 @@ impl WriteJournal {
         base_content_hash: Option<String>,
         expected_file_id: Option<String>,
     ) -> Result<u64> {
+        self.enqueue_with_mode(path, bytes, base_content_hash, expected_file_id, None)
+    }
+
+    /// Enqueue a write that may also CREATE the path, carrying the mode the
+    /// creation would have published. Folding the two into one journal entry is
+    /// what turns a create+write from two publications into one.
+    pub fn enqueue_with_mode(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        base_content_hash: Option<String>,
+        expected_file_id: Option<String>,
+        create_mode: Option<u32>,
+    ) -> Result<u64> {
         let mut state = self
             .shared
             .state
@@ -236,6 +260,7 @@ impl WriteJournal {
             size_bytes: bytes.len() as u64,
             base_content_hash,
             expected_file_id,
+            create_mode,
         };
         append_json_line(&mut state.journal, &write, "append vfs write journal")?;
         state.pending.push_back(write);
@@ -575,6 +600,7 @@ fn run_worker(
                         bytes,
                         base_content_hash: write.base_content_hash.clone(),
                         expected_file_id: write.expected_file_id.clone(),
+                        mode: write.create_mode,
                     })
                     .with_context(|| format!("read staged vfs write {}", write.staged_file))
             })
@@ -593,7 +619,9 @@ fn run_worker(
                     .collect::<HashMap<_, _>>()
             })
             .unwrap_or_default();
-        let result = writes.and_then(|writes| tokio.block_on(client.write_many(writes, surface)));
+        let result = writes.and_then(|writes| {
+            flush_batch_concurrently(&client, &tokio, writes, surface)
+        });
         // A 4xx means the gateway rejected the batch outright; retrying the
         // same batch can never succeed. Resolve each write individually so one
         // poisoned entry cannot wedge the journal forever.
@@ -745,6 +773,7 @@ fn resolve_rejected_write(
         bytes: bytes.clone(),
         base_content_hash: base_content_hash.clone(),
         expected_file_id: write.expected_file_id.clone(),
+        mode: write.create_mode,
     }) {
         Ok(()) => return RejectedWriteOutcome::Committed(content_hash),
         Err(error) => error,
@@ -807,6 +836,7 @@ fn resolve_rejected_write(
             bytes: bytes.clone(),
             base_content_hash: base_content_hash.clone(),
             expected_file_id: write.expected_file_id.clone(),
+            mode: write.create_mode,
         }) {
             Ok(()) => return RejectedWriteOutcome::Committed(content_hash),
             Err(error) => error,
@@ -1131,6 +1161,90 @@ fn remove_dead_letter_temporary(path: &Path) -> Result<()> {
             Err(error).with_context(|| format!("remove rejected vfs temporary {}", path.display()))
         }
     }
+}
+
+/// How many write batches may be in flight at once.
+///
+/// The journal batched writes but issued exactly one request at a time, so
+/// throughput was `batch_bytes / round_trip` no matter how large the batch got —
+/// a hard ceiling of ~5.6MiB/s on a link whose RTT is 0.87ms. Overlapping
+/// requests multiplies that; it does not require the gateway to get any faster.
+///
+/// Bounded rather than unbounded: the gateway serialises publications per owner,
+/// so past a small number of concurrent batches the extra requests only queue
+/// server-side while consuming host sockets and guest memory.
+const MAX_INFLIGHT_WRITE_BATCHES: usize = 4;
+
+/// Split a coalesced batch into shards that may be issued concurrently.
+///
+/// ORDERING CONTRACT: every write for a given path lands in the SAME shard, in
+/// its original relative order. Two writes to one path are order-dependent —
+/// each carries `base_content_hash` as a CAS precondition chaining onto the
+/// previous content — so splitting them across shards would let the second race
+/// the first and be rejected, or worse, applied out of order.
+///
+/// Partitioning by path specifically, NOT by `JournalWrite::target()`: that key
+/// is `(path, expected_file_id)`, so a file deleted and recreated inside one
+/// batch appears twice under the same path with different identities. Keying on
+/// the target would place those in different shards and let the recreate
+/// overtake the delete.
+fn shard_writes_by_path(writes: Vec<RemoteWrite>, shards: usize) -> Vec<Vec<RemoteWrite>> {
+    let shards = shards.max(1);
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<RemoteWrite>> = HashMap::new();
+    for write in writes {
+        if !groups.contains_key(&write.path) {
+            order.push(write.path.clone());
+        }
+        groups.entry(write.path.clone()).or_default().push(write);
+    }
+    // Built by hand rather than `vec![Vec::new(); shards]`: RemoteWrite carries
+    // the payload bytes and is deliberately not Clone.
+    let mut buckets: Vec<Vec<RemoteWrite>> = (0..shards).map(|_| Vec::new()).collect();
+    for (index, path) in order.into_iter().enumerate() {
+        if let Some(group) = groups.remove(&path) {
+            buckets[index % shards].extend(group);
+        }
+    }
+    buckets.retain(|bucket| !bucket.is_empty());
+    buckets
+}
+
+/// Issue a batch as concurrent per-path shards.
+///
+/// On partial failure this returns the first error and the caller retries the
+/// WHOLE batch, which re-sends shards that already committed. Those retries hit
+/// a `base_content_hash` that no longer matches and are rejected, which routes
+/// into `resolve_rejected_batch` — the existing per-entry resolution path. That
+/// is slower than a clean retry but it is correct, and it is the same path a
+/// single-request flush already took on rejection.
+fn flush_batch_concurrently(
+    client: &RemoteVfsClient,
+    tokio: &Handle,
+    writes: Vec<RemoteWrite>,
+    surface: &str,
+) -> Result<RemotePublication> {
+    let shards = shard_writes_by_path(writes, MAX_INFLIGHT_WRITE_BATCHES);
+    if shards.len() <= 1 {
+        let only = shards.into_iter().next().unwrap_or_default();
+        return tokio.block_on(client.write_many(only, surface));
+    }
+    tokio.block_on(async {
+        let issued = shards
+            .into_iter()
+            .map(|shard| client.write_many(shard, surface));
+        let settled = futures::future::join_all(issued).await;
+        let mut revision = 0_u64;
+        let mut entries = Vec::new();
+        for outcome in settled {
+            // Report the first failure rather than a synthesised success: a
+            // partial publication must not look complete to the commit hook.
+            let publication = outcome?;
+            revision = revision.max(publication.revision);
+            entries.extend(publication.entries);
+        }
+        Ok(RemotePublication { revision, entries })
+    })
 }
 
 fn coalesce_batch(batch: &[JournalWrite]) -> Vec<JournalWrite> {
@@ -1555,6 +1669,7 @@ mod tests {
             JournalWrite {
                 id: 1,
                 path: "src/main.rs".to_string(),
+                create_mode: None,
                 staged_file: "1.bin".to_string(),
                 size_bytes: 10,
                 base_content_hash: Some("base".to_string()),
@@ -1563,6 +1678,7 @@ mod tests {
             JournalWrite {
                 id: 2,
                 path: "README.md".to_string(),
+                create_mode: None,
                 staged_file: "2.bin".to_string(),
                 size_bytes: 20,
                 base_content_hash: None,
@@ -1571,6 +1687,7 @@ mod tests {
             JournalWrite {
                 id: 3,
                 path: "src/main.rs".to_string(),
+                create_mode: None,
                 staged_file: "3.bin".to_string(),
                 size_bytes: 30,
                 base_content_hash: Some("intermediate".to_string()),
@@ -1592,6 +1709,7 @@ mod tests {
         let entry = |id: u64, expected_file_id: &str, base: &str| JournalWrite {
             id,
             path: "config".to_string(),
+            create_mode: None,
             staged_file: format!("{id}.bin"),
             size_bytes: id,
             base_content_hash: Some(base.to_string()),
@@ -1621,6 +1739,7 @@ mod tests {
         let committed = vec![JournalWrite {
             id: 1,
             path: "src/main.rs".to_string(),
+            create_mode: None,
             staged_file: "1.bin".to_string(),
             size_bytes: 10,
             base_content_hash: Some("base".to_string()),
@@ -1630,6 +1749,7 @@ mod tests {
             JournalWrite {
                 id: 2,
                 path: "src/main.rs".to_string(),
+                create_mode: None,
                 staged_file: "2.bin".to_string(),
                 size_bytes: 20,
                 base_content_hash: Some("base".to_string()),
@@ -1638,6 +1758,7 @@ mod tests {
             JournalWrite {
                 id: 3,
                 path: "src/main.rs".to_string(),
+                create_mode: None,
                 staged_file: "3.bin".to_string(),
                 size_bytes: 30,
                 base_content_hash: Some("external".to_string()),
@@ -1646,6 +1767,7 @@ mod tests {
             JournalWrite {
                 id: 4,
                 path: "README.md".to_string(),
+                create_mode: None,
                 staged_file: "4.bin".to_string(),
                 size_bytes: 40,
                 base_content_hash: Some("readme-base".to_string()),
@@ -1668,6 +1790,7 @@ mod tests {
         let entry = |id: u64, expected_file_id: &str| JournalWrite {
             id,
             path: "config".to_string(),
+            create_mode: None,
             staged_file: format!("{id}.bin"),
             size_bytes: id,
             base_content_hash: Some("same-base".to_string()),
@@ -1719,6 +1842,7 @@ mod tests {
                 pending: VecDeque::from([JournalWrite {
                     id: 1,
                     path: "src/main.rs".to_string(),
+                    create_mode: None,
                     staged_file: "1.bin".to_string(),
                     size_bytes: 4,
                     base_content_hash: None,
@@ -1858,6 +1982,7 @@ mod tests {
         let write = JournalWrite {
             id: 1,
             path: "src/main.rs".to_string(),
+            create_mode: None,
             staged_file: "1.bin".to_string(),
             size_bytes: b"desired".len() as u64,
             base_content_hash: Some("old".to_string()),
@@ -1906,6 +2031,7 @@ mod tests {
         let write = JournalWrite {
             id: 1,
             path: "config".to_string(),
+            create_mode: None,
             staged_file: "1.bin".to_string(),
             size_bytes: b"identical".len() as u64,
             base_content_hash: Some("old".to_string()),
@@ -1975,6 +2101,7 @@ mod tests {
         let write = JournalWrite {
             id: 1,
             path: "config".to_string(),
+            create_mode: None,
             staged_file: "1.bin".to_string(),
             size_bytes: b"local open bytes".len() as u64,
             base_content_hash: Some("old".to_string()),
@@ -2019,6 +2146,7 @@ mod tests {
         let write = JournalWrite {
             id: 1,
             path: "src/main.rs".to_string(),
+            create_mode: None,
             staged_file: "1.bin".to_string(),
             size_bytes: b"desired".len() as u64,
             base_content_hash: Some("old".to_string()),
@@ -2067,6 +2195,7 @@ mod tests {
         let entry = |id: u64, path: &str, base: Option<&str>| JournalWrite {
             id,
             path: path.to_string(),
+            create_mode: None,
             staged_file: format!("{id}.bin"),
             size_bytes: match id {
                 1 => b"committed bytes".len() as u64,
@@ -2193,6 +2322,7 @@ mod tests {
         let entry = JournalWrite {
             id: 1,
             path: "probe.txt".to_string(),
+            create_mode: None,
             staged_file: "1.bin".to_string(),
             size_bytes: 14,
             base_content_hash: Some("stale".to_string()),
@@ -2249,6 +2379,7 @@ mod tests {
         let entry = JournalWrite {
             id: 1,
             path: "probe.txt".to_string(),
+            create_mode: None,
             staged_file: "1.bin".to_string(),
             size_bytes: 14,
             base_content_hash: Some("stale".to_string()),
@@ -2304,6 +2435,7 @@ mod tests {
                 pending: VecDeque::from([JournalWrite {
                     id: 1,
                     path: "logs/api.log".to_string(),
+                    create_mode: None,
                     staged_file: "1.bin".to_string(),
                     size_bytes: 4,
                     base_content_hash: None,
@@ -2400,6 +2532,7 @@ mod tests {
                     &JournalWrite {
                         id,
                         path: format!("src/generated/{id:05}/module.rs"),
+                        create_mode: None,
                         staged_file: format!("{id}.bin"),
                         size_bytes: id,
                         base_content_hash: Some(format!("base-{id}")),
@@ -2429,6 +2562,7 @@ mod tests {
         let identity_aware = JournalWrite {
             id: 2,
             path: "config".to_string(),
+            create_mode: None,
             staged_file: "2.bin".to_string(),
             size_bytes: 2,
             base_content_hash: Some("base".to_string()),
@@ -2476,6 +2610,7 @@ mod tests {
         let first = JournalWrite {
             id: 1,
             path: "first.txt".to_string(),
+            create_mode: None,
             staged_file: "1.bin".to_string(),
             size_bytes: 5,
             base_content_hash: None,
@@ -2541,6 +2676,7 @@ mod tests {
         let write = JournalWrite {
             id: 1,
             path: "large.bin".to_string(),
+            create_mode: None,
             staged_file: "1.bin".to_string(),
             size_bytes: LARGE_BYTES,
             base_content_hash: None,
@@ -2597,6 +2733,7 @@ mod tests {
         let write = JournalWrite {
             id: 1,
             path: "four.txt".to_string(),
+            create_mode: None,
             staged_file: "1.bin".to_string(),
             size_bytes: 4,
             base_content_hash: None,
@@ -2690,6 +2827,7 @@ mod tests {
         let first = JournalWrite {
             id: 1,
             path: "first.txt".to_string(),
+            create_mode: None,
             staged_file: "1.bin".to_string(),
             size_bytes: 5,
             base_content_hash: None,
@@ -2719,6 +2857,7 @@ mod tests {
         let entry = JournalWrite {
             id: 7,
             path: "complete.txt".to_string(),
+            create_mode: None,
             staged_file: "7.bin".to_string(),
             size_bytes: 8,
             base_content_hash: Some("base".to_string()),
@@ -2763,6 +2902,7 @@ mod tests {
         let entry = JournalWrite {
             id: 1,
             path: "src/main.rs".to_string(),
+            create_mode: None,
             staged_file: "1.bin".to_string(),
             size_bytes: 15,
             base_content_hash: Some("base".to_string()),
@@ -2845,6 +2985,7 @@ mod tests {
             let first = JournalWrite {
                 id: 1,
                 path: "first.txt".to_string(),
+                create_mode: None,
                 staged_file: "1.bin".to_string(),
                 size_bytes: 5,
                 base_content_hash: None,
@@ -2926,6 +3067,7 @@ mod tests {
         let entry = JournalWrite {
             id: 1,
             path: "missing.txt".to_string(),
+            create_mode: None,
             staged_file: "1.bin".to_string(),
             size_bytes: 7,
             base_content_hash: None,
@@ -2942,6 +3084,7 @@ mod tests {
         let entry = JournalWrite {
             id: 1,
             path: "kept.txt".to_string(),
+            create_mode: None,
             staged_file: "1.bin".to_string(),
             size_bytes: 4,
             base_content_hash: None,
@@ -2959,5 +3102,115 @@ mod tests {
         assert!(!dir.path().join("2.bin").exists());
         assert!(!dir.path().join("3.tmp").exists());
         assert!(dir.path().join("notes.txt").exists());
+    }
+
+    fn remote_write(path: &str, file_id: Option<&str>, base: Option<&str>, byte: u8) -> RemoteWrite {
+        RemoteWrite {
+            path: path.to_string(),
+            mode: None,
+            bytes: vec![byte],
+            base_content_hash: base.map(str::to_string),
+            expected_file_id: file_id.map(str::to_string),
+        }
+    }
+
+    /// THE ORDERING CONTRACT for concurrent flushes.
+    ///
+    /// Two writes to one path chain through `base_content_hash`, so the second
+    /// is only valid against the first's result. Sharding them apart would let
+    /// the second be issued concurrently with — or ahead of — the first.
+    #[test]
+    fn sharding_keeps_every_write_for_a_path_together_and_in_order() {
+        let writes = vec![
+            remote_write("a.txt", None, None, 1),
+            remote_write("b.txt", None, None, 2),
+            remote_write("a.txt", None, Some("hash-of-1"), 3),
+            remote_write("c.txt", None, None, 4),
+            remote_write("a.txt", None, Some("hash-of-3"), 5),
+        ];
+
+        let shards = shard_writes_by_path(writes, 4);
+
+        let a_shard = shards
+            .iter()
+            .find(|shard| shard.iter().any(|write| write.path == "a.txt"))
+            .expect("a.txt must land somewhere");
+        let a_bytes: Vec<u8> = a_shard
+            .iter()
+            .filter(|write| write.path == "a.txt")
+            .map(|write| write.bytes[0])
+            .collect();
+        assert_eq!(
+            a_bytes,
+            vec![1, 3, 5],
+            "all writes for one path must stay in a single shard, in submission order"
+        );
+        // And nowhere else.
+        let stray = shards
+            .iter()
+            .filter(|shard| shard.iter().any(|write| write.path == "a.txt"))
+            .count();
+        assert_eq!(stray, 1, "a path must not be split across shards");
+    }
+
+    /// `coalesce_batch` keys on (path, expected_file_id), so a file deleted and
+    /// recreated inside one batch appears TWICE under the same path with
+    /// different identities. Sharding by that key would separate them and let
+    /// the recreate overtake its predecessor.
+    #[test]
+    fn sharding_keeps_a_recreated_path_ordered_despite_differing_file_ids() {
+        let writes = vec![
+            remote_write("recreated.txt", Some("inode-1"), None, 1),
+            remote_write("other.txt", None, None, 9),
+            remote_write("recreated.txt", Some("inode-2"), None, 2),
+        ];
+
+        let shards = shard_writes_by_path(writes, 4);
+
+        let owning: Vec<&Vec<RemoteWrite>> = shards
+            .iter()
+            .filter(|shard| shard.iter().any(|write| write.path == "recreated.txt"))
+            .collect();
+        assert_eq!(owning.len(), 1, "differing file ids must not split a path");
+        let ids: Vec<Option<&str>> = owning[0]
+            .iter()
+            .filter(|write| write.path == "recreated.txt")
+            .map(|write| write.expected_file_id.as_deref())
+            .collect();
+        assert_eq!(ids, vec![Some("inode-1"), Some("inode-2")], "recreate must follow the original");
+    }
+
+    /// The point of the change: independent paths must actually fan out, or the
+    /// write path keeps its one-request-at-a-time ceiling.
+    #[test]
+    fn sharding_distributes_independent_paths_across_shards() {
+        let writes = (0..8)
+            .map(|index| remote_write(&format!("f{index}.txt"), None, None, index as u8))
+            .collect::<Vec<_>>();
+
+        let shards = shard_writes_by_path(writes, MAX_INFLIGHT_WRITE_BATCHES);
+
+        assert_eq!(shards.len(), MAX_INFLIGHT_WRITE_BATCHES, "independent paths must parallelise");
+        assert_eq!(
+            shards.iter().map(|shard| shard.len()).sum::<usize>(),
+            8,
+            "sharding must not drop or duplicate writes"
+        );
+    }
+
+    /// A batch touching one path must not pay fan-out overhead, and must remain
+    /// a single request so its CAS chain is issued in order.
+    #[test]
+    fn sharding_a_single_path_yields_one_shard() {
+        let writes = vec![
+            remote_write("only.txt", None, None, 1),
+            remote_write("only.txt", None, Some("hash-of-1"), 2),
+        ];
+        assert_eq!(shard_writes_by_path(writes, 4).len(), 1);
+    }
+
+    #[test]
+    fn sharding_an_empty_batch_yields_no_shards() {
+        assert!(shard_writes_by_path(Vec::new(), 4).is_empty());
     }
 }

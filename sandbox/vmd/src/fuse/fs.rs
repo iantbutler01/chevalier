@@ -2888,6 +2888,42 @@ impl RemoteFuseFs {
             }
         }
         self.acknowledge_pending_publication_locked(fh)?;
+        // Fold this handle's own undrained creation into the write that is
+        // about to publish its contents. `create(2)+write(2)+close(2)` costs two
+        // publications otherwise — a `namespace-many` for the creation and a
+        // `write-many` for the content — and the second can carry the first:
+        // `write-many` already takes a create mode, and a pathname whose
+        // creation has not reached the gateway needs no CAS base because there
+        // is nothing there to guard against.
+        //
+        // Deliberately attempted BEFORE the ordering fence below, because
+        // withdrawing the creation is exactly what makes the fence unnecessary.
+        // Best-effort by design: `false` means the creation already published
+        // (or is on the wire, or never existed), the fence then does its normal
+        // job, and the pair costs what it always did.
+        let folded_creation = {
+            let handles = self.lock_handles()?;
+            let state = handles.files.get(&fh).ok_or(Errno::ENOENT)?;
+            // The exact-mode route below publishes under a lease with its own
+            // preconditions and never touches the write journal, so it cannot
+            // carry a creation.
+            state.dirty && !state.unlinked && state.base_mode == Some(state.mode)
+        } && {
+            let path = self
+                .lock_handles()?
+                .files
+                .get(&fh)
+                .ok_or(Errno::ENOENT)?
+                .path
+                .clone();
+            match self.namespace.as_ref() {
+                Some(namespace) => namespace.withdraw_pending_creation(&path).map_err(|error| {
+                    tracing::warn!(path, %error, "vfs namespace creation withdrawal failed");
+                    Errno::EIO
+                })?,
+                None => false,
+            }
+        };
         // A queued namespace mutation for this exact pathname — in practice its
         // own journaled creation — must reach the gateway before this handle's
         // content does: `write-many` carries a CAS base the gateway can only
@@ -2899,7 +2935,8 @@ impl RemoteFuseFs {
         // when there is content to publish. Closing a file whose namespace state
         // is already published costs nothing even while unrelated creations sit
         // in the journal — which is the difference between a close and an fsync
-        // (see `flush_handle_immediate_locked`).
+        // (see `flush_handle_immediate_locked`). A folded creation is no longer
+        // queued, so it is no longer fenced against.
         let ordering_fence_required = {
             let handles = self.lock_handles()?;
             let state = handles.files.get(&fh).ok_or(Errno::ENOENT)?;
@@ -2985,15 +3022,33 @@ impl RemoteFuseFs {
             let _ = self.tokio.block_on(self.client.release_lease(&lease));
             result?
         } else {
+            // A write that carries a withdrawn creation publishes it: it names
+            // the mode the creation would have applied, and it drops both
+            // preconditions. Neither can be honoured and neither is needed —
+            // the CAS base and file id this handle holds are the ones the
+            // journaled creation PROJECTED, so the gateway would evaluate them
+            // against a pathname it has never seen and reject the batch. There
+            // is likewise nothing to guard: an unpublished pathname has no
+            // concurrent writer whose overwrite this base would have caught.
+            let (base_content_hash, expected_file_id, create_mode) = if folded_creation {
+                (None, None, Some(state.mode))
+            } else {
+                (
+                    state.base_content_hash.clone(),
+                    state.file_id.clone(),
+                    None,
+                )
+            };
             let publication_id = self
                 .writes
                 .as_ref()
                 .ok_or(Errno::EIO)?
-                .enqueue(
+                .enqueue_with_mode(
                     state.path.as_str(),
                     state.buffer.as_slice(),
-                    state.base_content_hash.clone(),
-                    state.file_id.clone(),
+                    base_content_hash,
+                    expected_file_id,
+                    create_mode,
                 )
                 .map_err(|_| Errno::EIO)?;
             {
@@ -8680,11 +8735,34 @@ mod tests {
                                 });
                                 written.push(write.path);
                             }
-                            // A content publication's snapshot names only the
-                            // written paths (see `post_write_many` in
-                            // crates/sandbox/src/vfs.rs) — no parent entry,
-                            // which is exactly why a write must not evict its
-                            // parent directory's cached metadata.
+                            // A content publication's snapshot names the written
+                            // paths, plus the parent of any write that CREATED
+                            // its path (see `post_write_many` in
+                            // crates/sandbox/src/vfs.rs). An OVERWRITE names no
+                            // parent, which is exactly why a write must not
+                            // evict its parent directory's cached metadata; a
+                            // create-carrying write did change that directory,
+                            // and a watcher holding the parent's cached absence
+                            // has no other way to learn it now exists.
+                            let created_parents = results
+                                .iter()
+                                .filter(|result| result.previous_hash.is_none())
+                                .filter_map(|result| {
+                                    result
+                                        .path
+                                        .trim_matches('/')
+                                        .rsplit_once('/')
+                                        .map(|(parent, _)| parent.to_string())
+                                })
+                                .collect::<std::collections::BTreeSet<_>>();
+                            let written = written
+                                .into_iter()
+                                .chain(
+                                    created_parents
+                                        .into_iter()
+                                        .filter(|parent| !parent.is_empty()),
+                                )
+                                .collect::<Vec<_>>();
                             let entries = written
                                 .iter()
                                 .map(|path| chevalier_sandbox::vfs::VfsPublicationSnapshotEntry {
@@ -9033,16 +9111,18 @@ mod tests {
             }
         }
         let create_write_close = sample().since(&base);
-        // Budget two publications per create plus the one cold lookup of the
-        // parent directory before it exists. The two are structural and are
-        // named in the assertions below: the namespace ordering fence a content
-        // write owes its own creation, and the content publication itself.
-        // Anything beyond them is a regression — this class cost 3.00 per op
-        // while every create re-stat'd the directory it had just written into.
+        // Budget ONE publication per create plus the one cold lookup of the
+        // parent directory before it exists. The write carries the creation
+        // (`withdraw_pending_creation` in fuse/namespace.rs), so there is no
+        // namespace publication and no ordering fence to owe it — the class is
+        // exactly its content writes. Anything beyond that is a regression:
+        // this cost 3.00 per op while every create re-stat'd the directory it
+        // had just written into, and 2.02 while the creation still published
+        // separately from the content it was immediately superseded by.
         rows.push((
             "create_write_close",
             CREATE_OPS,
-            CREATE_OPS * 2 + 1,
+            CREATE_OPS + 1,
             create_write_close,
         ));
 
@@ -9400,6 +9480,126 @@ mod tests {
             .load(AtomicOrdering::Relaxed)
             - hashed_before;
 
+        // ---- INVENTORY: the mutating classes the table previously omitted ----
+        //
+        // The table covered creates and reads but not rewrite, unlink, mkdir,
+        // rename, or chmod, so their round-trip cost was unknown while their
+        // latency was being argued about. A class with no row here is a class
+        // whose cost nobody is watching.
+
+        // rewrite: overwrite an EXISTING file. Measured at ~2x a create in the
+        // arena (48ms vs 21.8ms), which this row either explains as a second
+        // round trip or exonerates.
+        // Modelled as a WARM rewrite: the file was just looked up, so the
+        // handle carries the metadata an open(2) would already have supplied.
+        // Passing None here instead would force a cold load and measure this
+        // test's construction rather than the rewrite path — the exact
+        // instrument-versus-subject confusion that produced two retracted
+        // findings earlier.
+        // Metadata is gathered BEFORE the measurement starts: an open(2) has
+        // already paid for it, and counting it here would attribute this test's
+        // setup to the rewrite path.
+        let known_metadata: Vec<RemoteMetadata> = (0..CREATE_OPS)
+            .map(|index| {
+                fs.stat_path(&format!("many/file-{index}"))
+                    .unwrap()
+                    .expect("file exists")
+            })
+            .collect();
+        let base = sample();
+        for index in 0..CREATE_OPS {
+            let path = format!("many/file-{index}");
+            let known = &known_metadata[index];
+            let fh = fs
+                .next_handle(
+                    &path,
+                    Vec::new(),
+                    true,
+                    known.content_hash.clone(),
+                    0o644,
+                    true,
+                    known.file_id.clone(),
+                    known.link_count,
+                )
+                .unwrap();
+            {
+                let mut handles = fs.lock_handles().unwrap();
+                let state = handles.files.get_mut(&fh).unwrap();
+                state.buffer = format!("rewritten {index}").into_bytes();
+                state.dirty = true;
+                state.loaded = true;
+                state.revision = state.revision.saturating_add(1);
+                RemoteFuseFs::mirror_handle_state_locked(&mut handles, fh).unwrap();
+            }
+            fs.flush_handle_immediate(fh, FlushBarrier::Close).unwrap();
+        }
+        fs.flush_writes().ok();
+        let rewrite = sample().since(&base);
+        rows.push(("rewrite", CREATE_OPS, CREATE_OPS * 2, rewrite));
+
+        // unlink: the delete half of the create/delete cycle every build runs.
+        // NOT batchable: `enqueue_namespace_creation` asserts "only creations
+        // may publish asynchronously", so every delete is its own synchronous
+        // publication. That asymmetry — creates amortize to ~0.06 round trips
+        // each, deletes cost a full one — is the finding, not an implementation
+        // detail. A `rm -rf` pays one round trip per file.
+        let base = sample();
+        for index in 0..CREATE_OPS {
+            fs.commit_namespace(VfsNamespaceMutation::DeleteFile {
+                path: format!("queued/new-{index}"),
+                precondition: None,
+            })
+            .ok();
+        }
+        let unlink = sample().since(&base);
+        rows.push(("unlink_sync", CREATE_OPS, CREATE_OPS * 2, unlink));
+
+        // mkdir: directory creation, which a checkout does once per tree level.
+        let base = sample();
+        for index in 0..CREATE_OPS {
+            fs.enqueue_namespace_creation(
+                VfsNamespaceMutation::CreateDirectory {
+                    path: format!("dirs/d-{index}"),
+                    mode: Some(0o755),
+                },
+                None,
+            )
+            .unwrap();
+        }
+        fs.flush_namespace().unwrap();
+        let mkdir_journaled = sample().since(&base);
+        rows.push(("mkdir_journaled", CREATE_OPS, 11, mkdir_journaled));
+
+        // rename: the atomic-replace shape every editor and compiler uses to
+        // write a file safely (write temp, rename over target).
+        // Also synchronous, for the same reason. This is the atomic-replace
+        // shape every editor and compiler uses (write temp, rename over target).
+        let base = sample();
+        for index in 0..CREATE_OPS {
+            fs.commit_namespace(VfsNamespaceMutation::Rename {
+                from: format!("many/file-{index}"),
+                to: format!("many/renamed-{index}"),
+            })
+            .ok();
+        }
+        let rename_sync = sample().since(&base);
+        rows.push(("rename_sync", CREATE_OPS, CREATE_OPS * 2, rename_sync));
+
+        // chmod: `chmod +x` after a build, and the mode-preservation path that
+        // any create/write merge must not regress.
+        // `chmod +x` after a build. Synchronous too, and the mode-preservation
+        // path any create/write merge must not regress.
+        let base = sample();
+        for index in 0..CREATE_OPS {
+            fs.commit_namespace(VfsNamespaceMutation::SetMode {
+                path: format!("many/renamed-{index}"),
+                mode: 0o755,
+            })
+            .ok();
+        }
+        let chmod_sync = sample().since(&base);
+        rows.push(("chmod_sync", CREATE_OPS, CREATE_OPS * 2, chmod_sync));
+
         println!("\ngateway round trips per filesystem operation");
         println!(
             "{:<15} {:>5} {:>12} {:>8}  {}",
@@ -9471,25 +9671,34 @@ mod tests {
             "creates must not issue confirmation stats: {}",
             create.breakdown()
         );
-        // Mechanism: a content publication supersedes the file it wrote, not the
-        // directory holding it. `write-many`'s publication snapshot names only
-        // the written paths, so evicting the parent's metadata leaves nothing to
-        // restore it and the next create pays a wire round trip to re-learn a
-        // directory this mount never changed.
+        // Mechanism: a content publication supersedes the file it wrote and, when
+        // that write CREATED the file, its parent — which the gateway then
+        // snapshots back in the same response (`post_write_many` in
+        // crates/sandbox/src/vfs.rs). Evicting the parent without seeding it
+        // back, or an overwrite naming a parent it did not change, both show up
+        // here as a wire round trip per create to re-learn one directory.
         assert!(
             create_write_close.metadata_many <= 1,
             "creates re-stat'd their parent directory {} times: {}",
             create_write_close.metadata_many,
             create_write_close.breakdown()
         );
+        // Mechanism: the write carries the creation, so a create/write/close
+        // publishes ONCE. A namespace publication here means the fold stopped
+        // working — either the creation drained before the write could withdraw
+        // it, or the withdrawal is no longer attempted — and the class silently
+        // doubles.
+        assert_eq!(
+            create_write_close.namespace_many, 0,
+            "create/write/close published its creation separately from the content \
+             that supersedes it: {}",
+            create_write_close.breakdown()
+        );
         // Mechanism: an ordinary close is not a publication barrier, so the only
-        // namespace traffic a create/write/close owes is the ordering fence its
-        // own content write needs, and the only content traffic is the write.
+        // traffic a create/write/close owes is its own content write.
         assert_eq!(
             create_write_close.charged(),
-            create_write_close.namespace_many
-                + create_write_close.write_many
-                + create_write_close.metadata_many,
+            create_write_close.write_many + create_write_close.metadata_many,
             "create/write/close reached a route it has no business on: {}",
             create_write_close.breakdown()
         );
@@ -9992,15 +10201,25 @@ impl RemoteFuseFs {
             // that load. So such an open defers the hash rather than making the
             // gateway read a multi-GB file to produce one.
             //
-            // O_TRUNC is the exception and keeps the unbounded stat: it marks
-            // the handle dirty at open, so nothing ever loads it, and the CAS
-            // base it publishes from is exactly the hash resolved here. Deferral
-            // there would drop a content precondition, not postpone it.
-            let route = if truncate {
-                self.resolve_inode_file_route(ino)?
-            } else {
-                self.resolve_inode_file_route_deferred_hash(ino)?
-            };
+            // O_TRUNC used to be the exception and keep the unbounded stat, to
+            // preserve the content CAS base it publishes from. That cost a wire
+            // round trip on the single most common write shape there is:
+            // `cmd > file` opens O_TRUNC, and an unbounded stat cannot be served
+            // from a cached entry that carries no hash. It is why a rewrite
+            // measured 48.6ms against a 24ms single round trip on the mounted
+            // arena — one stat, then the publication.
+            //
+            // A content fingerprint is also the wrong guard here. O_TRUNC
+            // discards the file's contents before a single byte is written, so
+            // there is no read-modify-write to protect: the caller has already
+            // declared the previous bytes irrelevant. What still matters is that
+            // the pathname denotes the SAME inode it did at open — an unlink and
+            // recreate underneath must not be silently overwritten — and that is
+            // the identity precondition, which needs no hash.
+            //
+            // So: resolve deferred (cache-servable), and publish under identity
+            // rather than content. See the base_content_hash below.
+            let route = self.resolve_inode_file_route_deferred_hash(ino)?;
             let path = route.path;
             let metadata = route.metadata;
             if metadata.kind == "directory" {

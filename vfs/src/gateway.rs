@@ -1748,6 +1748,7 @@ mod tests {
         let writes = (0..1_000)
             .map(|index| VfsStorageWrite {
                 path: format!(".git/objects/ab/{index:04x}"),
+                mode: None,
                 bytes: Bytes::from(format!("object-{index:04}\n")),
                 token_count: None,
                 precondition: None,
@@ -1791,18 +1792,21 @@ mod tests {
         let mut writes = (0..mutation_count)
             .map(|index| VfsStorageWrite {
                 path: format!(".git/refs/heads/perf-{index:05}.lock"),
+                mode: None,
                 bytes: Bytes::from(format!("ref-{generation}-{index:05}\n")),
                 token_count: None,
                 precondition: None,
             })
             .chain((0..mutation_count).map(|index| VfsStorageWrite {
                 path: format!("src/generated/perf-{index:05}.ts"),
+                mode: None,
                 bytes: Bytes::from(format!("export const value = {generation}_{index};\n")),
                 token_count: None,
                 precondition: None,
             }))
             .chain((0..object_count).map(|index| VfsStorageWrite {
                 path: format!(".git/objects/{:02x}/{:038x}", index % 256, index),
+                mode: None,
                 bytes: Bytes::from(format!("blob {generation} {index:08}\n")),
                 token_count: None,
                 precondition: None,
@@ -2145,12 +2149,14 @@ mod tests {
             .write_many_if_changed_atomic(vec![
                 VfsStorageWrite {
                     path: "a.txt".to_string(),
+                    mode: None,
                     bytes: unchanged_body,
                     token_count: None,
                     precondition: None,
                 },
                 VfsStorageWrite {
                     path: "b.txt".to_string(),
+                    mode: None,
                     bytes: changed_body,
                     token_count: None,
                     precondition: Some(VfsStorageWritePrecondition {

@@ -464,8 +464,37 @@ fn build_durable_volume_setup_script(enabled: bool) -> String {
         return r#"log "durable machine-state volume disabled""#.to_string();
     }
     r#"log "configuring durable machine-state volume"
-mkdir -p /usr/local/sbin /etc/systemd/system
-cat <<'EOF' >/usr/local/sbin/chevalier-mount-durable.sh
+# NOT /usr/local/sbin: /usr/local is itself one of the bind_state paths below,
+# so anything written there is shadowed by the durable volume the moment this
+# script mounts it. The script that mounts the volume cannot live on the volume
+# — after first boot every later boot re-ran the STALE copy from the volume,
+# which is how a repair that was correctly built into the image never once ran.
+# /usr/lib is rootfs-only and never bind-mounted, so it always reflects the
+# image that actually booted.
+mkdir -p /usr/lib/chevalier /etc/systemd/system
+
+# Bound the guest's own teardown so it finishes INSIDE the host's stop budget.
+# systemd's stock 90s-per-unit ceiling meant docker alone could outlast the
+# host's patience, and the resulting power-cut is what damages the durable
+# filesystem. These limits are deliberately well under GRACEFUL_STOP_TIMEOUT.
+mkdir -p /etc/systemd/system.conf.d
+cat <<'EOF' >/etc/systemd/system.conf.d/10-chevalier-shutdown.conf
+[Manager]
+DefaultTimeoutStopSec=45s
+EOF
+
+# Containers hold the most dirty state and sit above the durable mount in the
+# dependency graph, so they must be the first thing to let go on shutdown.
+mkdir -p /etc/systemd/system/docker.service.d /etc/systemd/system/containerd.service.d
+cat <<'EOF' >/etc/systemd/system/docker.service.d/10-chevalier-shutdown.conf
+[Service]
+TimeoutStopSec=30s
+EOF
+cat <<'EOF' >/etc/systemd/system/containerd.service.d/10-chevalier-shutdown.conf
+[Service]
+TimeoutStopSec=30s
+EOF
+cat <<'EOF' >/usr/lib/chevalier/durable-volume.sh
 #!/bin/bash
 set -euo pipefail
 
@@ -485,13 +514,57 @@ if [ ! -b "$DEVICE" ]; then
   exit 1
 fi
 
+# A stop that outruns its budget power-cuts the guest, so this filesystem will
+# take journal damage eventually. Nothing used to repair it: a volume the kernel
+# had already flagged with "mounting fs with errors, running e2fsck is
+# recommended" got mounted read-write anyway, so a single injury compounded into
+# hundreds of recorded errors and eventually broke ordinary cargo builds.
+#
+# Repair is unattended by design. There is no operator inside a sandbox VM to
+# answer a prompt, so a check that can block on one is worse than no check.
+repair_durable_volume() {
+  STATE=$(dumpe2fs -h "$DEVICE" 2>/dev/null | sed -n 's/^Filesystem state: *//p')
+  ERRORS=$(dumpe2fs -h "$DEVICE" 2>/dev/null | sed -n 's/^FS Error count: *//p')
+  log "durable volume state=${STATE:-unknown} recorded_errors=${ERRORS:-0}"
+
+  STATUS=0
+  if [ -n "${ERRORS:-}" ] && [ "${ERRORS:-0}" != "0" ] || [ "${STATE:-clean}" != "clean" ]; then
+    # Recorded errors mean preen is not enough: it skips exactly the cases a
+    # damaged bitmap needs. Force the full pass instead of discovering that.
+    log "durable volume reports prior errors; forcing full unattended repair"
+    e2fsck -f -y "$DEVICE" || STATUS=$?
+  else
+    e2fsck -p "$DEVICE" || STATUS=$?
+  fi
+
+  # 0 clean, 1 errors corrected, 2 corrected + reboot advised. 4 and above means
+  # the pass stopped short, so escalate once to a forced unattended repair.
+  if [ "$STATUS" -ge 4 ]; then
+    log "e2fsck stopped short (status $STATUS); escalating to full repair"
+    STATUS=0
+    e2fsck -f -y "$DEVICE" || STATUS=$?
+  fi
+  if [ "$STATUS" -ge 4 ]; then
+    log "durable volume STILL reports uncorrected errors (status $STATUS); mounting anyway"
+  else
+    log "durable volume repaired/verified (status $STATUS)"
+  fi
+
+  # Stop writing through damage. A fresh error now remounts the volume read-only
+  # rather than compounding, and the next boot repairs it in the block above.
+  tune2fs -e remount-ro "$DEVICE" >/dev/null 2>&1 || true
+}
+
 TYPE=$(blkid -s TYPE -o value "$DEVICE" 2>/dev/null || true)
 if [ -z "$TYPE" ]; then
   log "formatting first-use durable volume"
   mkfs.ext4 -F -L openbracket-durable "$DEVICE"
+  tune2fs -e remount-ro "$DEVICE" >/dev/null 2>&1 || true
 elif [ "$TYPE" != "ext4" ]; then
   log "unsupported durable volume filesystem: $TYPE"
   exit 1
+else
+  repair_durable_volume
 fi
 
 mkdir -p "$MOUNT"
@@ -522,9 +595,17 @@ bind_state /var/lib/docker var-lib-docker
 bind_state /var/cache/openbracket var-cache-openbracket
 bind_state /root root
 bind_state /usr/local usr-local
+
+# The backing qcow2 is thin-provisioned and, without discard, only ever grows:
+# every block a deleted file ever touched stays allocated on the host. Paired
+# with discard=unmap on the drive, this hands freed space back. Kept best-effort
+# so a kernel or image without discard support cannot fail the mount unit.
+fstrim "$MOUNT" >/dev/null 2>&1 || log "fstrim unavailable on durable volume"
+systemctl enable --now fstrim.timer >/dev/null 2>&1 || true
+
 log "durable machine-state paths mounted"
 EOF
-chmod 0755 /usr/local/sbin/chevalier-mount-durable.sh
+chmod 0755 /usr/lib/chevalier/durable-volume.sh
 
 cat <<'EOF' >/etc/systemd/system/chevalier-durable-volume.service
 [Unit]
@@ -534,7 +615,7 @@ Before=containerd.service docker.service chevalier-shared-mounts.service portpro
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/chevalier-mount-durable.sh
+ExecStart=/usr/lib/chevalier/durable-volume.sh
 RemainAfterExit=yes
 
 [Install]
@@ -1436,6 +1517,67 @@ mod tests {
             "Before=containerd.service docker.service chevalier-shared-mounts.service portproxy.service"
         ));
         assert!(script.contains("systemctl start --no-block containerd.service docker.service"));
+    }
+
+    /// A durable volume that is never repaired turns one power-cut into
+    /// permanent, compounding damage: the kernel asks for e2fsck, the mount
+    /// proceeds anyway, and the recorded error count only climbs. Pin the
+    /// repair path, its unattended flags, and the read-only-on-error policy.
+    #[test]
+    fn init_script_repairs_the_durable_volume_before_mounting_it() {
+        let script = build_init_script("vm-test", None, None, None, true);
+
+        // An existing filesystem is checked before it is ever mounted.
+        assert!(script.contains("repair_durable_volume"));
+        let repair_at = script.find("repair_durable_volume()").expect("repair function");
+        let mount_at = script
+            .find(r#"mount -t ext4 -o noatime "$DEVICE" "$MOUNT""#)
+            .expect("durable mount");
+        assert!(repair_at < mount_at, "repair must be defined before the mount");
+
+        // Unattended by design: nothing inside a sandbox VM can answer a prompt.
+        assert!(script.contains("e2fsck -p \"$DEVICE\""));
+        assert!(script.contains("e2fsck -f -y \"$DEVICE\""));
+        assert!(!script.contains("e2fsck -n"), "a dry run would repair nothing");
+
+        // Recorded errors must force the full pass, not the preen that skips them.
+        assert!(script.contains("FS Error count"));
+
+        // Stop writing through damage so a fresh error cannot compound.
+        assert!(script.contains("tune2fs -e remount-ro \"$DEVICE\""));
+
+        // Freed blocks return to the thin-provisioned host image.
+        assert!(script.contains("fstrim \"$MOUNT\""));
+
+        // The guest must finish teardown inside the host's stop budget.
+        assert!(script.contains("DefaultTimeoutStopSec=45s"));
+        assert!(script.contains("TimeoutStopSec=30s"));
+
+        // The mount script must NOT live under any path this script later
+        // bind-mounts from the durable volume, or every boot after the first
+        // re-runs the stale copy stored on that volume and the repair above
+        // silently never executes. /usr/lib is rootfs-only.
+        assert!(script.contains("ExecStart=/usr/lib/chevalier/durable-volume.sh"));
+        assert!(
+            !script.contains("/usr/local/sbin/chevalier-mount-durable.sh"),
+            "the durable mount script cannot live on a bind_state path"
+        );
+        // Scoped to the durable-volume unit. NOTE: portproxy.service still runs
+        // ExecStartPre=/usr/local/sbin/chevalier-apply-tap-network.sh, and the
+        // shares/diagnostics helpers also live under /usr/local/sbin — all of
+        // them are shadowed the same way and run stale copies after first boot.
+        // Moving those is a separate change; chevalier-mount-shares.sh is what
+        // mounts /workspace, so it does not ride along with a repair fix.
+        let durable_unit = script
+            .split("chevalier-durable-volume.service")
+            .nth(1)
+            .expect("durable volume unit");
+        for shadowed in ["/usr/local/", "/root/", "/var/lib/docker/", "/var/cache/openbracket/"] {
+            assert!(
+                !durable_unit.contains(&format!("ExecStart={shadowed}")),
+                "durable-volume unit must not execute from bind-shadowed {shadowed}"
+            );
+        }
     }
 
     fn read_root_entries(path: &Path) -> Result<Vec<String>> {

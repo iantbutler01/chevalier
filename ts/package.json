@@ -1,7 +1,7 @@
 {
   "name": "chevalier",
   "version": "0.0.0",
-  "description": "TypeScript bindings for Chevalier — agents are just functions.",
+  "description": "TypeScript bindings for Chevalier \u2014 agents are just functions.",
   "license": "Apache-2.0",
   "type": "commonjs",
   "main": "index.js",
@@ -41,7 +41,7 @@
     "build:native:debug": "napi build --platform --js native.js --dts native.d.ts",
     "build:ts": "tsc -p tsconfig.json && node scripts/generate-esm-shim.mjs",
     "build": "napi build --platform --release --js native.js --dts native.d.ts && tsc -p tsconfig.json && node scripts/generate-esm-shim.mjs",
-    "test": "node --test --test-force-exit"
+    "test": "npm run build:ts && node --test --test-force-exit"
   },
   "dependencies": {
     "zod-to-json-schema": "^3.24.0"

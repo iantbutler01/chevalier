@@ -38,6 +38,16 @@ const METADATA_READ_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 // File bodies have a longer per-attempt timeout than metadata. Their total
 // budget must exceed one attempt or a congested first request can never retry.
 const FILE_READ_RETRY_TIMEOUT: Duration = Duration::from_secs(45);
+/// Budget for hard-link alias resolution, which runs on the UNLINK path.
+///
+/// Deliberately far below `METADATA_READ_RETRY_TIMEOUT`. That budget exists to
+/// ride out a gateway restart for reads a caller cannot proceed without; this
+/// lookup is neither. A conflict here has only ever meant "the workspace is
+/// busy", and a busy workspace is the normal state during any package install —
+/// so spending the generic budget turned each unlink into a 30s stall
+/// (`operation="unlink" operation_time_ms=30723`). An unlink that cannot get an
+/// alias answer promptly is better served by proceeding than by waiting.
+const ALIAS_READ_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 const METADATA_READ_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const FILE_READ_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
 const ADVISORY_LOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -283,6 +293,8 @@ pub struct RemoteWrite {
     pub bytes: Vec<u8>,
     pub base_content_hash: Option<String>,
     pub expected_file_id: Option<String>,
+    /// Applied only if this write creates the path; see `VfsWriteManyItem::mode`.
+    pub mode: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -895,7 +907,7 @@ impl RemoteVfsClient {
                         excluding_path: self.path_arg(excluding_path),
                     })
                     .timeout(METADATA_READ_ATTEMPT_TIMEOUT),
-                METADATA_READ_RETRY_TIMEOUT,
+                ALIAS_READ_RETRY_TIMEOUT,
                 |status, body| {
                     if !status.is_success() {
                         return Err(anyhow!("vfs hard-link alias failed: {status}"));
@@ -1364,6 +1376,7 @@ impl RemoteVfsClient {
         VfsWriteManyItem {
             path: self.path_arg(write.path.as_str()),
             body: write.bytes,
+            mode: write.mode,
             precondition,
         }
     }
@@ -2197,6 +2210,99 @@ mod tests {
         assert!(FILE_READ_RETRY_TIMEOUT > FILE_READ_ATTEMPT_TIMEOUT);
     }
 
+    /// DEGENERATE WORKLOAD GATE — a busy namespace must not turn one filesystem
+    /// operation into a multi-second stall.
+    ///
+    /// `hard-link-alias/v1` runs on the UNLINK path, and the gateway answers 409
+    /// ("namespace changed during recursive snapshot") whenever a writer overlaps
+    /// its optimistic snapshot. Under `pnpm install` — which hard-links thousands
+    /// of files and so needs alias resolution on nearly every unlink — that
+    /// overlap is the steady state, not the exception. Retrying it against the
+    /// generic 30s metadata budget produced exactly this in production:
+    ///
+    ///   vfs fuse operation ... operation="unlink" operation_time_ms=30723
+    ///
+    /// A 409 here means "the workspace is busy", and a busy workspace is normal.
+    /// The retry budget on this path must therefore be bounded tightly enough
+    /// that giving up and letting the caller proceed beats waiting.
+    #[test]
+    fn alias_lookup_under_sustained_snapshot_conflict_stays_within_a_bounded_budget() {
+        use std::sync::atomic::AtomicUsize;
+
+        /// What a single unlink may spend resolving an alias before the mount is
+        /// better off without the answer. Deliberately far below
+        /// `METADATA_READ_RETRY_TIMEOUT`, which exists for reads a caller cannot
+        /// proceed without.
+        const ALIAS_STALL_CEILING: Duration = Duration::from_secs(3);
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let server = runtime.spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/hard-link-alias/v1",
+                    axum::routing::post(move || {
+                        let attempts = Arc::clone(&server_attempts);
+                        async move {
+                            attempts.fetch_add(1, Ordering::AcqRel);
+                            // Exactly what the gateway returns when a writer
+                            // overlapped every optimistic-snapshot attempt.
+                            (
+                                axum::http::StatusCode::CONFLICT,
+                                "namespace changed during recursive snapshot; retry",
+                            )
+                                .into_response()
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let client = RemoteVfsClient::new(&endpoint, "token", "scope").unwrap();
+
+        let started = Instant::now();
+        let settled = runtime.block_on(async {
+            tokio::time::timeout(
+                ALIAS_STALL_CEILING,
+                client.find_hard_link_alias("file-1", "pkg/node_modules/.bin/thing"),
+            )
+            .await
+        });
+        let elapsed = started.elapsed();
+        server.abort();
+
+        assert!(
+            settled.is_ok(),
+            "alias lookup was still retrying after {:?} against a namespace that is \
+             merely BUSY (generic budget is {:?}, {} attempts made). Every hard-link \
+             unlink pays this, so a package install stalls for the whole budget per file.",
+            ALIAS_STALL_CEILING,
+            METADATA_READ_RETRY_TIMEOUT,
+            attempts.load(Ordering::Acquire),
+        );
+        assert!(
+            elapsed < ALIAS_STALL_CEILING,
+            "alias lookup consumed {elapsed:?}, over the {ALIAS_STALL_CEILING:?} ceiling"
+        );
+        // Whatever the outcome, a 409 must not be reported as a hard failure that
+        // strands the unlink; the caller needs an answer it can act on.
+        assert!(
+            settled.is_ok(),
+            "alias lookup must resolve or give up within its budget"
+        );
+    }
+
     /// The gateway answers in the OWNER's namespace; the shared cache and every
     /// mount's inode table are keyed relative to the registry's scope. Until the
     /// answer is translated, every targeted revocation matched nothing at all —
@@ -2730,6 +2836,7 @@ mod tests {
         let client = RemoteVfsClient::new("http://localhost", "token", "scope").unwrap();
         let identity_only = client.scope_remote_write(RemoteWrite {
             path: "tracked".to_string(),
+            mode: None,
             bytes: b"next".to_vec(),
             base_content_hash: None,
             expected_file_id: Some("file-1".to_string()),
@@ -2752,6 +2859,7 @@ mod tests {
 
         let absent = client.scope_remote_write(RemoteWrite {
             path: "new".to_string(),
+            mode: None,
             bytes: b"new".to_vec(),
             base_content_hash: Some("absent".to_string()),
             expected_file_id: None,

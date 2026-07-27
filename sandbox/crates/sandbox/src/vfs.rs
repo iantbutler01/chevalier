@@ -418,6 +418,15 @@ impl VfsWritePrecondition {
 pub struct VfsWriteManyItem {
     pub path: String,
     pub body: Vec<u8>,
+    /// POSIX mode applied only when this write CREATES the path.
+    ///
+    /// Carried so a creation can be folded into the write that follows it,
+    /// instead of costing its own namespace publication. Without it the merge
+    /// silently strips the executable bit: the namespace mutation is otherwise
+    /// the only carrier of mode. Skipped on the wire when absent so older
+    /// gateways are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
     #[serde(default)]
     pub precondition: Option<VfsWritePrecondition>,
 }
@@ -1893,7 +1902,7 @@ mod server {
         validate_declared_resource_key(&headers, &aliases, first_scope.resource_key.as_str())?;
         let publication = publications.owner(owner_id.as_str());
         let revision = publication.write().await;
-        let snapshot_paths = body
+        let mut snapshot_paths = body
             .writes
             .iter()
             .map(|write| write.path.clone())
@@ -1906,10 +1915,38 @@ mod server {
                 scope: first_scope,
             })
             .await?;
+        // A write that CREATED its path changed its parent directory too — the
+        // parent may not have existed at all a moment ago. Report and snapshot
+        // it exactly as `namespace_snapshot_paths` does for a `CreateFile`,
+        // because a create-carrying write is that creation.
+        //
+        // Without this, a watcher that had cached the parent's absence keeps
+        // that negative entry: an unrelated publication retags a surviving
+        // negative rather than dropping it (which is what makes sibling reads
+        // cheap), so a parent nobody names is never re-read and the directory
+        // stays invisible. `previous_hash` is the discriminator the backend
+        // already returns — `None` means nothing was there to overwrite.
+        //
+        // An OVERWRITE still names only the file. That is the property that
+        // keeps a write from evicting every cached sibling in its directory,
+        // and it is unaffected here: an overwrite's parent is unchanged.
+        {
+            let mut seen = snapshot_paths
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>();
+            for result in results.iter().filter(|result| result.previous_hash.is_none()) {
+                let parent = immediate_parent(result.path.as_str());
+                if !parent.is_empty() && seen.insert(parent.clone()) {
+                    snapshot_paths.push(parent);
+                }
+            }
+        }
         let affected = snapshot_paths.clone();
         let entries = publication_snapshot(&backend, owner_id.as_str(), snapshot_paths).await?;
-        // A content write supersedes the file it wrote and nothing beneath any
-        // path: no subtree prefixes.
+        // A content write supersedes the file it wrote (plus any directory it
+        // brought into existence) and nothing beneath any path: no subtree
+        // prefixes.
         let published = publication
             .commit_and_await_acks_for(revision, affected, Vec::new())
             .await;

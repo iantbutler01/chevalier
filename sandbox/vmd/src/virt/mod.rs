@@ -1189,10 +1189,29 @@ pub async fn spawn_virtiofsd(
         "--shared-dir={}",
         spawn.source_path.to_string_lossy()
     ));
-    // The host source is itself a remote FUSE mount. Another VM can publish
-    // through a separate FUSE/virtiofsd pair, so virtiofsd cannot safely retain
-    // entry or attribute metadata without a cross-daemon invalidation channel.
-    cmd.arg("--cache=never");
+    // The host source is itself a remote FUSE mount, so in principle another VM
+    // could publish through a separate FUSE/virtiofsd pair and this daemon would
+    // not learn of it. That was the reason for `never`.
+    //
+    // In practice it costs far more than it buys. vmd ALREADY serves reads from
+    // a content cache with a 60s TTL, so `never` was not delivering coherence —
+    // it only stopped the guest kernel from caching on top of a cache that is
+    // stale by design. Measured cost: every read crosses to the host, there is
+    // no readahead, and 4KiB writes cannot coalesce (1.0MiB/s versus 5.6MiB/s
+    // block-aligned).
+    //
+    // Production mounts each scope exactly once, and authority is single-sided:
+    // when the remote is authoritative nothing writes from the local side, so
+    // the guest's cache is coherent with the only writer there is — itself.
+    //
+    // Configurable so a suspected staleness bug can be bisected by restarting
+    // vmd rather than rebuilding it.
+    let cache_mode = std::env::var("CHEVALIER_VIRTIOFSD_CACHE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| matches!(value.as_str(), "never" | "auto" | "always"))
+        .unwrap_or_else(|| "auto".to_string());
+    cmd.arg(format!("--cache={cache_mode}"));
     let sandbox_mode = configured_virtiofsd_sandbox_mode();
     cmd.arg(format!("--sandbox={sandbox_mode}"));
     // Blocking SETLKW/flock requests must not monopolize the sole vhost-user
@@ -2093,9 +2112,13 @@ while :; do sleep 0.05; done
             Some(libc::ECHILD)
         );
         let log = fs::read_to_string(&log_path).expect("read fake virtiofsd arguments");
+        // Default is `auto`: vmd's own 60s content cache already means `never`
+        // was not buying coherence, while it did cost every read a host round
+        // trip and blocked write coalescing. `CHEVALIER_VIRTIOFSD_CACHE` can
+        // pin it back to `never` to bisect a suspected staleness bug.
         assert!(
-            log.lines().any(|line| line == "--cache=never"),
-            "virtiofsd must not retain metadata across independently mounted VMs: {log}"
+            log.lines().any(|line| line == "--cache=auto"),
+            "virtiofsd cache mode must default to auto: {log}"
         );
     }
 

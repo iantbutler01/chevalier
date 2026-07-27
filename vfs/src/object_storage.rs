@@ -509,6 +509,7 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
     ) -> VfsStorageResult<VfsStorageWriteResult> {
         self.write_many_atomic(vec![VfsStorageWrite {
             path: path.to_string(),
+            mode: None,
             bytes,
             token_count: None,
             precondition,
@@ -1671,12 +1672,14 @@ mod tests {
             .write_many_atomic(vec![
                 VfsStorageWrite {
                     path: "notes/a.md".to_string(),
+                    mode: None,
                     bytes: Bytes::from_static(b"alpha"),
                     token_count: Some(1),
                     precondition: None,
                 },
                 VfsStorageWrite {
                     path: "notes/b.md".to_string(),
+                    mode: None,
                     bytes: Bytes::from_static(b"beta beta"),
                     token_count: Some(2),
                     precondition: None,
@@ -1732,6 +1735,7 @@ mod tests {
         let writes = (0..1_000)
             .map(|index| VfsStorageWrite {
                 path: format!(".git/objects/ab/{index:04x}"),
+                mode: None,
                 bytes: Bytes::from(format!("object-{index:04}\n")),
                 token_count: None,
                 precondition: None,
@@ -1770,18 +1774,21 @@ mod tests {
         let mut writes = (0..mutation_count)
             .map(|index| VfsStorageWrite {
                 path: format!(".git/refs/heads/perf-{index:05}.lock"),
+                mode: None,
                 bytes: Bytes::from(format!("ref-{generation}-{index:05}\n")),
                 token_count: None,
                 precondition: None,
             })
             .chain((0..mutation_count).map(|index| VfsStorageWrite {
                 path: format!("src/generated/perf-{index:05}.ts"),
+                mode: None,
                 bytes: Bytes::from(format!("export const value = {generation}_{index};\n")),
                 token_count: None,
                 precondition: None,
             }))
             .chain((0..object_count).map(|index| VfsStorageWrite {
                 path: format!(".git/objects/{:02x}/{:038x}", index % 256, index),
+                mode: None,
                 bytes: Bytes::from(format!("blob {generation} {index:08}\n")),
                 token_count: None,
                 precondition: None,
@@ -1979,12 +1986,14 @@ mod tests {
             .write_many_if_changed_atomic(vec![
                 VfsStorageWrite {
                     path: "same.md".to_string(),
+                    mode: None,
                     bytes: Bytes::from_static(b"same"),
                     token_count: None,
                     precondition: None,
                 },
                 VfsStorageWrite {
                     path: "changed.md".to_string(),
+                    mode: None,
                     bytes: Bytes::from_static(b"new"),
                     token_count: None,
                     precondition: None,
@@ -2157,12 +2166,14 @@ mod tests {
             .write_many_atomic(vec![
                 VfsStorageWrite {
                     path: "source".to_string(),
+                    mode: None,
                     bytes: Bytes::from_static(b"left"),
                     token_count: None,
                     precondition: None,
                 },
                 VfsStorageWrite {
                     path: "alias".to_string(),
+                    mode: None,
                     bytes: Bytes::from_static(b"right"),
                     token_count: None,
                     precondition: None,
@@ -2182,12 +2193,14 @@ mod tests {
             .write_many_atomic(vec![
                 VfsStorageWrite {
                     path: "notes/a.md".to_string(),
+                    mode: None,
                     bytes: Bytes::from_static(b"alpha"),
                     token_count: None,
                     precondition: None,
                 },
                 VfsStorageWrite {
                     path: "notes/b.md".to_string(),
+                    mode: None,
                     bytes: Bytes::from_static(b"beta"),
                     token_count: None,
                     precondition: None,

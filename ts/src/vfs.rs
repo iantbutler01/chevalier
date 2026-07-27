@@ -727,6 +727,7 @@ impl VfsStorage {
             .into_iter()
             .map(|write| VfsStorageWrite {
                 path: write.path,
+                mode: None,
                 bytes: Bytes::from(write.body),
                 token_count: None,
                 precondition: write.precondition,

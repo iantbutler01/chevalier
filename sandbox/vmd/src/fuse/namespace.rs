@@ -61,6 +61,10 @@ struct JournalState {
     journal: File,
     force_flush: bool,
     flushing: bool,
+    /// Operation ids the worker has handed to the wire and not yet reconciled.
+    /// A creation in this set has already cost its round trip and its response
+    /// still has to find its record, so it may not be withdrawn.
+    in_flight: std::collections::HashSet<String>,
     stop: bool,
     /// A rewrite crossed or may have crossed the atomic rename boundary but
     /// did not complete both parent-directory sync and append-handle reopen.
@@ -130,6 +134,7 @@ impl NamespaceJournal {
                 journal,
                 force_flush: false,
                 flushing: false,
+                in_flight: std::collections::HashSet::new(),
                 stop: false,
                 journal_needs_repair: false,
                 last_error: None,
@@ -199,6 +204,71 @@ impl NamespaceJournal {
         }
         self.shared.changed.notify_all();
         Ok(())
+    }
+
+    /// Withdraw an undrained creation for `path`, handing ownership of the
+    /// pathname to the content write that is about to be enqueued for it.
+    ///
+    /// A create followed by a write costs two publications: the namespace
+    /// creation and the content. When the write arrives before the creation has
+    /// drained, the write can create the path itself — `write-many` carries the
+    /// mode and needs no CAS base for a pathname nothing has published yet — so
+    /// publishing the namespace record separately is pure cost.
+    /// `create_write_close` is 2.02 round trips per file with the pair and ~1.0
+    /// with the fold.
+    ///
+    /// Returns `false` when there is nothing to withdraw — already published,
+    /// already withdrawn, or never journaled. Callers MUST treat that as
+    /// "proceed normally": this is an optimisation, and a missed withdrawal
+    /// costs one round trip rather than correctness.
+    ///
+    /// The record is REMOVED, not marked. A marked-but-retained record would
+    /// never be collected — `observe_revision` prunes on `committed_revision`,
+    /// which a withdrawn record never acquires — so its projection would mask
+    /// the file as permanently empty long after the write published the real
+    /// contents. Removal also hands read-your-writes to the write journal
+    /// cleanly: `stat_path_attributes` drains a pending write for the path
+    /// before answering, so the pathname is never unobservable, only briefly
+    /// answered by a drain instead of a projection.
+    ///
+    /// The rewritten journal is durable before this returns, so a crash cannot
+    /// resurrect a creation the write already owns. A crash in the window
+    /// between this and the write's own journal append loses the file entirely
+    /// — which is what an interrupted `close(2)` promises anyway, and strictly
+    /// less than the empty file the unfolded pair would have left.
+    pub fn withdraw_pending_creation(&self, path: &str) -> Result<bool> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| anyhow!("vfs namespace journal lock poisoned"))?;
+        let wanted = path.trim_matches('/');
+        let Some(index) = state.pending.iter().position(|record| {
+            record.committed_revision.is_none()
+                && matches!(
+                    &record.mutation,
+                    VfsNamespaceMutation::CreateFile { path, .. } if path.trim_matches('/') == wanted
+                )
+        }) else {
+            return Ok(false);
+        };
+        // Never withdraw a creation the worker has already handed to the wire:
+        // its publication is in flight and will land regardless, and dropping
+        // the record here would leave nothing to reconcile the response
+        // against. This is per-record, not "is the worker busy" — a mount
+        // materializing a tree keeps the worker permanently mid-batch, and a
+        // blanket check would fold nothing.
+        if state.in_flight.contains(state.pending[index].operation_id.as_str()) {
+            return Ok(false);
+        }
+        let removed = state.pending.remove(index);
+        if let Err(error) = rewrite_journal(&self.shared.journal_path, &mut state) {
+            if let Some(record) = removed {
+                state.pending.insert(index, record);
+            }
+            return Err(error);
+        }
+        Ok(true)
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -739,6 +809,22 @@ fn run_worker(
                 .any(|record| record.committed_revision.is_none())
                 && !state.stop
             {
+                // Nothing is queued, so a pending force-flush request is
+                // satisfied by definition — retire it here rather than carrying
+                // it into work that has not been asked for yet.
+                //
+                // `flush()` raises the flag unconditionally, including when the
+                // journal is already empty, and only a batch take lowers it. A
+                // flush with nothing to drain therefore used to latch the flag
+                // until the NEXT enqueue, which the worker then published alone
+                // instead of batching. That is self-sustaining once a create is
+                // followed by a close: the lone publication defeats the
+                // create/write fold, the fold's absence makes the close take the
+                // namespace ordering fence, the fence flushes an empty journal,
+                // and the flag is set again for the create after it. One
+                // no-op flush was enough to turn a whole 1,000-file
+                // materialization from one publication per file into two.
+                state.force_flush = false;
                 state = match shared.changed.wait(state) {
                     Ok(state) => state,
                     Err(_) => return,
@@ -795,6 +881,10 @@ fn run_worker(
                 .collect::<Vec<_>>();
             state.force_flush = false;
             state.flushing = true;
+            state.in_flight = batch
+                .iter()
+                .map(|record| record.operation_id.clone())
+                .collect();
             (batch, surface)
         };
 
@@ -853,6 +943,7 @@ fn run_worker(
             Err(_) => return,
         };
         state.flushing = false;
+        state.in_flight.clear();
         if let Some(resolution) = resolution {
             apply_namespace_resolution(&shared, &mut state, resolution);
             shared.changed.notify_all();
@@ -2036,6 +2127,7 @@ mod tests {
                 journal: open_append(&journal_path).expect("journal"),
                 force_flush: false,
                 flushing: false,
+                in_flight: std::collections::HashSet::new(),
                 stop: false,
                 journal_needs_repair: false,
                 last_error: None,
@@ -2132,6 +2224,7 @@ mod tests {
                 journal: open_append(&journal_path).expect("journal"),
                 force_flush: false,
                 flushing: false,
+                in_flight: std::collections::HashSet::new(),
                 stop: false,
                 journal_needs_repair: false,
                 last_error: None,
@@ -2193,6 +2286,7 @@ mod tests {
                 journal: open_append(&journal_path).expect("journal"),
                 force_flush: false,
                 flushing: false,
+                in_flight: std::collections::HashSet::new(),
                 stop: false,
                 journal_needs_repair: false,
                 last_error: Some("vfs request failed: 409".to_string()),
@@ -2506,6 +2600,7 @@ mod tests {
                 journal: open_append(&journal_path).expect("journal"),
                 force_flush: false,
                 flushing: false,
+                in_flight: std::collections::HashSet::new(),
                 stop: false,
                 journal_needs_repair: false,
                 last_error: None,
@@ -2564,6 +2659,7 @@ mod tests {
                 journal: open_append(&journal_path).expect("journal"),
                 force_flush: false,
                 flushing: false,
+                in_flight: std::collections::HashSet::new(),
                 stop: false,
                 journal_needs_repair: false,
                 last_error: None,
@@ -2614,6 +2710,7 @@ mod tests {
                 journal: open_append(&journal_path).expect("journal"),
                 force_flush: false,
                 flushing: false,
+                in_flight: std::collections::HashSet::new(),
                 stop: false,
                 journal_needs_repair: false,
                 last_error: Some("rewrite failed".to_string()),
@@ -2807,6 +2904,7 @@ mod tests {
                 journal: open_append(&journal_path).expect("open journal"),
                 force_flush: false,
                 flushing: false,
+                in_flight: std::collections::HashSet::new(),
                 stop: false,
                 journal_needs_repair: false,
                 last_error: None,
@@ -2864,6 +2962,7 @@ mod tests {
                     journal: open_append(&journal_path).expect("open journal"),
                     force_flush: false,
                     flushing: false,
+                    in_flight: std::collections::HashSet::new(),
                     stop: false,
                     journal_needs_repair: false,
                     last_error: None,
@@ -2918,5 +3017,98 @@ mod tests {
             }
             drop(journal);
         }
+    }
+
+    /// Withdrawing an undrained creation must remove it outright — from the
+    /// in-memory queue AND the durable WAL — so the following write can create
+    /// the path itself instead of costing a second publication, and so nothing
+    /// is left behind to project a permanently-empty file. A creation the
+    /// worker has already put on the wire must NOT be withdrawn: the round trip
+    /// is already spent and its response still has to find its record.
+    #[test]
+    fn withdrawing_an_undrained_creation_removes_it_from_memory_and_the_wal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("namespace.jsonl");
+        let shared = Arc::new(Shared {
+            state: Mutex::new(JournalState {
+                pending: VecDeque::from([journal_record(
+                    "create-tool",
+                    VfsNamespaceMutation::CreateFile {
+                        path: "bin/tool.sh".to_string(),
+                        mode: Some(0o755),
+                    },
+                )]),
+                journal: open_append(&journal_path).expect("journal"),
+                force_flush: false,
+                flushing: false,
+                in_flight: std::collections::HashSet::new(),
+                stop: false,
+                journal_needs_repair: false,
+                last_error: None,
+                dead_letter_error: None,
+            }),
+            changed: Condvar::new(),
+            journal_path,
+        });
+        let journal = NamespaceJournal {
+            shared,
+            worker: Mutex::new(None),
+        };
+
+        // In flight: the round trip is already spent, so there is nothing to
+        // save and the response still needs its record.
+        {
+            let mut state = journal.shared.state.lock().expect("state");
+            state.in_flight.insert("create-tool".to_string());
+        }
+        assert!(
+            !journal
+                .withdraw_pending_creation("bin/tool.sh")
+                .expect("in-flight withdraw"),
+            "a creation already handed to the wire must never be withdrawn"
+        );
+        {
+            let mut state = journal.shared.state.lock().expect("state");
+            assert_eq!(state.pending.len(), 1, "the in-flight record must survive");
+            state.in_flight.clear();
+        }
+
+        assert!(
+            journal
+                .withdraw_pending_creation("bin/tool.sh")
+                .expect("withdraw"),
+            "an undrained creation must be withdrawable"
+        );
+
+        {
+            let state = journal.shared.state.lock().expect("state");
+            assert!(
+                state.pending.is_empty(),
+                "a withdrawn creation must be removed, not marked: nothing prunes a \
+                 record that never commits, so a retained one would project this file \
+                 as empty forever"
+            );
+        }
+        assert!(
+            read_journal(&journal.shared.journal_path)
+                .expect("reopen WAL")
+                .is_empty(),
+            "the withdrawal must be durable before the caller enqueues the write that \
+             supersedes it, or a crash resurrects a creation the write already owns"
+        );
+
+        // Idempotent: a second withdrawal finds nothing, and callers treat that
+        // as "publish normally" rather than an error.
+        assert!(
+            !journal
+                .withdraw_pending_creation("bin/tool.sh")
+                .expect("second withdraw")
+        );
+        // An unrelated path is never affected.
+        assert!(
+            !journal
+                .withdraw_pending_creation("bin/other")
+                .expect("other")
+        );
     }
 }

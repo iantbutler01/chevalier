@@ -77,6 +77,13 @@ const LEASE_MODE_HEADER = "x-chevalier-vfs-lease-mode";
 const ADVISORY_LOCK_LEASE_MS = 45_000;
 const MAX_BATCH_ITEMS = 4096;
 const MAX_OPTIMISTIC_SNAPSHOT_ATTEMPTS = 3;
+/**
+ * Re-resolutions allowed when a hard-link alias candidate is unlinked between
+ * being found and being confirmed. Bounded because a workspace churning hard
+ * enough to lose three consecutive candidates is one whose answer the caller
+ * should not wait on: the unlink path needs a verdict, not a retry loop.
+ */
+const MAX_ALIAS_VALIDATION_ATTEMPTS = 3;
 /** How many publications of affected-path history an owner retains. A watcher
  *  polls continuously, so it is normally one publication behind; this covers a
  *  watcher that missed a burst without letting the history grow with the mount's
@@ -114,6 +121,17 @@ class VfsPublicationCoordinator {
      * duration. The two short checkpoints linearize the result only when no
      * writer overlapped the scan; otherwise the discarded scan is retried.
      */
+    /**
+     * The current revision, without holding the namespace against writers.
+     *
+     * For a read whose correctness is established by validating its own answer
+     * (see the hard-link-alias handler), a whole-owner snapshot buys nothing and
+     * cannot be satisfied by a busy workspace. The revision is still reported so
+     * callers can fence on it.
+     */
+    async currentRevision(ownerId) {
+        return (await __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_checkpoint).call(this, ownerId)).revision;
+    }
     async optimisticRead(ownerId, read) {
         for (let attempt = 0; attempt < MAX_OPTIMISTIC_SNAPSHOT_ATTEMPTS; attempt += 1) {
             const before = await __classPrivateFieldGet(this, _VfsPublicationCoordinator_instances, "m", _VfsPublicationCoordinator_checkpoint).call(this, ownerId);
@@ -1148,12 +1166,37 @@ function createVfsGatewayServer(opts) {
                 const excludingPath = normalizePath(typeof body.excluding_path === "string" ? body.excluding_path : "");
                 if (isExcludedPath(excludingPath))
                     return errorResponse(400, `excluded path: ${excludingPath}`);
-                const snapshot = await publications.read(ownerId, () => store.findHardLinkAlias(fileId, excludingPath));
-                return withNamespaceRevision(json(200, {
-                    path: snapshot.value !== null && isExcludedPath(snapshot.value)
-                        ? null
-                        : snapshot.value,
-                }), snapshot.revision);
+                // Validate the ANSWER, not the whole namespace.
+                //
+                // This ran under `optimisticRead`, whose activity epoch is OWNER-GLOBAL:
+                // any write anywhere invalidated the attempt. Alias resolution runs on
+                // the unlink path, and `pnpm install` hard-links thousands of files, so
+                // "some unrelated path changed" is the steady state — the snapshot could
+                // never converge, every attempt 409'd, and vmd spent its 30s metadata
+                // budget on a signal that only ever meant "busy". Observed as
+                // operation="unlink" operation_time_ms=30723.
+                //
+                // The blocking `read` is not the alternative either: it queues every
+                // delete behind the writer backlog.
+                //
+                // What actually matters is narrow: does the path we are about to hand
+                // back still name this file_id? That is answerable by re-statting the
+                // candidate, costs one lookup, and is unaffected by writes elsewhere. A
+                // candidate that raced away is retried a bounded number of times; the
+                // endpoint then reports "no alias we can vouch for" rather than a 409 the
+                // caller can only spin on.
+                let alias = null;
+                for (let attempt = 0; attempt < MAX_ALIAS_VALIDATION_ATTEMPTS; attempt += 1) {
+                    const candidate = await store.findHardLinkAlias(fileId, excludingPath);
+                    if (candidate === null)
+                        break;
+                    const confirmed = await store.stat(candidate).catch(() => null);
+                    if (confirmed !== null && confirmed.fileId === fileId) {
+                        alias = candidate;
+                        break;
+                    }
+                }
+                return withNamespaceRevision(json(200, { path: alias !== null && isExcludedPath(alias) ? null : alias }), await publications.currentRevision(ownerId));
             }
             if (method === "POST" && op === "rename") {
                 const from = normalizePath(q.get("from"));
@@ -1343,23 +1386,29 @@ function createVfsGatewayServer(opts) {
                                 ? {}
                                 : { expected_file_id: expectedFileId }),
                         };
+                        const mode = ownValue(write, "mode");
                         return {
                             path: write.path,
                             body: write.body,
+                            ...(typeof mode === "number" ? { mode } : {}),
                             ...(Object.keys(wirePrecondition).length === 0
                                 ? {}
                                 : { precondition: wirePrecondition }),
                         };
                     });
                     try {
-                        const affected = normalizedWrites.map((write) => write.path);
-                        const publication = await publications.mutate(ownerId, async () => {
+                        const publication = await publications.transact(ownerId, async () => {
                             const results = await writeMany(normalizedWrites);
+                            const affected = writeManyAffectedPaths(normalizedWrites.map((write) => write.path), results);
                             return {
-                                results,
-                                entries: await snapshotPaths(store, affected),
+                                value: {
+                                    results,
+                                    entries: await snapshotPaths(store, affected),
+                                },
+                                mutated: true,
+                                paths: affected,
                             };
-                        }, affected);
+                        });
                         return withNamespaceRevision(json(200, {
                             results: publication.value.results.map((result) => ({
                                 path: result.path,
@@ -1411,7 +1460,7 @@ function createVfsGatewayServer(opts) {
                             changed: res.changed ?? previousHash !== hash,
                         });
                     }
-                    const affected = writes.map((write) => write.path);
+                    const affected = writeManyAffectedPaths(writes.map((write) => write.path), results);
                     return {
                         value: json(200, {
                             results,
@@ -1668,6 +1717,16 @@ function normalizeWriteManyItems(value, isExcludedPath) {
             !write.body.every((byte) => Number.isSafeInteger(byte) && byte >= 0 && byte <= 255)) {
             return errorResponse(400, "write-many body must be an array of bytes");
         }
+        // Optional POSIX mode, applied only when this write CREATES the path.
+        // Without it a create cannot be folded into its write: the namespace
+        // mutation is the only carrier of mode today, so dropping that round trip
+        // would silently strip the executable bit off every file a build produces.
+        const modeValue = ownValue(write, "mode");
+        if (modeValue !== undefined &&
+            modeValue !== null &&
+            !(Number.isSafeInteger(modeValue) && modeValue >= 0 && modeValue <= 0o7777)) {
+            return errorResponse(400, "write-many mode must be an integer in 0..0o7777");
+        }
         const preconditionValue = ownValue(write, "precondition");
         if (preconditionValue !== undefined &&
             preconditionValue !== null &&
@@ -1699,6 +1758,40 @@ function mutationPaths(mutation) {
 function immediateParent(path) {
     const parent = node_path_1.posix.dirname(normalizePath(path));
     return parent === "." ? "" : normalizePath(parent);
+}
+/**
+ * The paths a `write-many` affected: the files it wrote, plus the parent of
+ * every write that CREATED its path.
+ *
+ * A write that created a file changed its parent directory too — the parent may
+ * not have existed at all a moment ago — so it is reported and snapshotted
+ * exactly as a `create_file` namespace mutation would be. Without it, a watcher
+ * that had cached the parent's absence keeps that negative entry: an unrelated
+ * publication RETAGS a surviving negative rather than dropping it (which is what
+ * makes sibling reads cheap), so a parent nobody names is never re-read and the
+ * directory stays invisible to that mount. This is exactly what a mount's
+ * create/write fold produces — the write carries the creation, so the write is
+ * the only publication there is.
+ *
+ * An OVERWRITE still names only the file. That is what keeps a write from
+ * evicting every cached sibling in its directory, and it is untouched here: an
+ * overwrite's parent did not change. `previousHash === null` is the
+ * discriminator the store already reports.
+ */
+function writeManyAffectedPaths(writtenPaths, results) {
+    const affected = writtenPaths.map(normalizePath);
+    const seen = new Set(affected);
+    for (const result of results) {
+        const previousHash = result.previous_hash ?? result.previousHash ?? null;
+        if (previousHash !== null)
+            continue;
+        const parent = immediateParent(result.path);
+        if (parent === "" || seen.has(parent))
+            continue;
+        seen.add(parent);
+        affected.push(parent);
+    }
+    return affected;
 }
 async function snapshotPaths(store, requestedPaths) {
     const paths = [...new Set(requestedPaths.map(normalizePath))];

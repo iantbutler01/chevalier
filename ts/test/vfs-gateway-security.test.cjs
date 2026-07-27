@@ -846,8 +846,13 @@ test("a content publication reports no superseded subtrees", async () => {
         return files.has(path) ? { kind: "file", sizeBytes: files.get(path).length } : null;
       },
       async write(path, body) {
+        const previous = files.get(path);
         files.set(path, body);
-        return { content_hash: "hash", previous_hash: null, changed: true };
+        return {
+          content_hash: "hash",
+          previous_hash: previous === undefined ? null : "previous-hash",
+          changed: true,
+        };
       },
     }),
   });
@@ -858,20 +863,43 @@ test("a content publication reports no superseded subtrees", async () => {
   ]);
   const baseline = Number(seeded.headers.get(NAMESPACE_REVISION_HEADER));
 
-  const written = await handler(
-    new Request(`http://local/internal/chevalier/vfs/${owner}/write-many`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ writes: [{ path: "tree/file.txt", body: [1, 2, 3] }] }),
-    }),
-  );
+  const write = (path) =>
+    handler(
+      new Request(`http://local/internal/chevalier/vfs/${owner}/write-many`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ writes: [{ path, body: [1, 2, 3] }] }),
+      }),
+    );
+
+  const written = await write("tree/file.txt");
   assert.strictEqual(written.status, 200);
 
   const answer = await (
     await watchRequest(handler, owner, `since=${baseline}&timeout_ms=1000`)
   ).json();
-  assert.deepStrictEqual(answer.paths, ["tree/file.txt"]);
+  // The write CREATED the file, so it also brought `tree` into existence: a
+  // watcher holding that directory's cached absence learns of it here or never
+  // (an unrelated publication retags a surviving negative rather than dropping
+  // it). This is the same set `create_file` reports — see the truncation test
+  // below, which expects ["kept", "kept/second.txt"].
+  assert.deepStrictEqual([...answer.paths].sort(), ["tree", "tree/file.txt"]);
   assert.deepStrictEqual(answer.subtrees, []);
+
+  // An OVERWRITE names only the file. Reporting the parent here is what would
+  // make every cached sibling in the directory collateral damage on each write,
+  // and the parent genuinely did not change.
+  const overwriteBaseline = Number(
+    (await watchRequest(handler, owner, `since=${baseline}&timeout_ms=1000`)).headers.get(
+      NAMESPACE_REVISION_HEADER,
+    ),
+  );
+  assert.strictEqual((await write("tree/file.txt")).status, 200);
+  const overwritten = await (
+    await watchRequest(handler, owner, `since=${overwriteBaseline}&timeout_ms=1000`)
+  ).json();
+  assert.deepStrictEqual(overwritten.paths, ["tree/file.txt"]);
+  assert.deepStrictEqual(overwritten.subtrees, []);
 });
 
 test("a watcher behind the retained publication history is answered truncated", async () => {

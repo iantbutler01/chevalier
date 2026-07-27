@@ -48,6 +48,21 @@ use crate::virt;
 
 const ARCH_AMD64: &str = "amd64";
 const ARCH_ARM64: &str = "arm64";
+
+/// How long an ACPI powerdown gets before the stop is forced.
+///
+/// This was 10s, which a guest running docker, containerd, and a build
+/// toolchain over a 64 GB durable volume essentially never met. The timeout
+/// therefore expired on ORDINARY stops, making the power-cut fallback the
+/// normal path rather than the exceptional one, and the durable filesystem
+/// took journal damage on a routine basis.
+///
+/// A hard limit still exists on purpose: a wedged guest must not block a stop
+/// forever. The budget is only long enough for an honest flush.
+/// The guest bounds its own teardown well inside this (see the systemd stop
+/// timeouts installed by the bootstrap), so reaching this ceiling means the
+/// guest is genuinely wedged rather than merely busy.
+const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(180);
 const FORK_BASES_DIR_NAME: &str = "_fork_bases";
 const VOLUMES_DIR_NAME: &str = "volumes";
 const VOLUME_FORK_BASES_DIR_NAME: &str = "_fork_bases";
@@ -3778,7 +3793,7 @@ impl Manager {
             );
             return self.force_stop_vm(id).await;
         }
-        if let Err(err) = wait_for_exit(&vm, Duration::from_secs(10)).await {
+        if let Err(err) = wait_for_exit(&vm, GRACEFUL_STOP_TIMEOUT).await {
             warn!(
                 vm_id = %id,
                 error = %err,
@@ -4850,8 +4865,12 @@ fn build_qemu_args(
             .join(VOLUMES_DIR_NAME)
             .join(format!("{}.qcow2", volume.volume_id));
         args.push("-drive".to_string());
+        // discard=unmap lets the guest's fstrim return freed blocks to the host
+        // qcow2. Without it the image is monotonic: a volume holding 22 GB of
+        // live data had grown to 50 GB on disk because every block a deleted
+        // file ever touched stayed allocated.
         args.push(format!(
-            "file={},if=none,id=openbracket-durable,cache=none,aio=threads,format=qcow2",
+            "file={},if=none,id=openbracket-durable,cache=none,aio=threads,format=qcow2,discard=unmap,detect-zeroes=unmap",
             volume_path.display()
         ));
         args.push("-device".to_string());

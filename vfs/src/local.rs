@@ -1198,6 +1198,7 @@ impl OptimizedVfsStorage for LocalVfsStorage {
     ) -> VfsStorageResult<VfsStorageWriteResult> {
         let write = VfsStorageWrite {
             path: path.to_string(),
+            mode: None,
             bytes,
             token_count: None,
             precondition,
@@ -1722,6 +1723,7 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                             vec![(
                                 VfsStorageWrite {
                                     path: path.clone(),
+                                    mode: None,
                                     bytes: Bytes::new(),
                                     token_count: None,
                                     precondition: Some(VfsStorageWritePrecondition::absent()),
@@ -2317,11 +2319,20 @@ fn install_writes_with_options(
         let previous_hash = storage
             .metadata_for_abs(&abs_path)?
             .and_then(|metadata| metadata.content_hash);
-        let previous_mode = if options.is_some() {
-            existing_regular_file_mode(&abs_path)?
-        } else {
-            None
+        // A folded creation carries the mode the separate namespace publication
+        // would have set. Apply it ONLY when this write is the one creating the
+        // path: on an overwrite the file already has a mode, and silently
+        // resetting it would make every rewrite a chmod.
+        let existing_mode = existing_regular_file_mode(&abs_path)?;
+        let options = match (options, write.mode) {
+            (Some(options), _) => Some(options),
+            (None, Some(mode)) if existing_mode.is_none() => Some(VfsStorageWriteOptions {
+                executable: mode & 0o111 != 0,
+                mode: Some(mode),
+            }),
+            (None, _) => None,
         };
+        let previous_mode = if options.is_some() { existing_mode } else { None };
         let content_hash = hex_hash(&write.bytes);
         let durability_directories = abs_path
             .parent()
@@ -3696,12 +3707,14 @@ mod tests {
             .write_many_atomic(vec![
                 VfsStorageWrite {
                     path: "one/a.txt".to_string(),
+                    mode: None,
                     bytes: Bytes::from_static(b"a"),
                     token_count: None,
                     precondition: None,
                 },
                 VfsStorageWrite {
                     path: "two/b.txt".to_string(),
+                    mode: None,
                     bytes: Bytes::from_static(b"b"),
                     token_count: None,
                     precondition: None,
@@ -3977,6 +3990,7 @@ mod tests {
             .write_many_atomic(vec![
                 VfsStorageWrite {
                     path: "existing".to_string(),
+                    mode: None,
                     bytes: Bytes::from_static(b"desired"),
                     token_count: None,
                     precondition: Some(VfsStorageWritePrecondition {
@@ -3988,6 +4002,7 @@ mod tests {
                 },
                 VfsStorageWrite {
                     path: "new".to_string(),
+                    mode: None,
                     bytes: Bytes::from_static(b"new"),
                     token_count: None,
                     precondition: Some(VfsStorageWritePrecondition {
@@ -4041,6 +4056,7 @@ mod tests {
         });
         let write = VfsStorageWrite {
             path: "value".to_string(),
+            mode: None,
             bytes: Bytes::from_static(b"desired"),
             token_count: None,
             precondition: None,
@@ -4802,12 +4818,14 @@ mod tests {
             .write_many_atomic(vec![
                 VfsStorageWrite {
                     path: "a/one.txt".to_string(),
+                    mode: None,
                     bytes: Bytes::from_static(b"abcdef"),
                     token_count: None,
                     precondition: None,
                 },
                 VfsStorageWrite {
                     path: "a/two.txt".to_string(),
+                    mode: None,
                     bytes: Bytes::from_static(b"ghijkl"),
                     token_count: None,
                     precondition: None,
@@ -5180,12 +5198,14 @@ mod tests {
             .write_many_if_changed_atomic(vec![
                 VfsStorageWrite {
                     path: "note.txt".to_string(),
+                    mode: None,
                     bytes: Bytes::from_static(b"same"),
                     token_count: None,
                     precondition: None,
                 },
                 VfsStorageWrite {
                     path: "other.txt".to_string(),
+                    mode: None,
                     bytes: Bytes::from_static(b"new"),
                     token_count: None,
                     precondition: None,
@@ -6830,7 +6850,9 @@ mod tests {
         let writes = (0..1_000)
             .map(|index| VfsStorageWrite {
                 path: format!(".git/objects/ab/{index:04x}"),
-                bytes: Bytes::from(format!("object-{index:04}\n")),
+                mode: None,
+                bytes: Bytes::from(format!("object-{index:04}
+")),
                 token_count: None,
                 precondition: None,
             })
@@ -6869,19 +6891,24 @@ mod tests {
         let mut writes = (0..mutation_count)
             .map(|index| VfsStorageWrite {
                 path: format!(".git/refs/heads/perf-{index:05}.lock"),
-                bytes: Bytes::from(format!("ref-{generation}-{index:05}\n")),
+                mode: None,
+                bytes: Bytes::from(format!("ref-{generation}-{index:05}
+")),
                 token_count: None,
                 precondition: None,
             })
             .chain((0..mutation_count).map(|index| VfsStorageWrite {
                 path: format!("src/generated/perf-{index:05}.ts"),
+                mode: None,
                 bytes: Bytes::from(format!("export const value = {generation}_{index};\n")),
                 token_count: None,
                 precondition: None,
             }))
             .chain((0..object_count).map(|index| VfsStorageWrite {
                 path: format!(".git/objects/{:02x}/{:038x}", index % 256, index),
-                bytes: Bytes::from(format!("blob {generation} {index:08}\n")),
+                mode: None,
+                bytes: Bytes::from(format!("blob {generation} {index:08}
+")),
                 token_count: None,
                 precondition: None,
             }))
@@ -7313,5 +7340,57 @@ mod tests {
             .await
             .expect_err("escape rejected");
         assert!(matches!(err, VfsStorageError::BadRequest(_)));
+    }
+
+    /// A creation folded into its write must carry the mode the separate
+    /// namespace publication used to set. Without this the merge that removes
+    /// one round trip per file silently strips the executable bit off
+    /// everything a build produces.
+    #[tokio::test]
+    async fn a_folded_create_applies_its_mode_and_an_overwrite_does_not() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+
+        storage
+            .write_many_atomic(vec![VfsStorageWrite {
+                path: "tool.sh".to_string(),
+                bytes: Bytes::from_static(b"#!/bin/sh\n"),
+                token_count: None,
+                precondition: None,
+                mode: Some(0o755),
+            }])
+            .await
+            .expect("create with mode");
+
+        let created = fs::metadata(dir.path().join("tool.sh")).expect("stat created");
+        assert_eq!(
+            created.permissions().mode() & 0o777,
+            0o755,
+            "a folded creation must apply its mode"
+        );
+
+        // Overwriting must NOT re-apply mode: the file already has one, and a
+        // rewrite is not a chmod. Someone who ran `chmod 700` keeps it.
+        fs::set_permissions(dir.path().join("tool.sh"), fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+        storage
+            .write_many_atomic(vec![VfsStorageWrite {
+                path: "tool.sh".to_string(),
+                bytes: Bytes::from_static(b"#!/bin/sh\necho hi\n"),
+                token_count: None,
+                precondition: None,
+                mode: Some(0o755),
+            }])
+            .await
+            .expect("overwrite");
+
+        let overwritten = fs::metadata(dir.path().join("tool.sh")).expect("stat overwritten");
+        assert_eq!(
+            overwritten.permissions().mode() & 0o777,
+            0o700,
+            "an overwrite must leave the existing mode alone"
+        );
     }
 }

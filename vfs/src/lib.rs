@@ -295,6 +295,13 @@ pub struct VfsStorageWrite {
     pub bytes: Bytes,
     pub token_count: Option<i32>,
     pub precondition: Option<VfsStorageWritePrecondition>,
+    /// POSIX mode to apply only when this write CREATES the path.
+    ///
+    /// Lets a creation be folded into the write that follows it, so the pair
+    /// costs one publication instead of two. `None` means "leave mode alone",
+    /// which is what every overwrite wants and what old callers decode to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
