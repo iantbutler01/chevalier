@@ -2241,13 +2241,43 @@ type WriteManyRequestItem = {
   };
 };
 
+function base64Sextet(code: number): number {
+  if (code >= 65 && code <= 90) return code - 65;
+  if (code >= 97 && code <= 122) return code - 97 + 26;
+  if (code >= 48 && code <= 57) return code - 48 + 52;
+  if (code === 43) return 62;
+  if (code === 47) return 63;
+  return -1;
+}
+
 function isCanonicalBase64(value: unknown): value is string {
   if (typeof value !== "string" || value.length % 4 !== 0) return false;
-  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
-    return false;
+  if (value.length === 0) return true;
+
+  let payloadLength = value.length;
+  let padding = 0;
+  if (value.charCodeAt(payloadLength - 1) === 61) {
+    padding = 1;
+    payloadLength -= 1;
+    if (payloadLength > 0 && value.charCodeAt(payloadLength - 1) === 61) {
+      padding = 2;
+      payloadLength -= 1;
+    }
   }
-  const decoded = Buffer.from(value, "base64");
-  return decoded.toString("base64") === value;
+
+  let finalSextet = -1;
+  for (let index = 0; index < payloadLength; index += 1) {
+    finalSextet = base64Sextet(value.charCodeAt(index));
+    if (finalSextet < 0) return false;
+  }
+  if (payloadLength === 0) return false;
+
+  // Padding is canonical only when the unused low bits in the final sextet are
+  // zero. Checking those bits avoids decoding and re-encoding multi-megabyte
+  // bodies merely to validate them.
+  if (padding === 2) return payloadLength % 4 === 2 && (finalSextet & 0x0f) === 0;
+  if (padding === 1) return payloadLength % 4 === 3 && (finalSextet & 0x03) === 0;
+  return payloadLength % 4 === 0;
 }
 
 function decodedWriteBody(write: WriteManyRequestItem): number[] {

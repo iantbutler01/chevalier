@@ -57,6 +57,9 @@ pub struct VfsPackedFileCommit {
     pub parent_logical_path: String,
     pub entry_name: String,
     pub manifest: VfsFileManifest,
+    /// POSIX mode applied only when this commit creates the path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
     /// Preserve this identity when replacing content through any hard-link alias.
     #[serde(default)]
     pub file_id: Option<String>,

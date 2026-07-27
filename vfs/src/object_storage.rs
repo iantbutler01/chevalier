@@ -704,6 +704,7 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
                         parent_logical_path,
                         entry_name,
                         manifest: manifest.clone(),
+                        mode: write.mode,
                         file_id: previous
                             .get(&write.path)
                             .and_then(|entry| entry.entry.file_id.clone()),

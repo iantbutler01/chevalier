@@ -51,6 +51,7 @@ struct MockVmdState {
     start_calls: usize,
     stop_calls: usize,
     delete_calls: usize,
+    delete_delay: Option<Duration>,
     restore_calls: usize,
     restored_snapshot_ids: Vec<String>,
     predownload_requests: Vec<(String, String)>,
@@ -225,6 +226,10 @@ impl VmdService for MockVmd {
         request: Request<DeleteVmRequest>,
     ) -> Result<Response<Empty>, Status> {
         let vm_id = request.into_inner().vm_id;
+        let delete_delay = self.state.lock().await.delete_delay;
+        if let Some(delete_delay) = delete_delay {
+            sleep(delete_delay).await;
+        }
         let mut guard = self.state.lock().await;
         guard.vms.remove(&vm_id);
         guard.delete_calls += 1;
@@ -824,7 +829,12 @@ async fn durable_volume_inventory_has_a_short_rpc_deadline() {
 async fn session_reuse_and_fork_lineage_contract() {
     let harness = TestHarness::start().await;
 
-    let sandbox = Sandbox::connect(harness.vmd_endpoint.clone(), sandbox_config())
+    // Delete owns a longer lifecycle budget than the ordinary RPC deadline
+    // because vmd drains publication before stopping the VM.
+    harness.vmd_state.lock().await.delete_delay = Some(Duration::from_millis(350));
+    let mut config = sandbox_config();
+    config.connect_timeout = Duration::from_millis(250);
+    let sandbox = Sandbox::connect(harness.vmd_endpoint.clone(), config)
         .await
         .expect("connect sandbox facade to mock vmd");
 
@@ -889,9 +899,9 @@ async fn session_reuse_and_fork_lineage_contract() {
         .expect("child session should discard independently");
 
     let guard = harness.vmd_state.lock().await;
-    assert!(
-        guard.stop_calls >= 2,
-        "discard should stop VMs before delete"
+    assert_eq!(
+        guard.stop_calls, 0,
+        "discard must let drain-aware DeleteVm stop the VM after publication"
     );
     assert!(
         guard.delete_calls >= 2,

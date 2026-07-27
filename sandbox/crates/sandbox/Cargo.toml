@@ -19,6 +19,7 @@ vfs-server = ["client", "dep:async-trait", "dep:axum"]
 [dependencies]
 async-trait = { version = "0.1.89", optional = true }
 axum = { version = "0.8.6", optional = true }
+base64 = "0.22.1"
 bytes = "1.10.1"
 chrono = { version = "0.4.42", features = ["serde"] }
 futures = "0.3.31"

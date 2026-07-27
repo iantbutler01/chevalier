@@ -4,6 +4,7 @@
 
 use std::fmt;
 
+use base64::Engine as _;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -414,7 +415,7 @@ impl VfsWritePrecondition {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct VfsWriteManyItem {
     pub path: String,
     pub body: Vec<u8>,
@@ -429,6 +430,51 @@ pub struct VfsWriteManyItem {
     pub mode: Option<u32>,
     #[serde(default)]
     pub precondition: Option<VfsWritePrecondition>,
+}
+
+impl<'de> Deserialize<'de> for VfsWriteManyItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireItem {
+            path: String,
+            #[serde(default)]
+            body: Option<Vec<u8>>,
+            #[serde(default)]
+            body_base64: Option<String>,
+            #[serde(default, deserialize_with = "deserialize_vfs_mode")]
+            mode: Option<u32>,
+            #[serde(default)]
+            precondition: Option<VfsWritePrecondition>,
+        }
+
+        let item = WireItem::deserialize(deserializer)?;
+        let body = match (item.body, item.body_base64) {
+            (Some(body), None) => body,
+            (None, Some(body_base64)) => base64::engine::general_purpose::STANDARD
+                .decode(body_base64)
+                .map_err(serde::de::Error::custom)?,
+            (Some(_), Some(_)) => {
+                return Err(serde::de::Error::custom(
+                    "vfs write must contain exactly one of body or body_base64",
+                ));
+            }
+            (None, None) => {
+                return Err(serde::de::Error::custom(
+                    "vfs write must contain exactly one of body or body_base64",
+                ));
+            }
+        };
+
+        Ok(Self {
+            path: item.path,
+            body,
+            mode: item.mode,
+            precondition: item.precondition,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -2811,7 +2857,7 @@ pub use server::{VfsGatewayBackend, chevalier_vfs_routes, vfs_routes};
 mod tests {
     use super::{
         VfsGatewayError, VfsMetadata, VfsNamespaceMutation, VfsSubtreeMetadataEntry,
-        owner_vfs_endpoint, parse_vfs_range_header, scoped_vfs_path,
+        VfsWriteManyItem, owner_vfs_endpoint, parse_vfs_range_header, scoped_vfs_path,
     };
 
     #[test]
@@ -2974,6 +3020,36 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn write_many_item_accepts_legacy_and_compact_bodies() {
+        let legacy: VfsWriteManyItem = serde_json::from_value(serde_json::json!({
+            "path": "legacy.bin",
+            "body": [0, 1, 2, 255],
+        }))
+        .unwrap();
+        assert_eq!(legacy.body, [0, 1, 2, 255]);
+
+        let compact: VfsWriteManyItem = serde_json::from_value(serde_json::json!({
+            "path": "compact.bin",
+            "body_base64": "AAEC/w==",
+        }))
+        .unwrap();
+        assert_eq!(compact.body, [0, 1, 2, 255]);
+    }
+
+    #[test]
+    fn write_many_item_requires_one_canonical_body_encoding() {
+        for invalid in [
+            serde_json::json!({"path": "missing.bin"}),
+            serde_json::json!({"path": "both.bin", "body": [], "body_base64": ""}),
+            serde_json::json!({"path": "malformed.bin", "body_base64": "***"}),
+            serde_json::json!({"path": "noncanonical.bin", "body_base64": "YR=="}),
+            serde_json::json!({"path": "bad-mode.bin", "body": [], "mode": 0o10000}),
+        ] {
+            assert!(serde_json::from_value::<VfsWriteManyItem>(invalid).is_err());
+        }
     }
 
     #[test]
@@ -4330,7 +4406,7 @@ mod server_tests {
                                         "expected_file_id": "file-1"
                                     }
                                 },
-                                {"path": "second.txt", "body": [116, 119, 111]},
+                                {"path": "second.txt", "body_base64": "dHdv"},
                             ],
                         }))
                         .unwrap(),

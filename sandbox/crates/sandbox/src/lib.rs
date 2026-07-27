@@ -76,6 +76,11 @@ const PCI_CAPABILITY_HEADER: &str = "x-chevalier-pci-token";
 const DURABLE_VOLUME_LIST_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_PORTPROXY_FILE_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PORTPROXY_WRITE_FILE_RPC_TIMEOUT: Duration = Duration::from_secs(120);
+/// VMD drains mount-local publication for up to 30 seconds before a destructive
+/// delete, then stops qemu and removes its runtime resources. The ordinary
+/// control-plane timeout is intentionally short and cannot cover that lifecycle
+/// contract.
+const VMD_DELETE_TIMEOUT: Duration = Duration::from_secs(60);
 
 const META_SESSION_ID: &str = "chevalier.session_id";
 const META_PARENT_SESSION_ID: &str = "chevalier.parent_session_id";
@@ -3552,12 +3557,21 @@ impl Sandbox {
         &self,
         endpoint_raw: &str,
     ) -> Result<VmdServiceClient<tonic::transport::Channel>> {
+        self.vmd_client_for_endpoint_with_timeout(endpoint_raw, self.inner.cfg.connect_timeout)
+            .await
+    }
+
+    async fn vmd_client_for_endpoint_with_timeout(
+        &self,
+        endpoint_raw: &str,
+        request_timeout: Duration,
+    ) -> Result<VmdServiceClient<tonic::transport::Channel>> {
         let endpoint_raw = normalize_endpoint(endpoint_raw)?;
         let endpoint_raw = self.rewrite_endpoint(&endpoint_raw)?;
         let mut endpoint = Endpoint::from_shared(endpoint_raw.clone())
             .map_err(|err| SandboxError::InvalidEndpoint(err.to_string()))?
             .connect_timeout(self.inner.cfg.connect_timeout)
-            .timeout(self.inner.cfg.connect_timeout);
+            .timeout(request_timeout);
         if endpoint_raw.starts_with("https://") {
             endpoint = endpoint
                 .tls_config(self.build_client_tls_config(endpoint_raw.as_str())?)
@@ -4888,12 +4902,14 @@ impl Sandbox {
         )
         .await?;
 
-        let mut client = self.vmd_client_for_endpoint(endpoint).await?;
-        let _ = client
-            .force_stop_vm(self.request_with_auth(VmActionRequest {
-                vm_id: vm_id.to_string(),
-            }))
-            .await;
+        let mut client = self
+            .vmd_client_for_endpoint_with_timeout(endpoint, VMD_DELETE_TIMEOUT)
+            .await?;
+        // `DeleteVm` owns the destructive lifecycle boundary. In particular,
+        // vmd drains every live mount's publication cursor before it stops qemu.
+        // Pre-stopping here would tear down the publisher under the shorter
+        // exit-reaper deadline and can leave an otherwise healthy WAL suffix
+        // unpublished, forcing the fail-closed delete to retain the VM.
         client
             .delete_vm(self.request_with_auth(proto::vmd::v1::DeleteVmRequest {
                 vm_id: vm_id.to_string(),
