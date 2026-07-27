@@ -21,7 +21,9 @@ use super::local_view::mount::{
     MountLocalView, MountLocalViewOptions, MountOpen, MountOwnership,
     default_state_dir_for_mountpoint,
 };
-use super::local_view::publisher::{MountPublisher, PublisherOptions, TreeGenerationSource};
+use super::local_view::publisher::{
+    AuthoritativePathSource, MountPublisher, PublisherOptions, TreeGenerationSource,
+};
 use super::local_view::types::{DrainOutcome, MountOwnerRecord, PublicationHealth};
 use super::local_view::wal::MountWal;
 use super::local_view::{
@@ -659,12 +661,20 @@ async fn attach_mount_publisher(
     // back would make the pair immortal and leak the mount's state-directory
     // lock for the lifetime of the process. A dropped view reports generation 0,
     // which the WAL reads as "keep the generation the last checkpoint carried".
-    let weak = Arc::downgrade(view);
+    let weak_generation = Arc::downgrade(view);
+    let weak_paths = Arc::downgrade(view);
     let options = PublisherOptions::defaults(surface_kind_for_scope(scope_path))
         .with_tree_generation(TreeGenerationSource::new(move || {
-            weak.upgrade()
+            weak_generation
+                .upgrade()
                 .map(|view| view.tree().tree_generation())
                 .unwrap_or(0)
+        }))
+        .with_authoritative_paths(AuthoritativePathSource::new(move |path| {
+            let view = weak_paths.upgrade().ok_or_else(|| {
+                anyhow::anyhow!("mount local view closed during publication reconciliation")
+            })?;
+            Ok(view.tree().lstat(path)?.map(|metadata| metadata.kind))
         }));
     let publisher = MountPublisher::spawn(client.clone(), wal.clone(), Handle::current(), options);
     if let Err(error) = view.attach_publisher(Arc::clone(&publisher)) {
@@ -784,6 +794,7 @@ impl UnpublishedMountState {
 /// one WAL is the one thing recovery cannot survive.
 pub async fn report_unpublished_vfs_state_under(vm_dir: &Path) -> Vec<UnpublishedMountState> {
     let root = MountStateLayout::vfs_state_root(vm_dir);
+    let failed_root = root.clone();
     let tokio = Handle::current();
     // Ownership acquisition, replay and checkpoint validation are all blocking
     // device work; none of it belongs on a runtime worker.
@@ -794,7 +805,10 @@ pub async fn report_unpublished_vfs_state_under(vm_dir: &Path) -> Vec<Unpublishe
                 error = %error,
                 "joining the unpublished vfs state probe failed"
             );
-            Vec::new()
+            vec![unknown_unpublished_state(
+                failed_root,
+                format!("join unpublished vfs state probe: {error}"),
+            )]
         })
 }
 
@@ -808,11 +822,24 @@ fn inspect_vfs_state_root(root: &Path, tokio: &Handle) -> Vec<UnpublishedMountSt
                 error = %error,
                 "reading the vfs state root before a destructive transition failed"
             );
-            return Vec::new();
+            return vec![unknown_unpublished_state(
+                root.to_path_buf(),
+                format!("read vfs state root: {error}"),
+            )];
         }
     };
     let mut residue = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                residue.push(unknown_unpublished_state(
+                    root.to_path_buf(),
+                    format!("read vfs state directory entry: {error}"),
+                ));
+                continue;
+            }
+        };
         if !entry.path().is_dir() {
             continue;
         }
@@ -821,6 +848,17 @@ fn inspect_vfs_state_root(root: &Path, tokio: &Handle) -> Vec<UnpublishedMountSt
         }
     }
     residue
+}
+
+fn unknown_unpublished_state(state_dir: PathBuf, error: String) -> UnpublishedMountState {
+    UnpublishedMountState {
+        state_dir,
+        scope_path: String::new(),
+        endpoint: String::new(),
+        acknowledged_sequence: 0,
+        last_committed_sequence: 0,
+        inspection_error: Some(error),
+    }
 }
 
 /// `None` when the directory provably holds nothing unpublished.
@@ -883,8 +921,8 @@ fn inspect_mount_state_dir(state_dir: &Path, tokio: &Handle) -> Option<Unpublish
     })
 }
 
-/// Log the residue a destructive transition is about to destroy. Returns whether
-/// anything was reported, so a caller can record the decision in its own span.
+/// Log the residue fencing a destructive transition. Returns whether anything
+/// was reported, so the caller can refuse to destroy the authoritative WAL.
 pub fn warn_unpublished_vfs_state(context: &str, residue: &[UnpublishedMountState]) -> bool {
     for state in residue {
         match state.inspection_error.as_deref() {
@@ -894,7 +932,8 @@ pub fn warn_unpublished_vfs_state(context: &str, residue: &[UnpublishedMountStat
                 scope = %state.scope_path,
                 endpoint = %state.endpoint,
                 error,
-                "vfs mount state directory could not be proven drained before it is destroyed"
+                "vfs mount state directory could not be proven drained; refusing destructive \
+                 transition"
             ),
             None => tracing::error!(
                 context,
@@ -904,8 +943,8 @@ pub fn warn_unpublished_vfs_state(context: &str, residue: &[UnpublishedMountStat
                 acknowledged_sequence = state.acknowledged_sequence,
                 last_committed_sequence = state.last_committed_sequence,
                 pending_events = state.pending_events(),
-                "destroying a vfs mount state directory that still holds unpublished committed \
-                 events; they are being discarded, not deferred"
+                "vfs mount state directory still holds unpublished committed events; refusing \
+                 destructive transition"
             ),
         }
     }

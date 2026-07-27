@@ -22,18 +22,20 @@
 //! * `Cursor` -- local-only events (`SetTimes`, `SetOwner`) and aborted gaps: the
 //!   cursor advances with no request at all.
 //!
-//! Runs are issued strictly in WAL order and awaited before the next one starts.
-//! Throughput comes from bigger batches and from concurrency *inside* a run --
-//! never from reordering a rename, delete or write dependency.
+//! Runs are issued in dependency order and awaited before the next one starts.
+//! Independent paths may move across a route-class boundary so a batch does not
+//! alternate `namespace-many`, `write-many`, `namespace-many`, `write-many` for
+//! thousands of unrelated files. Conflicting paths retain their exact WAL
+//! order; namespace events within one request retain their WAL order too.
 //!
 //! ## The creation fold
 //!
 //! A `CreateFile{path,mode}` followed by a `ReplaceFile{path}` with no
-//! intervening event on that path or its ancestors is folded into one
-//! `write-many` item carrying `mode` and an `Absent` precondition. This is what
-//! collapses the dominant install pattern (`mkdir`, then N create+write) into one
-//! `namespace-many` plus K `write-many`, instead of two namespace publications
-//! and an ordering fence per file.
+//! intervening conflicting event is folded into one `write-many` item carrying
+//! `mode` and an `Absent` precondition. `SetMode` mutations for that new file
+//! are folded into the same write, while owner/time mutations remain local-only.
+//! This collapses the dominant copy/install pattern even when many worker tasks
+//! interleave their operations across unrelated files.
 //!
 //! ## Crash-safe idempotency
 //!
@@ -60,7 +62,7 @@
 //! backends consume the same ordered batches and acknowledge the same sequence
 //! semantics. There is no backend-specific path here and there must never be one.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -128,6 +130,35 @@ impl std::fmt::Debug for TreeGenerationSource {
     }
 }
 
+/// Read-only access to the mount's current authoritative path state.
+///
+/// Rejection recovery needs this only for a replayed rename whose old and new
+/// paths both exist remotely. The event history alone cannot distinguish a
+/// legitimate conflict from a stale temporary subtree recreated by an earlier
+/// partially-applied replay; the current local view can.
+#[derive(Clone)]
+pub(crate) struct AuthoritativePathSource(
+    Arc<dyn Fn(&str) -> Result<Option<LocalKind>> + Send + Sync>,
+);
+
+impl AuthoritativePathSource {
+    pub(crate) fn new(
+        source: impl Fn(&str) -> Result<Option<LocalKind>> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(source))
+    }
+
+    fn kind(&self, path: &str) -> Result<Option<LocalKind>> {
+        (self.0)(path)
+    }
+}
+
+impl std::fmt::Debug for AuthoritativePathSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AuthoritativePathSource")
+    }
+}
+
 /// Tunables the mount passes in, defaulted from the module constants.
 #[derive(Clone, Debug)]
 pub(crate) struct PublisherOptions {
@@ -142,6 +173,9 @@ pub(crate) struct PublisherOptions {
     /// backing tree generation. `None` records `0`, which the WAL reads as
     /// "unknown -- keep the generation the previous checkpoint carried".
     pub(crate) tree_generation: Option<TreeGenerationSource>,
+    /// Current local path state, used only to resolve ambiguous replayed
+    /// namespace operations after a gateway rejection.
+    pub(crate) authoritative_paths: Option<AuthoritativePathSource>,
 }
 
 impl PublisherOptions {
@@ -155,11 +189,17 @@ impl PublisherOptions {
             stream_threshold_bytes: super::STREAM_PAYLOAD_THRESHOLD_BYTES,
             surface_kind: surface_kind.to_string(),
             tree_generation: None,
+            authoritative_paths: None,
         }
     }
 
     pub(crate) fn with_tree_generation(mut self, source: TreeGenerationSource) -> Self {
         self.tree_generation = Some(source);
+        self
+    }
+
+    pub(crate) fn with_authoritative_paths(mut self, source: AuthoritativePathSource) -> Self {
+        self.authoritative_paths = Some(source);
         self
     }
 }
@@ -327,20 +367,13 @@ enum PublishProgress {
     Stalled,
 }
 
-/// One run's result, expressed so a partially landed run can still advance the
-/// cursor over the part that is provably remote.
+/// One run's result. The cursor advances only after the whole
+/// dependency-reordered batch succeeds. Replaying an already-landed prefix is
+/// safe through rejection reconciliation; acknowledging it independently would
+/// not be safe when a folded earlier sequence is represented by a later run.
 enum RunOutcome {
-    Complete {
-        revision: u64,
-    },
-    Partial {
-        through_sequence: u64,
-        revision: u64,
-        failure: PublishFailure,
-    },
-    Failed {
-        failure: PublishFailure,
-    },
+    Complete { revision: u64 },
+    Failed { failure: PublishFailure },
 }
 
 #[derive(Clone, Debug)]
@@ -377,7 +410,10 @@ async fn coordinate(shared: Arc<PublisherShared>) {
             break;
         }
         match shared.publish_once().await {
-            Ok(PublishProgress::Advanced) => backoff = RETRY_BACKOFF_MIN,
+            Ok(PublishProgress::Advanced) => {
+                backoff = RETRY_BACKOFF_MIN;
+                shared.coalesce_live_tail().await;
+            }
             Ok(PublishProgress::Idle) => {
                 backoff = RETRY_BACKOFF_MIN;
                 shared.wait_for_work().await;
@@ -481,6 +517,39 @@ impl PublisherShared {
         }
     }
 
+    /// Let a producer that is still appending fill the next request instead of
+    /// chasing its live tail one syscall at a time.
+    ///
+    /// The initial idle transition already coalesces, but without this second
+    /// window a publisher that completes its first request while the guest is
+    /// still writing immediately reads whatever tiny suffix exists at that
+    /// instant. It then stays in that request-per-file loop indefinitely. A
+    /// real backlog (at least one full batch) skips the window and drains at
+    /// full speed, so outage recovery is not artificially rate-limited.
+    async fn coalesce_live_tail(&self) {
+        if self.wal.pending_publication_depth() >= self.options.max_events as u64 {
+            return;
+        }
+        let deadline = Instant::now() + self.options.max_window;
+        loop {
+            if self.stopping.load(Ordering::Acquire)
+                || self.wal.pending_publication_depth() >= self.options.max_events as u64
+            {
+                return;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return;
+            }
+            let idle = self.options.idle_window.min(deadline - now);
+            tokio::select! {
+                _ = sleep(idle) => return,
+                _ = self.wake.notified() => {}
+                _ = self.stop.notified() => return,
+            }
+        }
+    }
+
     async fn sleep_or_stop(&self, duration: Duration) {
         tokio::select! {
             _ = sleep(duration) => {}
@@ -524,20 +593,11 @@ impl PublisherShared {
         if runs.is_empty() {
             return Ok(PublishProgress::Idle);
         }
+        let mut remote_revision = self.wal.remote_revision();
         for run in runs {
-            let through_sequence = run.through_sequence();
             match self.issue_run(run).await? {
                 RunOutcome::Complete { revision } => {
-                    self.acknowledge(through_sequence, revision)?;
-                }
-                RunOutcome::Partial {
-                    through_sequence,
-                    revision,
-                    failure,
-                } => {
-                    self.acknowledge(through_sequence, revision)?;
-                    self.record_failure(&failure);
-                    return Ok(PublishProgress::Stalled);
+                    remote_revision = remote_revision.max(revision);
                 }
                 RunOutcome::Failed { failure } => {
                     self.record_failure(&failure);
@@ -545,6 +605,12 @@ impl PublisherShared {
                 }
             }
         }
+        // One committed prefix gets one durable acknowledgement. Checkpointing
+        // every route-class run turns workloads that alternate namespace and
+        // content events into an fsync + atomic checkpoint rewrite per file.
+        // If the process dies before this acknowledgement, replaying an already
+        // landed run is safe because rejection reconciliation is idempotent.
+        self.acknowledge(batch.through_sequence, remote_revision)?;
         // Every run of a non-empty batch acknowledged, so the cursor must have
         // moved. Reporting `Advanced` without it would spin the coordinator on
         // the same prefix, so a cursor that stood still is treated as a stall.
@@ -575,17 +641,7 @@ impl PublisherShared {
     // -- namespace ----------------------------------------------------------
 
     async fn publish_namespace(&self, events: Vec<MountEvent>) -> Result<RunOutcome> {
-        let mut operation_ids = Vec::with_capacity(events.len());
-        let mut mutations = Vec::with_capacity(events.len());
-        for event in &events {
-            operation_ids.push(event.idempotency_key.clone());
-            mutations.push(namespace_mutation_for(event)?);
-        }
-        match self
-            .client
-            .apply_namespace_batch(&operation_ids, &mutations, &self.options.surface_kind)
-            .await
-        {
+        match self.issue_namespace_events(&events).await {
             Ok(publication) => Ok(RunOutcome::Complete {
                 revision: publication.revision,
             }),
@@ -596,44 +652,86 @@ impl PublisherShared {
                         failure: PublishFailure::transient(events[0].sequence, reason),
                     });
                 }
-                // A permanent rejection is never trusted: the batch may have
-                // applied a prefix before the failing mutation, and a replay
-                // after a lost response rejects work that in fact landed.
-                self.reconcile_ordered(&events, reason).await
+                // The local backend applies an ordered namespace batch
+                // sequentially, so a rejected request may have committed a
+                // prefix. Isolate it in original order instead of declaring the
+                // first unapplied collateral event to be the conflict.
+                self.isolate_rejected_namespace(events, reason, 0).await
             }
         }
     }
 
-    /// Walk an ordered run against the gateway and find the longest prefix that
-    /// provably landed. Everything after the first genuine mismatch is preserved
-    /// and blocked.
-    async fn reconcile_ordered(&self, events: &[MountEvent], reason: String) -> Result<RunOutcome> {
-        let mut snapshots = RemoteSnapshots::new(&self.client);
-        let mut landed_through: Option<u64> = None;
+    async fn issue_namespace_events(&self, events: &[MountEvent]) -> Result<RemotePublication> {
+        let mut operation_ids = Vec::with_capacity(events.len());
+        let mut mutations = Vec::with_capacity(events.len());
         for event in events {
-            let failure = match self.event_landed(event, &mut snapshots).await {
-                Ok(true) => {
-                    landed_through = Some(event.sequence);
+            operation_ids.push(event.idempotency_key.clone());
+            mutations.push(namespace_mutation_for(event)?);
+        }
+        self.client
+            .apply_namespace_batch(&operation_ids, &mutations, &self.options.surface_kind)
+            .await
+    }
+
+    async fn isolate_rejected_namespace(
+        &self,
+        events: Vec<MountEvent>,
+        reason: String,
+        initial_revision: u64,
+    ) -> Result<RunOutcome> {
+        // `Some(reason)` is a group already known to have rejected. `None` is
+        // an isolated subgroup ready to retry. Right is pushed before left so
+        // the LIFO stack never changes namespace order.
+        let mut pending = vec![(events, Some(reason))];
+        let mut revision = initial_revision;
+        while let Some((mut events, rejection)) = pending.pop() {
+            if let Some(reason) = rejection {
+                if events.len() == 1 {
+                    let event = &events[0];
+                    let mut snapshots = RemoteSnapshots::new(&self.client);
+                    snapshots.observe_revision(revision);
+                    match self.event_landed(event, &mut snapshots).await {
+                        Ok(true) => {
+                            revision = revision.max(snapshots.revision());
+                        }
+                        Ok(false) => {
+                            return Ok(RunOutcome::Failed {
+                                failure: PublishFailure::permanent(event.sequence, reason),
+                            });
+                        }
+                        Err(error) => {
+                            return Ok(RunOutcome::Failed {
+                                failure: PublishFailure::transient(
+                                    event.sequence,
+                                    format!("{reason}; reconciliation read failed: {error:#}"),
+                                ),
+                            });
+                        }
+                    }
                     continue;
                 }
-                Ok(false) => PublishFailure::permanent(event.sequence, reason.clone()),
-                Err(error) => PublishFailure::transient(
-                    event.sequence,
-                    format!("{reason}; reconciliation read failed: {error:#}"),
-                ),
-            };
-            return Ok(match landed_through {
-                Some(through_sequence) => RunOutcome::Partial {
-                    through_sequence,
-                    revision: snapshots.revision(),
-                    failure,
-                },
-                None => RunOutcome::Failed { failure },
-            });
+                let right = events.split_off(events.len() / 2);
+                pending.push((right, None));
+                pending.push((events, None));
+                continue;
+            }
+
+            match self.issue_namespace_events(&events).await {
+                Ok(publication) => {
+                    revision = revision.max(publication.revision);
+                }
+                Err(error) => {
+                    let reason = format!("{error:#}");
+                    if rejected_request_status(&error).is_none() {
+                        return Ok(RunOutcome::Failed {
+                            failure: PublishFailure::transient(events[0].sequence, reason),
+                        });
+                    }
+                    pending.push((events, Some(reason)));
+                }
+            }
         }
-        Ok(RunOutcome::Complete {
-            revision: snapshots.revision(),
-        })
+        Ok(RunOutcome::Complete { revision })
     }
 
     // -- content ------------------------------------------------------------
@@ -679,8 +777,7 @@ impl PublisherShared {
         if failures.is_empty() {
             return Ok(RunOutcome::Complete { revision });
         }
-        self.reconcile_content(&events, &publications, failures, revision)
-            .await
+        self.reconcile_content(failures, revision).await
     }
 
     /// Chunk a content run into concurrently issuable requests: small payloads
@@ -728,82 +825,115 @@ impl PublisherShared {
         Ok(requests)
     }
 
-    /// Content events inside a run are independent, so a failure is per-request.
-    /// Verdicts are collected per sequence and then walked in WAL order: the
-    /// cursor may only advance over an unbroken landed prefix.
+    /// Content events inside a run are independent, so a rejected request can
+    /// be isolated by dependency-safe bisection. A batch-level 409 does not say
+    /// which item conflicted: treating its first missing item as permanent would
+    /// deadlock on collateral work that the atomic request never attempted.
     async fn reconcile_content(
         &self,
-        events: &[MountEvent],
-        publications: &[RemotePublication],
         failures: Vec<(Vec<MountEvent>, anyhow::Error)>,
-        revision: u64,
+        mut revision: u64,
     ) -> Result<RunOutcome> {
-        let mut snapshots = RemoteSnapshots::new(&self.client);
-        snapshots.observe_revision(revision);
-        for publication in publications {
-            snapshots.seed(publication);
-        }
-
-        let failed_sequences: HashSet<u64> = failures
-            .iter()
-            .flat_map(|(events, _)| events.iter().map(|event| event.sequence))
-            .collect();
-        let mut verdicts: HashMap<u64, EventVerdict> = HashMap::new();
-        for event in events {
-            if !failed_sequences.contains(&event.sequence) {
-                verdicts.insert(event.sequence, EventVerdict::landed());
+        for (failed_events, error) in failures {
+            let reason = format!("{error:#}");
+            if rejected_request_status(&error).is_none() {
+                return Ok(RunOutcome::Failed {
+                    failure: PublishFailure::transient(failed_events[0].sequence, reason),
+                });
+            }
+            match self
+                .isolate_rejected_content(failed_events, reason, revision)
+                .await?
+            {
+                RunOutcome::Complete { revision: resolved } => revision = revision.max(resolved),
+                failed @ RunOutcome::Failed { .. } => return Ok(failed),
             }
         }
-        for (failed_events, error) in &failures {
-            let reason = format!("{error:#}");
-            if rejected_request_status(error).is_none() {
-                for event in failed_events {
-                    verdicts.insert(event.sequence, EventVerdict::failed(false, reason.clone()));
+        Ok(RunOutcome::Complete { revision })
+    }
+
+    async fn isolate_rejected_content(
+        &self,
+        events: Vec<MountEvent>,
+        reason: String,
+        initial_revision: u64,
+    ) -> Result<RunOutcome> {
+        // `Some(reason)` means this group was just rejected and must be
+        // reconciled. `None` means it is an isolated subgroup ready to retry.
+        let mut pending = vec![(events, Some(reason))];
+        let mut revision = initial_revision;
+        while let Some((events, rejection)) = pending.pop() {
+            let Some(reason) = rejection else {
+                let request = ContentRequest {
+                    kind: if events.len() == 1
+                        && events[0].payload.as_ref().is_some_and(|payload| {
+                            payload.length >= self.options.stream_threshold_bytes
+                        }) {
+                        ContentRequestKind::Streamed
+                    } else {
+                        ContentRequestKind::Batched
+                    },
+                    events: events.clone(),
+                };
+                match issue_content_request(
+                    &self.client,
+                    &self.wal,
+                    &request,
+                    self.options.surface_kind.as_str(),
+                )
+                .await
+                {
+                    Ok(publication) => {
+                        revision = revision.max(publication.revision);
+                    }
+                    Err(error) => {
+                        let reason = format!("{error:#}");
+                        if rejected_request_status(&error).is_none() {
+                            return Ok(RunOutcome::Failed {
+                                failure: PublishFailure::transient(events[0].sequence, reason),
+                            });
+                        }
+                        pending.push((events, Some(reason)));
+                    }
                 }
                 continue;
-            }
-            for event in failed_events {
-                let verdict = match self.event_landed(event, &mut snapshots).await {
-                    Ok(true) => EventVerdict::landed(),
-                    Ok(false) => EventVerdict::failed(true, reason.clone()),
-                    Err(read_error) => EventVerdict::failed(
-                        false,
-                        format!("{reason}; reconciliation read failed: {read_error:#}"),
-                    ),
-                };
-                verdicts.insert(event.sequence, verdict);
-            }
-        }
-
-        let mut landed_through: Option<u64> = None;
-        for event in events {
-            let verdict = verdicts.get(&event.sequence).ok_or_else(|| {
-                anyhow!(
-                    "content run produced no verdict for sequence {}",
-                    event.sequence
-                )
-            })?;
-            if verdict.landed {
-                landed_through = Some(event.sequence);
-                continue;
-            }
-            let failure = PublishFailure {
-                sequence: event.sequence,
-                permanent: verdict.permanent,
-                reason: verdict.reason.clone(),
             };
-            return Ok(match landed_through {
-                Some(through_sequence) => RunOutcome::Partial {
-                    through_sequence,
-                    revision: snapshots.revision(),
-                    failure,
-                },
-                None => RunOutcome::Failed { failure },
-            });
+
+            let mut snapshots = RemoteSnapshots::new(&self.client);
+            snapshots.observe_revision(revision);
+            let attempted_len = events.len();
+            let mut unlanded = Vec::new();
+            for event in events {
+                match self.event_landed(&event, &mut snapshots).await {
+                    Ok(true) => {}
+                    Ok(false) => unlanded.push(event),
+                    Err(read_error) => {
+                        return Ok(RunOutcome::Failed {
+                            failure: PublishFailure::transient(
+                                event.sequence,
+                                format!("{reason}; reconciliation read failed: {read_error:#}"),
+                            ),
+                        });
+                    }
+                }
+            }
+            revision = revision.max(snapshots.revision());
+            match unlanded.len() {
+                0 => {}
+                1 if attempted_len == 1 => {
+                    return Ok(RunOutcome::Failed {
+                        failure: PublishFailure::permanent(unlanded[0].sequence, reason),
+                    });
+                }
+                1 => pending.push((unlanded, None)),
+                length => {
+                    let right = unlanded.split_off(length / 2);
+                    pending.push((right, None));
+                    pending.push((unlanded, None));
+                }
+            }
         }
-        Ok(RunOutcome::Complete {
-            revision: snapshots.revision(),
-        })
+        Ok(RunOutcome::Complete { revision })
     }
 
     // -- reconciliation predicate -------------------------------------------
@@ -830,7 +960,12 @@ impl PublisherShared {
                 };
                 Ok(is_kind(&metadata, LocalKind::File) && mode_agrees(&metadata, *mode))
             }
-            MountMutation::ReplaceFile { path, .. } => {
+            MountMutation::ReplaceFile {
+                path,
+                mode,
+                base_content_hash,
+                ..
+            } => {
                 let payload = event.payload.as_ref().ok_or_else(|| {
                     anyhow!("content event {} carries no payload", event.sequence)
                 })?;
@@ -841,7 +976,9 @@ impl PublisherShared {
                 // when the write creates the path, so an overwrite legitimately
                 // leaves an older mode in place.
                 Ok(is_kind(&metadata, LocalKind::File)
-                    && metadata.content_hash.as_deref() == Some(payload.content_hash.as_str()))
+                    && metadata.content_hash.as_deref() == Some(payload.content_hash.as_str())
+                    && (base_content_hash.as_deref() != Some(ABSENT_PRECONDITION)
+                        || mode_agrees(&metadata, *mode)))
             }
             MountMutation::CreateSymlink { path, target } => {
                 let Some(metadata) = snapshots.get(path).await? else {
@@ -872,10 +1009,19 @@ impl PublisherShared {
             MountMutation::Rename {
                 old_path, new_path, ..
             } => {
-                if snapshots.get(old_path).await?.is_some() {
-                    return Ok(false);
+                let old = snapshots.get(old_path).await?;
+                let new = snapshots.get(new_path).await?;
+                if old.is_none() {
+                    return Ok(new.is_some());
                 }
-                Ok(snapshots.get(new_path).await?.is_some())
+                if new.is_some() && self.rename_source_is_superseded(old_path, new_path)? {
+                    let cleanup_revision = self
+                        .remove_remote_subtree(old_path, event.idempotency_key.as_str())
+                        .await?;
+                    snapshots.observe_revision(cleanup_revision);
+                    return Ok(true);
+                }
+                Ok(false)
             }
             MountMutation::RemoveFile { path, .. } | MountMutation::RemoveDirectory { path } => {
                 Ok(snapshots.get(path).await?.is_none())
@@ -889,6 +1035,64 @@ impl PublisherShared {
             // Never published, so never reconciled: the cursor walks past them.
             MountMutation::SetTimes { .. } | MountMutation::SetOwner { .. } => Ok(true),
         }
+    }
+
+    fn rename_source_is_superseded(&self, old_path: &str, new_path: &str) -> Result<bool> {
+        let Some(source) = self.options.authoritative_paths.as_ref() else {
+            return Ok(false);
+        };
+        Ok(source.kind(old_path)?.is_none() && source.kind(new_path)?.is_some())
+    }
+
+    /// Remove one stale remote subtree through the ordinary gateway namespace
+    /// contract. This is used only when the current mount-local view proves the
+    /// replayed rename source no longer exists, and therefore cannot delete a
+    /// live local path or race another owner under the one-mount invariant.
+    async fn remove_remote_subtree(&self, root: &str, operation_prefix: &str) -> Result<u64> {
+        let mut pending = vec![(root.to_string(), false)];
+        let mut removals = Vec::new();
+        let mut revision = self.client.observed_namespace_revision();
+        while let Some((path, visited)) = pending.pop() {
+            if visited {
+                removals.push(VfsNamespaceMutation::RemoveDirectory { path });
+                continue;
+            }
+            let listing = self.client.list_dir_versioned(path.as_str()).await?;
+            revision = revision.max(listing.revision);
+            let Some(entries) = listing.value else {
+                removals.push(VfsNamespaceMutation::DeleteFile {
+                    path,
+                    precondition: None,
+                });
+                continue;
+            };
+            pending.push((path.clone(), true));
+            for entry in entries.into_iter().rev() {
+                let child = format!("{path}/{}", entry.name);
+                if LocalKind::from_wire_kind(entry.kind.as_str()) == Some(LocalKind::Directory) {
+                    pending.push((child, false));
+                } else {
+                    removals.push(VfsNamespaceMutation::DeleteFile {
+                        path: child,
+                        precondition: None,
+                    });
+                }
+            }
+        }
+
+        for (chunk_index, chunk) in removals.chunks(self.options.max_events.max(1)).enumerate() {
+            let operation_ids = chunk
+                .iter()
+                .enumerate()
+                .map(|(index, _)| format!("{operation_prefix}:cleanup:{chunk_index}:{index}"))
+                .collect::<Vec<_>>();
+            let publication = self
+                .client
+                .apply_namespace_batch(&operation_ids, chunk, self.options.surface_kind.as_str())
+                .await?;
+            revision = revision.max(publication.revision);
+        }
+        Ok(revision)
     }
 }
 
@@ -912,30 +1116,6 @@ struct ContentRequest {
 struct ContentTaskResult {
     events: Vec<MountEvent>,
     outcome: Result<RemotePublication>,
-}
-
-struct EventVerdict {
-    landed: bool,
-    permanent: bool,
-    reason: String,
-}
-
-impl EventVerdict {
-    fn landed() -> Self {
-        Self {
-            landed: true,
-            permanent: false,
-            reason: String::new(),
-        }
-    }
-
-    fn failed(permanent: bool, reason: String) -> Self {
-        Self {
-            landed: false,
-            permanent,
-            reason,
-        }
-    }
 }
 
 async fn issue_content_request(
@@ -1202,6 +1382,222 @@ impl<'a> RemoteSnapshots<'a> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{ABSENT_PRECONDITION, plan_runs};
+    use crate::fuse::local_view::types::{
+        MountEvent, MountMutation, MountPreImage, PayloadRef, PayloadStorage, PublishBatch,
+        PublishRun,
+    };
+
+    fn event(sequence: u64, mutation: MountMutation, payload: Option<PayloadRef>) -> MountEvent {
+        MountEvent {
+            format_version: super::super::WAL_FORMAT_VERSION,
+            epoch: "test-epoch".to_string(),
+            sequence,
+            idempotency_key: format!("test-epoch:{sequence}"),
+            mutation,
+            payload,
+            pre_image: MountPreImage::empty(),
+            local_identity: Some(format!("1:{sequence}")),
+        }
+    }
+
+    fn payload(sequence: u64) -> PayloadRef {
+        PayloadRef {
+            storage: PayloadStorage::Segment {
+                file: "segment.bin".to_string(),
+                offset: sequence,
+            },
+            length: 1,
+            hash_algorithm: "blake3".to_string(),
+            content_hash: format!("hash-{sequence}"),
+        }
+    }
+
+    #[test]
+    fn sibling_create_write_pairs_fold_into_one_content_run() {
+        let batch = PublishBatch {
+            events: vec![
+                event(
+                    1,
+                    MountMutation::CreateFile {
+                        path: "node_modules/a.js".to_string(),
+                        mode: 0o644,
+                    },
+                    None,
+                ),
+                event(
+                    2,
+                    MountMutation::ReplaceFile {
+                        path: "node_modules/a.js".to_string(),
+                        mode: 0o600,
+                        expected_file_id: None,
+                        base_content_hash: None,
+                    },
+                    Some(payload(2)),
+                ),
+                event(
+                    3,
+                    MountMutation::CreateFile {
+                        path: "node_modules/b.js".to_string(),
+                        mode: 0o755,
+                    },
+                    None,
+                ),
+                event(
+                    4,
+                    MountMutation::ReplaceFile {
+                        path: "node_modules/b.js".to_string(),
+                        mode: 0o600,
+                        expected_file_id: None,
+                        base_content_hash: None,
+                    },
+                    Some(payload(4)),
+                ),
+            ],
+            through_sequence: 4,
+        };
+
+        let runs = plan_runs(&batch).expect("plan sibling package files");
+        let [
+            PublishRun::Content {
+                events,
+                through_sequence,
+            },
+        ] = runs.as_slice()
+        else {
+            panic!("sibling create/write pairs should produce one content run: {runs:?}");
+        };
+        assert_eq!(*through_sequence, 4);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].mutation.primary_path(), "node_modules/a.js");
+        assert_eq!(events[1].mutation.primary_path(), "node_modules/b.js");
+        for (event, expected_mode) in events.iter().zip([0o644, 0o755]) {
+            let MountMutation::ReplaceFile {
+                mode,
+                base_content_hash,
+                ..
+            } = &event.mutation
+            else {
+                panic!("folded event was not a content generation");
+            };
+            assert_eq!(*mode, expected_mode);
+            assert_eq!(base_content_hash.as_deref(), Some(ABSENT_PRECONDITION));
+        }
+    }
+
+    #[test]
+    fn interleaved_copy_metadata_folds_and_batches_by_dependency() {
+        let path_a = "node_modules/pkg/a.js";
+        let path_b = "node_modules/pkg/b.js";
+        let batch = PublishBatch {
+            events: vec![
+                event(
+                    1,
+                    MountMutation::CreateFile {
+                        path: path_a.to_string(),
+                        mode: 0o600,
+                    },
+                    None,
+                ),
+                event(
+                    2,
+                    MountMutation::CreateFile {
+                        path: path_b.to_string(),
+                        mode: 0o600,
+                    },
+                    None,
+                ),
+                event(
+                    3,
+                    MountMutation::SetTimes {
+                        path: path_a.to_string(),
+                        atime: None,
+                        mtime: None,
+                    },
+                    None,
+                ),
+                event(
+                    4,
+                    MountMutation::SetMode {
+                        path: path_a.to_string(),
+                        mode: 0o644,
+                    },
+                    None,
+                ),
+                event(
+                    5,
+                    MountMutation::SetOwner {
+                        path: path_a.to_string(),
+                        uid: Some(1000),
+                        gid: Some(1000),
+                    },
+                    None,
+                ),
+                event(
+                    6,
+                    MountMutation::SetMode {
+                        path: path_b.to_string(),
+                        mode: 0o755,
+                    },
+                    None,
+                ),
+                event(
+                    7,
+                    MountMutation::ReplaceFile {
+                        path: path_a.to_string(),
+                        mode: 0o600,
+                        expected_file_id: None,
+                        base_content_hash: None,
+                    },
+                    Some(payload(7)),
+                ),
+                event(
+                    8,
+                    MountMutation::ReplaceFile {
+                        path: path_b.to_string(),
+                        mode: 0o600,
+                        expected_file_id: None,
+                        base_content_hash: None,
+                    },
+                    Some(payload(8)),
+                ),
+            ],
+            through_sequence: 8,
+        };
+
+        let runs = plan_runs(&batch).expect("plan interleaved package copies");
+        let [
+            PublishRun::Content {
+                events,
+                through_sequence,
+            },
+        ] = runs.as_slice()
+        else {
+            panic!("interleaved copies should produce one content run: {runs:?}");
+        };
+        assert_eq!(*through_sequence, 8);
+        assert_eq!(events.len(), 2);
+        for (event, (expected_path, expected_mode)) in
+            events.iter().zip([(path_a, 0o644), (path_b, 0o755)])
+        {
+            let MountMutation::ReplaceFile {
+                path,
+                mode,
+                base_content_hash,
+                ..
+            } = &event.mutation
+            else {
+                panic!("folded event was not a content generation");
+            };
+            assert_eq!(path, expected_path);
+            assert_eq!(*mode, expected_mode);
+            assert_eq!(base_content_hash.as_deref(), Some(ABSENT_PRECONDITION));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Run planning
 // ---------------------------------------------------------------------------
@@ -1212,63 +1608,14 @@ enum RunClass {
     Content,
 }
 
-/// A run under construction. `class` stays `None` while only local-only or
-/// folded-away events have been absorbed, which is exactly a `Cursor` run.
-struct PendingRun {
-    class: Option<RunClass>,
-    events: Vec<MountEvent>,
-    through_sequence: u64,
-}
-
-impl PendingRun {
-    fn absorbing(through_sequence: u64) -> Self {
-        Self {
-            class: None,
-            events: Vec::new(),
-            through_sequence,
-        }
-    }
-
-    fn finish(self) -> PublishRun {
-        match self.class {
-            None => PublishRun::Cursor {
-                through_sequence: self.through_sequence,
-            },
-            Some(RunClass::Namespace) => PublishRun::Namespace {
-                events: self.events,
-                through_sequence: self.through_sequence,
-            },
-            Some(RunClass::Content) => PublishRun::Content {
-                events: self.events,
-                through_sequence: self.through_sequence,
-            },
-        }
-    }
-
-    /// A namespace run absorbs anything ordered; a content run only absorbs an
-    /// event that conflicts with none of its members, because that is what makes
-    /// its uploads safe to issue concurrently.
-    fn accepts(&self, class: RunClass, event: &MountEvent) -> bool {
-        match self.class {
-            None => true,
-            Some(RunClass::Namespace) => class == RunClass::Namespace,
-            Some(RunClass::Content) => {
-                class == RunClass::Content && {
-                    let keys = event.dependency_keys();
-                    self.events
-                        .iter()
-                        .all(|member| !dependency_sets_conflict(&member.dependency_keys(), &keys))
-                }
-            }
-        }
-    }
-}
-
-/// Split a contiguous committed prefix into runs that may be issued in order.
+/// Split a contiguous committed prefix into dependency-ordered route batches.
 ///
-/// Splits when the route class changes, when a content run would repeat a path,
-/// or when two events inside a prospective run have conflicting dependency key
-/// sets. Folds an eligible `CreateFile` into the following `ReplaceFile`.
+/// Folds a newly-created file's mode and first content generation into one
+/// absent-precondition write. It then topologically schedules the remaining
+/// operations by the exact same dependency keys used by callbacks: unrelated
+/// paths may cross route-class boundaries, while every conflicting pair retains
+/// WAL order. Ordered namespace mutations can share one request; content
+/// generations share a run only when they are mutually independent.
 pub(crate) fn plan_runs(batch: &PublishBatch) -> Result<Vec<PublishRun>> {
     let events = batch.events.as_slice();
     for pair in events.windows(2) {
@@ -1291,10 +1638,10 @@ pub(crate) fn plan_runs(batch: &PublishBatch) -> Result<Vec<PublishRun>> {
     }
 
     // Pass 1 -- the creation fold. A folded creation carries no wire item of its
-    // own: its mode and its `Absent` precondition move onto the write, and its
-    // sequence is absorbed by whichever run covers it. That is safe precisely
-    // because the write now *is* the creation, so a crash before the write is
-    // published replays a create-and-write, never a bare write.
+    // own: its final mode and its `Absent` precondition move onto the write.
+    // The publisher acknowledges only after every run in this whole batch
+    // succeeds, so an interleaved unrelated run can never acknowledge the
+    // creation before the content operation that represents it.
     let mut planned: Vec<MountEvent> = events.to_vec();
     let mut folded = vec![false; events.len()];
     for index in 0..events.len() {
@@ -1314,60 +1661,134 @@ pub(crate) fn plan_runs(batch: &PublishBatch) -> Result<Vec<PublishRun>> {
             continue;
         }
         folded[index] = true;
+        let mut final_mode = created_mode;
+        for candidate in index + 1..target {
+            if let MountMutation::SetMode {
+                path: changed,
+                mode,
+            } = &events[candidate].mutation
+                && changed == path
+            {
+                final_mode = *mode;
+                folded[candidate] = true;
+            }
+        }
+        // A chmod shortly after the first write is also part of materializing a
+        // newly-created file. Absorb it until another remote mutation conflicts
+        // with this path; unrelated work and local-only metadata commute.
+        let creation_keys = events[index].dependency_keys();
+        for candidate in target + 1..events.len() {
+            match &events[candidate].mutation {
+                MountMutation::SetMode {
+                    path: changed,
+                    mode,
+                } if changed == path => {
+                    final_mode = *mode;
+                    folded[candidate] = true;
+                }
+                mutation if mutation.is_local_only() => {}
+                _ if dependency_sets_conflict(
+                    &creation_keys,
+                    &events[candidate].dependency_keys(),
+                ) =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
         if let MountMutation::ReplaceFile {
             mode,
             base_content_hash,
             ..
         } = &mut planned[target].mutation
         {
-            *mode = created_mode;
+            *mode = final_mode;
             *base_content_hash = Some(ABSENT_PRECONDITION.to_string());
         }
     }
 
-    // Pass 2 -- grouping. Local-only and folded-away events produce no request,
-    // so they are absorbed into the run in progress instead of splitting it.
-    let mut runs: Vec<PublishRun> = Vec::new();
-    let mut pending: Option<PendingRun> = None;
-    for (index, event) in planned.iter().enumerate() {
-        if folded[index] || event.mutation.is_local_only() {
-            match pending.as_mut() {
-                Some(run) => run.through_sequence = event.sequence,
-                None => pending = Some(PendingRun::absorbing(event.sequence)),
-            }
-            continue;
-        }
-        let class = if event.mutation.is_content() {
-            RunClass::Content
-        } else {
-            RunClass::Namespace
-        };
-        let splits = pending
-            .as_ref()
-            .is_some_and(|run| !run.accepts(class, event));
-        if splits && let Some(run) = pending.take() {
-            runs.push(run.finish());
-        }
-        let run = pending.get_or_insert_with(|| PendingRun::absorbing(event.sequence));
-        run.class = Some(class);
-        run.events.push(event.clone());
-        run.through_sequence = event.sequence;
+    // Pass 2 -- dependency scheduling. Start with the oldest unscheduled wire
+    // event, then pull every later event of the same route class that has no
+    // earlier conflicting event waiting in another run. Selected namespace
+    // events do not block later namespace events because `namespace-many`
+    // applies them in their original order. Selected content events do block a
+    // conflict because their uploads execute concurrently.
+    let publishable: Vec<MountEvent> = planned
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            (!folded[index] && !event.mutation.is_local_only()).then_some(event)
+        })
+        .collect();
+    if publishable.is_empty() {
+        return Ok((batch.through_sequence > 0)
+            .then_some(PublishRun::Cursor {
+                through_sequence: batch.through_sequence,
+            })
+            .into_iter()
+            .collect());
     }
-
-    match pending.take() {
-        Some(mut run) => {
-            // Aborted sequences trailing the last event are folded into the final
-            // run so the cursor never stalls on a gap that will never publish.
-            run.through_sequence = run.through_sequence.max(batch.through_sequence);
-            runs.push(run.finish());
-        }
-        None => {
-            if batch.through_sequence > 0 {
-                runs.push(PublishRun::Cursor {
-                    through_sequence: batch.through_sequence,
-                });
+    let classes: Vec<RunClass> = publishable
+        .iter()
+        .map(|event| {
+            if event.mutation.is_content() {
+                RunClass::Content
+            } else {
+                RunClass::Namespace
+            }
+        })
+        .collect();
+    let keys: Vec<_> = publishable
+        .iter()
+        .map(MountEvent::dependency_keys)
+        .collect();
+    let mut remaining = vec![true; publishable.len()];
+    let mut runs: Vec<PublishRun> = Vec::new();
+    while let Some(first) = remaining.iter().position(|pending| *pending) {
+        let class = classes[first];
+        let mut selected = vec![false; publishable.len()];
+        for candidate in first..publishable.len() {
+            if !remaining[candidate] || classes[candidate] != class {
+                continue;
+            }
+            let blocked = (0..candidate).any(|predecessor| {
+                remaining[predecessor]
+                    && (!selected[predecessor] || class == RunClass::Content)
+                    && dependency_sets_conflict(&keys[predecessor], &keys[candidate])
+            });
+            if !blocked {
+                selected[candidate] = true;
             }
         }
+        let indices: Vec<usize> = selected
+            .iter()
+            .enumerate()
+            .filter_map(|(index, chosen)| chosen.then_some(index))
+            .collect();
+        debug_assert!(!indices.is_empty());
+        let through_sequence = indices
+            .iter()
+            .map(|index| publishable[*index].sequence)
+            .max()
+            .unwrap_or(batch.through_sequence);
+        let events = indices
+            .iter()
+            .map(|index| publishable[*index].clone())
+            .collect();
+        for index in indices {
+            remaining[index] = false;
+        }
+        runs.push(match class {
+            RunClass::Namespace => PublishRun::Namespace {
+                events,
+                through_sequence,
+            },
+            RunClass::Content => PublishRun::Content {
+                events,
+                through_sequence,
+            },
+        });
     }
     Ok(runs)
 }
@@ -1397,10 +1818,19 @@ pub(crate) fn creation_folds_into_write(
     if remote_file_id(expected_file_id.as_deref()).is_some() {
         return false;
     }
-    // Local-only events never reach the gateway, so they cannot invalidate the
-    // `Absent` predicate even though they hold the path's key locally.
+    // Local-only metadata and chmods on the newly-created path can collapse
+    // into the absent-precondition write. Any other path conflict preserves the
+    // separate events and their original remote order.
     let keys = create.dependency_keys();
     !between.iter().any(|event| {
-        !event.mutation.is_local_only() && dependency_sets_conflict(&keys, &event.dependency_keys())
+        if event.mutation.is_local_only()
+            || matches!(
+                &event.mutation,
+                MountMutation::SetMode { path, .. } if path == created
+            )
+        {
+            return false;
+        }
+        dependency_sets_conflict(&keys, &event.dependency_keys())
     })
 }

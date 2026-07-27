@@ -1979,6 +1979,19 @@ impl Manager {
             .with_context(|| format!("retry path-only FUSE cleanup before deleting VM {id}"))
             .map_err(ManagerError::Other)?;
         ensure_vm_fuse_mounts_detached(id, &vm.dir).map_err(ManagerError::Other)?;
+        // The mount WAL remains authoritative until the gateway acknowledges
+        // it. Deleting this directory with a pending or unreadable WAL would
+        // turn a successful guest syscall into silent data loss.
+        let residue = fuse::report_unpublished_vfs_state_under(&vm.dir).await;
+        if fuse::warn_unpublished_vfs_state("delete-vm", &residue) {
+            return Err(ManagerError::Other(anyhow!(
+                "refusing to delete VM {id}: {} vfs state director{} could not be proven fully published; authoritative WAL retained under {}",
+                residue.len(),
+                if residue.len() == 1 { "y" } else { "ies" },
+                vm.dir.join("vfs-state").display()
+            )));
+        }
+
         let (runtime_dir, assignments) = {
             let inner = vm.lock().await;
             (
@@ -1993,19 +2006,6 @@ impl Manager {
                 .map_err(ManagerError::Other)?;
         }
 
-        // Everything below destroys the VM directory, and with it every mount's
-        // write-ahead log. Anything still unacknowledged at this point is being
-        // discarded, not deferred — the mount was the authority for those events
-        // and nothing else in the system knows they existed, so the decision is
-        // recorded before it is executed.
-        let residue = fuse::report_unpublished_vfs_state_under(&vm.dir).await;
-        if fuse::warn_unpublished_vfs_state("delete-vm", &residue) {
-            warn!(
-                vm_id = %id,
-                state_directories = residue.len(),
-                "deleting a VM whose vfs mount state could not be proven fully published"
-            );
-        }
         remove_vm_dir_if_detached(id, &vm.dir).map_err(ManagerError::Other)?;
         let _ = fs::remove_dir_all(runtime_dir);
         self.vms.write().await.remove(id);

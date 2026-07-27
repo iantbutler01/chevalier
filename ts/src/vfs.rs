@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use base64::Engine as _;
 use bytes::Bytes;
 use chevalier_vfs::SeededFileHash;
 use chevalier_vfs::gateway::{GatewayVfsStorage, GatewayVfsStorageConfig};
@@ -377,17 +378,32 @@ struct VfsWriteManyInput {
     precondition: Option<VfsStorageWritePrecondition>,
 }
 
-fn storage_writes_from_value(writes: Value) -> napi::Result<Vec<VfsStorageWrite>> {
-    let writes = serde_json::from_value::<Vec<VfsWriteManyInput>>(writes)
-        .map_err(|error| invalid_options_err(format!("invalid write batch: {error}")))?;
+#[derive(Deserialize)]
+struct VfsWriteManyBase64Input {
+    path: String,
+    body_base64: String,
+    #[serde(default)]
+    mode: Option<u32>,
+    #[serde(default)]
+    precondition: Option<VfsStorageWritePrecondition>,
+}
+
+fn validate_write_modes(writes: impl IntoIterator<Item = Option<u32>>) -> napi::Result<()> {
     if writes
-        .iter()
-        .any(|write| write.mode.is_some_and(|mode| mode & !0o7777 != 0))
+        .into_iter()
+        .any(|mode| mode.is_some_and(|mode| mode & !0o7777 != 0))
     {
         return Err(invalid_options_err(
             "invalid write batch: mode must contain only POSIX permission and special bits",
         ));
     }
+    Ok(())
+}
+
+fn storage_writes_from_value(writes: Value) -> napi::Result<Vec<VfsStorageWrite>> {
+    let writes = serde_json::from_value::<Vec<VfsWriteManyInput>>(writes)
+        .map_err(|error| invalid_options_err(format!("invalid write batch: {error}")))?;
+    validate_write_modes(writes.iter().map(|write| write.mode))?;
     Ok(writes
         .into_iter()
         .map(|write| VfsStorageWrite {
@@ -398,6 +414,32 @@ fn storage_writes_from_value(writes: Value) -> napi::Result<Vec<VfsStorageWrite>
             precondition: write.precondition,
         })
         .collect())
+}
+
+fn storage_writes_from_base64_value(writes: Value) -> napi::Result<Vec<VfsStorageWrite>> {
+    let writes = serde_json::from_value::<Vec<VfsWriteManyBase64Input>>(writes)
+        .map_err(|error| invalid_options_err(format!("invalid base64 write batch: {error}")))?;
+    validate_write_modes(writes.iter().map(|write| write.mode))?;
+    writes
+        .into_iter()
+        .map(|write| {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(write.body_base64.as_bytes())
+                .map_err(|error| {
+                    invalid_options_err(format!(
+                        "invalid base64 write batch body for {}: {error}",
+                        write.path
+                    ))
+                })?;
+            Ok(VfsStorageWrite {
+                path: write.path,
+                mode: write.mode,
+                bytes: Bytes::from(bytes),
+                token_count: None,
+                precondition: write.precondition,
+            })
+        })
+        .collect()
 }
 
 /// One durably-stored content hash plus the stat witness proving it was current
@@ -748,6 +790,23 @@ impl VfsStorage {
     #[napi]
     pub async fn write_many(&self, writes: Value) -> napi::Result<Value> {
         let writes = storage_writes_from_value(writes)?;
+        let result = self
+            .inner
+            .write_many_atomic(writes)
+            .await
+            .map_err(vfs_err)?;
+        to_json(result)
+    }
+
+    /// Compact counterpart to `write_many`: decode bodies inside Rust so a
+    /// multi-megabyte batch never expands into a recursive JavaScript number
+    /// array at the Node-API boundary.
+    // Runtime-only capability used by the gateway's optional fast path. Keeping
+    // it out of the generated `VfsStorage` declaration preserves the existing
+    // structural storage contract for wrappers and non-local backends.
+    #[napi(skip_typescript)]
+    pub async fn write_many_base64(&self, writes: Value) -> napi::Result<Value> {
+        let writes = storage_writes_from_base64_value(writes)?;
         let result = self
             .inner
             .write_many_atomic(writes)

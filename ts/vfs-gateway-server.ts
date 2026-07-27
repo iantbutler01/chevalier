@@ -978,6 +978,18 @@ function lockResponse(lock: VfsAdvisoryLock) {
   };
 }
 
+type StreamingWrite = {
+  path: string;
+  body: number[];
+  /** Applied only when the write creates the path; ignored on overwrite. */
+  mode?: number;
+  precondition?: { predicate?: VfsCasPredicate; expected_file_id?: string };
+};
+
+type StreamingBase64Write = Omit<StreamingWrite, "body"> & {
+  body_base64: string;
+};
+
 type StreamingVfsStorage = VfsStorage & {
   readRange?: (path: string, offset: bigint, length: number) => Promise<Buffer>;
   writeFromFile?: (
@@ -991,13 +1003,8 @@ type StreamingVfsStorage = VfsStorage & {
       mode?: number;
     } | null,
   ) => Promise<unknown>;
-  writeMany?: (writes: Array<{
-    path: string;
-    body: number[];
-    /** Applied only when the write creates the path; ignored on overwrite. */
-    mode?: number;
-    precondition?: { predicate?: VfsCasPredicate; expected_file_id?: string };
-  }>) => Promise<StreamingWriteManyResult[]>;
+  writeMany?: (writes: StreamingWrite[]) => Promise<StreamingWriteManyResult[]>;
+  writeManyBase64?: (writes: StreamingBase64Write[]) => Promise<StreamingWriteManyResult[]>;
   prefetchSubtree?: (
     prefix: string,
     options?: {
@@ -1844,7 +1851,9 @@ export function createVfsGatewayServer(
         if (writes instanceof Response) return writes;
         const streamingStore = store as StreamingVfsStorage;
         if (typeof streamingStore.writeMany === "function") {
-          const writeMany = streamingStore.writeMany.bind(streamingStore);
+          const compact =
+            typeof streamingStore.writeManyBase64 === "function" &&
+            writes.every((write) => write.body_base64 !== undefined);
           const normalizedWrites = writes.map((write) => {
             const precondition = writeItemPrecondition(write);
             const expectedFileId = writeItemExpectedFileId(write);
@@ -1857,7 +1866,9 @@ export function createVfsGatewayServer(
             const mode = ownValue(write, "mode");
             return {
               path: write.path,
-              body: write.body,
+              ...(compact
+                ? { body_base64: write.body_base64! }
+                : { body: decodedWriteBody(write) }),
               ...(typeof mode === "number" ? { mode } : {}),
               ...(Object.keys(wirePrecondition).length === 0
                 ? {}
@@ -1866,7 +1877,13 @@ export function createVfsGatewayServer(
           });
           try {
             const publication = await publications.transact(ownerId, async () => {
-              const results = await writeMany(normalizedWrites);
+              const results = compact
+                ? await streamingStore.writeManyBase64!(
+                    normalizedWrites as StreamingBase64Write[],
+                  )
+                : await streamingStore.writeMany!(
+                    normalizedWrites as StreamingWrite[],
+                  );
               const affected = writeManyAffectedPaths(
                 normalizedWrites.map((write) => write.path),
                 results,
@@ -1923,7 +1940,7 @@ export function createVfsGatewayServer(
             try {
               res = (await store.write(
                 p,
-                Buffer.from(write.body),
+                bufferedWriteBody(write),
                 preconditionOptions(precondition, expectedFileId),
               )) as typeof res;
             } catch (e) {
@@ -1965,6 +1982,10 @@ export function createVfsGatewayServer(
       if (e instanceof VfsSnapshotChangedError) {
         return errorResponse(409, e.message);
       }
+      console.error(
+        "[chevalier-vfs-gateway] unexpected request failure",
+        e instanceof Error ? (e.stack ?? e.message) : String(e),
+      );
       return errorResponse(500, `gateway server error: ${(e as Error).message}`);
     }
   };
@@ -2207,7 +2228,8 @@ function preconditionOptions(
 
 type WriteManyRequestItem = {
   path: string;
-  body: number[];
+  body?: number[];
+  body_base64?: string;
   ifMatch?: string | null;
   if_match?: string | null;
   precondition?: {
@@ -2218,6 +2240,24 @@ type WriteManyRequestItem = {
     expected_file_id?: string | null;
   };
 };
+
+function isCanonicalBase64(value: unknown): value is string {
+  if (typeof value !== "string" || value.length % 4 !== 0) return false;
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    return false;
+  }
+  const decoded = Buffer.from(value, "base64");
+  return decoded.toString("base64") === value;
+}
+
+function decodedWriteBody(write: WriteManyRequestItem): number[] {
+  if (write.body !== undefined) return write.body;
+  return Array.from(Buffer.from(write.body_base64!, "base64"));
+}
+
+function bufferedWriteBody(write: WriteManyRequestItem): Buffer {
+  return write.body !== undefined ? Buffer.from(write.body) : Buffer.from(write.body_base64!, "base64");
+}
 
 function normalizeWriteManyItems(
   value: unknown,
@@ -2238,11 +2278,17 @@ function normalizeWriteManyItems(
     if (path === "" || isExcludedPath(path)) {
       return errorResponse(400, `invalid write-many path: ${path}`);
     }
-    if (
-      !Array.isArray(write.body) ||
-      !write.body.every((byte) => Number.isSafeInteger(byte) && byte >= 0 && byte <= 255)
-    ) {
-      return errorResponse(400, "write-many body must be an array of bytes");
+    if (write.body !== undefined && write.body_base64 !== undefined) {
+      return errorResponse(400, "write-many accepts exactly one of body or body_base64");
+    }
+    const legacyBody =
+      Array.isArray(write.body) &&
+      write.body.every((byte) => Number.isSafeInteger(byte) && byte >= 0 && byte <= 255)
+        ? [...write.body]
+        : null;
+    const encodedBody = isCanonicalBase64(write.body_base64) ? write.body_base64 : null;
+    if (legacyBody === null && encodedBody === null) {
+      return errorResponse(400, "write-many body must be a byte array or canonical base64");
     }
     // Optional POSIX mode, applied only when this write CREATES the path.
     // Without it a create cannot be folded into its write: the namespace
@@ -2271,7 +2317,11 @@ function normalizeWriteManyItems(
     } catch (error) {
       return errorResponse(400, error instanceof Error ? error.message : String(error));
     }
-    writes.push({ ...(write as WriteManyRequestItem), path, body: [...write.body] });
+    writes.push({
+      ...(write as WriteManyRequestItem),
+      path,
+      ...(legacyBody === null ? { body_base64: encodedBody! } : { body: legacyBody }),
+    });
   }
   return writes;
 }

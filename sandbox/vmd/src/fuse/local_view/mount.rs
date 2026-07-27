@@ -56,8 +56,8 @@ use super::types::{
 };
 use super::wal::MountWal;
 use super::{
-    CHECKPOINT_EVENT_INTERVAL, CHECKPOINT_INTERVAL_MS, MountStateLayout, WAL_FORMAT_VERSION,
-    sync_directory,
+    CHECKPOINT_EVENT_INTERVAL, CHECKPOINT_INTERVAL_MS, MAX_SEGMENTED_PAYLOAD_BYTES,
+    MountStateLayout, WAL_FORMAT_VERSION, sync_directory,
 };
 
 /// How the mount was constructed.
@@ -357,6 +357,12 @@ impl MountLocalView {
                 ApplyState::Applied => {
                     // The guest already observed this. The replica converges onto
                     // it rather than away from it.
+                    wal.verify_event_payload(event).with_context(|| {
+                        format!(
+                            "recover applied mount sequence {} before committing it",
+                            event.sequence
+                        )
+                    })?;
                     wal.resolve_recovered(event.sequence, RecoveryResolution::Commit)?;
                     summary.resolved_committed += 1;
                 }
@@ -796,11 +802,30 @@ impl MountLocalView {
             let paths = mutation.affected_paths();
             self.tree.observe(&paths)?
         };
-        let prepared = wal.prepare(
-            mutation,
-            PayloadSource::File(backing_path.as_path()),
-            pre_image,
-        )?;
+        // Small generations are the package-install hot path. Read at most the
+        // segment threshold into memory so they share one packed payload file;
+        // larger generations retain the reflink/streamed dedicated-file path.
+        let small_payload = if metadata.size_bytes <= MAX_SEGMENTED_PAYLOAD_BYTES as u64 {
+            let bytes = std::fs::read(&backing_path).with_context(|| {
+                format!("read small backing generation {}", backing_path.display())
+            })?;
+            if bytes.len() as u64 != metadata.size_bytes {
+                bail!(
+                    "small backing generation {} changed size while sealed: expected {}, read {}",
+                    backing_path.display(),
+                    metadata.size_bytes,
+                    bytes.len()
+                );
+            }
+            Some(bytes)
+        } else {
+            None
+        };
+        let payload = match small_payload.as_deref() {
+            Some(bytes) => PayloadSource::Bytes(bytes),
+            None => PayloadSource::File(backing_path.as_path()),
+        };
+        let prepared = wal.prepare(mutation, payload, pre_image)?;
         let sequence = prepared.sequence();
         match self.tree.apply(&prepared.event.mutation) {
             Ok(applied) => wal.commit(prepared, applied.local_identity.clone())?,
@@ -1492,4 +1517,104 @@ pub(crate) fn default_state_dir_for_mountpoint(mountpoint: &Path) -> Result<Moun
     Ok(MountStateLayout::new(
         &parent.join(format!(".{name}-vfs-state")),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{MountLocalView, MountLocalViewOptions};
+    use crate::fuse::local_view::MountStateLayout;
+    use crate::fuse::local_view::types::{MountMutation, PayloadSource, PayloadStorage};
+
+    fn options(root: &Path, tokio: &tokio::runtime::Handle) -> MountLocalViewOptions {
+        MountLocalViewOptions {
+            layout: MountStateLayout::new(root),
+            scope_path: "test-scope".to_string(),
+            endpoint: "http://127.0.0.1:1".to_string(),
+            mount_tag: "test".to_string(),
+            read_only: false,
+            tokio: tokio.clone(),
+        }
+    }
+
+    #[test]
+    fn sealing_a_small_backing_file_uses_the_packed_segment_path() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let opened =
+            MountLocalView::open(options(temp.path(), runtime.handle())).expect("open local view");
+        let view = opened.view;
+        let (file, _) = view
+            .create_file("small.txt", 0o644, libc::O_RDWR)
+            .expect("create file");
+        view.write(&file, b"small payload", 0).expect("write file");
+        view.flush_handle(&file).expect("seal file");
+
+        let batch = view
+            .wal()
+            .expect("writable WAL")
+            .next_publish_batch(32, 1024 * 1024)
+            .expect("read publish batch")
+            .expect("pending events");
+        let payload = batch
+            .events
+            .iter()
+            .find_map(|event| {
+                matches!(event.mutation, MountMutation::ReplaceFile { .. })
+                    .then_some(event.payload.as_ref())
+                    .flatten()
+            })
+            .expect("sealed content payload");
+        assert!(matches!(payload.storage, PayloadStorage::Segment { .. }));
+    }
+
+    #[test]
+    fn recovery_rejects_an_applied_prepare_with_a_missing_payload() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = MountStateLayout::new(temp.path());
+        let opened =
+            MountLocalView::open(options(temp.path(), runtime.handle())).expect("open local view");
+        let view = opened.view;
+        let file = view
+            .tree()
+            .hydrate_file("lost.txt", 0o644)
+            .expect("create backing file");
+        file.write_at(b"accepted bytes", 0)
+            .expect("write backing file");
+        let mutation = MountMutation::ReplaceFile {
+            path: "lost.txt".to_string(),
+            mode: 0o644,
+            expected_file_id: None,
+            base_content_hash: None,
+        };
+        let pre_image = view
+            .tree()
+            .observe(&mutation.affected_paths())
+            .expect("observe pre-image");
+        let wal = view.wal().expect("writable WAL");
+        let prepared = wal
+            .prepare(mutation, PayloadSource::Bytes(b"accepted bytes"), pre_image)
+            .expect("prepare content event");
+        let payload_file = prepared
+            .event
+            .payload
+            .as_ref()
+            .expect("payload")
+            .storage
+            .file()
+            .to_string();
+        wal.sync_local().expect("sync unresolved prepare");
+        std::fs::remove_file(layout.payload_dir().join(payload_file))
+            .expect("remove prepared payload");
+        drop(file);
+        drop(view);
+
+        let error = match MountLocalView::open(options(temp.path(), runtime.handle())) {
+            Ok(_) => panic!("missing applied payload must fail recovery"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("verify mount event"));
+    }
 }

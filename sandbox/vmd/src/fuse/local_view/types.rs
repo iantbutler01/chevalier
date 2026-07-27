@@ -701,9 +701,11 @@ pub(crate) struct PublishBatch {
     pub(crate) through_sequence: u64,
 }
 
-/// One issuable unit inside a batch. Runs are issued strictly in order; the
-/// events inside a run are mutually independent by dependency key, so their
-/// payload uploads may proceed concurrently.
+/// One issuable unit inside a batch. Runs are dependency-ordered rather than
+/// necessarily WAL-ordered: unrelated paths may be grouped across route-class
+/// boundaries. Namespace events retain WAL order within their request; content
+/// events in one run are mutually independent so their uploads may proceed
+/// concurrently. The WAL cursor advances only after every run succeeds.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PublishRun {
     /// Ordered `namespace-many` mutations.
@@ -719,20 +721,6 @@ pub(crate) enum PublishRun {
     /// Local-only events (`SetTimes`, `SetOwner`) plus aborted gaps: the cursor
     /// advances with no gateway request at all.
     Cursor { through_sequence: u64 },
-}
-
-impl PublishRun {
-    pub(crate) fn through_sequence(&self) -> u64 {
-        match self {
-            Self::Namespace {
-                through_sequence, ..
-            }
-            | Self::Content {
-                through_sequence, ..
-            }
-            | Self::Cursor { through_sequence } => *through_sequence,
-        }
-    }
 }
 
 /// What the WAL knows immediately after `open`, before the backing tree has been

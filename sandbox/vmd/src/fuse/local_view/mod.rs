@@ -65,12 +65,16 @@ pub(crate) const LOG_TARGET_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const STREAM_PAYLOAD_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Largest event count and payload byte total the publisher pulls in one batch.
-pub(crate) const PUBLISH_MAX_EVENTS: usize = 512;
+/// The gateway accepts 4096 items per namespace/write request. WAL events also
+/// include local-only metadata and foldable create/mode records, so a 4096-event
+/// prefix remains within that wire bound while avoiding hundreds of tiny
+/// checkpoints for one materialized tree.
+pub(crate) const PUBLISH_MAX_EVENTS: usize = 4096;
 pub(crate) const PUBLISH_MAX_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Publication window: the coordinator waits for a short idle gap before
 /// building a batch, but never delays a batch longer than the maximum.
-pub(crate) const PUBLISH_IDLE_WINDOW_MS: u64 = 10;
+pub(crate) const PUBLISH_IDLE_WINDOW_MS: u64 = 50;
 pub(crate) const PUBLISH_MAX_WINDOW_MS: u64 = 100;
 
 /// Bounded worker pool for independent payload uploads and independent

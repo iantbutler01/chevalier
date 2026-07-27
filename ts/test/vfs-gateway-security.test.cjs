@@ -217,6 +217,9 @@ test("gateway rejects malformed and oversized write batches atomically", async (
     { writes: [{ path: "file.txt", body: [256] }] },
     { writes: [{ path: "file.txt", body: [1.5] }] },
     { writes: [{ path: "file.txt", body: ["1"] }] },
+    { writes: [{ path: "file.txt", body_base64: "not base64" }] },
+    { writes: [{ path: "file.txt", body_base64: "YQ" }] },
+    { writes: [{ path: "file.txt", body: [1], body_base64: "AQ==" }] },
     { writes: [{ path: "file.txt", body: [1], ifMatch: 7 }] },
     { writes: [{ path: "file.txt", body: [1], precondition: "bad" }] },
     { writes: [{ path: "file.txt", body: [1], precondition: { fingerprint: 7 } }] },
@@ -259,6 +262,61 @@ test("gateway accepts bounded, well-formed batches after validation", async () =
     read: 1,
     writeMany: 1,
   });
+});
+
+test("write-many decodes canonical base64 before the storage boundary", async () => {
+  let received = null;
+  const store = {
+    async stat(path) {
+      return { path, kind: "File", sizeBytes: 4n, contentHash: "a".repeat(64) };
+    },
+    async writeMany(writes) {
+      received = writes;
+      return writes.map((write) => ({
+        path: write.path,
+        contentHash: "b".repeat(64),
+        previousHash: null,
+        changed: true,
+      }));
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: () => store });
+  const response = await requestBody(handler, "write-many", {
+    writes: [{ path: "file.bin", body_base64: "AAEC/w==", mode: 0o755 }],
+  });
+
+  assert.strictEqual(response.status, 200);
+  assert.deepStrictEqual(received, [{ path: "file.bin", body: [0, 1, 2, 255], mode: 0o755 }]);
+});
+
+test("write-many keeps base64 compact for storage backends that accept it", async () => {
+  let received = null;
+  const store = {
+    async stat(path) {
+      return { path, kind: "File", sizeBytes: 4n, contentHash: "a".repeat(64) };
+    },
+    async writeMany() {
+      throw new Error("legacy writeMany should not receive a compact batch");
+    },
+    async writeManyBase64(writes) {
+      received = writes;
+      return writes.map((write) => ({
+        path: write.path,
+        contentHash: "b".repeat(64),
+        previousHash: null,
+        changed: true,
+      }));
+    },
+  };
+  const handler = createVfsGatewayServer({ resolveStore: () => store });
+  const response = await requestBody(handler, "write-many", {
+    writes: [{ path: "file.bin", body_base64: "AAEC/w==", mode: 0o755 }],
+  });
+
+  assert.strictEqual(response.status, 200);
+  assert.deepStrictEqual(received, [
+    { path: "file.bin", body_base64: "AAEC/w==", mode: 0o755 },
+  ]);
 });
 
 test("gateway validates namespace batches and malformed preconditions before mutation", async () => {

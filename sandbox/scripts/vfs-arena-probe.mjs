@@ -42,10 +42,20 @@ const authToken = need("SANDBOX_AUTH_TOKEN");
 const image = need("SANDBOX_IMAGE");
 const gatewayUrl = need("VFS_GATEWAY_URL").replace(/\/+$/, "");
 const bulkCount = Number.parseInt(process.env.VFS_BULK_COUNT?.trim() || "500", 10);
+const settleMs = Number.parseInt(process.env.VFS_PROBE_SETTLE_MS?.trim() || "0", 10);
 if (!Number.isSafeInteger(bulkCount) || bulkCount < 1) {
   console.error("VFS_BULK_COUNT must be a positive integer");
   process.exit(2);
 }
+if (!Number.isSafeInteger(settleMs) || settleMs < 0) {
+  console.error("VFS_PROBE_SETTLE_MS must be a non-negative integer");
+  process.exit(2);
+}
+const settlePublisher = async () => {
+  if (settleMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, settleMs));
+  }
+};
 
 for (const [name, value] of [
   ["SANDBOX_ENDPOINT", endpoint],
@@ -161,12 +171,14 @@ printf 'bulk-publish barrier: %s ms\n' $(( (e-s)/1000000 ))`,
     600,
   );
   console.log(bulk.stdout.trim());
+  await settlePublisher();
   console.log(`ROUTES for ${bulkCount} creates:`, JSON.stringify(await counters(true)));
   const cleanup = await exec(`rm -rf ${bulkPath}`, 300);
   if (cleanup.code !== 0) {
     console.error(`bulk cleanup failed: ${cleanup.stdout.trim()}`);
     exitCode = 1;
   }
+  await settlePublisher();
   await counters(true);
 
   const script = `set -u
@@ -192,6 +204,8 @@ cd /; rm -rf "$b"`;
   const run = await exec(script, 300);
   console.log(run.stdout.trim());
   if (run.code !== 0) exitCode = 1;
+  await settlePublisher();
+  console.log("ROUTES for scalar probe:", JSON.stringify(await counters(true)));
 }
 
 try {

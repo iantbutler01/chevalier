@@ -6,6 +6,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use base64::Engine as _;
 use chevalier_sandbox::vfs::{
     CHEVALIER_VFS_COMPONENT_HEADER, CHEVALIER_VFS_LEASE_MODE_HEADER,
     CHEVALIER_VFS_LEASE_MODE_IMPLICIT, CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
@@ -17,7 +18,7 @@ use chevalier_sandbox::vfs::{
     VfsLeaseGrant as LeaseGrant, VfsLeaseReleaseRequest, VfsMetadata as RemoteMetadata,
     VfsNamespaceMutation, VfsNamespaceMutationBatchBody, VfsNamespaceMutationBatchResponse,
     VfsPrefetchSubtreeRequest, VfsPrefetchSubtreeResponse, VfsPublicationSnapshotEntry,
-    VfsSubtreeMetadataRequest, VfsSubtreeMetadataResponse, VfsWriteManyBody, VfsWriteManyItem,
+    VfsSubtreeMetadataRequest, VfsSubtreeMetadataResponse, VfsWriteManyItem,
     VfsWriteManyPublicationResponse, VfsWritePrecondition, scoped_vfs_path,
 };
 use reqwest::{Client, StatusCode, header};
@@ -105,6 +106,38 @@ pub struct RemoteWrite {
     pub expected_file_id: Option<String>,
     /// Applied only if this write creates the path; see `VfsWriteManyItem::mode`.
     pub mode: Option<u32>,
+}
+
+/// Compact wire form for the gateway's JSON `write-many` route.
+///
+/// Serializing `Vec<u8>` directly turns every byte into a decimal JSON token,
+/// inflating a package tree several-fold before it crosses the network. The
+/// gateway accepts this base64 field alongside the legacy `body: number[]`
+/// shape and decodes it before calling the same backend-neutral `writeMany`.
+#[derive(Serialize)]
+struct CompactWriteManyItem {
+    path: String,
+    body_base64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    precondition: Option<VfsWritePrecondition>,
+}
+
+#[derive(Serialize)]
+struct CompactWriteManyBody {
+    writes: Vec<CompactWriteManyItem>,
+}
+
+impl From<VfsWriteManyItem> for CompactWriteManyItem {
+    fn from(write: VfsWriteManyItem) -> Self {
+        Self {
+            path: write.path,
+            body_base64: base64::engine::general_purpose::STANDARD.encode(write.body),
+            mode: write.mode,
+            precondition: write.precondition,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -699,10 +732,11 @@ impl RemoteVfsClient {
                 "flush vfs fuse write batch",
             )
             .await?;
-        let body = VfsWriteManyBody {
+        let body = CompactWriteManyBody {
             writes: writes
                 .into_iter()
                 .map(|write| self.scope_remote_write(write))
+                .map(CompactWriteManyItem::from)
                 .collect(),
         };
         let result = async {
@@ -1596,5 +1630,22 @@ mod tests {
                 .is_some_and(|precondition| precondition.fingerprint.is_none()
                     && precondition.secondary_fingerprint.is_none())
         );
+    }
+
+    #[test]
+    fn write_many_uses_compact_base64_wire_bodies() {
+        let encoded = CompactWriteManyItem::from(VfsWriteManyItem {
+            path: "scope/file.bin".to_string(),
+            body: vec![0, 1, 2, 255],
+            mode: Some(0o755),
+            precondition: None,
+        });
+        let wire = serde_json::to_value(encoded).unwrap();
+
+        assert_eq!(wire["path"], "scope/file.bin");
+        assert_eq!(wire["body_base64"], "AAEC/w==");
+        assert_eq!(wire["mode"], 0o755);
+        assert!(wire.get("body").is_none());
+        assert!(wire.get("precondition").is_none());
     }
 }

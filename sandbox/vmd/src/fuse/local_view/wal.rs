@@ -871,6 +871,26 @@ impl MountWal {
         self.inner.payloads.dedicated_path(payload)
     }
 
+    /// Prove an event's immutable payload is still complete and unchanged.
+    ///
+    /// Committed events are verified while the WAL opens. Recovery also calls
+    /// this before promoting an applied-but-uncommitted prepare: otherwise a
+    /// missing payload would be committed locally and surface later as a
+    /// retryable publication error even though no retry could repair it.
+    pub(crate) fn verify_event_payload(&self, event: &MountEvent) -> Result<()> {
+        match event.payload.as_ref() {
+            Some(payload) => self
+                .inner
+                .payloads
+                .verify(payload)
+                .with_context(|| format!("verify mount event {} payload", event.sequence)),
+            None if event.mutation.requires_payload() => {
+                bail!("mount content event {} carries no payload", event.sequence)
+            }
+            None => Ok(()),
+        }
+    }
+
     // -- maintenance ---------------------------------------------------------
 
     /// Publish a checkpoint without an acknowledgement. Runs on the maintenance

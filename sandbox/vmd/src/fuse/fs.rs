@@ -318,7 +318,9 @@ impl InodeTable {
                 if record_identity.is_some_and(|current| current != identity)
                     || mapped.is_some_and(|mapped| mapped != ino)
                 {
-                    self.detach_exact(path);
+                    // The name was reused, but the displaced object may still
+                    // have a hard-link alias that a later lookup reveals.
+                    self.detach_exact_preserving_identity(path);
                     return self.ensure_with_identity(path, Some(identity));
                 }
             }
@@ -330,6 +332,16 @@ impl InodeTable {
                         self.identity_to_ino.insert(identity.to_string(), ino);
                     }
                 }
+                if identity.is_some() {
+                    // This pathname was just proven by a backing-tree lstat.
+                    // Prefer it over an older alias retained for the same
+                    // dev:ino. Besides being valid for real hard links, this is
+                    // essential when the host filesystem recycles an inode
+                    // number while the kernel still holds the old FUSE inode:
+                    // callbacks on the new dentry must not keep resolving
+                    // through the vanished historical pathname.
+                    record.path = path.to_string();
+                }
             }
             return ino;
         }
@@ -338,11 +350,11 @@ impl InodeTable {
         {
             self.path_to_ino.insert(path.to_string(), ino);
             if let Some(record) = self.ino_to_path.get_mut(&ino) {
-                let had_linked_path = !record.paths.is_empty();
                 record.paths.insert(path.to_string());
-                if record.path.is_empty() || !had_linked_path {
-                    record.path = path.to_string();
-                }
+                // The caller obtained this identity from a positive local
+                // lookup. It is therefore a stronger route than an older alias
+                // or retained path hint.
+                record.path = path.to_string();
                 record.last_access = Instant::now();
             }
             return ino;
@@ -413,7 +425,7 @@ impl InodeTable {
         if let Some(other) = self.path_to_ino.get(path).copied()
             && other != ino
         {
-            self.detach_exact(path);
+            self.detach_exact_preserving_identity(path);
         }
         if stale_path != path && self.path_to_ino.get(stale_path).copied() == Some(ino) {
             self.path_to_ino.remove(stale_path);
@@ -502,10 +514,19 @@ impl InodeTable {
     }
 
     fn detach_exact(&mut self, path: &str) {
+        self.detach_exact_with_identity_retirement(path, true);
+    }
+
+    fn detach_exact_preserving_identity(&mut self, path: &str) {
+        self.detach_exact_with_identity_retirement(path, false);
+    }
+
+    fn detach_exact_with_identity_retirement(&mut self, path: &str, retire: bool) {
         let Some(ino) = self.path_to_ino.remove(path) else {
             return;
         };
         let mut remove_inode = false;
+        let mut retire_identity = None;
         if let Some(record) = self.ino_to_path.get_mut(&ino) {
             record.paths.remove(path);
             if record.path == path {
@@ -521,16 +542,23 @@ impl InodeTable {
                     }
                 });
             }
+            if retire && record.paths.is_empty() {
+                // Keep the FUSE inode record until the kernel's delayed FORGET,
+                // but retire its reverse dev:ino binding immediately. The host
+                // filesystem may recycle that inode number for the next package
+                // directory while this record is still retained.
+                retire_identity = record.identity.clone();
+            }
             remove_inode =
                 record.paths.is_empty() && !(record.identity.is_some() && record.lookup_count > 0);
         }
+        if let Some(identity) = retire_identity
+            && self.identity_to_ino.get(identity.as_str()) == Some(&ino)
+        {
+            self.identity_to_ino.remove(identity.as_str());
+        }
         if remove_inode {
-            if let Some(record) = self.ino_to_path.remove(&ino)
-                && let Some(identity) = record.identity
-                && self.identity_to_ino.get(identity.as_str()) == Some(&ino)
-            {
-                self.identity_to_ino.remove(identity.as_str());
-            }
+            self.ino_to_path.remove(&ino);
         }
     }
 
@@ -552,6 +580,7 @@ impl InodeTable {
 
     fn detach_subtree(&mut self, path: &str) {
         let mut emptied = Vec::new();
+        let mut retired_identities = Vec::new();
         for (candidate, ino) in self.subtree_entries(path) {
             self.path_to_ino.remove(candidate.as_str());
             if let Some(record) = self.ino_to_path.get_mut(&ino) {
@@ -566,20 +595,23 @@ impl InodeTable {
                         }
                     });
                 }
-                if record.paths.is_empty()
-                    && !(record.identity.is_some() && record.lookup_count > 0)
-                {
-                    emptied.push(ino);
+                if record.paths.is_empty() {
+                    if let Some(identity) = record.identity.clone() {
+                        retired_identities.push((ino, identity));
+                    }
+                    if !(record.identity.is_some() && record.lookup_count > 0) {
+                        emptied.push(ino);
+                    }
                 }
             }
         }
-        for ino in emptied {
-            if let Some(record) = self.ino_to_path.remove(&ino)
-                && let Some(identity) = record.identity
-                && self.identity_to_ino.get(identity.as_str()) == Some(&ino)
-            {
+        for (ino, identity) in retired_identities {
+            if self.identity_to_ino.get(identity.as_str()) == Some(&ino) {
                 self.identity_to_ino.remove(identity.as_str());
             }
+        }
+        for ino in emptied {
+            self.ino_to_path.remove(&ino);
         }
     }
 
@@ -2088,6 +2120,11 @@ mod tests {
         table.detach_exact("source");
         assert_eq!(table.path(alias).as_deref(), Some("nested/alias"));
         assert_eq!(table.ensure_with_identity("third", Some("inode-1")), alias);
+        assert_eq!(
+            table.path(alias).as_deref(),
+            Some("third"),
+            "a newly proven alias becomes the callback route"
+        );
     }
 
     #[test]
@@ -2162,6 +2199,45 @@ mod tests {
         assert_eq!(
             table.route(replacement),
             Some(("replacement".to_string(), Some("unix:1:42".to_string())))
+        );
+    }
+
+    #[test]
+    fn exact_detach_retires_identity_before_delayed_forget() {
+        let mut table = InodeTable::new();
+        let original = table.lookup_with_identity("package_tmp", Some("unix:1:42"));
+
+        table.detach_exact("package_tmp");
+        let replacement = table.lookup_with_identity("next-package", Some("unix:1:42"));
+
+        assert_ne!(
+            original, replacement,
+            "a recycled backing inode must not reuse a retained FUSE inode"
+        );
+        assert_eq!(
+            table.route(original),
+            Some(("package_tmp".to_string(), Some("unix:1:42".to_string()))),
+            "the old kernel route remains only until FORGET"
+        );
+        assert_eq!(
+            table.route(replacement),
+            Some(("next-package".to_string(), Some("unix:1:42".to_string())))
+        );
+    }
+
+    #[test]
+    fn subtree_detach_retires_descendant_identities_before_reuse() {
+        let mut table = InodeTable::new();
+        let original = table.lookup_with_identity("package_tmp/lib/node/utils", Some("unix:1:99"));
+
+        table.detach_subtree("package_tmp");
+        let replacement =
+            table.lookup_with_identity("other-package/lib/node/utils", Some("unix:1:99"));
+
+        assert_ne!(original, replacement);
+        assert_eq!(
+            table.path(replacement).as_deref(),
+            Some("other-package/lib/node/utils")
         );
     }
 
