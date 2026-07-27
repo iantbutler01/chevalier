@@ -6,10 +6,16 @@
 //! `spawn_blocking` added two scheduler hops to every local LOOKUP/CREATE/WRITE
 //! in package extraction workloads without adding concurrency.
 //!
-//! Only distributed blocking-lock waits use a separate bounded Tokio pool.
-//! This prevents a lock waiter from occupying every native FUSE request thread.
-//! Kernel-side parallelism is raised in `init` (`max_background` defaults to
-//! 12, which would otherwise throttle the whole exercise from above).
+//! Only distributed blocking-lock waits use a separate bounded Tokio pool. They
+//! are the one callback class that still reaches the gateway, and this prevents
+//! a lock waiter from occupying every native FUSE request thread. Kernel-side
+//! parallelism is raised in `init` (`max_background` defaults to 12, which would
+//! otherwise throttle the whole exercise from above).
+//!
+//! `OperationCounters` is kept deliberately. It is the only in-mount latency
+//! instrument that measures what the guest actually experienced -- one timestamp
+//! pair around the callback body, on the thread that ran it -- and it is what the
+//! mounted gates read the per-class 100-500 ms bar off.
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -20,18 +26,20 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use fuser::{
-    BsdFileFlags, FileHandle, Filesystem, INodeNo, InterruptResult, KernelConfig, LockNamespace,
-    LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyWrite, Request,
-    RequestId, TimeOrNow, WriteFlags,
+    BsdFileFlags, CopyFileRangeFlags, FileHandle, Filesystem, INodeNo, InterruptResult,
+    KernelConfig, LockNamespace, LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
+    ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen,
+    ReplyStatfs, ReplyWrite, Request, RequestId, TimeOrNow, WriteFlags,
 };
 use tokio::sync::Semaphore;
 
 use super::fs::{LockWaitCancellation, RemoteFuseFs};
 
-/// Upper bound on concurrently executing FUSE ops per mount. The gateway
-/// sustains far more, but each op holds a blocking-pool thread; 64 keeps a
-/// dep-tree scan saturating the wire without monopolizing the pool.
+/// Kernel-side parallelism this mount asks for: `max_background` is twice this
+/// and the congestion threshold sits just above it. Every ordinary callback is
+/// now local work against the backing tree, so the bound is about how many
+/// requests the guest kernel may keep outstanding, not about how much the
+/// gateway can absorb.
 const MAX_IN_FLIGHT_OPS: usize = 64;
 const MAX_IN_FLIGHT_BLOCKING_LOCKS: usize = 32;
 const OPERATION_COUNTER_LOG_INTERVAL: u64 = 20_000;
@@ -415,8 +423,21 @@ impl Filesystem for SpawnedFuseFs {
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        // Replies immediately without touching the network.
+        // Allocates the readdir cursor and replies; touches no device.
         self.inner.opendir(ino, flags, reply);
+    }
+
+    fn releasedir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        // Frees the readdir cursor. Without it every `opendir` would leak its
+        // directory snapshot for the life of the mount.
+        self.inner.releasedir(ino, fh, reply);
     }
 
     fn readdir(
@@ -530,11 +551,52 @@ impl Filesystem for SpawnedFuseFs {
         reply: ReplyEmpty,
     ) {
         // Without this the op falls through to fuser's ENOSYS default, so a
-        // guest asking for its directory entries to be durable silently got
-        // nothing — and since close stopped draining the namespace journal,
-        // this is the only barrier that publishes them on demand.
+        // guest asking for the entries it created in a directory to be durable
+        // silently got nothing.
         self.spawn("fsyncdir", req.unique(), move |fs| {
             fs.fsyncdir(ino, fh, datasync, reply)
+        });
+    }
+
+    fn statfs(&self, req: &Request, ino: INodeNo, reply: ReplyStatfs) {
+        // fuser's default replies with zeroes, so `df` and every "is there room
+        // for this" check in the guest saw a filesystem with no capacity at all.
+        self.spawn("statfs", req.unique(), move |fs| fs.statfs(ino, reply));
+    }
+
+    fn fallocate(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        self.spawn("fallocate", req.unique(), move |fs| {
+            fs.fallocate(ino, fh, offset, length, mode, reply)
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &self,
+        req: &Request,
+        ino_in: INodeNo,
+        fh_in: FileHandle,
+        offset_in: u64,
+        ino_out: INodeNo,
+        fh_out: FileHandle,
+        offset_out: u64,
+        len: u64,
+        _flags: CopyFileRangeFlags,
+        reply: ReplyWrite,
+    ) {
+        self.spawn("copy_file_range", req.unique(), move |fs| {
+            fs.copy_file_range(
+                ino_in, fh_in, offset_in, ino_out, fh_out, offset_out, len, reply,
+            )
         });
     }
 

@@ -470,8 +470,16 @@ impl VmdService for GrpcService {
 
     async fn health(&self, request: Request<HealthRequest>) -> GrpcResult<HealthResponse> {
         self.authorize(&request, AccessLevel::Read).await?;
+        // Deliberately still `Ok`: vmd itself is serving, and a VFS mount whose
+        // publication is blocked keeps serving its guest from the authoritative
+        // local view. What it is not doing is replicating, and that is invisible
+        // everywhere else — so it is reported here rather than silently held.
+        let status = match self.manager.vfs_publication_is_degraded().await {
+            true => "degraded: vfs mount publication",
+            false => "ok",
+        };
         Ok(Response::new(HealthResponse {
-            status: "ok".to_string(),
+            status: status.to_string(),
         }))
     }
 

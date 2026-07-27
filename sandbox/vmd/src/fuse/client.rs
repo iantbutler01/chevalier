@@ -1,36 +1,28 @@
-use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{
-    Arc, Mutex, OnceLock, Weak,
+    Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use chevalier_sandbox::vfs::{
-    CHEVALIER_VFS_COMPONENT_HEADER, CHEVALIER_VFS_EXECUTABLE_HEADER,
-    CHEVALIER_VFS_LEASE_MODE_HEADER, CHEVALIER_VFS_LEASE_MODE_IMPLICIT,
-    CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, CHEVALIER_VFS_MODE_HEADER,
-    CHEVALIER_VFS_NAMESPACE_REVISION_HEADER, CHEVALIER_VFS_OPERATION_HEADER,
-    CHEVALIER_VFS_PRECONDITION_FILE_ID_HEADER, CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER,
-    CHEVALIER_VFS_PRECONDITION_KIND_HEADER, CHEVALIER_VFS_RESOURCE_KEY_HEADER,
-    CHEVALIER_VFS_SURFACE_KIND_HEADER, VFS_COMPONENT_VM_RUNTIME, VfsCasPredicate,
-    VfsDirEntry as RemoteDirEntry, VfsHardLinkAliasBody, VfsHardLinkAliasResponse, VfsHardLinkBody,
-    VfsHardLinkMetadataResponse, VfsLeaseAcquireRequest, VfsLeaseGrant as LeaseGrant,
-    VfsLeaseReleaseRequest, VfsMetadata as RemoteMetadata, VfsMetadataManyRequest,
-    VfsMetadataManyResponse, VfsNamespaceMutation, VfsNamespaceMutationBatchBody,
-    VfsNamespaceMutationBatchResponse, VfsPrefetchSubtreeRequest, VfsPrefetchSubtreeResponse,
-    VfsPublicationSnapshotEntry, VfsSubtreeMetadataRequest, VfsSubtreeMetadataResponse,
-    VfsWriteManyBody, VfsWriteManyItem, VfsWriteManyPublicationResponse, VfsWritePrecondition,
-    scoped_vfs_path,
+    CHEVALIER_VFS_COMPONENT_HEADER, CHEVALIER_VFS_LEASE_MODE_HEADER,
+    CHEVALIER_VFS_LEASE_MODE_IMPLICIT, CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+    CHEVALIER_VFS_MODE_HEADER, CHEVALIER_VFS_NAMESPACE_REVISION_HEADER,
+    CHEVALIER_VFS_OPERATION_HEADER, CHEVALIER_VFS_PRECONDITION_FILE_ID_HEADER,
+    CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER, CHEVALIER_VFS_PRECONDITION_KIND_HEADER,
+    CHEVALIER_VFS_RESOURCE_KEY_HEADER, CHEVALIER_VFS_SURFACE_KIND_HEADER, VFS_COMPONENT_VM_RUNTIME,
+    VfsCasPredicate, VfsDirEntry as RemoteDirEntry, VfsLeaseAcquireRequest,
+    VfsLeaseGrant as LeaseGrant, VfsLeaseReleaseRequest, VfsMetadata as RemoteMetadata,
+    VfsNamespaceMutation, VfsNamespaceMutationBatchBody, VfsNamespaceMutationBatchResponse,
+    VfsPrefetchSubtreeRequest, VfsPrefetchSubtreeResponse, VfsPublicationSnapshotEntry,
+    VfsSubtreeMetadataRequest, VfsSubtreeMetadataResponse, VfsWriteManyBody, VfsWriteManyItem,
+    VfsWriteManyPublicationResponse, VfsWritePrecondition, scoped_vfs_path,
 };
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
-use tokio::runtime::Handle;
 use tokio_util::io::ReaderStream;
-
-use super::cache::{MountInvalidators, PublicationInvalidation, RemoteFuseCache};
-use super::fs::ATTR_ENTRY_LEASE_TTL;
 
 pub const RANGE_FINGERPRINT_HEADER: &str = "x-chevalier-vfs-range-fingerprint";
 /// Transient-failure budget sized to ride out a gateway restart, not mask a
@@ -40,16 +32,6 @@ const METADATA_READ_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 // File bodies have a longer per-attempt timeout than metadata. Their total
 // budget must exceed one attempt or a congested first request can never retry.
 const FILE_READ_RETRY_TIMEOUT: Duration = Duration::from_secs(45);
-/// Budget for hard-link alias resolution, which runs on the UNLINK path.
-///
-/// Deliberately far below `METADATA_READ_RETRY_TIMEOUT`. That budget exists to
-/// ride out a gateway restart for reads a caller cannot proceed without; this
-/// lookup is neither. A conflict here has only ever meant "the workspace is
-/// busy", and a busy workspace is the normal state during any package install —
-/// so spending the generic budget turned each unlink into a 30s stall
-/// (`operation="unlink" operation_time_ms=30723`). An unlink that cannot get an
-/// alias answer promptly is better served by proceeding than by waiting.
-const ALIAS_READ_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 const METADATA_READ_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const FILE_READ_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Hard wall for one streamed write publication. Large writes bypass the
@@ -63,80 +45,29 @@ const ADVISORY_LOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const ADVISORY_LOCK_RENEWAL_BATCH_SIZE: usize = 4_096;
 const READ_RETRY_DELAY_MIN: Duration = Duration::from_millis(50);
 const READ_RETRY_DELAY_MAX: Duration = Duration::from_millis(500);
-/// Long-poll window advertised to the gateway watch endpoint. The gateway
-/// returns 200 as soon as the owner revision advances past `since`, or 204 at
-/// this deadline. Kept inside the contract's 1000..30000 ms band.
-const REVISION_WATCH_TIMEOUT_MS: u64 = 25_000;
-/// Per-attempt HTTP budget for the watch poll: the long-poll window plus slack
-/// for the response to land. Explicitly overrides the client's 30s mutation
-/// timeout so a held-open watch is never mistaken for a stuck mutation.
-const REVISION_WATCH_ATTEMPT_TIMEOUT: Duration =
-    Duration::from_millis(REVISION_WATCH_TIMEOUT_MS + 5_000);
-/// Long-poll window for the FIRST poll after a failure, used only to re-establish
-/// liveness. `watch_live` is asserted when a poll RETURNS, and an idle long poll
-/// does not return until its deadline — so re-establishing with the normal
-/// window costs a full `REVISION_WATCH_TIMEOUT_MS` of `TTL=0` serving after even
-/// a momentary blip, on a connection that recovered immediately. A short first
-/// poll confirms the same thing (gateway reachable, `since` fence current)
-/// against the same endpoint, only sooner. `WATCH_TIMEOUT_MIN_MS` in the gateway
-/// is the floor for this value; going lower is clamped there, not honoured here.
-const REVISION_WATCH_REESTABLISH_TIMEOUT_MS: u64 = 1_000;
-/// Reconnect backoff floor after a watch failure; rides out a gateway restart.
-const REVISION_WATCH_BACKOFF_MIN: Duration = Duration::from_millis(500);
-/// Reconnect backoff ceiling. The watch is down and serves fail closed to
-/// strict while backing off, so a bounded retry cadence is enough.
-const REVISION_WATCH_BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// Content-hash budget the mount asks every bulk metadata route (`/tree`,
-/// `/metadata-many`, `/subtree-metadata`) to honour: hash a file at or under
-/// this size, skip it above.
+/// `/subtree-metadata`) to honour: hash a file at or under this size, skip it
+/// above.
 ///
-/// A full stat (`stat_path`, the route open(2) resolves through) promises a
-/// content hash — `read_bytes` matches cached bytes against it and `open`
-/// chains a write's CAS base from it — so an entry a bulk route installed
-/// WITHOUT one cannot stand in for it, and every open of such a path fell
-/// through to a point `/stat` (~30 per measured `git status` phase). Asking the
-/// bulk routes to hash makes those entries complete, so the open is served from
-/// the fence-matched cache instead of costing an RTT.
+/// Hydration is the only caller now, and it uses the hash as the content
+/// precondition it verifies each downloaded file against, so an entry that
+/// arrives hashed saves a verification read the mount would otherwise do
+/// itself.
 ///
 /// The bound is the whole design. Hashing is the gateway reading the file, and
 /// a bulk route can name thousands of paths, so an unbounded budget would turn
 /// a metadata sweep into a full content read of the tree. At 1 MiB a hash costs
-/// the gateway well under a millisecond of hardware-accelerated SHA-256 against
-/// a local read (and is memoized in its mtime/ctime-keyed hash cache, so a
-/// re-sweep is free), against the ~4ms RTT each avoided point stat saves. Above
-/// it, the point stat is the cheaper of the two and is what the mount keeps
-/// paying — `full_stat_metadata_is_complete` still gates the serve, so an
-/// unhashed entry wires exactly as it does today. The bulk routes are entry
-/// capped (`MAX_METADATA_BATCH_PATHS` / `MAX_SUBTREE_METADATA_ENTRIES`), so this
-/// bound is also what caps the work one request can ask of the gateway.
+/// the gateway well under a millisecond against a local read (and is memoized
+/// in its mtime/ctime-keyed hash cache, so a re-sweep is free). Above it the
+/// entry simply arrives hashless and the hydrator verifies the bytes it
+/// downloaded on its own terms. The bulk routes are entry capped
+/// (`MAX_METADATA_BATCH_PATHS` / `MAX_SUBTREE_METADATA_ENTRIES`), so this bound
+/// is also what caps the work one request can ask of the gateway.
 ///
 /// This is a request, not a requirement: `max_hash_bytes` is an established
-/// query/body field on all three routes, and a gateway that ignores it (or
-/// answers without hashes at all) simply leaves entries incomplete and the
-/// mount falls through to the wire as before.
+/// query/body field on both routes, and a gateway that ignores it (or answers
+/// without hashes at all) simply leaves entries unhashed.
 pub(super) const BULK_METADATA_MAX_HASH_BYTES: u64 = 1024 * 1024;
-
-/// Hashing budget for the point `/stat` an `open(2)` falls through to when the
-/// bulk-seeded entry is incomplete.
-///
-/// The point stat sends no budget by default — it owes its caller a hash at any
-/// size — and hashing is the gateway READING the file. For a file past this
-/// bound that trade is indefensible: opening a 5 GiB ML dataset makes the
-/// gateway read 5 GiB, once per hash-cache expiry, to produce a hash the open
-/// cannot use. It cannot, because a file this large is never held in the mount's
-/// whole-file content cache (`MAX_FILE_BYTES` in fuse/cache.rs, the same 10 MiB
-/// as `LARGE_FILE_BYTES`): there are no cached bytes to match it against, and
-/// ranged reads are pinned by fingerprint, not by hash. The one remaining
-/// consumer is the CAS base a later write chains from, and that base is
-/// established authoritatively when the handle is first loaded for that write.
-///
-/// So the budget is set exactly at the content-cache ceiling: at or under it the
-/// gateway still hashes (the open needs the hash to match cached bytes, and the
-/// read is bounded), past it the answer comes back hashless and the open serves
-/// it as-is. Callers that genuinely require a hash now (`O_TRUNC`, whose CAS
-/// base is fixed at open because it publishes without ever loading) keep using
-/// the unbounded `stat_versioned`.
-pub(super) const OPEN_STAT_MAX_HASH_BYTES: u64 = 10 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct RemoteVfsClient {
@@ -145,193 +76,26 @@ pub struct RemoteVfsClient {
     auth_token: String,
     scope_path: String,
     revisions: Arc<SharedRevisionState>,
-    /// Paths this mount currently has a publication in flight for. Shared by
-    /// every clone of one mount's client (the journals hold clones) and by
-    /// nothing else — see [`InFlightPublications`].
-    publications: Arc<InFlightPublications>,
 }
 
-/// The mount-relative paths one mount is publishing to the gateway right now.
+/// The little cross-clone state one mount's client keeps.
 ///
-/// This exists for exactly one decision: whether a kernel revocation may be put
-/// on a publication's ack path. `notify_inval_entry` blocks in the guest kernel
-/// on the affected dentry's PARENT inode lock, and the op that is publishing
-/// holds that lock for its whole duration — so a revocation for a path this
-/// mount is itself publishing cannot land until that publication returns, and
-/// the publication cannot return until the watcher acks. That is a lock-order
-/// inversion, not a coherence requirement: measured at 27.6 ms per publication
-/// (200/200 hitting the 25 ms ack cap) against 0.40 ms when the same revocation
-/// does not contend.
-///
-/// Refcounted rather than a set: two batches may have the same path in flight
-/// (a content write behind a namespace mutation), and the first to finish must
-/// not un-register the second.
-#[derive(Debug, Default)]
-pub(super) struct InFlightPublications {
-    inner: Mutex<HashMap<String, usize>>,
-}
-
-impl InFlightPublications {
-    /// Register `paths` for the life of the returned guard.
-    pub(super) fn begin(self: &Arc<Self>, paths: Vec<String>) -> InFlightPublicationGuard {
-        {
-            let mut inner = self
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for path in &paths {
-                *inner.entry(path.clone()).or_insert(0) += 1;
-            }
-        }
-        InFlightPublicationGuard {
-            publications: Arc::clone(self),
-            paths,
-        }
-    }
-
-    /// Whether this mount is currently publishing `path` itself.
-    pub(super) fn contains(&self, path: &str) -> bool {
-        let inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if inner.is_empty() {
-            return false;
-        }
-        inner.contains_key(path.trim_matches('/'))
-    }
-
-    /// Fast negative for the common case (nothing in flight), so the revocation
-    /// path never pays a per-target lookup it cannot need.
-    pub(super) fn is_idle(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty()
-    }
-
-    /// Snapshot the paths whose publication response is still waiting on this
-    /// mount's revision-watch acknowledgement.
-    pub(super) fn paths(&self) -> HashSet<String> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .keys()
-            .cloned()
-            .collect()
-    }
-}
-
-/// Drops one publication's registration, including on the error path — a
-/// publication that fails still stops being in flight.
-pub(super) struct InFlightPublicationGuard {
-    publications: Arc<InFlightPublications>,
-    paths: Vec<String>,
-}
-
-impl Drop for InFlightPublicationGuard {
-    fn drop(&mut self) {
-        let mut inner = self
-            .publications
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for path in &self.paths {
-            if let Some(count) = inner.get_mut(path) {
-                *count -= 1;
-                if *count == 0 {
-                    inner.remove(path);
-                }
-            }
-        }
-    }
-}
-
-/// Every mount-relative path a batch of namespace mutations publishes. Both
-/// endpoints of a rename and both ends of a hard link are in flight together:
-/// the op holds each one's parent inode lock for the whole publication.
-fn in_flight_namespace_paths(mutations: &[VfsNamespaceMutation]) -> Vec<String> {
-    let mut paths = HashSet::new();
-    for path in mutations
-        .iter()
-        .flat_map(|mutation| mutation.paths())
-        .map(|path| path.trim_matches('/'))
-        .filter(|path| !path.is_empty())
-    {
-        paths.insert(path.to_string());
-        paths.insert(parent_path(path));
-    }
-    paths.into_iter().collect()
-}
-
-/// Mirror the affected-set shape produced by gateway `write-many`: every
-/// written path, plus the parent directory when the write owns an unpublished
-/// creation. The publication changes that parent's listing too, and a busy
-/// installer commonly has another create holding the parent's kernel lock.
-/// Marking only the leaf made the mount's own watcher try to revoke its parent
-/// before acking, so each publication rode the gateway ack cap.
-fn in_flight_write_paths(writes: &[RemoteWrite]) -> Vec<String> {
-    let mut paths = HashSet::new();
-    for write in writes {
-        let path = write.path.trim_matches('/');
-        if path.is_empty() {
-            continue;
-        }
-        paths.insert(path.to_string());
-        if write.mode.is_some() {
-            paths.insert(parent_path(path));
-        }
-    }
-    paths.into_iter().collect()
-}
-
+/// It used to be a per-(endpoint, scope) registry backing a coherence fence and
+/// a long-poll revision watch. Both are gone: a writable mount owns its scope
+/// and serves every read from its backing tree, so there is nothing for a
+/// sibling to invalidate and nothing to keep confirmed. What survives is the
+/// highest namespace revision this client has seen an authoritative read answer
+/// with -- the seed a read-only observer's follower starts its poll from -- and
+/// the gateway's implicit-lease advertisement.
 #[derive(Debug, Default)]
 struct SharedRevisionState {
-    /// Highest revision proven visible by an authoritative read. Namespace
-    /// projections may retire only against this value.
+    /// Highest revision proven visible by an authoritative read through this
+    /// client. Read by `observed_namespace_revision`.
     observed_read: AtomicU64,
-    /// Highest revision either read or published by a sibling mount. Cache
-    /// entries are valid only while this generation is unchanged.
-    coherence: AtomicU64,
     /// Set only after the gateway explicitly advertises that mutation
     /// endpoints provide their own serialization. Real lease-backed gateways
     /// never set this and retain acquire/release behavior unchanged.
     implicit_leases: AtomicBool,
-    /// True only while a long-poll revision watch is actively confirming this
-    /// registry's coherence fence. Amortized cache serves are valid only under
-    /// a live watch; when it drops the fs layer fails closed to strict,
-    /// wire-backed serves. This is a live-channel signal, never a wall-clock
-    /// freshness window.
-    watch_live: AtomicBool,
-    /// Guards lazy, once-per-registry spawn of the watch task. The first mount
-    /// to use this registry flips it and owns the detached watch loop.
-    watch_started: AtomicBool,
-    /// Stable, opaque identity for this registry's single watch loop, sent as
-    /// `watcher_id` on every poll. The gateway keys revocation-ack progress by
-    /// it: a poll's `since` acks that revision, and a sibling's publication
-    /// blocks until this watcher's ack reaches the published revision. Generated
-    /// once per registry — every sibling mount of the same (endpoint, scope)
-    /// shares this one watch loop and therefore this one identity.
-    watcher_id: String,
-}
-
-fn shared_revision_state(key: &str) -> Arc<SharedRevisionState> {
-    static STATES: OnceLock<Mutex<HashMap<String, Weak<SharedRevisionState>>>> = OnceLock::new();
-    let mut states = STATES
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(state) = states.get(key).and_then(Weak::upgrade) {
-        return state;
-    }
-    let state = Arc::new(SharedRevisionState {
-        // A fresh identity per registry so every observer mount-host acks
-        // independently; the default atomics fill the rest.
-        watcher_id: uuid::Uuid::new_v4().to_string(),
-        ..Default::default()
-    });
-    states.insert(key.to_string(), Arc::downgrade(&state));
-    state
 }
 
 pub struct RemoteWrite {
@@ -431,101 +195,27 @@ impl RemoteVfsClient {
             builder = builder.http2_prior_knowledge();
         }
         let client = builder.build().context("build vfs reqwest client")?;
-        let revisions = shared_revision_state(&format!("{endpoint}\n{scope_path}"));
         Ok(Self {
             client,
             endpoint,
             auth_token: auth_token.to_string(),
             scope_path,
-            revisions,
-            publications: Arc::new(InFlightPublications::default()),
+            revisions: Arc::new(SharedRevisionState::default()),
         })
     }
 
-    /// This mount's in-flight publication set, handed to its kernel-invalidation
-    /// hook so a revocation for a path the mount is itself publishing never gates
-    /// that publication's ack.
-    pub(super) fn in_flight_publications(&self) -> Arc<InFlightPublications> {
-        Arc::clone(&self.publications)
-    }
-
+    /// Highest namespace revision an authoritative read through this client has
+    /// answered with. A read-only observer's follower seeds its poll from it so
+    /// a hydrate that already saw the current revision does not immediately
+    /// re-read the scope.
     pub fn observed_namespace_revision(&self) -> u64 {
         self.revisions.observed_read.load(Ordering::Acquire)
-    }
-
-    pub fn coherence_revision(&self) -> u64 {
-        self.revisions.coherence.load(Ordering::Acquire)
-    }
-
-    pub fn coherence_key(&self) -> String {
-        format!("{}\n{}", self.endpoint, self.scope_path)
     }
 
     fn observe_read_revision(&self, revision: u64) {
         self.revisions
             .observed_read
             .fetch_max(revision, Ordering::AcqRel);
-        self.revisions
-            .coherence
-            .fetch_max(revision, Ordering::AcqRel);
-    }
-
-    pub(super) fn observe_published_revision(&self, revision: u64) {
-        self.revisions
-            .coherence
-            .fetch_max(revision, Ordering::AcqRel);
-    }
-
-    /// Whether a long-poll revision watch is currently confirming this
-    /// registry's coherence fence. The fs layer serves amortized cache hits
-    /// only while this is true and fails closed to strict serves otherwise.
-    pub(super) fn revision_watch_live(&self) -> bool {
-        self.revisions.watch_live.load(Ordering::Acquire)
-    }
-
-    /// Lazily start the per-registry revision watch on first mount use. The
-    /// watch keeps the coherence fence continuously confirmed so cache serves
-    /// are valid; it is spawned exactly once per endpoint+scope registry and
-    /// runs detached (it holds only weak references and never blocks process
-    /// shutdown). `cache` is the shared cache for this registry, notified so a
-    /// remote publication observed by the watch clears superseded entries;
-    /// `invalidators` is the shared set of every mount's kernel-invalidation
-    /// hook, swept in lockstep so a remote publication also revokes the affected
-    /// kernel attr/entry leases before the watch acks it.
-    pub(super) fn ensure_revision_watch(
-        &self,
-        tokio: &Handle,
-        cache: &Arc<RemoteFuseCache>,
-        invalidators: &Arc<MountInvalidators>,
-    ) {
-        if self.revisions.watch_started.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let http = self.client.clone();
-        let endpoint = self.endpoint.clone();
-        let auth_token = self.auth_token.clone();
-        // The registry is keyed by endpoint + scope, so every mount sharing this
-        // watch shares this scope — which is what makes it sound to translate
-        // one answer's owner-absolute paths into mount-relative ones once, here.
-        let scope_path = self.scope_path.clone();
-        let revisions = Arc::downgrade(&self.revisions);
-        let cache = Arc::downgrade(cache);
-        let notifiers = Arc::downgrade(invalidators);
-        let publications = Arc::downgrade(&self.publications);
-        tokio.spawn(run_revision_watch(
-            http,
-            endpoint,
-            auth_token,
-            scope_path,
-            revisions,
-            cache,
-            notifiers,
-            publications,
-        ));
-    }
-
-    pub async fn list_dir(&self, path: &str) -> Result<Option<Vec<RemoteDirEntry>>> {
-        Ok(self.list_dir_versioned(path).await?.value)
     }
 
     pub async fn list_dir_versioned(
@@ -553,68 +243,22 @@ impl RemoteVfsClient {
         .await
     }
 
-    pub async fn stat(&self, path: &str) -> Result<Option<RemoteMetadata>> {
-        Ok(self.stat_versioned(path).await?.value)
-    }
-
-    pub async fn stat_attributes(&self, path: &str) -> Result<Option<RemoteMetadata>> {
-        Ok(self.stat_attributes_versioned(path).await?.value)
-    }
-
+    /// A point stat carrying the gateway's full content hash. Hydration's
+    /// per-file precondition and the publisher's reconciliation read both need
+    /// it, so it is deliberately unbounded.
     pub async fn stat_versioned(&self, path: &str) -> Result<Versioned<Option<RemoteMetadata>>> {
         self.stat_with_max_hash_bytes_versioned(path, None).await
     }
 
+    /// The cheapest point stat the gateway offers: attributes and the scope's
+    /// namespace revision, no content hash and therefore no gateway-side read.
+    /// This is the read a read-only observer's follower probes the scope
+    /// revision with.
     pub async fn stat_attributes_versioned(
         &self,
         path: &str,
     ) -> Result<Versioned<Option<RemoteMetadata>>> {
         self.stat_with_max_hash_bytes_versioned(path, Some(0)).await
-    }
-
-    /// A point stat for a caller that can proceed without a hash it would have
-    /// no use for. See [`OPEN_STAT_MAX_HASH_BYTES`]: the gateway hashes up to
-    /// the mount's content-cache ceiling and answers hashless past it, so an
-    /// open of a multi-GB file never asks the gateway to read multi-GB.
-    pub async fn stat_bounded_hash_versioned(
-        &self,
-        path: &str,
-    ) -> Result<Versioned<Option<RemoteMetadata>>> {
-        self.stat_with_max_hash_bytes_versioned(path, Some(OPEN_STAT_MAX_HASH_BYTES))
-            .await
-    }
-
-    pub async fn metadata_many_attributes(
-        &self,
-        paths: &[String],
-    ) -> Result<Vec<Option<RemoteMetadata>>> {
-        Ok(self.metadata_many_attributes_versioned(paths).await?.value)
-    }
-
-    pub async fn metadata_many_attributes_versioned(
-        &self,
-        paths: &[String],
-    ) -> Result<Versioned<Vec<Option<RemoteMetadata>>>> {
-        let body = VfsMetadataManyRequest {
-            paths: paths.iter().map(|path| self.path_arg(path)).collect(),
-        };
-        self.read_decoded(
-            self.client
-                .post(self.url("/metadata-many"))
-                .query(&[("max_hash_bytes", BULK_METADATA_MAX_HASH_BYTES)])
-                .json(&body)
-                .timeout(METADATA_READ_ATTEMPT_TIMEOUT),
-            METADATA_READ_RETRY_TIMEOUT,
-            |status, body| {
-                if !status.is_success() {
-                    return Err(anyhow!("vfs metadata-many failed: {status}"));
-                }
-                serde_json::from_slice::<VfsMetadataManyResponse>(body)
-                    .context("decode vfs metadata-many response")
-                    .map(|response| response.entries)
-            },
-        )
-        .await
     }
 
     pub async fn subtree_metadata_attributes_versioned(
@@ -733,10 +377,6 @@ impl RemoteVfsClient {
         .await
     }
 
-    pub async fn read_file_raw(&self, path: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self.read_file_raw_versioned(path).await?.value)
-    }
-
     pub async fn read_file_raw_versioned(&self, path: &str) -> Result<Versioned<Option<Vec<u8>>>> {
         self.read_decoded(
             self.client
@@ -755,19 +395,6 @@ impl RemoteVfsClient {
             },
         )
         .await
-    }
-
-    pub async fn read_file_range(
-        &self,
-        path: &str,
-        offset: u64,
-        length: u64,
-        fingerprint: Option<&str>,
-    ) -> Result<RangeRead> {
-        Ok(self
-            .read_file_range_versioned(path, offset, length, fingerprint)
-            .await?
-            .value)
     }
 
     pub async fn read_file_range_versioned(
@@ -799,241 +426,6 @@ impl RemoteVfsClient {
             Ok(RangeRead::Bytes(body.to_vec()))
         })
         .await
-    }
-
-    pub async fn write_file(
-        &self,
-        path: &str,
-        bytes: &[u8],
-        executable: bool,
-        mode: Option<u32>,
-        lease: &LeaseGrant,
-        surface_kind: &str,
-        operation: &str,
-        base_content_hash: Option<&str>,
-        expected_file_id: Option<&str>,
-    ) -> Result<()> {
-        let mut request = self
-            .client
-            .put(self.url("/file"))
-            .query(&[("path", self.path_arg(path))])
-            .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
-            .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
-            .header(CHEVALIER_VFS_OPERATION_HEADER, operation)
-            .header(CHEVALIER_VFS_EXECUTABLE_HEADER, executable.to_string())
-            .header(
-                CHEVALIER_VFS_RESOURCE_KEY_HEADER,
-                lease.resource_key.as_str(),
-            )
-            .header(
-                CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
-                lease.owner_token.to_string(),
-            );
-        request = with_mode_header(request, mode);
-        request = with_precondition_headers(request, base_content_hash, expected_file_id);
-        self.request_mutation(request.body(bytes.to_vec())).await?;
-        Ok(())
-    }
-
-    pub async fn delete_file(
-        &self,
-        path: &str,
-        lease: &LeaseGrant,
-        surface_kind: &str,
-        operation: &str,
-    ) -> Result<()> {
-        self.request_mutation(
-            self.client
-                .delete(self.url("/file"))
-                .query(&[("path", self.path_arg(path))])
-                .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
-                .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
-                .header(CHEVALIER_VFS_OPERATION_HEADER, operation)
-                .header(
-                    CHEVALIER_VFS_RESOURCE_KEY_HEADER,
-                    lease.resource_key.as_str(),
-                )
-                .header(
-                    CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
-                    lease.owner_token.to_string(),
-                ),
-        )
-        .await?;
-        Ok(())
-    }
-
-    pub async fn mkdir(
-        &self,
-        path: &str,
-        mode: Option<u32>,
-        lease: &LeaseGrant,
-        surface_kind: &str,
-        operation: &str,
-    ) -> Result<()> {
-        let request = self
-            .client
-            .put(self.url("/dir"))
-            .query(&[("path", self.path_arg(path))])
-            .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
-            .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
-            .header(CHEVALIER_VFS_OPERATION_HEADER, operation)
-            .header(
-                CHEVALIER_VFS_RESOURCE_KEY_HEADER,
-                lease.resource_key.as_str(),
-            )
-            .header(
-                CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
-                lease.owner_token.to_string(),
-            );
-        self.request_mutation(with_mode_header(request, mode))
-            .await?;
-        Ok(())
-    }
-
-    pub async fn create_symlink(
-        &self,
-        path: &str,
-        target: &str,
-        lease: &LeaseGrant,
-        surface_kind: &str,
-        operation: &str,
-    ) -> Result<()> {
-        self.request_mutation(
-            self.client
-                .put(self.url("/symlink"))
-                .query(&[
-                    ("path", self.path_arg(path)),
-                    ("target", target.to_string()),
-                ])
-                .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
-                .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
-                .header(CHEVALIER_VFS_OPERATION_HEADER, operation)
-                .header(
-                    CHEVALIER_VFS_RESOURCE_KEY_HEADER,
-                    lease.resource_key.as_str(),
-                )
-                .header(
-                    CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
-                    lease.owner_token.to_string(),
-                ),
-        )
-        .await?;
-        Ok(())
-    }
-
-    pub async fn create_hard_link(
-        &self,
-        source_path: &str,
-        destination_path: &str,
-        lease: &LeaseGrant,
-        surface_kind: &str,
-    ) -> Result<VfsHardLinkMetadataResponse> {
-        self.request_mutation(
-            self.client
-                .post(self.url("/hard-link/v1"))
-                .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
-                .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
-                .header(CHEVALIER_VFS_OPERATION_HEADER, "vfs_hard_link")
-                .header(
-                    CHEVALIER_VFS_RESOURCE_KEY_HEADER,
-                    lease.resource_key.as_str(),
-                )
-                .header(
-                    CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
-                    lease.owner_token.to_string(),
-                )
-                .json(&VfsHardLinkBody {
-                    source_path: self.path_arg(source_path),
-                    destination_path: self.path_arg(destination_path),
-                }),
-        )
-        .await?
-        .json()
-        .await
-        .context("decode vfs hard-link response")
-    }
-
-    pub async fn find_hard_link_alias(
-        &self,
-        file_id: &str,
-        excluding_path: &str,
-    ) -> Result<Option<String>> {
-        Ok(self
-            .read_decoded(
-                self.client
-                    .post(self.url("/hard-link-alias/v1"))
-                    .json(&VfsHardLinkAliasBody {
-                        file_id: file_id.to_string(),
-                        excluding_path: self.path_arg(excluding_path),
-                    })
-                    .timeout(METADATA_READ_ATTEMPT_TIMEOUT),
-                ALIAS_READ_RETRY_TIMEOUT,
-                |status, body| {
-                    if !status.is_success() {
-                        return Err(anyhow!("vfs hard-link alias failed: {status}"));
-                    }
-                    serde_json::from_slice::<VfsHardLinkAliasResponse>(body)
-                        .context("decode vfs hard-link alias response")
-                        .map(|response| response.path.map(|path| self.unscoped_path(path.as_str())))
-                },
-            )
-            .await?
-            .value)
-    }
-
-    pub async fn rmdir(
-        &self,
-        path: &str,
-        lease: &LeaseGrant,
-        surface_kind: &str,
-        operation: &str,
-    ) -> Result<()> {
-        self.request_mutation(
-            self.client
-                .delete(self.url("/dir"))
-                .query(&[("path", self.path_arg(path))])
-                .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
-                .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
-                .header(CHEVALIER_VFS_OPERATION_HEADER, operation)
-                .header(
-                    CHEVALIER_VFS_RESOURCE_KEY_HEADER,
-                    lease.resource_key.as_str(),
-                )
-                .header(
-                    CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
-                    lease.owner_token.to_string(),
-                ),
-        )
-        .await?;
-        Ok(())
-    }
-
-    pub async fn rename(
-        &self,
-        from: &str,
-        to: &str,
-        lease: &LeaseGrant,
-        surface_kind: &str,
-        operation: &str,
-    ) -> Result<()> {
-        self.request_mutation(
-            self.client
-                .post(self.url("/rename"))
-                .query(&[("from", self.path_arg(from)), ("to", self.path_arg(to))])
-                .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
-                .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
-                .header(CHEVALIER_VFS_OPERATION_HEADER, operation)
-                .header(
-                    CHEVALIER_VFS_RESOURCE_KEY_HEADER,
-                    lease.resource_key.as_str(),
-                )
-                .header(
-                    CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
-                    lease.owner_token.to_string(),
-                ),
-        )
-        .await?;
-        Ok(())
     }
 
     pub async fn acquire_lease(
@@ -1233,13 +625,6 @@ impl RemoteVfsClient {
             .iter()
             .map(|mutation| self.scope_namespace_mutation(mutation))
             .collect::<Vec<_>>();
-        // Mark these paths in flight for the life of the request. The gateway
-        // holds the response until its watchers ack, and this mount's watcher
-        // must not be made to revoke a dentry whose parent inode lock the op
-        // parked on this very request is holding.
-        let _in_flight = self
-            .publications
-            .begin(in_flight_namespace_paths(mutations));
         let result = async {
             let response = self
                 .request_mutation(
@@ -1302,7 +687,7 @@ impl RemoteVfsClient {
     ) -> Result<RemotePublication> {
         if writes.is_empty() {
             return Ok(RemotePublication {
-                revision: self.coherence_revision(),
+                revision: self.observed_namespace_revision(),
                 entries: Vec::new(),
             });
         }
@@ -1314,9 +699,6 @@ impl RemoteVfsClient {
                 "flush vfs fuse write batch",
             )
             .await?;
-        // Same in-flight window as the namespace batch above: a content
-        // publication's own affected set must never gate its own ack.
-        let _in_flight = self.publications.begin(in_flight_write_paths(&writes));
         let body = VfsWriteManyBody {
             writes: writes
                 .into_iter()
@@ -1369,8 +751,8 @@ impl RemoteVfsClient {
     ///
     /// The gateway verifies `content_hash` while streaming the request to its
     /// own temporary file, then hands that file to the storage backend. Small
-    /// writes continue to use `write_many`; this is the bounded-memory path for
-    /// a single oversized journal entry.
+    /// writes continue to use `write_many`; this is the bounded-memory path the
+    /// publisher takes for a single oversized WAL payload.
     pub async fn write_staged_file(
         &self,
         path: &str,
@@ -1391,7 +773,7 @@ impl RemoteVfsClient {
             .with_context(|| format!("stat staged vfs stream {}", staged_path.display()))?;
         if !metadata.is_file() || metadata.len() != size_bytes {
             return Err(anyhow!(
-                "staged vfs stream {} has {} bytes but journal requires {}",
+                "staged vfs stream {} has {} bytes but the publication requires {}",
                 staged_path.display(),
                 metadata.len(),
                 size_bytes,
@@ -1401,14 +783,6 @@ impl RemoteVfsClient {
         let lease = self
             .acquire_lease(path, 1, "flush streamed vfs fuse write")
             .await?;
-        let in_flight = [RemoteWrite {
-            path: path.to_string(),
-            bytes: Vec::new(),
-            base_content_hash: base_content_hash.map(ToOwned::to_owned),
-            expected_file_id: expected_file_id.map(ToOwned::to_owned),
-            mode,
-        }];
-        let _in_flight = self.publications.begin(in_flight_write_paths(&in_flight));
         let result = async {
             let mut request = self
                 .client
@@ -1583,8 +957,10 @@ impl RemoteVfsClient {
         builder: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response> {
         let response = self.request(builder).await?;
-        let revision = parse_namespace_revision(response.headers())?;
-        self.observe_published_revision(revision);
+        // Validated, not recorded: a publication's revision belongs to the WAL's
+        // acknowledgement cursor, which the caller advances. Nothing in this
+        // client fences a read against it any more.
+        parse_namespace_revision(response.headers())?;
         Ok(response)
     }
 
@@ -1681,493 +1057,6 @@ impl RemoteVfsClient {
     }
 }
 
-#[derive(Deserialize)]
-struct RevisionWatchResponse {
-    revision: u64,
-    /// Paths published between the poll's `since` and `revision`.
-    ///
-    /// `None` means the field was absent — a gateway that does not report
-    /// affected paths at all — which is NOT the same as a present-but-empty
-    /// set ("this publication touched nothing this mount must revoke"). The
-    /// former must fall back to the conservative sweep; the latter is a
-    /// complete answer.
-    #[serde(default)]
-    paths: Option<Vec<String>>,
-    /// The subset of `paths` whose ENTIRE subtree the publications superseded —
-    /// a `RemoveDirectory` or a `Rename`, the only two mutations that can move
-    /// or remove a whole tree.
-    ///
-    /// `None` means the field was absent — a gateway too old to distinguish the
-    /// kinds — which is NOT the same as a present-but-empty set ("these
-    /// publications superseded no subtree"). The former must fall back to the
-    /// conservative reading of `paths` as prefixes; the latter is a complete
-    /// answer, and is what keeps a lock-file publication inside `.git/` from
-    /// evicting `.git/config`.
-    #[serde(default)]
-    subtrees: Option<Vec<String>>,
-    /// Set when the gateway could not report the affected set completely, so
-    /// `paths` must not be treated as exhaustive.
-    #[serde(default)]
-    truncated: bool,
-}
-
-/// The affected set one watch answer reported, split by scope.
-///
-/// The split is the whole point: a publication's affected set names each
-/// changed path AND its parent directory, so reading every entry as a subtree
-/// prefix means one `.git/index.lock` create drops the cached metadata of
-/// `.git/config`, `.git/HEAD`, `.git/info/exclude` and every ref — measured as
-/// 30 point stats over 9 paths per warm `git status`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct WatchAffected {
-    /// Exact paths the publications changed (each changed path plus its parent).
-    paths: Vec<String>,
-    /// Prefixes whose whole subtree they superseded. Equal to `paths` when the
-    /// gateway did not report the set at all — the conservative reading an
-    /// older gateway leaves no alternative to.
-    subtrees: Vec<String>,
-}
-
-impl WatchAffected {
-    /// Translate one answer out of the owner's namespace and into the one this
-    /// registry's cache and inode tables are keyed on.
-    ///
-    /// The watch is per (endpoint, scope) registry, so one scope applies to
-    /// every mount that observes this answer. A path outside that scope is
-    /// dropped rather than passed through: this mount cannot name it, so it
-    /// holds nothing to revoke for it, and passing it through would alias an
-    /// unrelated owner path onto a mount-relative one of the same spelling.
-    fn unscoped(self, scope_path: &str) -> Self {
-        let unscope = |paths: Vec<String>| {
-            paths
-                .into_iter()
-                .filter_map(|path| unscope_watch_path(scope_path, path.as_str()))
-                .collect()
-        };
-        Self {
-            paths: unscope(self.paths),
-            subtrees: unscope(self.subtrees),
-        }
-    }
-}
-
-/// One owner-absolute watch path as this registry's mounts name it, or `None`
-/// when it lies outside their scope.
-fn unscope_watch_path(scope_path: &str, path: &str) -> Option<String> {
-    let path = path.trim_matches('/');
-    let scope_path = scope_path.trim_matches('/');
-    if scope_path.is_empty() {
-        return Some(path.to_string());
-    }
-    if path == scope_path {
-        // The scope root itself: the mount's own root directory.
-        return Some(String::new());
-    }
-    path.strip_prefix(&format!("{scope_path}/"))
-        .map(str::to_string)
-}
-
-/// One completed watch poll. `Advanced` carries the new owner revision from a
-/// 200; `Unchanged` is a 204 long-poll timeout. Both mean the channel is live.
-enum RevisionWatchPoll {
-    /// The owner revision advanced. `affected` carries the exact set the
-    /// publications touched when the gateway could report it completely;
-    /// `None` means the watcher must fall back to its own conservative
-    /// revocation (older gateway, truncated set, or a watcher too far behind).
-    Advanced {
-        revision: u64,
-        affected: Option<WatchAffected>,
-    },
-    Unchanged,
-}
-
-/// A watch poll that did not complete cleanly. `Transport` is a send-class
-/// failure — the request never round-tripped (connect refused, or, by far most
-/// often, the gateway reaped our idle keep-alive socket under its own
-/// keepAliveTimeout, which is well under our 25s long-poll window). reqwest
-/// evicts the dead socket on that error, so an immediate retry lands on a fresh
-/// connection. `Protocol` is a completed round-trip the client rejects (a
-/// non-200/204 status, or an undecodable 200 body); retrying it on a fresh
-/// connection would not change the answer, so it fails through immediately.
-enum RevisionWatchError {
-    Transport(anyhow::Error),
-    Protocol(anyhow::Error),
-}
-
-impl RevisionWatchError {
-    /// The underlying cause, for the once-per-transition WARN. The classifier
-    /// only gates the immediate retry; the operator-facing message is identical
-    /// either way.
-    fn into_inner(self) -> anyhow::Error {
-        match self {
-            RevisionWatchError::Transport(error) | RevisionWatchError::Protocol(error) => error,
-        }
-    }
-}
-
-/// Edge-detects watch health so a WARN is emitted once per transition (down,
-/// then restored), never once per retry. Initial establishment is silent.
-#[derive(Debug, Default, PartialEq, Eq)]
-enum WatchHealth {
-    #[default]
-    Establishing,
-    Live,
-    Down,
-}
-
-impl WatchHealth {
-    /// Record a successful poll. Returns true only on the down -> live edge,
-    /// where a "watch restored" WARN should fire. The first establishment
-    /// (Establishing -> Live) returns false and stays silent.
-    fn on_success(&mut self) -> bool {
-        let restored = *self == WatchHealth::Down;
-        *self = WatchHealth::Live;
-        restored
-    }
-
-    /// Record a failed poll. Returns true only on the first edge into Down,
-    /// where a "watch unavailable" WARN should fire; further failures are
-    /// silent until the channel is restored.
-    fn on_failure(&mut self) -> bool {
-        let newly_down = *self != WatchHealth::Down;
-        *self = WatchHealth::Down;
-        newly_down
-    }
-}
-
-/// Read one watch 200 body into the affected set the watcher may act on.
-///
-/// An empty set from a gateway that reports completeness is a real answer
-/// ("nothing this mount must revoke"); truncation, or a gateway that omits
-/// `paths` entirely, forces the conservative fallback (`None`).
-///
-/// `subtrees` is read on the same terms one level down: present (empty
-/// included) means the gateway distinguished the prefixes it wholly superseded
-/// from the paths it merely touched, so a create/delete may not evict its
-/// siblings. Absent means an older gateway that cannot say which affected paths
-/// were directories it removed or renamed, and the only sound reading left is
-/// the one this client used before the split existed — every path is a prefix.
-fn watch_affected(body: RevisionWatchResponse) -> Option<WatchAffected> {
-    if body.truncated {
-        return None;
-    }
-    let paths = body.paths?;
-    Some(WatchAffected {
-        subtrees: body.subtrees.unwrap_or_else(|| paths.clone()),
-        paths,
-    })
-}
-
-/// Issue one long-poll against the gateway watch endpoint. Uses the same bearer
-/// auth as every other route and an explicit read-class timeout above the
-/// long-poll window so the client's default mutation timeout never applies.
-async fn poll_revision_watch(
-    http: &Client,
-    endpoint: &str,
-    auth_token: &str,
-    watcher_id: &str,
-    since: u64,
-    timeout_ms: u64,
-) -> Result<RevisionWatchPoll, RevisionWatchError> {
-    let response = http
-        .get(format!("{endpoint}/watch"))
-        .query(&[
-            ("since", since.to_string()),
-            ("timeout_ms", timeout_ms.to_string()),
-            // The stable identity that lets the gateway treat this poll's `since`
-            // as an ack of that revision and gate sibling publications on it.
-            ("watcher_id", watcher_id.to_string()),
-        ])
-        .bearer_auth(auth_token)
-        .timeout(REVISION_WATCH_ATTEMPT_TIMEOUT)
-        .send()
-        .await
-        // A failed `send` is the send-class case: the request never round-
-        // tripped, so the pooled socket (if any) is now evicted.
-        .context("send vfs revision watch")
-        .map_err(RevisionWatchError::Transport)?;
-    let status = response.status();
-    if status == StatusCode::NO_CONTENT {
-        return Ok(RevisionWatchPoll::Unchanged);
-    }
-    if status == StatusCode::OK {
-        let body: RevisionWatchResponse = response
-            .json()
-            .await
-            .context("decode vfs revision watch response")
-            .map_err(RevisionWatchError::Protocol)?;
-        return Ok(RevisionWatchPoll::Advanced {
-            revision: body.revision,
-            affected: watch_affected(body),
-        });
-    }
-    let body = response.text().await.unwrap_or_default();
-    Err(RevisionWatchError::Protocol(anyhow!(
-        "vfs revision watch returned {status} {body}"
-    )))
-}
-
-/// One watch poll, absorbing a single send-class blip. A gateway that reaps our
-/// idle keep-alive socket surfaces the reap as a transport error on the NEXT
-/// poll; reqwest evicts that dead socket as it fails, so the immediate retry
-/// lands on a fresh connection and succeeds. Only when the retry ALSO fails
-/// (a second consecutive failure) — or the first failure is a protocol reject,
-/// which a retry cannot fix — does the error reach the caller, which then
-/// declares the watch down. This keeps one reaped socket from flapping
-/// `watch_live` (and resurfacing strict serves) every keepAlive interval.
-async fn poll_revision_watch_resilient(
-    http: &Client,
-    endpoint: &str,
-    auth_token: &str,
-    watcher_id: &str,
-    since: u64,
-    timeout_ms: u64,
-) -> Result<RevisionWatchPoll, RevisionWatchError> {
-    match poll_revision_watch(http, endpoint, auth_token, watcher_id, since, timeout_ms).await {
-        Err(RevisionWatchError::Transport(first)) => {
-            tracing::debug!(
-                error = %first,
-                "vfs revision watch transport blip; retrying once on a fresh connection"
-            );
-            poll_revision_watch(http, endpoint, auth_token, watcher_id, since, timeout_ms).await
-        }
-        other => other,
-    }
-}
-
-/// Per-registry watch loop. Keeps the coherence fence continuously confirmed so
-/// the fs layer may serve fence-matched cache hits. Fails closed: any transport
-/// error or non-200/204 clears `watch_live` (strict serves resume) and backs
-/// off before retrying. Exits only when the registry itself is dropped so it
-/// never blocks process shutdown.
-async fn run_revision_watch(
-    http: Client,
-    endpoint: String,
-    auth_token: String,
-    scope_path: String,
-    revisions: Weak<SharedRevisionState>,
-    cache: Weak<RemoteFuseCache>,
-    notifiers: Weak<MountInvalidators>,
-    publications: Weak<InFlightPublications>,
-) {
-    let mut health = WatchHealth::default();
-    let mut backoff = REVISION_WATCH_BACKOFF_MIN;
-    // Set after a failure so the next poll re-establishes liveness on a short
-    // window instead of blocking `watch_live` behind a full idle long poll.
-    // Cleared as soon as a poll succeeds, so the steady state keeps the long
-    // window and its request cadence exactly as before.
-    let mut reestablishing = false;
-    // Capture the stable watcher identity once. It never changes for the life of
-    // the registry, and every poll must present it so the gateway can key ack
-    // progress to this watcher.
-    let watcher_id = match revisions.upgrade() {
-        Some(state) => state.watcher_id.clone(),
-        None => return,
-    };
-    loop {
-        // Read the fence, then drop the strong ref so a long-poll never pins
-        // the registry alive across the await.
-        let since = match revisions.upgrade() {
-            Some(state) => state.coherence.load(Ordering::Acquire),
-            None => return,
-        };
-        let timeout_ms = if reestablishing {
-            REVISION_WATCH_REESTABLISH_TIMEOUT_MS
-        } else {
-            REVISION_WATCH_TIMEOUT_MS
-        };
-        match poll_revision_watch_resilient(
-            &http,
-            &endpoint,
-            &auth_token,
-            &watcher_id,
-            since,
-            timeout_ms,
-        )
-        .await
-        {
-            Ok(poll) => {
-                reestablishing = false;
-                let Some(state) = revisions.upgrade() else {
-                    return;
-                };
-                if let RevisionWatchPoll::Advanced { revision, affected } = poll {
-                    // The gateway answers in the owner's namespace; this cache
-                    // and every mount's inode table are keyed on paths relative
-                    // to the registry's scope. Translate once, here, before
-                    // either is touched. Without it every targeted revocation
-                    // silently matched nothing: the path a sibling actually
-                    // changed was never evicted (it was retagged forward as
-                    // "unaffected"), and no kernel lease was revoked, yet the
-                    // watch still acked and unblocked the writer.
-                    let affected = affected.map(|affected| affected.unscoped(scope_path.as_str()));
-                    // ACK-ORDERING INVARIANT (revocation-acked publications): the
-                    // gateway treats the NEXT poll's `since` as this watcher's ack
-                    // of that revision, and a sibling's publication is blocked
-                    // until this ack lands. We MUST update the cache and expose the
-                    // new fence BEFORE that next poll is issued, so the ack can
-                    // never precede this mount becoming coherent.
-                    //
-                    // Cache first, fence second. Publishing `coherence` first
-                    // created a real reader race: concurrent FUSE callbacks saw
-                    // the new fence while the cache still carried the prior one,
-                    // treated every entry as stale, and started wire metadata/tree
-                    // fetches. An 8-vCPU package install amplified that tiny window
-                    // into thousands of requests. Retagging/evicting the cache
-                    // first is fail-closed while the old fence remains visible
-                    // (newly retagged entries simply cannot serve at the old
-                    // revision), then the release-store makes the coherent cache
-                    // and its revision visible together to later readers.
-                    //
-                    // Apply the publication to the shared cache with the SAME
-                    // set the kernel revocation below uses. The gateway reports
-                    // the exact union of paths published in `(since, revision]`
-                    // (or reports the answer truncated, in which case `affected`
-                    // is None), and that set is already trusted to be exhaustive
-                    // enough to drive every guest kernel's revocation — so
-                    // trusting anything less of it here was never a safety
-                    // property, only a cost. Discarding it meant every
-                    // publication, INCLUDING THIS PROCESS'S OWN, wiped the whole
-                    // shared cache: a warm `git status` re-read the entire tree
-                    // because git had rewritten its index mid-scan.
-                    //
-                    // Fail-closed is unchanged where it is load-bearing: without
-                    // a trustworthy set the blunt authoritative-revision clear
-                    // still runs, and the cache itself refuses the targeted path
-                    // whenever its own fence is older than `since` (publications
-                    // it never classified would otherwise go unaccounted for).
-                    if let Some(cache) = cache.upgrade() {
-                        match &affected {
-                            // Point paths evict their own entry (and their
-                            // parent's listing); only the prefixes the gateway
-                            // named as superseded subtrees evict descendants.
-                            // Reading every path as a prefix is what made one
-                            // `.git/index.lock` publication drop the cached
-                            // metadata of every `.git` internal and cost the
-                            // next `git status` phase 30 point stats.
-                            Some(affected) => {
-                                let local_paths = publications
-                                    .upgrade()
-                                    .map(|publications| publications.paths())
-                                    .unwrap_or_default();
-                                cache.observe_remote_publication_with_local_paths(
-                                    since,
-                                    revision,
-                                    &affected.paths,
-                                    &affected.subtrees,
-                                    &local_paths,
-                                )
-                            }
-                            None => cache.observe_authoritative_revision(revision),
-                        }
-                    }
-                    state.coherence.fetch_max(revision, Ordering::Release);
-                    // Extend the ack-ordering invariant to the KERNEL: this
-                    // remote publication carries only a revision (no path set),
-                    // so sweep every attr/dentry each mount of this registry
-                    // handed its kernel. This MUST complete before the ack — the
-                    // next loop iteration reads `since` from `coherence`
-                    // (advanced above) and re-polls, and the gateway treats that
-                    // poll as this watcher's ack, unblocking the remote writer.
-                    // Sweeping here guarantees the writer's fsync return implies
-                    // this process's kernels hold no superseded attrs, exactly as
-                    // the cache clear guarantees no stale userspace serve.
-                    //
-                    // The notifier calls themselves run on the registry's
-                    // invalidation worker, never inline here: they block in the
-                    // guest kernel (`fuse_reverse_inval_entry` waits on the
-                    // parent inode's lock, held by whatever op is mutating that
-                    // directory) and this is a tokio runtime thread — the same
-                    // pool serving the FUSE dispatch work that must complete for
-                    // that lock to drop. So enqueue, then await the drain: this
-                    // task holds no FUSE lock and no FUSE op waits on it, so
-                    // waiting here is safe and keeps the ordering exact.
-                    let swept = match notifiers.upgrade() {
-                        Some(notifiers) => {
-                            let ticket = match &affected {
-                                // The gateway reported exactly what changed, so
-                                // revoke that and nothing else. This is the whole
-                                // point of the targeted set: an untargeted sweep
-                                // is proportional to the mount's working set and
-                                // takes a guest-kernel parent-inode write lock
-                                // per entry, which stalls the guest's own lookups
-                                // behind it.
-                                Some(affected) => notifiers.enqueue_revocation_tracked(
-                                    &PublicationInvalidation::for_affected(
-                                        &affected.paths,
-                                        &affected.subtrees,
-                                    ),
-                                ),
-                                // No trustworthy set: fall back to the untargeted
-                                // sweep, which declines itself past its own bound
-                                // and fails closed rather than storming.
-                                None => notifiers.enqueue_full_sweep_tracked(),
-                            };
-                            // Resolves only once THIS enqueued revocation has
-                            // been applied (or refused: a saturated queue and a
-                            // shutting-down worker both resolve to `false`, which
-                            // takes the same fail-closed path below as a notifier
-                            // error).
-                            ticket.landed().await
-                        }
-                        None => true,
-                    };
-                    if !swept {
-                        // A revocation did not land, so the kernel may still
-                        // serve an attr this revision supersedes. Acking now
-                        // would unblock the remote writer against that stale
-                        // lease, so fail closed instead: drop watch liveness
-                        // (subsequent replies carry TTL=0 and every serve is
-                        // wire-backed) and hold the ack until any lease granted
-                        // before the failure has expired on its own.
-                        tracing::warn!(
-                            revision,
-                            "vfs kernel revocation incomplete; serving strict until leases expire"
-                        );
-                        state.watch_live.store(false, Ordering::Release);
-                        drop(state);
-                        tokio::time::sleep(ATTR_ENTRY_LEASE_TTL).await;
-                        // The lease-expiry hold above is the fail-closed part and
-                        // is unchanged. Re-establish on the short window after it:
-                        // the ack is sent when the next poll is ISSUED, not when it
-                        // returns, so the window cannot move the ack — it only
-                        // decides whether liveness returns in ~1s or sits at TTL=0
-                        // for a full idle long poll after a 1s hold.
-                        reestablishing = true;
-                        continue;
-                    }
-                }
-                // Set last: an observer that sees watch_live is guaranteed to
-                // also see the fence advance, cache clear, and kernel sweep
-                // above.
-                state.watch_live.store(true, Ordering::Release);
-                drop(state);
-                if health.on_success() {
-                    tracing::warn!("vfs revision watch restored");
-                }
-                backoff = REVISION_WATCH_BACKOFF_MIN;
-                // Immediate re-poll (no sleep/backoff on success): this next poll
-                // carries the ack for the revision just applied, so writer-visible
-                // ack latency is ~RTT + apply cost, not RTT + a backoff.
-            }
-            Err(error) => {
-                reestablishing = true;
-                if let Some(state) = revisions.upgrade() {
-                    state.watch_live.store(false, Ordering::Release);
-                }
-                if health.on_failure() {
-                    tracing::warn!(
-                        error = %error.into_inner(),
-                        "vfs revision watch unavailable; serving strict metadata"
-                    );
-                }
-                tokio::time::sleep(backoff).await;
-                backoff = backoff.saturating_mul(2).min(REVISION_WATCH_BACKOFF_MAX);
-            }
-        }
-    }
-}
-
 fn implicit_lease_grant(scoped_path: &str) -> LeaseGrant {
     LeaseGrant {
         resource_key: format!("implicit:{scoped_path}"),
@@ -2234,8 +1123,8 @@ fn with_precondition_headers(
     request
 }
 
-/// HTTP status carried through anyhow chains so journal replay can tell a
-/// gateway rejection (4xx, will never succeed) from a transient failure.
+/// HTTP status carried through anyhow chains so the publisher can tell a gateway
+/// rejection (4xx, will never succeed) from a transient failure.
 #[derive(Debug)]
 pub struct VfsRequestStatusError {
     pub status: StatusCode,
@@ -2365,8 +1254,11 @@ fn common_parent<'a>(paths: impl Iterator<Item = &'a str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Mutex;
+
     use axum::response::IntoResponse;
+
+    use super::*;
 
     #[test]
     fn read_retry_budgets_exceed_their_attempt_timeouts() {
@@ -2374,233 +1266,11 @@ mod tests {
         assert!(FILE_READ_RETRY_TIMEOUT > FILE_READ_ATTEMPT_TIMEOUT);
     }
 
-    /// DEGENERATE WORKLOAD GATE — a busy namespace must not turn one filesystem
-    /// operation into a multi-second stall.
-    ///
-    /// `hard-link-alias/v1` runs on the UNLINK path, and the gateway answers 409
-    /// ("namespace changed during recursive snapshot") whenever a writer overlaps
-    /// its optimistic snapshot. Under `pnpm install` — which hard-links thousands
-    /// of files and so needs alias resolution on nearly every unlink — that
-    /// overlap is the steady state, not the exception. Retrying it against the
-    /// generic 30s metadata budget produced exactly this in production:
-    ///
-    ///   vfs fuse operation ... operation="unlink" operation_time_ms=30723
-    ///
-    /// A 409 here means "the workspace is busy", and a busy workspace is normal.
-    /// The retry budget on this path must therefore be bounded tightly enough
-    /// that giving up and letting the caller proceed beats waiting.
-    #[test]
-    fn alias_lookup_under_sustained_snapshot_conflict_stays_within_a_bounded_budget() {
-        use std::sync::atomic::AtomicUsize;
-
-        /// What a single unlink may spend resolving an alias before the mount is
-        /// better off without the answer. Deliberately far below
-        /// `METADATA_READ_RETRY_TIMEOUT`, which exists for reads a caller cannot
-        /// proceed without.
-        const ALIAS_STALL_CEILING: Duration = Duration::from_secs(3);
-
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let server_attempts = Arc::clone(&attempts);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                axum::Router::new().route(
-                    "/hard-link-alias/v1",
-                    axum::routing::post(move || {
-                        let attempts = Arc::clone(&server_attempts);
-                        async move {
-                            attempts.fetch_add(1, Ordering::AcqRel);
-                            // Exactly what the gateway returns when a writer
-                            // overlapped every optimistic-snapshot attempt.
-                            (
-                                axum::http::StatusCode::CONFLICT,
-                                "namespace changed during recursive snapshot; retry",
-                            )
-                                .into_response()
-                        }
-                    }),
-                ),
-            )
-            .await
-            .unwrap();
-        });
-        let client = RemoteVfsClient::new(&endpoint, "token", "scope").unwrap();
-
-        let started = Instant::now();
-        let settled = runtime.block_on(async {
-            tokio::time::timeout(
-                ALIAS_STALL_CEILING,
-                client.find_hard_link_alias("file-1", "pkg/node_modules/.bin/thing"),
-            )
-            .await
-        });
-        let elapsed = started.elapsed();
-        server.abort();
-
-        assert!(
-            settled.is_ok(),
-            "alias lookup was still retrying after {:?} against a namespace that is \
-             merely BUSY (generic budget is {:?}, {} attempts made). Every hard-link \
-             unlink pays this, so a package install stalls for the whole budget per file.",
-            ALIAS_STALL_CEILING,
-            METADATA_READ_RETRY_TIMEOUT,
-            attempts.load(Ordering::Acquire),
-        );
-        assert!(
-            elapsed < ALIAS_STALL_CEILING,
-            "alias lookup consumed {elapsed:?}, over the {ALIAS_STALL_CEILING:?} ceiling"
-        );
-        // Whatever the outcome, a 409 must not be reported as a hard failure that
-        // strands the unlink; the caller needs an answer it can act on.
-        assert!(
-            settled.is_ok(),
-            "alias lookup must resolve or give up within its budget"
-        );
-    }
-
-    /// The gateway answers in the OWNER's namespace; the shared cache and every
-    /// mount's inode table are keyed relative to the registry's scope. Until the
-    /// answer is translated, every targeted revocation matched nothing at all —
-    /// the path a sibling mount actually changed was retagged forward as
-    /// "unaffected" instead of evicted, and no kernel lease was revoked, yet the
-    /// watch still acked and unblocked the writer.
-    #[test]
-    fn watch_paths_are_translated_out_of_the_owner_namespace() {
-        let affected = WatchAffected {
-            paths: vec![
-                "test-scope/git/index.lock".to_string(),
-                "test-scope/git".to_string(),
-                "test-scope".to_string(),
-                "other-scope/unrelated".to_string(),
-            ],
-            subtrees: vec![
-                "test-scope/tree/doomed".to_string(),
-                "other-scope/tree".to_string(),
-            ],
-        };
-
-        assert_eq!(
-            affected.clone().unscoped("test-scope"),
-            WatchAffected {
-                // The scope root maps to this mount's own root ("").
-                paths: vec![
-                    "git/index.lock".to_string(),
-                    "git".to_string(),
-                    String::new(),
-                ],
-                subtrees: vec!["tree/doomed".to_string()],
-            },
-            "a path outside the scope is dropped, never passed through: this \
-             mount cannot name it, and passing it through would alias an \
-             unrelated owner path onto a mount-relative one of the same spelling"
-        );
-
-        // An unscoped registry sees the owner namespace directly.
-        assert_eq!(
-            WatchAffected {
-                paths: vec!["a/b".to_string()],
-                subtrees: Vec::new(),
-            }
-            .unscoped(""),
-            WatchAffected {
-                paths: vec!["a/b".to_string()],
-                subtrees: Vec::new(),
-            }
-        );
-    }
-
-    /// A watch answer's `subtrees` field decides whether a publication may cost
-    /// a sibling entry its cached metadata, so all three of its states must stay
-    /// distinguishable on the wire: populated, present-and-empty, and absent.
-    #[test]
-    fn watch_subtrees_distinguish_present_empty_from_absent() {
-        let decode = |body: serde_json::Value| {
-            watch_affected(serde_json::from_value::<RevisionWatchResponse>(body).unwrap())
-        };
-
-        // Present and EMPTY: a create/delete supersedes its own path and its
-        // parent's listing, and nothing beneath either. No prefixes.
-        assert_eq!(
-            decode(serde_json::json!({
-                "revision": 18,
-                "paths": ["git/index.lock", "git"],
-                "subtrees": [],
-            })),
-            Some(WatchAffected {
-                paths: vec!["git/index.lock".to_string(), "git".to_string()],
-                subtrees: Vec::new(),
-            })
-        );
-
-        // Populated: only the rmdir/rename prefixes, never their parents.
-        assert_eq!(
-            decode(serde_json::json!({
-                "revision": 19,
-                "paths": ["tree/doomed", "tree"],
-                "subtrees": ["tree/doomed"],
-            })),
-            Some(WatchAffected {
-                paths: vec!["tree/doomed".to_string(), "tree".to_string()],
-                subtrees: vec!["tree/doomed".to_string()],
-            })
-        );
-
-        // ABSENT: an older gateway that cannot say which paths were directories.
-        // The only sound reading left is the pre-split one — every path is a
-        // prefix — which is conservative, not weaker.
-        assert_eq!(
-            decode(serde_json::json!({
-                "revision": 20,
-                "paths": ["git/index.lock", "git"],
-            })),
-            Some(WatchAffected {
-                paths: vec!["git/index.lock".to_string(), "git".to_string()],
-                subtrees: vec!["git/index.lock".to_string(), "git".to_string()],
-            })
-        );
-
-        // Truncated and path-less answers keep forcing the full sweep.
-        assert_eq!(
-            decode(serde_json::json!({
-                "revision": 21,
-                "paths": [],
-                "subtrees": [],
-                "truncated": true,
-            })),
-            None
-        );
-        assert_eq!(decode(serde_json::json!({ "revision": 22 })), None);
-    }
-
-    /// Every bulk metadata route asks the gateway for a BOUNDED content hash,
-    /// and the point stat asks for an unbounded one.
-    ///
-    /// A full stat is the route open(2) resolves through, and it can only be
-    /// served from a cached entry carrying a content hash (`read_bytes` matches
-    /// cached bytes against it, a write chains its CAS base from it). While the
-    /// bulk routes sent `max_hash_bytes=0`, everything they installed was
-    /// incomplete and every open of a path they had already described still fell
-    /// through to a point `/stat` — ~30 per measured `git status` phase.
-    ///
-    /// Both halves are the fix. Sending a budget is what makes the bulk answer
-    /// complete; keeping it finite is what stops a metadata sweep over thousands
-    /// of paths from becoming a full content read of the tree. The point stat
-    /// keeps no budget at all: it owes its caller a hash at any size, and it is
-    /// where an oversized file's open still goes.
     #[test]
     fn bulk_metadata_routes_request_a_bounded_content_hash() {
-        // Finite and non-zero: zero is "hash nothing", which is what left every
-        // bulk-seeded entry incomplete; unbounded would hash whatever a sweep
-        // over thousands of paths happened to name.
+        // Finite and non-zero: zero is "hash nothing", which costs hydration a
+        // verification read it could have had for free; unbounded would hash
+        // whatever a sweep over thousands of paths happened to name.
         const _: () = assert!(BULK_METADATA_MAX_HASH_BYTES > 0);
         const _: () = assert!(BULK_METADATA_MAX_HASH_BYTES <= 16 * 1024 * 1024);
 
@@ -2632,9 +1302,6 @@ mod tests {
                 .push((route.clone(), query_budget.or(body_budget)));
             match route.as_str() {
                 "/tree" => axum::Json(serde_json::json!([])).into_response(),
-                "/metadata-many" => {
-                    axum::Json(serde_json::json!({ "entries": [null] })).into_response()
-                }
                 "/subtree-metadata" => {
                     axum::Json(serde_json::json!({ "entries": [] })).into_response()
                 }
@@ -2669,9 +1336,6 @@ mod tests {
 
         runtime.block_on(client.list_dir_versioned("dir")).unwrap();
         runtime
-            .block_on(client.metadata_many_attributes_versioned(&["dir/file".to_string()]))
-            .unwrap();
-        runtime
             .block_on(client.subtree_metadata_attributes_versioned("dir", 64))
             .unwrap();
         runtime.block_on(client.stat_versioned("dir/file")).unwrap();
@@ -2681,63 +1345,11 @@ mod tests {
             *seen.lock().unwrap(),
             vec![
                 ("/tree".to_string(), Some(expected.clone())),
-                ("/metadata-many".to_string(), Some(expected.clone())),
                 ("/subtree-metadata".to_string(), Some(expected)),
                 ("/stat".to_string(), None),
             ]
         );
         server.abort();
-    }
-
-    #[test]
-    fn revision_watch_attempt_timeout_exceeds_the_long_poll_window() {
-        // The read-class budget must outlast a full long-poll so a held-open
-        // watch is never cut short by the client's default mutation timeout.
-        assert!(REVISION_WATCH_ATTEMPT_TIMEOUT > Duration::from_millis(REVISION_WATCH_TIMEOUT_MS));
-        assert!(REVISION_WATCH_BACKOFF_MAX > REVISION_WATCH_BACKOFF_MIN);
-    }
-
-    #[test]
-    fn watch_health_warns_once_per_transition() {
-        let mut health = WatchHealth::default();
-        // Initial establishment is silent (no "restored" on first success).
-        assert!(!health.on_success());
-        assert!(!health.on_success());
-        // The first failure warns once; further failures stay silent.
-        assert!(health.on_failure());
-        assert!(!health.on_failure());
-        assert!(!health.on_failure());
-        // Recovery warns exactly once, then stays silent.
-        assert!(health.on_success());
-        assert!(!health.on_success());
-        // A fresh drop warns again.
-        assert!(health.on_failure());
-        assert!(!health.on_failure());
-    }
-
-    #[test]
-    fn watch_health_warns_on_a_first_poll_failure() {
-        // A watch that never establishes still surfaces one WARN.
-        let mut health = WatchHealth::default();
-        assert!(health.on_failure());
-        assert!(!health.on_failure());
-    }
-
-    #[test]
-    fn sibling_mounts_share_cache_coherence_without_retiring_on_publish() {
-        let endpoint = format!("http://revision-test-{}", uuid::Uuid::new_v4());
-        let first = RemoteVfsClient::new(&endpoint, "token-a", "scope").unwrap();
-        let second = RemoteVfsClient::new(&endpoint, "token-b", "scope").unwrap();
-
-        first.observe_published_revision(41);
-        assert_eq!(first.coherence_revision(), 41);
-        assert_eq!(second.coherence_revision(), 41);
-        assert_eq!(first.observed_namespace_revision(), 0);
-        assert_eq!(second.observed_namespace_revision(), 0);
-
-        second.observe_read_revision(41);
-        assert_eq!(first.observed_namespace_revision(), 41);
-        assert_eq!(second.observed_namespace_revision(), 41);
     }
 
     #[test]
@@ -2804,61 +1416,6 @@ mod tests {
         assert_eq!(posts.load(Ordering::Acquire), 1);
         assert_eq!(deletes.load(Ordering::Acquire), 0);
         assert_eq!(second.owner_token, uuid::Uuid::nil());
-        server.abort();
-    }
-
-    #[test]
-    fn versioned_read_keeps_its_response_revision_when_shared_coherence_is_newer() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                axum::Router::new().route(
-                    "/stat",
-                    axum::routing::get(|| async {
-                        let mut response = axum::Json(serde_json::json!({
-                            "kind": "file",
-                            "size_bytes": 1,
-                            "file_id": "file-1",
-                            "link_count": 1,
-                            "link_target": null,
-                            "content_hash": null,
-                            "executable": false,
-                            "mode": 420,
-                            "updated_at": null
-                        }))
-                        .into_response();
-                        response.headers_mut().insert(
-                            header::HeaderName::from_static(
-                                CHEVALIER_VFS_NAMESPACE_REVISION_HEADER,
-                            ),
-                            header::HeaderValue::from_static("41"),
-                        );
-                        response
-                    }),
-                ),
-            )
-            .await
-            .unwrap();
-        });
-        let client = RemoteVfsClient::new(&endpoint, "token", "").unwrap();
-        client.observe_read_revision(99);
-
-        let response = runtime
-            .block_on(client.stat_attributes_versioned("file"))
-            .unwrap();
-
-        assert_eq!(response.revision, 41);
-        assert_eq!(client.coherence_revision(), 99);
-        assert_eq!(response.value.unwrap().file_id.as_deref(), Some("file-1"));
         server.abort();
     }
 
@@ -2993,58 +1550,6 @@ mod tests {
     }
 
     #[test]
-    fn in_flight_publications_cover_the_gateway_affected_parents() {
-        let namespace = in_flight_namespace_paths(&[
-            VfsNamespaceMutation::CreateDirectory {
-                path: "node_modules/pkg".to_string(),
-                mode: Some(0o755),
-            },
-            VfsNamespaceMutation::SetMode {
-                path: "top-level".to_string(),
-                mode: 0o644,
-            },
-        ])
-        .into_iter()
-        .collect::<HashSet<_>>();
-        assert_eq!(
-            namespace,
-            HashSet::from([
-                "".to_string(),
-                "node_modules".to_string(),
-                "node_modules/pkg".to_string(),
-                "top-level".to_string(),
-            ])
-        );
-
-        let writes = in_flight_write_paths(&[
-            RemoteWrite {
-                path: "node_modules/pkg/index.js".to_string(),
-                mode: Some(0o644),
-                bytes: Vec::new(),
-                base_content_hash: Some("absent".to_string()),
-                expected_file_id: None,
-            },
-            RemoteWrite {
-                path: "existing/file.txt".to_string(),
-                mode: None,
-                bytes: Vec::new(),
-                base_content_hash: Some("hash".to_string()),
-                expected_file_id: Some("file-1".to_string()),
-            },
-        ])
-        .into_iter()
-        .collect::<HashSet<_>>();
-        assert_eq!(
-            writes,
-            HashSet::from([
-                "existing/file.txt".to_string(),
-                "node_modules/pkg".to_string(),
-                "node_modules/pkg/index.js".to_string(),
-            ])
-        );
-    }
-
-    #[test]
     fn write_many_preserves_identity_only_and_absent_preconditions() {
         let client = RemoteVfsClient::new("http://localhost", "token", "scope").unwrap();
         let identity_only = client.scope_remote_write(RemoteWrite {
@@ -3091,1065 +1596,5 @@ mod tests {
                 .is_some_and(|precondition| precondition.fingerprint.is_none()
                     && precondition.secondary_fingerprint.is_none())
         );
-    }
-
-    #[test]
-    fn watch_acks_only_after_the_fence_advance_and_cache_clear() {
-        use std::collections::HashMap;
-
-        use super::super::cache::{KernelInvalidator, PublicationInvalidation};
-
-        // In-process probe: the stub gateway, the client's cache, and a kernel-
-        // invalidation double all share this process, so the ack-poll handler can
-        // inspect them directly to prove BOTH the cache clear AND the kernel sweep
-        // preceded the ack. (revocation-ack ordering invariant, cache + kernel)
-        struct AckProbe {
-            poll_count: usize,
-            ack_since: Option<u64>,
-            ack_watcher_id: Option<String>,
-            cache_cleared_before_ack: bool,
-            kernel_invalidated_before_ack: bool,
-        }
-
-        // Stands in for a mounted session's kernel-invalidation hook: the real
-        // fuser notifier needs a live /dev/fuse fd, so the invalidation is
-        // factored through the `KernelInvalidator` trait the watch drives, which
-        // this double captures. A remote publication reaches `invalidate_all`.
-        //
-        // The watch no longer calls this inline — it enqueues onto the
-        // registry's invalidation worker and waits for that item to drain — so
-        // the double takes its time before recording. A watch that acked on
-        // enqueue rather than on drain would send the ack poll during this
-        // delay, and the ack-time assertions below would see `fired == false`.
-        const REVOCATION_WORK: Duration = Duration::from_millis(250);
-        struct RecordingInvalidator {
-            fired: Arc<AtomicBool>,
-        }
-        impl RecordingInvalidator {
-            fn apply(&self) -> bool {
-                std::thread::sleep(REVOCATION_WORK);
-                self.fired.store(true, Ordering::Release);
-                true
-            }
-        }
-        impl KernelInvalidator for RecordingInvalidator {
-            fn invalidate(&self, _: &PublicationInvalidation) -> bool {
-                self.apply()
-            }
-            fn invalidate_all(&self) -> bool {
-                self.apply()
-            }
-        }
-
-        const BASELINE: u64 = 1_000;
-        const PUBLISHED: u64 = 2_000;
-
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-
-        let cache = Arc::new(RemoteFuseCache::default());
-        // Seed a directory listing fenced at BASELINE. The client's fence advance
-        // + cache clear on PUBLISHED must evict it BEFORE the ack poll is sent.
-        cache.put_dir("probe", Vec::new(), BASELINE);
-
-        let probe = Arc::new(Mutex::new(AckProbe {
-            poll_count: 0,
-            ack_since: None,
-            ack_watcher_id: None,
-            cache_cleared_before_ack: false,
-            kernel_invalidated_before_ack: false,
-        }));
-        let ready = Arc::new(tokio::sync::Notify::new());
-
-        // Register the kernel-invalidation double so the watch's remote-
-        // publication sweep reaches it. Its flag mirrors the cache-clear probe.
-        let kernel_invalidated = Arc::new(AtomicBool::new(false));
-        let invalidators = Arc::new(MountInvalidators::default());
-        let double: Arc<dyn KernelInvalidator> = Arc::new(RecordingInvalidator {
-            fired: Arc::clone(&kernel_invalidated),
-        });
-        invalidators.register(Arc::downgrade(&double));
-
-        let server_cache = Arc::clone(&cache);
-        let server_probe = Arc::clone(&probe);
-        let server_ready = Arc::clone(&ready);
-        let server_kernel_invalidated = Arc::clone(&kernel_invalidated);
-        let server = runtime.spawn(async move {
-            let app = axum::Router::new().route(
-                "/watch",
-                axum::routing::get(
-                    move |axum::extract::Query(params): axum::extract::Query<
-                        HashMap<String, String>,
-                    >| {
-                        let cache = Arc::clone(&server_cache);
-                        let probe = Arc::clone(&server_probe);
-                        let ready = Arc::clone(&server_ready);
-                        let kernel_invalidated = Arc::clone(&server_kernel_invalidated);
-                        async move {
-                            let since = params
-                                .get("since")
-                                .and_then(|value| value.parse::<u64>().ok())
-                                .unwrap_or(0);
-                            let watcher_id = params.get("watcher_id").cloned().unwrap_or_default();
-                            let count = {
-                                let mut guard = probe
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                guard.poll_count += 1;
-                                guard.poll_count
-                            };
-                            if count == 1 {
-                                // A sibling's publication lands on the first poll.
-                                return axum::Json(serde_json::json!({ "revision": PUBLISHED }))
-                                    .into_response();
-                            }
-                            if count == 2 {
-                                // This poll is the ACK. The BASELINE-fenced entry
-                                // must already be evicted by the client's clear,
-                                // and the kernel double must already have been
-                                // swept — both strictly before this ack is sent.
-                                let cleared = cache.get_dir("probe", BASELINE).is_none();
-                                let swept = kernel_invalidated.load(Ordering::Acquire);
-                                let mut guard = probe
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                guard.ack_since = Some(since);
-                                guard.ack_watcher_id = Some(watcher_id);
-                                guard.cache_cleared_before_ack = cleared;
-                                guard.kernel_invalidated_before_ack = swept;
-                                drop(guard);
-                                ready.notify_one();
-                            }
-                            axum::http::StatusCode::NO_CONTENT.into_response()
-                        }
-                    },
-                ),
-            );
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let client = RemoteVfsClient::new(&endpoint, "token", "scope").unwrap();
-        client.ensure_revision_watch(runtime.handle(), &cache, &invalidators);
-
-        runtime.block_on(async {
-            tokio::time::timeout(Duration::from_secs(5), ready.notified())
-                .await
-                .expect("client must issue the ack poll after applying the publication");
-        });
-
-        let guard = probe
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(
-            guard.ack_since,
-            Some(PUBLISHED),
-            "the ack poll's since must equal the fence-advanced (published) revision"
-        );
-        assert!(
-            guard
-                .ack_watcher_id
-                .as_deref()
-                .is_some_and(|id| !id.is_empty()),
-            "the ack poll must carry the stable watcher_id"
-        );
-        assert!(
-            guard.cache_cleared_before_ack,
-            "the cache clear MUST precede the ack poll so a writer never unblocks \
-             while this mount can still serve stale reads"
-        );
-        assert!(
-            guard.kernel_invalidated_before_ack,
-            "the queued kernel revocation MUST have DRAINED before the ack poll: \
-             enqueueing is not enough, or a writer unblocks while this mount's \
-             kernel can still serve a stale attr lease"
-        );
-        drop(guard);
-        drop(double);
-        server.abort();
-    }
-
-    #[test]
-    fn watch_withholds_the_ack_and_drops_liveness_when_the_revocation_fails() {
-        use std::collections::HashMap;
-
-        use super::super::cache::{KernelInvalidator, PublicationInvalidation};
-
-        // Moving the revocation onto a worker thread must not soften the
-        // fail-closed path: a revocation that does not land still means the
-        // kernel may serve a superseded attr, so the watch drops liveness
-        // (replies revert to TTL=0) and holds the ack until the leases granted
-        // before the failure have expired on their own.
-        struct FailingInvalidator {
-            fired: Mutex<Option<std::sync::mpsc::Sender<()>>>,
-        }
-        impl FailingInvalidator {
-            fn refuse(&self) -> bool {
-                if let Some(fired) = self
-                    .fired
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take()
-                {
-                    let _ = fired.send(());
-                }
-                false
-            }
-        }
-        impl KernelInvalidator for FailingInvalidator {
-            fn invalidate(&self, _: &PublicationInvalidation) -> bool {
-                self.refuse()
-            }
-            fn invalidate_all(&self) -> bool {
-                self.refuse()
-            }
-        }
-
-        const PUBLISHED: u64 = 3_000;
-
-        struct FailProbe {
-            polls: usize,
-            withheld_ack_since: Option<u64>,
-        }
-
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-
-        let cache = Arc::new(RemoteFuseCache::default());
-        let probe = Arc::new(Mutex::new(FailProbe {
-            polls: 0,
-            withheld_ack_since: None,
-        }));
-        let acked = Arc::new(tokio::sync::Notify::new());
-
-        let (fired_tx, fired_rx) = std::sync::mpsc::channel();
-        let invalidators = Arc::new(MountInvalidators::default());
-        let double: Arc<dyn KernelInvalidator> = Arc::new(FailingInvalidator {
-            fired: Mutex::new(Some(fired_tx)),
-        });
-        invalidators.register(Arc::downgrade(&double));
-
-        let server_probe = Arc::clone(&probe);
-        let server_acked = Arc::clone(&acked);
-        let server = runtime.spawn(async move {
-            let app = axum::Router::new().route(
-                "/watch",
-                axum::routing::get(
-                    move |axum::extract::Query(params): axum::extract::Query<
-                        HashMap<String, String>,
-                    >| {
-                        let probe = Arc::clone(&server_probe);
-                        let acked = Arc::clone(&server_acked);
-                        async move {
-                            let since = params
-                                .get("since")
-                                .and_then(|value| value.parse::<u64>().ok())
-                                .unwrap_or(0);
-                            let count = {
-                                let mut guard = probe
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                guard.polls += 1;
-                                guard.polls
-                            };
-                            match count {
-                                // Establish the watch so `watch_live` is true and
-                                // the drop below is a real transition.
-                                1 => axum::http::StatusCode::NO_CONTENT.into_response(),
-                                // A remote publication whose revocation fails.
-                                2 => axum::Json(serde_json::json!({ "revision": PUBLISHED }))
-                                    .into_response(),
-                                // The withheld ack, issuable only after the lease
-                                // TTL has elapsed.
-                                3 => {
-                                    let mut guard = probe
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                    guard.withheld_ack_since = Some(since);
-                                    drop(guard);
-                                    acked.notify_one();
-                                    axum::http::StatusCode::NO_CONTENT.into_response()
-                                }
-                                _ => {
-                                    std::future::pending::<()>().await;
-                                    unreachable!()
-                                }
-                            }
-                        }
-                    },
-                ),
-            );
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let client = RemoteVfsClient::new(&endpoint, "token", "scope").unwrap();
-        client.ensure_revision_watch(runtime.handle(), &cache, &invalidators);
-
-        fired_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the publication's revocation must reach the invalidation worker");
-
-        // The failure must land as dropped liveness, not as a silent ack.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while client.revision_watch_live() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            !client.revision_watch_live(),
-            "a revocation that did not land must drop watch liveness so replies serve strict"
-        );
-        assert_eq!(
-            probe
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .polls,
-            2,
-            "the ack poll must be withheld while a superseded lease may still be live"
-        );
-
-        // It is withheld, not abandoned: once the lease TTL has elapsed the ack
-        // goes out carrying the fence-advanced revision.
-        runtime.block_on(async {
-            tokio::time::timeout(ATTR_ENTRY_LEASE_TTL * 5, acked.notified())
-                .await
-                .expect("the ack must follow once the pre-failure leases have expired");
-        });
-        assert_eq!(
-            probe
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .withheld_ack_since,
-            Some(PUBLISHED),
-            "the withheld ack still carries the fence-advanced revision"
-        );
-
-        drop(double);
-        server.abort();
-    }
-
-    #[test]
-    fn watch_survives_a_single_transport_blip_without_flapping_live() {
-        // Mirrors the ack stub test: an in-process raw-TCP stub drives the real
-        // watch loop. A gateway that reaps our idle keep-alive socket surfaces
-        // the reap as a send-class error on the NEXT poll. The transport retry
-        // must absorb that single blip WITHOUT ever clearing watch_live (which
-        // would resurface strict serves and emit the down/restored WARN pair).
-        //
-        // Sequence: poll #1 establishes (204 -> watch_live true); poll #2 is the
-        // reaped-socket blip (connection dropped, no response -> a `send`
-        // failure); poll #3 is the immediate retry. The stub snapshots watch_live
-        // exactly when poll #3 arrives — still MID-retry, before its own success
-        // is recorded. With the retry, the blip never touched watch_live, so the
-        // snapshot is `true`. Without it, poll #2's failure would have cleared it
-        // and the snapshot would be `false`. Deterministic: no timing, no WARN
-        // capture. Every response sets `connection: close` so each poll lands on
-        // its own fresh connection and the poll count is unambiguous.
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        const RESP_204: &[u8] =
-            b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-
-        let cache = Arc::new(RemoteFuseCache::default());
-        let client = RemoteVfsClient::new(&endpoint, "token", "scope").unwrap();
-
-        // Records watch_live as observed by the stub at the recovery poll (#3).
-        let live_at_recovery = Arc::new(Mutex::new(None::<bool>));
-        let ready = Arc::new(tokio::sync::Notify::new());
-
-        let server_client = client.clone();
-        let server_live = Arc::clone(&live_at_recovery);
-        let server_ready = Arc::clone(&ready);
-        let server = runtime.spawn(async move {
-            let mut poll = 0usize;
-            loop {
-                let (mut socket, _) = match listener.accept().await {
-                    Ok(pair) => pair,
-                    Err(_) => break,
-                };
-                // Drain the request head so the peer's `send` fully lands before
-                // we choose how (or whether) to answer.
-                let mut head = Vec::new();
-                let mut buf = [0u8; 1024];
-                loop {
-                    match socket.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            head.extend_from_slice(&buf[..n]);
-                            if head.windows(4).any(|w| w == b"\r\n\r\n") {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                poll += 1;
-                match poll {
-                    1 => {
-                        // Establish the watch: a live long-poll timeout.
-                        let _ = socket.write_all(RESP_204).await;
-                        let _ = socket.flush().await;
-                    }
-                    2 => {
-                        // The reaped-socket blip: drop with no response, exactly
-                        // as a gateway keepAliveTimeout close would.
-                        drop(socket);
-                    }
-                    3 => {
-                        // The immediate retry. Snapshot watch_live as seen right
-                        // now — the retry must have kept it live.
-                        let live = server_client.revision_watch_live();
-                        *server_live
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(live);
-                        let _ = socket.write_all(RESP_204).await;
-                        let _ = socket.flush().await;
-                        server_ready.notify_one();
-                    }
-                    _ => {
-                        // Hold subsequent long-polls open so the client neither
-                        // errors nor busy-loops while the test asserts.
-                        std::future::pending::<()>().await;
-                    }
-                }
-            }
-        });
-
-        let invalidators = Arc::new(MountInvalidators::default());
-        client.ensure_revision_watch(runtime.handle(), &cache, &invalidators);
-
-        runtime.block_on(async {
-            tokio::time::timeout(Duration::from_secs(5), ready.notified())
-                .await
-                .expect("the watch must issue a recovery poll after the transport blip");
-        });
-
-        let observed = *live_at_recovery
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(
-            observed,
-            Some(true),
-            "a single send-class blip must be absorbed by the immediate retry: \
-             watch_live must never be cleared, so it is still live at the recovery poll"
-        );
-        assert!(
-            client.revision_watch_live(),
-            "the watch must remain live after the retry recovers the blip"
-        );
-        server.abort();
-    }
-
-    // ---------------------------------------------------------------------
-    // Revocation-acked publications: what a publisher must and must not wait for
-    // ---------------------------------------------------------------------
-
-    /// Stand-in for the gateway's publication coordinator
-    /// (`chevalier_sandbox::vfs`'s `OwnerState`), reproduced here because vmd
-    /// links the sandbox crate without its `vfs-server` feature: a monotonic
-    /// revision, a long-poll `/watch` that answers the union of paths published
-    /// since the caller's fence AND treats the poll's `since` as that watcher's
-    /// ack, and a `/namespace-many` that publishes then holds its response until
-    /// every registered watcher acks the new revision or the ack cap elapses.
-    struct AckGateway {
-        revision: Mutex<u64>,
-        revision_tx: tokio::sync::watch::Sender<u64>,
-        history: Mutex<Vec<(u64, Vec<String>)>>,
-        acks: Mutex<HashMap<String, u64>>,
-        ack_tx: tokio::sync::watch::Sender<u64>,
-        ack_cap: Duration,
-        capped: std::sync::atomic::AtomicUsize,
-    }
-
-    /// Ack cap the probe gateway runs with — the production default
-    /// (`CHEVALIER_VFS_PUBLICATION_ACK_TIMEOUT_MS`).
-    const PROBE_ACK_CAP: Duration = Duration::from_millis(25);
-
-    impl AckGateway {
-        fn new() -> Arc<Self> {
-            let (revision_tx, _) = tokio::sync::watch::channel(0u64);
-            let (ack_tx, _) = tokio::sync::watch::channel(0u64);
-            Arc::new(Self {
-                revision: Mutex::new(0),
-                revision_tx,
-                history: Mutex::new(Vec::new()),
-                acks: Mutex::new(HashMap::new()),
-                ack_tx,
-                ack_cap: PROBE_ACK_CAP,
-                capped: std::sync::atomic::AtomicUsize::new(0),
-            })
-        }
-
-        fn lock<T>(guard: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-            guard
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        }
-
-        fn unacked(&self, revision: u64) -> usize {
-            Self::lock(&self.acks)
-                .values()
-                .filter(|acked| **acked < revision)
-                .count()
-        }
-
-        /// Bump, announce, then hold until every watcher acks or the cap fires —
-        /// the gateway's `commit_and_await_acks_for`.
-        async fn publish(&self, paths: Vec<String>) -> u64 {
-            let published = {
-                let mut revision = Self::lock(&self.revision);
-                *revision += 1;
-                *revision
-            };
-            Self::lock(&self.history).push((published, paths));
-            self.revision_tx.send_replace(published);
-            let mut progress = self.ack_tx.subscribe();
-            let deadline = tokio::time::Instant::now() + self.ack_cap;
-            loop {
-                if self.unacked(published) == 0 {
-                    return published;
-                }
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero()
-                    || tokio::time::timeout(remaining, progress.changed())
-                        .await
-                        .is_err()
-                {
-                    self.capped
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return published;
-                }
-            }
-        }
-
-        fn record_ack(&self, watcher_id: &str, since: u64) {
-            if watcher_id.is_empty() {
-                return;
-            }
-            {
-                let mut acks = Self::lock(&self.acks);
-                let entry = acks.entry(watcher_id.to_string()).or_insert(since);
-                *entry = (*entry).max(since);
-            }
-            self.ack_tx.send_modify(|counter| *counter += 1);
-        }
-
-        fn affected_since(&self, since: u64) -> Vec<String> {
-            Self::lock(&self.history)
-                .iter()
-                .filter(|(revision, _)| *revision > since)
-                .flat_map(|(_, paths)| paths.iter().cloned())
-                .collect()
-        }
-
-        fn cap_hits(&self) -> usize {
-            self.capped.load(std::sync::atomic::Ordering::Relaxed)
-        }
-    }
-
-    /// Bring the probe gateway up on a loopback port. Serves the three routes a
-    /// namespace publication touches: `/lease` (answered in implicit mode, so
-    /// only the first batch pays for it), `/namespace-many`, and `/watch`.
-    fn spawn_ack_gateway(
-        runtime: &tokio::runtime::Runtime,
-        gateway: Arc<AckGateway>,
-    ) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let watch_gateway = Arc::clone(&gateway);
-        let publish_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            let app = axum::Router::new()
-                .route(
-                    "/lease",
-                    axum::routing::post(|| async {
-                        (
-                            [(
-                                chevalier_sandbox::vfs::CHEVALIER_VFS_LEASE_MODE_HEADER,
-                                chevalier_sandbox::vfs::CHEVALIER_VFS_LEASE_MODE_IMPLICIT,
-                            )],
-                            axum::Json(serde_json::json!({
-                                "resource_key": "probe",
-                                "owner_token": uuid::Uuid::nil(),
-                                "task_id": serde_json::Value::Null,
-                            })),
-                        )
-                            .into_response()
-                    }),
-                )
-                .route(
-                    "/namespace-many",
-                    axum::routing::post(
-                        move |axum::Json(body): axum::Json<VfsNamespaceMutationBatchBody>| {
-                            let gateway = Arc::clone(&publish_gateway);
-                            async move {
-                                // The affected set a real publication reports:
-                                // every changed path AND its parent directory.
-                                let mut paths = Vec::new();
-                                for mutation in &body.mutations {
-                                    for path in mutation.paths() {
-                                        if path.is_empty() {
-                                            continue;
-                                        }
-                                        paths.push(path.to_string());
-                                        paths.push(
-                                            path.rsplit_once('/')
-                                                .map(|(parent, _)| parent.to_string())
-                                                .unwrap_or_default(),
-                                        );
-                                    }
-                                }
-                                let revision = gateway.publish(paths).await;
-                                (
-                                    [(
-                                        CHEVALIER_VFS_NAMESPACE_REVISION_HEADER,
-                                        revision.to_string(),
-                                    )],
-                                    axum::Json(serde_json::json!({ "entries": [] })),
-                                )
-                                    .into_response()
-                            }
-                        },
-                    ),
-                )
-                .route(
-                    "/watch",
-                    axum::routing::get(
-                        move |axum::extract::Query(params): axum::extract::Query<
-                            HashMap<String, String>,
-                        >| {
-                            let gateway = Arc::clone(&watch_gateway);
-                            async move {
-                                let since = params
-                                    .get("since")
-                                    .and_then(|value| value.parse::<u64>().ok())
-                                    .unwrap_or(0);
-                                let watcher_id =
-                                    params.get("watcher_id").cloned().unwrap_or_default();
-                                let timeout_ms = params
-                                    .get("timeout_ms")
-                                    .and_then(|value| value.parse::<u64>().ok())
-                                    .unwrap_or(1_000);
-                                gateway.record_ack(watcher_id.as_str(), since);
-                                let mut revisions = gateway.revision_tx.subscribe();
-                                let deadline =
-                                    tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
-                                loop {
-                                    let current = *AckGateway::lock(&gateway.revision);
-                                    if current > since {
-                                        return axum::Json(serde_json::json!({
-                                            "revision": current,
-                                            "paths": gateway.affected_since(since),
-                                            "subtrees": Vec::<String>::new(),
-                                        }))
-                                        .into_response();
-                                    }
-                                    let remaining = deadline
-                                        .saturating_duration_since(tokio::time::Instant::now());
-                                    if remaining.is_zero()
-                                        || tokio::time::timeout(remaining, revisions.changed())
-                                            .await
-                                            .is_err()
-                                    {
-                                        return axum::http::StatusCode::NO_CONTENT.into_response();
-                                    }
-                                }
-                            }
-                        },
-                    ),
-                );
-            axum::serve(listener, app).await.unwrap();
-        });
-        (endpoint, server)
-    }
-
-    /// One mount's kernel-invalidation hook, standing in for
-    /// `fs::MountKernelInvalidator` (whose real notifier needs a live
-    /// `/dev/fuse` session). `cached` plays the mount's inode table — the paths
-    /// it handed its kernel — and `publications` is the REAL in-flight set the
-    /// client registers around every publication, so the ack-critical rule under
-    /// test is the production one and not a restatement of it.
-    ///
-    /// `drain` models what a notify call costs. A target whose PARENT directory
-    /// is the one the publishing op holds locked blocks on `parent_lock` — that
-    /// is `notify_inval_entry` waiting in `fuse_reverse_inval_entry` for the
-    /// parent inode lock. A target elsewhere (the published directory's own
-    /// dentry, which hangs off the root) does not.
-    struct MountDouble {
-        cached: std::collections::HashSet<String>,
-        publications: Arc<InFlightPublications>,
-        parent_lock: Arc<Mutex<()>>,
-        /// Directory whose inode lock the driver's op holds while publishing.
-        locked_dir: String,
-        /// `false` reproduces the invalidator as ce855e3 deployed it, which put
-        /// a mount's own in-flight paths on the ack path.
-        exclude_own_publications: bool,
-        drain: Duration,
-        applied: std::sync::atomic::AtomicUsize,
-    }
-
-    impl MountDouble {
-        /// Mirror of `fs::resolve_invalidation_targets`: an affected path
-        /// resolves a target when this mount handed its kernel either that
-        /// path's inode or its parent's dentry, minus whatever it is publishing
-        /// itself (the `for_ack` filter).
-        fn targets(&self, invalidation: &PublicationInvalidation, for_ack: bool) -> Vec<String> {
-            invalidation
-                .paths
-                .iter()
-                .chain(invalidation.subtrees.iter())
-                .filter(|path| {
-                    self.cached.contains(path.as_str())
-                        || path
-                            .rsplit_once('/')
-                            .is_some_and(|(parent, _)| self.cached.contains(parent))
-                })
-                .filter(|path| {
-                    !(for_ack
-                        && self.exclude_own_publications
-                        && self.publications.contains(path.as_str()))
-                })
-                .cloned()
-                .collect()
-        }
-
-        fn apply(&self, targets: &[String]) -> bool {
-            if targets.is_empty() {
-                return true;
-            }
-            self.applied
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let contends = targets.iter().any(|path| {
-                path.rsplit_once('/')
-                    .is_some_and(|(parent, _)| parent == self.locked_dir)
-            });
-            if contends {
-                let _held = self
-                    .parent_lock
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-            }
-            if !self.drain.is_zero() {
-                std::thread::sleep(self.drain);
-            }
-            true
-        }
-    }
-
-    impl super::super::cache::KernelInvalidator for MountDouble {
-        fn invalidate(&self, invalidation: &PublicationInvalidation) -> bool {
-            self.apply(&self.targets(invalidation, false))
-        }
-
-        fn invalidate_all(&self) -> bool {
-            self.apply(&self.cached.iter().cloned().collect::<Vec<_>>())
-        }
-
-        fn has_ack_blocking_targets(&self, invalidation: &PublicationInvalidation) -> bool {
-            !self.targets(invalidation, true).is_empty()
-        }
-
-        fn invalidate_for_ack(&self, invalidation: &PublicationInvalidation) -> bool {
-            self.apply(&self.targets(invalidation, true))
-        }
-    }
-
-    struct AckProbeArm {
-        /// Per-publication latency the writer paid, in issue order.
-        samples: Vec<Duration>,
-        cap_hits: usize,
-        /// How many times the mount double's notifier ran.
-        applied: usize,
-    }
-
-    impl AckProbeArm {
-        fn mean(&self) -> Duration {
-            self.samples.iter().sum::<Duration>() / self.samples.len() as u32
-        }
-
-        fn max(&self) -> Duration {
-            self.samples.iter().copied().max().unwrap_or_default()
-        }
-    }
-
-    /// Drive `publications` real namespace publications through the real client,
-    /// the real revision watch, and the real kernel-revocation registry against
-    /// the probe gateway, with one mount double configured by the caller.
-    ///
-    /// `hold_parent_lock` reproduces the guest kernel's behaviour on a mutating
-    /// op: the parent directory's inode lock is held for the whole op, and the
-    /// op is parked on the publication.
-    ///
-    /// `publishing_mount` selects whether the invalidator belongs to the client
-    /// issuing the publication or to a sibling observer. Real mounts share the
-    /// watch/invalidator registry but keep distinct in-flight path sets, so an
-    /// observer must never inherit the publisher's ack exclusion.
-    fn run_ack_probe(
-        publications: usize,
-        cached: &[&str],
-        drain: Duration,
-        hold_parent_lock: bool,
-        exclude_own_publications: bool,
-        publishing_mount: bool,
-    ) -> AckProbeArm {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()
-            .unwrap();
-        let gateway = AckGateway::new();
-        let (endpoint, server) = spawn_ack_gateway(&runtime, Arc::clone(&gateway));
-
-        let cache = Arc::new(RemoteFuseCache::default());
-        let invalidators = Arc::new(MountInvalidators::default());
-        let client = RemoteVfsClient::new(&endpoint, "token", "").unwrap();
-        let parent_lock = Arc::new(Mutex::new(()));
-        let mount_publications = if publishing_mount {
-            client.in_flight_publications()
-        } else {
-            Arc::new(InFlightPublications::default())
-        };
-        let double = Arc::new(MountDouble {
-            cached: cached.iter().map(|path| path.to_string()).collect(),
-            publications: mount_publications,
-            parent_lock: Arc::clone(&parent_lock),
-            locked_dir: "many".to_string(),
-            exclude_own_publications,
-            drain,
-            applied: std::sync::atomic::AtomicUsize::new(0),
-        });
-        let registered: Arc<dyn super::super::cache::KernelInvalidator> = double.clone();
-        invalidators.register(Arc::downgrade(&registered));
-        client.ensure_revision_watch(runtime.handle(), &cache, &invalidators);
-        // Let the watch establish its first long poll before measuring.
-        std::thread::sleep(Duration::from_millis(150));
-
-        let handle = runtime.handle().clone();
-        let driver_client = client.clone();
-        let driver = std::thread::spawn(move || {
-            let mut samples = Vec::with_capacity(publications);
-            for index in 0..publications {
-                let mutation = VfsNamespaceMutation::CreateFile {
-                    path: format!("many/file-{index:04}"),
-                    mode: Some(0o644),
-                };
-                let held = hold_parent_lock.then(|| {
-                    parent_lock
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                });
-                let started = Instant::now();
-                handle
-                    .block_on(driver_client.apply_namespace_batch(
-                        std::slice::from_ref(&format!("op-{index}")),
-                        std::slice::from_ref(&mutation),
-                        "vm_workspace",
-                    ))
-                    .expect("probe publication");
-                samples.push(started.elapsed());
-                drop(held);
-            }
-            samples
-        });
-        let samples = driver.join().unwrap();
-        server.abort();
-        AckProbeArm {
-            cap_hits: gateway.cap_hits(),
-            applied: double.applied.load(std::sync::atomic::Ordering::Relaxed),
-            samples,
-        }
-    }
-
-    /// The paths one publication of `many/file-NNNN` names: the changed path
-    /// and its parent directory, which is what a real affected set carries.
-    fn published_paths(count: usize) -> Vec<String> {
-        let mut paths = vec!["many".to_string()];
-        paths.extend((0..count).map(|index| format!("many/file-{index:04}")));
-        paths
-    }
-
-    /// A watcher whose mount holds nothing the publication supersedes cannot
-    /// serve stale data for it, so it must not cost the writer anything — not
-    /// the queue, not the worker hop, and above all not the gateway's ack cap.
-    #[test]
-    fn a_publication_is_not_delayed_by_a_watcher_with_nothing_cached() {
-        // The mount holds `unrelated` and nothing under `many/`, which is where
-        // every publication lands. The publishing op holds `many`'s inode lock
-        // throughout, so any revocation that DID reach this mount for a child of
-        // `many` would block on it and ride the ack cap out.
-        let arm = run_ack_probe(20, &["unrelated"], Duration::ZERO, true, true, false);
-        assert_eq!(
-            arm.cap_hits,
-            0,
-            "no publication may hit the ack cap when no mount holds affected state \
-             (mean {:?}, max {:?})",
-            arm.mean(),
-            arm.max()
-        );
-        assert_eq!(
-            arm.applied, 0,
-            "a mount with nothing to revoke must not be handed a revocation at all"
-        );
-        assert!(
-            arm.max() < PROBE_ACK_CAP,
-            "every publication must return well inside the ack cap; max was {:?}",
-            arm.max()
-        );
-    }
-
-    /// The other half of the same contract: a watcher that DOES hold kernel
-    /// state for an affected path it is not itself publishing must still delay
-    /// the publisher until that state is revoked. This is the guarantee the fast
-    /// path above must never weaken.
-    #[test]
-    fn a_publication_is_still_delayed_by_a_watcher_that_holds_affected_state() {
-        const DRAIN: Duration = Duration::from_millis(8);
-        // `many` — the parent every publication's affected set names — is held
-        // by a mount that is publishing nothing, so its revocation is
-        // ack-critical. Its dentry hangs off the root, whose lock nothing holds,
-        // so the revocation CAN land: the point here is that the publisher waits
-        // for it, not that it deadlocks against it.
-        let arm = run_ack_probe(10, &["many"], DRAIN, false, true, false);
-        assert_eq!(
-            arm.applied, 10,
-            "every publication must revoke the observer mount's state"
-        );
-        assert!(
-            arm.samples.iter().all(|sample| *sample >= DRAIN),
-            "no publication may return before the observer's revocation landed; \
-             samples: {:?}",
-            arm.samples
-        );
-        assert_eq!(
-            arm.cap_hits, 0,
-            "a revocation that can land must land inside the cap, not fail open"
-        );
-    }
-
-    /// The measured ce855e3 regression, and the fix for it.
-    ///
-    /// The publishing mount holds kernel state for exactly the path it is
-    /// publishing, and the guest kernel holds that path's parent inode lock for
-    /// the whole op — so revoking it cannot complete until the publication
-    /// returns, while the publication cannot return until this ack does. Every
-    /// publication then rode the full ack cap out.
-    ///
-    /// The publisher is not an observer of its own write: its projection already
-    /// answers reads of the paths it just published, and its commit hook
-    /// enqueues the identical revocation the moment the publication returns.
-    #[test]
-    fn a_publication_is_not_delayed_by_the_publishing_mounts_own_in_flight_paths() {
-        const N: usize = 20;
-        let cached = published_paths(N);
-        let cached = cached.iter().map(String::as_str).collect::<Vec<_>>();
-
-        // Control: the same mount, the same lock, with a mount's own in-flight
-        // paths still on the ack path — ce855e3 as deployed. Every publication
-        // must wait the cap out, or this test is proving nothing.
-        let regressed = run_ack_probe(N, &cached, Duration::ZERO, true, false, true);
-        assert_eq!(
-            regressed.cap_hits,
-            N,
-            "control: with its own in-flight paths on the ack path every \
-             publication must ride the cap out (mean {:?})",
-            regressed.mean()
-        );
-
-        let fixed = run_ack_probe(N, &cached, Duration::ZERO, true, true, true);
-        assert_eq!(
-            fixed.cap_hits,
-            0,
-            "a publication must never wait out the ack cap for a revocation of \
-             the path it is itself publishing (mean {:?}, max {:?})",
-            fixed.mean(),
-            fixed.max()
-        );
-        assert!(
-            fixed.max() < PROBE_ACK_CAP,
-            "every publication must return well inside the ack cap; max was {:?}",
-            fixed.max()
-        );
-        // The gateway's affected set includes both the created path and its
-        // parent directory. Both are local publication paths: revoking either
-        // on this ack would contend with the publishing operation. The commit
-        // hook applies the local catch-up revocation after the response.
-        assert_eq!(
-            fixed.applied, 0,
-            "the publishing mount must not revoke its own leaf or parent on the ack path"
-        );
-    }
-
-    /// Standing measurement of the regression and its fix. Not an assertion —
-    /// run it with `--ignored --nocapture` for the per-arm table.
-    #[test]
-    #[ignore = "measurement probe; run with --ignored --nocapture"]
-    fn probe_publication_ack_latency() {
-        const N: usize = 100;
-        let cached = published_paths(N);
-        let cached = cached.iter().map(String::as_str).collect::<Vec<_>>();
-        let arms: [(&str, AckProbeArm); 4] = [
-            // Pre-ce855e3: the watch answer stayed in the owner namespace, so
-            // every resolved target set came back empty and the revocation was
-            // a no-op.
-            (
-                "pre-ce855e3 (no targets)",
-                run_ack_probe(N, &[], Duration::ZERO, true, true, false),
-            ),
-            // Targets resolve, nothing contends: the pure cost of the watch
-            // cycle plus the queue/worker hop.
-            (
-                "targets, uncontended",
-                run_ack_probe(N, &["many"], Duration::ZERO, false, true, false),
-            ),
-            // ce855e3 as deployed: the publishing mount's own paths resolve AND
-            // their revocation contends with the parked op's parent inode lock.
-            (
-                "ce855e3 (own paths on ack)",
-                run_ack_probe(N, &cached, Duration::ZERO, true, false, true),
-            ),
-            // Fixed: the publishing mount's in-flight paths are off the ack path.
-            (
-                "fixed (own paths excluded)",
-                run_ack_probe(N, &cached, Duration::ZERO, true, true, true),
-            ),
-        ];
-        for (name, arm) in arms.iter() {
-            let mut sorted = arm.samples.clone();
-            sorted.sort();
-            eprintln!(
-                "PROBE {name:<28} n={n} mean={mean:>9.3?} p50={p50:>9.3?} \
-                 p95={p95:>9.3?} max={max:>9.3?} cap_hits={cap}/{n}",
-                n = arm.samples.len(),
-                mean = arm.mean(),
-                p50 = sorted[sorted.len() / 2],
-                p95 = sorted[sorted.len() * 95 / 100],
-                max = arm.max(),
-                cap = arm.cap_hits,
-            );
-        }
     }
 }

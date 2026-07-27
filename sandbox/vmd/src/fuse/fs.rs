@@ -2,80 +2,60 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use chevalier_sandbox::vfs::{
-    VFS_OPERATION_SETATTR_SIZE, VFS_OPERATION_WRITE_THROUGH, VFS_SURFACE_KIND_VM_SHARED,
-    VFS_SURFACE_KIND_VM_WORKSPACE, VfsDirEntry as RemoteDirEntry, VfsMetadata as RemoteMetadata,
-    VfsNamespaceMutation, VfsWritePrecondition, scoped_vfs_path,
+    VFS_SURFACE_KIND_VM_SHARED, VFS_SURFACE_KIND_VM_WORKSPACE, scoped_vfs_path,
 };
 use fuser::{
     BsdFileFlags, Errno, FileAttr, FileHandle, FileType, FopenFlags, Generation, INodeNo,
     InitFlags, KernelConfig, LockNamespace, MountOption, OpenFlags, RenameFlags, ReplyAttr,
     ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen,
-    ReplyWrite, TimeOrNow,
+    ReplyStatfs, ReplyWrite, TimeOrNow,
 };
 use tokio::runtime::Handle;
 use uuid::Uuid;
 
-use super::cache::{
-    KernelInvalidator, MountInvalidators, PublicationInvalidation, RemoteFuseCache,
-};
-use super::client::{
-    AdvisoryLockRenewalIdentity, InFlightPublications, OPEN_STAT_MAX_HASH_BYTES, RangeRead,
-    RemoteVfsClient, Versioned, request_status,
-};
-use super::namespace::{NamespaceJournal, NamespaceProjection};
-use super::write::{WriteBarrierGuard, WriteJournal};
+use super::client::{AdvisoryLockRenewalIdentity, RemoteVfsClient, request_status};
+use super::local_view::hydrate::KernelPathInvalidator;
+use super::local_view::mount::MountLocalView;
+use super::local_view::tree::{MountFile, errno_of};
+use super::local_view::types::{LocalDirEntry, LocalKind, LocalMetadata, LocalTimestamp};
 
-/// Positive attribute/entry lease handed to the kernel for a warm metadata hit.
+/// Attribute/entry lease handed to the kernel for every positive reply.
 ///
-/// This is a *liveness-bounded lease*, never a correctness boundary. While the
-/// revision watch is live, a remote publication revokes the affected kernel
-/// entries via the fuser notifier *before* it is acked (the revocation-ack
-/// ordering invariant in `run_revision_watch`), so a writer in another process
-/// never unblocks while this process's kernels hold a superseded attr. A local
-/// publication instead *queues* its revocation on the invalidation worker and
-/// returns (see the commit hooks in `new_with_namespace_journal`: waiting there
-/// deadlocks against the guest kernel's parent-inode lock); the publishing
-/// mount's own projection answers reads of those paths in the meantime, and a
-/// sibling mount's kernel is caught up as the worker drains.
+/// A single owner materializes its scope into a local backing tree and is the
+/// only writer of it, so a leased dentry or attribute cannot be invalidated by
+/// anybody the mount does not already serialize against. The lease is therefore
+/// a long fixed value rather than a function of remote watch liveness: a short,
+/// watch-gated TTL existed only to bound the staleness of a projection
+/// reconstructed from remote state, and there is no such projection any more.
 ///
-/// The lease therefore bounds only the window *after* the watch drops: replies
-/// then carry `Duration::ZERO` (strict — every lstat/getattr crosses into
-/// userspace and reconfirms), and any entry already leased in the kernel
-/// naturally expires within this bound. `lease_ttl_for` selects between the two
-/// at reply time based on watch liveness.
-pub(super) const ATTR_ENTRY_LEASE_TTL: Duration = Duration::from_secs(1);
-/// Largest untargeted kernel revocation this mount will issue in one sweep.
+/// A read-only observer keeps the same long lease. It has no local authority, so
+/// its follower revokes exactly the entries it re-materializes through
+/// `KernelPathInvalidator`; an explicit revocation is strictly stronger than
+/// waiting out a TTL.
+const REPLY_ATTR_TTL: Duration = Duration::from_secs(86_400);
+/// Size past which a read-only observer's untargeted kernel sweep is worth a
+/// diagnostic.
 ///
 /// `notify_inval_entry` acquires the parent inode's write lock in the guest
 /// kernel, so a sweep proportional to the whole working set blocks the guest's
-/// own lookups for as long as it runs. Past this bound the mount declines the
-/// sweep and falls back to strict serving until its leases expire — bounded
-/// staleness-free degradation instead of a mount-wide stall.
+/// own lookups for as long as it runs. An observer cannot decline the sweep —
+/// converging on the remote scope is its whole contract — so this is a log
+/// threshold, not a limit.
 const KERNEL_SWEEP_MAX_TARGETS: usize = 128;
 const ROOT_INO_RAW: u64 = 1;
 const ROOT_INO: INodeNo = INodeNo(ROOT_INO_RAW);
-const LARGE_FILE_BYTES: u64 = 10 * 1024 * 1024;
-/// One HTTP range fetched for a sequential large-file handle. The kernel's
-/// direct-I/O requests are commonly only 128 KiB; forwarding each request
-/// independently turned a 1 GiB read into thousands of network round trips.
-/// A per-handle 16 MiB window keeps memory bounded while amortizing sequential
-/// reads to 64 requests per GiB.
-const LARGE_READ_AHEAD_BYTES: u64 = 16 * 1024 * 1024;
 /// Keep zero-lookup inode routes long enough for a kernel invalidation/FORGET
 /// to cross concurrent operations that were already dispatched with that inode
 /// as their parent. Explicit namespace deletion/rename detaches routes
 /// immediately; this is only bounded retention for otherwise-live paths.
 const MAX_RETAINED_INODE_RECORDS: usize = 262_144;
 const MAX_OPEN_HANDLES: usize = 8_192;
-const MAX_METADATA_BATCH_PATHS: usize = 4_096;
-const MAX_SUBTREE_METADATA_ENTRIES: i64 = 4_096;
-const MAX_SUBTREE_PREFETCH_BYTES: u64 = 64 * 1024 * 1024;
 const ADVISORY_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
 const ADVISORY_LOCK_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Emit one WARN if a blocking advisory-lock acquisition parks past this before
@@ -83,146 +63,29 @@ const ADVISORY_LOCK_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
 /// spam.
 const SLOW_ADVISORY_LOCK_WARN_AFTER: Duration = Duration::from_secs(10);
 const ADVISORY_LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+/// How long an advisory-lock callback waits for the publisher to make its path
+/// exist remotely. Bounded, because a lock request is a guest syscall and a
+/// gateway outage must never park one indefinitely: the request is issued
+/// anyway, and the gateway's own answer is authoritative.
+const ADVISORY_LOCK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const POSIX_MODE_MASK: u32 = 0o7777;
-const METADATA_WIRE_SAMPLE_LIMIT: u64 = 40;
-static METADATA_WIRE_SAMPLES: AtomicU64 = AtomicU64::new(0);
 
 type FuseResult<T> = std::result::Result<T, Errno>;
 
-/// Separate VMs have separate kernel page caches and there is no
-/// cross-kernel invalidation channel. Keep file data caching in the
-/// revision-aware FUSE layer so every handle read can revalidate the remote
-/// stable identity and content hash.
+/// Open flags returned to the kernel for a file handle.
+///
+/// `FOPEN_DIRECT_IO` used to be forced here because separate VMs had separate
+/// page caches over the same remote object and there was no cross-kernel
+/// invalidation channel, so a cached page could outlive the bytes it described.
+/// A single owner reading and writing its own backing tree has no such sibling:
+/// the guest's page cache is coherent with the only writer there is, and forcing
+/// direct I/O only turned every read and write into an unbuffered round trip
+/// through the FUSE transport.
+///
+/// `FUSE_WRITEBACK_CACHE` stays off (see `requested_init_capabilities_for`): it
+/// changes write semantics and needs measurement, which is not this step's work.
 fn remote_file_open_flags() -> FopenFlags {
-    FopenFlags::FOPEN_DIRECT_IO
-}
-
-/// Select the attribute/entry TTL for a reply. A positive lease
-/// (`ATTR_ENTRY_LEASE_TTL`) is handed to the kernel only while the registry's
-/// revision watch is live at reply time; with the watch down the reply fails
-/// closed to `Duration::ZERO`, so every subsequent lstat/getattr crosses into
-/// userspace and reconfirms against the (now unconfirmed) coherence fence.
-fn lease_ttl_for(watch_live: bool) -> Duration {
-    if watch_live {
-        ATTR_ENTRY_LEASE_TTL
-    } else {
-        Duration::ZERO
-    }
-}
-
-fn metadata_from_dir_entry(entry: &RemoteDirEntry) -> RemoteMetadata {
-    RemoteMetadata {
-        kind: entry.kind.clone(),
-        size_bytes: entry.size_bytes,
-        file_id: entry.file_id.clone(),
-        link_count: entry.link_count,
-        link_target: entry.link_target.clone(),
-        content_hash: entry.content_hash.clone(),
-        executable: entry.executable,
-        mode: entry.mode,
-        updated_at: entry.updated_at,
-    }
-}
-
-/// Whether a cached entry carries everything a FULL stat (`/stat`) promises its
-/// callers, as opposed to an entry installed by a bulk route that answered
-/// without a content hash.
-///
-/// The difference is the content hash: `read_bytes` matches cached file bytes
-/// against it and a write chains its CAS base from it, so a file entry without
-/// one must not be served in place of a full stat. Directories and symlinks
-/// carry no content hash at all, so for them the entry is already complete.
-///
-/// The bulk routes ask the gateway to hash up to
-/// `BULK_METADATA_MAX_HASH_BYTES`, so most file entries now arrive complete.
-/// This gate is what keeps the rest honest: a file over that bound, or any
-/// answer from a gateway that does not hash at all, still lands incomplete and
-/// still falls through to a point `/stat`.
-/// A directory this mount knows exists because its own queued writes are under
-/// it, but which the gateway has not been told about yet.
-fn projected_directory_metadata() -> RemoteMetadata {
-    RemoteMetadata {
-        kind: "directory".to_string(),
-        size_bytes: 0,
-        file_id: None,
-        link_count: 2,
-        link_target: None,
-        content_hash: None,
-        executable: false,
-        mode: Some(0o755),
-        updated_at: None,
-    }
-}
-
-fn full_stat_metadata_is_complete(metadata: &RemoteMetadata) -> bool {
-    metadata.kind != "file" || metadata.content_hash.is_some()
-}
-
-/// What a full-stat caller needs of a file entry's content hash.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FullStatHash {
-    /// The caller uses the hash NOW: to match cached bytes, or as a CAS base it
-    /// fixes at this instant and publishes from without ever loading the file
-    /// (`O_TRUNC`). An incomplete entry falls through to an unbounded point
-    /// `/stat`, which hashes whatever it costs.
-    Required,
-    /// The caller can proceed without a hash for a file the whole-file content
-    /// cache could not hold anyway — see [`deferred_hash_is_safe`]. The hash is
-    /// obtained later, from the authoritative route the first write resolves
-    /// (`ensure_handle_loaded_locked`), so no CAS precondition is weakened; it
-    /// is simply not paid for at open.
-    Deferred,
-}
-
-/// Whether serving `metadata` without its content hash defers work rather than
-/// dropping a check.
-///
-/// True only for a file past `LARGE_FILE_BYTES`, and that bound is the whole
-/// argument. At or under it a file lives in the mount's whole-file content
-/// cache (`MAX_FILE_BYTES`, the same 10 MiB), and the hash is what
-/// `get_file_matching` matches those cached bytes against — deferring it there
-/// would silently turn cache hits into wire reads. Past it the file is never
-/// cached whole, ranged reads are pinned by fingerprint rather than by hash, and
-/// the only remaining consumer of the open-time hash is the CAS base a later
-/// write chains from. That base is established, authoritatively and unbounded,
-/// when the handle is first loaded for that write.
-///
-/// What this buys: the point `/stat` an open falls through to sends no hashing
-/// budget, and hashing is the gateway reading the file. An `open(2)` of a 5 GiB
-/// dataset made the gateway read 5 GiB to produce a hash the open could not use.
-fn deferred_hash_is_safe(metadata: &RemoteMetadata) -> bool {
-    metadata.kind == "file" && metadata.size_bytes > LARGE_FILE_BYTES
-}
-
-/// The mount's content-cache ceiling and the point stat's hashing budget are the
-/// same line, and the deferral argument above depends on that: a file the
-/// gateway declines to hash must also be one this mount would never have held
-/// whole.
-const _: () = assert!(LARGE_FILE_BYTES == OPEN_STAT_MAX_HASH_BYTES);
-
-/// How much metadata one inode-route resolution owes its caller.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RouteMetadata {
-    /// Attributes only — no content hash requested at all (`max_hash_bytes=0`).
-    Attributes,
-    /// A full stat, hash included at any size.
-    Full,
-    /// A full stat whose hash may be deferred for a file too large for the
-    /// content cache. See [`FullStatHash::Deferred`].
-    FullDeferredHash,
-}
-
-/// A namespace projection is mount-local read-your-writes state. Only an
-/// unprojected server response may be published into the cache shared by
-/// sibling mounts, and callers must tag that publication with the exact
-/// revision carried by the response.
-fn publish_authoritative_projection<T>(
-    projection: &NamespaceProjection<T>,
-    publish: impl FnOnce(&T),
-) {
-    if !projection.applied {
-        publish(&projection.value);
-    }
+    FopenFlags::empty()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -409,6 +272,15 @@ struct InodeRecord {
     lookup_count: u64,
 }
 
+// The identity-retargeting and alias helpers describe a gateway `file_id` that
+// the backing entry's `dev:ino` has replaced as this mount's hard-link identity,
+// so they have no caller on the callback path any more. They are kept because
+// they are the inode table's complete contract -- `lookup`, `route`,
+// `retarget_identity*`, `detach_unlinked_identity`, `knows_path` and
+// `aliases_for_path` are the operations the structure is specified in terms of,
+// and the alias/lookup-count bookkeeping they encode is what makes the rest of
+// it correct.
+#[allow(dead_code)]
 impl InodeTable {
     fn new() -> Self {
         let mut table = Self {
@@ -790,38 +662,8 @@ impl InodeTable {
         targets
     }
 
-    /// Identity (hard-link) invalidation: drop the shared inode's attributes and
-    /// every cached alias dentry for a stable identity the publication changed.
-    /// Reaches aliases the kernel cached under a name other than the written
-    /// path — they share one inode via `identity_to_ino`.
-    fn identity_invalidation_targets(&self, file_id: &str) -> Vec<KernelInvalTarget> {
-        let Some(ino) = self.identity_to_ino.get(file_id).copied() else {
-            return Vec::new();
-        };
-        let Some(record) = self.ino_to_path.get(&ino) else {
-            return Vec::new();
-        };
-        let mut targets = vec![KernelInvalTarget {
-            ino: Some(ino),
-            parent: None,
-            name: OsString::new(),
-        }];
-        for alias in &record.paths {
-            if let Some((parent, name)) = split_parent_and_leaf(alias.as_str())
-                && let Some(parent_ino) = self.path_to_ino.get(parent).copied()
-            {
-                targets.push(KernelInvalTarget {
-                    ino: None,
-                    parent: Some(parent_ino),
-                    name: OsString::from(name),
-                });
-            }
-        }
-        targets
-    }
-
-    /// Every attribute/dentry this mount handed the kernel, for a full sweep on
-    /// a remote publication whose exact path set this process never learned.
+    /// Every attribute/dentry this mount handed the kernel, for a read-only
+    /// observer's full sweep when the affected path set is not known.
     fn all_invalidation_targets(&self) -> Vec<KernelInvalTarget> {
         self.path_to_ino
             .keys()
@@ -839,107 +681,6 @@ struct KernelInvalTarget {
     name: OsString,
 }
 
-/// Resolve one publication's invalidation into the exact attr/dentry targets a
-/// mount handed its kernel.
-///
-/// `skip_publishing` is `Some` only when the result gates a publication's ack.
-/// Paths that mount is itself publishing are then dropped: the op parked on that
-/// publication holds the path's parent inode lock for its whole duration and
-/// `fuse_reverse_inval_entry` takes the same lock, so the revocation cannot land
-/// until the publication returns — while the publication cannot return until
-/// this ack does. Nothing is lost: the mount's own projection answers reads of
-/// the paths it just published, and its commit hook enqueues the identical
-/// revocation as soon as the publication returns.
-fn resolve_invalidation_targets(
-    table: &InodeTable,
-    invalidation: &PublicationInvalidation,
-    skip_publishing: Option<&InFlightPublications>,
-) -> Vec<KernelInvalTarget> {
-    let is_own = own_publication_filter(skip_publishing);
-    let mut targets = Vec::new();
-    for path in &invalidation.paths {
-        if is_own(path.as_str()) {
-            continue;
-        }
-        if let Some(target) = table.invalidation_target(path) {
-            targets.push(target);
-        }
-    }
-    for path in &invalidation.relisted {
-        if is_own(path.as_str()) {
-            continue;
-        }
-        // A listing-only change invalidates the directory inode/page state, not
-        // the directory's own dentry in its parent. Invalidating that dentry on
-        // every child publication races concurrent CREATE operations using the
-        // directory as their parent and can make a live parent spuriously
-        // disappear from the daemon's inode table.
-        if let Some(target) = table.invalidation_target(path)
-            && target.ino.is_some()
-        {
-            targets.push(KernelInvalTarget {
-                ino: target.ino,
-                parent: None,
-                name: OsString::new(),
-            });
-        }
-    }
-    for prefix in &invalidation.subtrees {
-        if is_own(prefix.as_str()) {
-            continue;
-        }
-        targets.extend(table.subtree_invalidation_targets(prefix));
-    }
-    // Identities are reached through a stable file id, never a pathname, and a
-    // remote publication's answer never carries any (see
-    // `PublicationInvalidation::for_affected`), so there is nothing to filter.
-    for identity in &invalidation.identities {
-        targets.extend(table.identity_invalidation_targets(identity));
-    }
-    targets
-}
-
-/// Whether [`resolve_invalidation_targets`] would return anything, decided
-/// without building the vector and short-circuiting on the first hit.
-///
-/// This runs on the revision-watch task for every publication, so it must stay
-/// proportional to the answer rather than to the affected set: a `false` here is
-/// what lets the publication ack without touching the revocation queue at all.
-fn has_invalidation_targets(
-    table: &InodeTable,
-    invalidation: &PublicationInvalidation,
-    skip_publishing: Option<&InFlightPublications>,
-) -> bool {
-    let is_own = own_publication_filter(skip_publishing);
-    invalidation
-        .paths
-        .iter()
-        .any(|path| !is_own(path.as_str()) && table.invalidation_target(path).is_some())
-        || invalidation.relisted.iter().any(|path| {
-            !is_own(path.as_str())
-                && table
-                    .invalidation_target(path)
-                    .is_some_and(|target| target.ino.is_some())
-        })
-        || invalidation.subtrees.iter().any(|prefix| {
-            !is_own(prefix.as_str()) && !table.subtree_invalidation_targets(prefix).is_empty()
-        })
-        || invalidation
-            .identities
-            .iter()
-            .any(|identity| !table.identity_invalidation_targets(identity).is_empty())
-}
-
-/// Predicate for "this mount is publishing that path itself", pre-resolved so
-/// the common case (nothing in flight) costs one atomic-free map check rather
-/// than one per affected path.
-fn own_publication_filter(
-    skip_publishing: Option<&InFlightPublications>,
-) -> impl Fn(&str) -> bool + '_ {
-    let publishing = skip_publishing.filter(|publications| !publications.is_idle());
-    move |path: &str| publishing.is_some_and(|publications| publications.contains(path))
-}
-
 /// Split a scope-relative VFS path into its parent directory and leaf name.
 /// Returns `None` for the scope root (which has no parent dentry). A top-level
 /// name yields `("", name)` — the empty parent is the scope root inode.
@@ -954,37 +695,185 @@ fn split_parent_and_leaf(path: &str) -> Option<(&str, &str)> {
     })
 }
 
-/// One mount's implementation of the shared `KernelInvalidator` hook. Holds this
-/// mount's fuser notifier (a cloneable `Send + Sync` handle onto its `/dev/fuse`
-/// session) and a `Weak` into its inode table, so it can resolve a publication's
-/// affected paths to the exact inodes/dentries this mount handed the kernel and
-/// revoke them. Notifier calls originate from the watch task and journal-worker
-/// threads; `Notifier` is `Send + Sync`, so no extra wrapping is required.
-pub(super) struct MountKernelInvalidator {
+/// Captured before the fs is moved into its FUSE session, this defers binding
+/// the kernel notifier — which only exists after `spawn_mount2` — to the inode
+/// table it has to resolve paths through.
+///
+/// Only a read-only observer binds one. A writable mount owns its scope, serves
+/// every read from its own backing tree and has nobody to be contradicted by, so
+/// it revokes nothing and never builds an invalidator at all.
+pub(super) struct KernelInvalidationBinding {
+    inodes: Arc<Mutex<InodeTable>>,
+}
+
+impl KernelInvalidationBinding {
+    /// Build the read-only observer's kernel-revocation sink.
+    pub(super) fn path_invalidator(&self, notifier: fuser::Notifier) -> Arc<MountPathInvalidator> {
+        MountPathInvalidator::spawn(notifier, Arc::downgrade(&self.inodes))
+    }
+}
+
+/// Kernel revocation for a read-only observer mount, driven by
+/// `local_view::hydrate::RemoteFollower`.
+///
+/// The follower re-materializes what an external writer changed into the backing
+/// tree and then has to drop whatever this mount's guest kernel still caches for
+/// those paths. `notify_inval_entry` takes the guest kernel's parent-inode lock,
+/// which a parked FUSE operation may already hold, so the trait contract is
+/// enqueue-and-return: every request lands in this queue and one dedicated
+/// thread — which holds no FUSE lock and never runs a callback — issues the
+/// notifier calls.
+pub(super) struct MountPathInvalidator {
+    inner: Arc<PathInvalidatorInner>,
+}
+
+struct PathInvalidatorInner {
     notifier: fuser::Notifier,
+    /// `Weak`, so a queued revocation cannot keep the filesystem alive past
+    /// unmount; an upgrade failure simply means there is nothing left to revoke.
     inodes: Weak<Mutex<InodeTable>>,
-    /// Paths this mount is publishing to the gateway right now. A revocation
-    /// for one of them cannot land while the op that is publishing it holds the
-    /// dentry's parent inode lock, so it is excluded from the revocation that
-    /// gates that publication's ack — never from the mount's own commit-hook
-    /// revocation, which runs once the publication has returned.
-    publications: Arc<InFlightPublications>,
-    /// Edge-detects notify failures so an operator-facing WARN fires once per
-    /// failing transition, not once per path.
+    queue: Mutex<PathInvalidatorQueue>,
+    signal: Condvar,
+    /// Edge-detects notifier failures so a broken channel warns once, not once
+    /// per path.
     warned: AtomicBool,
 }
 
-impl MountKernelInvalidator {
-    /// Resolve one publication's invalidation into this mount's kernel targets.
-    ///
-    /// With `for_ack`, paths this mount is itself publishing are skipped: their
-    /// revocation is a catch-up its own commit hook performs, and putting it on
-    /// the ack path inverts the lock order against the op that is parked on the
-    /// publication being acked.
-    fn resolve_targets(
+/// Coalesced work. Repeated requests for the same path collapse into one
+/// revocation, and a pending full sweep subsumes everything finer.
+#[derive(Default)]
+struct PathInvalidatorQueue {
+    paths: BTreeSet<String>,
+    subtrees: BTreeSet<String>,
+    sweep: bool,
+    stopped: bool,
+}
+
+impl PathInvalidatorQueue {
+    fn is_idle(&self) -> bool {
+        !self.sweep && self.paths.is_empty() && self.subtrees.is_empty()
+    }
+}
+
+impl MountPathInvalidator {
+    fn spawn(notifier: fuser::Notifier, inodes: Weak<Mutex<InodeTable>>) -> Arc<Self> {
+        let inner = Arc::new(PathInvalidatorInner {
+            notifier,
+            inodes,
+            queue: Mutex::new(PathInvalidatorQueue::default()),
+            signal: Condvar::new(),
+            warned: AtomicBool::new(false),
+        });
+        let worker = Arc::clone(&inner);
+        if let Err(error) = std::thread::Builder::new()
+            .name("vfs-observer-inval".to_string())
+            .spawn(move || worker.run())
+        {
+            // Without the worker the observer would serve stale kernel entries
+            // silently. Say so once, loudly; the mount stays usable and falls
+            // back to lease expiry. Marking the queue stopped keeps every later
+            // request from accumulating behind a thread that will never run it.
+            tracing::error!(
+                %error,
+                "failed to start the read-only vfs observer's kernel revocation thread"
+            );
+            if let Ok(mut queue) = inner.queue.lock() {
+                queue.stopped = true;
+            }
+        }
+        Arc::new(Self { inner })
+    }
+}
+
+impl Drop for MountPathInvalidator {
+    fn drop(&mut self) {
+        // The worker owns its own `Arc` on the inner state, so it outlives this
+        // handle; ask it to finish the queue it holds and exit.
+        if let Ok(mut queue) = self.inner.queue.lock() {
+            queue.stopped = true;
+        }
+        self.inner.signal.notify_all();
+    }
+}
+
+impl KernelPathInvalidator for MountPathInvalidator {
+    fn invalidate_paths(&self, paths: &[String]) {
+        self.inner.enqueue(|queue| {
+            for path in paths {
+                queue.paths.insert(path.trim_matches('/').to_string());
+            }
+        });
+    }
+
+    fn invalidate_subtrees(&self, subtrees: &[String]) {
+        self.inner.enqueue(|queue| {
+            for subtree in subtrees {
+                let subtree = subtree.trim_matches('/');
+                // The scope root as a subtree is the whole mount, which only a
+                // full sweep expresses (`subtree_invalidation_targets` declines
+                // an empty prefix precisely because it means everything).
+                if subtree.is_empty() {
+                    queue.sweep = true;
+                } else {
+                    queue.subtrees.insert(subtree.to_string());
+                }
+            }
+        });
+    }
+
+    fn invalidate_all(&self) {
+        self.inner.enqueue(|queue| queue.sweep = true);
+    }
+}
+
+impl PathInvalidatorInner {
+    fn enqueue(&self, fill: impl FnOnce(&mut PathInvalidatorQueue)) {
+        let Ok(mut queue) = self.queue.lock() else {
+            return;
+        };
+        if queue.stopped {
+            return;
+        }
+        fill(&mut queue);
+        drop(queue);
+        self.signal.notify_one();
+    }
+
+    fn run(&self) {
+        loop {
+            let (paths, subtrees, sweep) = {
+                let mut queue = match self.queue.lock() {
+                    Ok(queue) => queue,
+                    Err(_) => return,
+                };
+                while queue.is_idle() && !queue.stopped {
+                    queue = match self.signal.wait(queue) {
+                        Ok(queue) => queue,
+                        Err(_) => return,
+                    };
+                }
+                if queue.is_idle() {
+                    // Idle and stopped: nothing left to revoke.
+                    return;
+                }
+                (
+                    std::mem::take(&mut queue.paths),
+                    std::mem::take(&mut queue.subtrees),
+                    std::mem::replace(&mut queue.sweep, false),
+                )
+            };
+            // The inode-table lock is dropped before any `writev` into
+            // `/dev/fuse`, so a revocation can never block a lookup behind it.
+            let targets = self.resolve(&paths, &subtrees, sweep);
+            self.apply(&targets);
+        }
+    }
+
+    fn resolve(
         &self,
-        invalidation: &PublicationInvalidation,
-        for_ack: bool,
+        paths: &BTreeSet<String>,
+        subtrees: &BTreeSet<String>,
+        sweep: bool,
     ) -> Vec<KernelInvalTarget> {
         let Some(inodes) = self.inodes.upgrade() else {
             return Vec::new();
@@ -992,16 +881,33 @@ impl MountKernelInvalidator {
         let table = inodes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        resolve_invalidation_targets(
-            &table,
-            invalidation,
-            for_ack.then_some(self.publications.as_ref()),
-        )
+        if sweep {
+            // An observer has no ack to withhold and no projection of its own to
+            // fall back on, so — unlike the owning mount's `invalidate_all` — it
+            // cannot decline a large sweep. Converging on the remote scope is the
+            // observer's entire contract.
+            let targets = table.all_invalidation_targets();
+            if targets.len() > KERNEL_SWEEP_MAX_TARGETS {
+                tracing::debug!(
+                    targets = targets.len(),
+                    "read-only vfs observer sweeping a large kernel working set"
+                );
+            }
+            return targets;
+        }
+        let mut targets = Vec::new();
+        for path in paths {
+            if let Some(target) = table.invalidation_target(path) {
+                targets.push(target);
+            }
+        }
+        for subtree in subtrees {
+            targets.extend(table.subtree_invalidation_targets(subtree));
+        }
+        targets
     }
 
-    /// Fire the notifier for each target, resolving the inode-table lock first
-    /// and dropping it before any `writev` into `/dev/fuse`.
-    fn apply(&self, targets: &[KernelInvalTarget]) -> bool {
+    fn apply(&self, targets: &[KernelInvalTarget]) {
         let mut clean = true;
         for target in targets {
             if let Some(ino) = target.ino
@@ -1018,107 +924,18 @@ impl MountKernelInvalidator {
             }
         }
         if clean {
-            // A fully clean sweep re-arms the edge so a later failure warns again.
             self.warned.store(false, Ordering::Release);
-        }
-        clean
-    }
-
-    fn warn_sweep_declined(&self, targets: usize) {
-        if !self.warned.swap(true, Ordering::AcqRel) {
-            tracing::warn!(
-                targets,
-                limit = KERNEL_SWEEP_MAX_TARGETS,
-                "vfs kernel sweep declined; serving strict until leases expire"
-            );
         }
     }
 
     fn warn_once(&self, error: &io::Error) {
-        // `notify_inval_*` already swallow ENOENT internally (the kernel had
-        // already dropped the cached entry), so anything reaching here is a
-        // genuine channel error (e.g. the session's fd closing on unmount).
         if !self.warned.swap(true, Ordering::AcqRel) {
-            tracing::warn!(%error, "vfs fuse kernel cache invalidation failed");
+            tracing::warn!(%error, "read-only vfs observer kernel revocation failed");
         }
     }
 }
 
-impl KernelInvalidator for MountKernelInvalidator {
-    fn invalidate(&self, invalidation: &PublicationInvalidation) -> bool {
-        self.apply(&self.resolve_targets(invalidation, false))
-    }
-
-    fn invalidate_for_ack(&self, invalidation: &PublicationInvalidation) -> bool {
-        self.apply(&self.resolve_targets(invalidation, true))
-    }
-
-    fn has_ack_blocking_targets(&self, invalidation: &PublicationInvalidation) -> bool {
-        // Inode-table lookups only — no notifier call, nothing that can block.
-        let Some(inodes) = self.inodes.upgrade() else {
-            return false;
-        };
-        let table = inodes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        has_invalidation_targets(&table, invalidation, Some(self.publications.as_ref()))
-    }
-
-    fn invalidate_all(&self) -> bool {
-        let Some(inodes) = self.inodes.upgrade() else {
-            return true;
-        };
-        let targets = {
-            let table = inodes
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            table.all_invalidation_targets()
-        };
-        // A remote publication carries no path set, so the only fully accurate
-        // revocation is every entry this mount handed the kernel. That is safe
-        // when the working set is small and actively harmful when it is not:
-        // `notify_inval_entry` takes the parent inode's write lock in the guest
-        // kernel, so sweeping thousands of dentries stalls the guest's own
-        // lookups behind the storm — a mount-wide freeze, not a fast revocation.
-        //
-        // Past the bound, decline the sweep instead. Returning `false` routes
-        // the caller down the same fail-closed path a failed revocation takes:
-        // watch liveness drops (replies revert to TTL=0, every serve becomes
-        // wire-backed) and the ack is withheld until the leases granted before
-        // this point have expired on their own. Correctness is preserved by
-        // strictness rather than by a storm the guest cannot absorb.
-        if targets.len() > KERNEL_SWEEP_MAX_TARGETS {
-            self.warn_sweep_declined(targets.len());
-            return false;
-        }
-        self.apply(&targets)
-    }
-}
-
-/// Captured before the fs is moved into its FUSE session, this defers binding
-/// the kernel notifier (which only exists after `spawn_mount2`) into the shared
-/// invalidator registry. `install` returns the strong handle the mount owner
-/// keeps for the mount's lifetime; dropping it deregisters the mount.
-pub(super) struct KernelInvalidationRegistrar {
-    invalidators: Arc<MountInvalidators>,
-    inodes: Arc<Mutex<InodeTable>>,
-    publications: Arc<InFlightPublications>,
-}
-
-impl KernelInvalidationRegistrar {
-    pub(super) fn install(self, notifier: fuser::Notifier) -> Arc<MountKernelInvalidator> {
-        let invalidator = Arc::new(MountKernelInvalidator {
-            notifier,
-            inodes: Arc::downgrade(&self.inodes),
-            publications: self.publications,
-            warned: AtomicBool::new(false),
-        });
-        let handle: Arc<dyn KernelInvalidator> = invalidator.clone();
-        self.invalidators.register(Arc::downgrade(&handle));
-        invalidator
-    }
-}
-
+/// Open file descriptors on the backing tree.
 struct HandleTable {
     next: u64,
     files: HashMap<u64, FileState>,
@@ -1133,428 +950,174 @@ impl Default for HandleTable {
     }
 }
 
+/// One open file description.
+///
+/// There is no whole-file buffer, no CAS baseline, no publication bookkeeping
+/// and no per-inode gate any more: the backing descriptor *is* the shared state
+/// two descriptors on one inode used to have to mirror between them, and the
+/// ordering a publication needed is the WAL's sequence.
 #[derive(Clone)]
 struct FileState {
+    /// `Arc` so a callback can take the descriptor out from under the handle
+    /// table lock and do its I/O without holding it -- the handle table is the
+    /// outermost lock in the mount and must never span a syscall.
+    file: Arc<MountFile>,
+    /// The mount-relative pathname this descriptor was opened at, retargeted by
+    /// `rename`. Kept alongside `MountFile`'s own name so the handle table can
+    /// be scanned by pathname without touching a descriptor.
     path: String,
-    file_id: Option<String>,
-    link_count: u64,
-    /// The pathname has been removed and no remaining alias can publish this
-    /// open inode. Its buffer remains usable until final release, but must
-    /// never be flushed back into the deleted namespace.
-    unlinked: bool,
-    buffer: Vec<u8>,
-    /// Permission and special bits, excluding the file-type bits carried
-    /// separately by FUSE.
-    mode: u32,
-    /// Exact mode last known to exist at the gateway. New files have no
-    /// baseline until their first mode-carrying write-through publishes them.
-    base_mode: Option<u32>,
-    /// The first if-absent write was acknowledged, but authoritative identity
-    /// binding has not completed yet. A retry must stat, never create again.
-    publication_acknowledged: bool,
-    /// Exact ordered-write publication currently owned by this handle.
-    /// Retained across a failed fsync/close so a retry waits for the original
-    /// WAL entry instead of enqueueing a duplicate with ambiguous attribution.
-    pending_publication: Option<HandlePublication>,
-    created: bool,
-    dirty: bool,
-    loaded: bool,
-    /// Exact gateway revision that verified `buffer` for a clean handle.
-    /// Repeated direct-I/O reads may reuse the buffer only while the shared
-    /// mount coherence revision remains equal to this token.
-    loaded_coherence_revision: u64,
-    /// Bounded read-ahead for clean large-file handles. Kept separate from
-    /// `buffer`: `loaded` means the complete file is resident and writable,
-    /// while this window is only a fingerprint-pinned slice.
-    range_window: Option<LargeReadWindow>,
-    base_content_hash: Option<String>,
-    /// Linearizes writeback, final release, and pathname transitions for this
-    /// open handle. FUSE may issue duplicate FLUSH requests and concurrent
-    /// RELEASE; clones must share the same gate.
-    publication_gate: Arc<Mutex<()>>,
-    revision: u64,
+    /// The guest's open flags, as the kernel sent them.
+    flags: i32,
 }
 
-/// Metadata-only copy used while a handle lock must be released for network
-/// I/O. Cloning `FileState` cloned its complete growing write buffer (or its
-/// 16 MiB range window) on every FUSE request, turning a sequential 1 GiB write
-/// into quadratic memory traffic.
-struct FileStateView {
-    path: String,
-    file_id: Option<String>,
-    link_count: u64,
-    unlinked: bool,
-    buffer_len: usize,
-    mode: u32,
-    dirty: bool,
-    loaded: bool,
-    loaded_coherence_revision: u64,
-    base_content_hash: Option<String>,
-    revision: u64,
-}
-
-impl FileStateView {
-    fn capture(state: &FileState) -> Self {
-        Self {
-            path: state.path.clone(),
-            file_id: state.file_id.clone(),
-            link_count: state.link_count,
-            unlinked: state.unlinked,
-            buffer_len: state.buffer.len(),
-            mode: state.mode,
-            dirty: state.dirty,
-            loaded: state.loaded,
-            loaded_coherence_revision: state.loaded_coherence_revision,
-            base_content_hash: state.base_content_hash.clone(),
-            revision: state.revision,
-        }
+impl FileState {
+    /// Whether this description may mutate its file. The guest kernel normally
+    /// enforces it, but every operation that changes bytes checks it too, so a
+    /// read-only descriptor can never dirty a path and pull its content into a
+    /// published generation.
+    fn is_writable(&self) -> bool {
+        self.flags & libc::O_ACCMODE != libc::O_RDONLY
     }
 }
 
-#[derive(Clone)]
-struct LargeReadWindow {
-    offset: u64,
-    bytes: Vec<u8>,
-    fingerprint: String,
-}
-
-struct LargeRangeRead {
-    bytes: Vec<u8>,
-    metadata: RemoteMetadata,
-}
-
-#[derive(Clone)]
-struct HandlePublication {
-    id: u64,
-    revision: u64,
-    path: String,
-    file_id: Option<String>,
-    size_bytes: u64,
-    content_hash: String,
-    mode: u32,
-}
-
-/// A successful local create whose first gateway publication still belongs to
-/// its content write. Mode changes made before that publication do not turn it
-/// into an overwrite: the write must continue to carry expect-absent plus the
-/// final mode.
-fn owns_unpublished_creation(state: &FileState) -> bool {
-    state.created && state.file_id.is_none() && state.base_content_hash.as_deref() == Some("absent")
-}
-
-/// What a handle flush owes its caller once it returns.
+/// One open directory description.
 ///
-/// The two are genuinely different operations and the guest kernel tells us
-/// which one it is asking for. Collapsing them made every close a mount-wide
-/// publication barrier, which is why nothing ever batched.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FlushBarrier {
-    /// close(2): the FUSE FLUSH and RELEASE pair. The handle's bytes must reach
-    /// the write journal's durable WAL, ordered behind any queued namespace
-    /// mutation for its own pathname, and an already-terminal publication
-    /// failure must be reported. Nothing else is owed — in particular, no
-    /// unrelated namespace mutation is forced onto the wire.
-    Close,
-    /// fsync(2)/fdatasync(2), and every internal path that goes on to report
-    /// authoritative post-publication state (fchmod's exact-mode publication,
-    /// advisory locking's stable identity). Both ordered journals must be
-    /// remotely acknowledged before this returns.
-    Durable,
-}
-
-#[derive(Clone)]
-struct LinkedFileRoute {
+/// `readdir`/`readdirplus` are served from a snapshot taken here rather than
+/// re-listing the directory on every kernel round, which is what makes the
+/// offset a real cursor: a continuation at offset N addresses the same child it
+/// would have on the previous round. The snapshot is refreshed whenever the
+/// kernel restarts the stream at offset 0, so `rewinddir(3)` still sees current
+/// contents.
+struct DirState {
     path: String,
-    metadata: RemoteMetadata,
-    revision: u64,
+    entries: Option<Arc<Vec<LocalDirEntry>>>,
 }
 
-enum StableFileRoute {
-    Linked(LinkedFileRoute),
-    Unlinked,
+struct DirHandleTable {
+    next: u64,
+    dirs: HashMap<u64, DirState>,
 }
 
-struct AdvisoryLockTarget {
-    path: String,
-    file_id: String,
-}
+/// Directory handles are minted from the top of the handle space so they can
+/// never collide with a file handle. `getattr` is dispatched with whichever
+/// descriptor the caller `fstat`ed, including a directory's, and answering it
+/// from a file table entry that happened to share the number would return a
+/// completely unrelated inode's attributes.
+const DIR_HANDLE_BASE: u64 = 1 << 63;
 
-type MetadataBatchResult = std::result::Result<Versioned<Option<RemoteMetadata>>, String>;
-
-struct MetadataBatchWaiter {
-    path: String,
-    result: Mutex<Option<MetadataBatchResult>>,
-    ready: Condvar,
-}
-
-#[derive(Default)]
-struct MetadataBatchState {
-    pending: Vec<Arc<MetadataBatchWaiter>>,
-    flushing: bool,
-}
-
-#[derive(Default)]
-struct MetadataBatcher {
-    state: Mutex<MetadataBatchState>,
-}
-
-impl MetadataBatcher {
-    fn stat_attributes(
-        &self,
-        client: &RemoteVfsClient,
-        tokio: &Handle,
-        path: &str,
-    ) -> MetadataBatchResult {
-        let waiter = Arc::new(MetadataBatchWaiter {
-            path: path.to_string(),
-            result: Mutex::new(None),
-            ready: Condvar::new(),
-        });
-        let leader = {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| "VFS metadata batch lock poisoned".to_string())?;
-            state.pending.push(Arc::clone(&waiter));
-            if state.flushing {
-                false
-            } else {
-                state.flushing = true;
-                true
-            }
-        };
-        if leader {
-            self.flush(client, tokio);
-        }
-        let mut result = waiter
-            .result
-            .lock()
-            .map_err(|_| "VFS metadata batch result lock poisoned".to_string())?;
-        while result.is_none() {
-            result = waiter
-                .ready
-                .wait(result)
-                .map_err(|_| "VFS metadata batch result lock poisoned".to_string())?;
-        }
-        result
-            .take()
-            .ok_or_else(|| "VFS metadata batch result missing".to_string())?
-    }
-
-    fn flush(&self, client: &RemoteVfsClient, tokio: &Handle) {
-        loop {
-            let requests = {
-                let mut state = match self.state.lock() {
-                    Ok(state) => state,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                let take = state.pending.len().min(MAX_METADATA_BATCH_PATHS);
-                state.pending.drain(..take).collect::<Vec<_>>()
-            };
-            if requests.is_empty() {
-                let mut state = match self.state.lock() {
-                    Ok(state) => state,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                state.flushing = false;
-                if state.pending.is_empty() {
-                    return;
-                }
-                state.flushing = true;
-                continue;
-            }
-
-            let mut unique_paths = Vec::new();
-            let mut path_indexes = HashMap::<String, usize>::new();
-            let mut request_indexes = Vec::with_capacity(requests.len());
-            for request in &requests {
-                let index = match path_indexes.get(&request.path) {
-                    Some(index) => *index,
-                    None => {
-                        let index = unique_paths.len();
-                        unique_paths.push(request.path.clone());
-                        path_indexes.insert(request.path.clone(), index);
-                        index
-                    }
-                };
-                request_indexes.push(index);
-            }
-            let response = tokio
-                .block_on(client.metadata_many_attributes_versioned(&unique_paths))
-                .map_err(|error| error.to_string())
-                .and_then(|response| {
-                    if response.value.len() == unique_paths.len() {
-                        Ok(response)
-                    } else {
-                        Err(format!(
-                            "VFS metadata-many returned {} entries for {} paths",
-                            response.value.len(),
-                            unique_paths.len()
-                        ))
-                    }
-                });
-            for (request, index) in requests.into_iter().zip(request_indexes) {
-                let result = match &response {
-                    Ok(response) => Ok(Versioned {
-                        value: response.value[index].clone(),
-                        revision: response.revision,
-                    }),
-                    Err(error) => Err(error.clone()),
-                };
-                if let Ok(mut slot) = request.result.lock() {
-                    *slot = Some(result);
-                    request.ready.notify_one();
-                }
-            }
+impl Default for DirHandleTable {
+    fn default() -> Self {
+        Self {
+            next: DIR_HANDLE_BASE,
+            dirs: HashMap::new(),
         }
     }
 }
 
 pub struct RemoteFuseFs {
     client: RemoteVfsClient,
-    cache: std::sync::Arc<RemoteFuseCache>,
-    metadata_batcher: MetadataBatcher,
-    // `Arc` so the post-mount kernel invalidator (see `MountKernelInvalidator`)
-    // can hold a `Weak` into this exact table and resolve affected paths to the
-    // inodes this mount handed its kernel, without keeping the fs alive.
+    /// The mount-local materialized view: the backing tree, the WAL and the
+    /// ownership lock for this mount's state directory. Opened, recovered and
+    /// hydrated by `handle::mount_remote_vfs_fuse` before the session is
+    /// spawned, so it is already the authoritative local state by the time the
+    /// kernel can issue a callback against it.
+    local: Arc<MountLocalView>,
+    // `Arc` so a read-only observer's post-mount path invalidator (see
+    // `MountPathInvalidator`) can hold a `Weak` into this exact table and
+    // resolve re-hydrated paths to the inodes this mount handed its kernel,
+    // without keeping the fs alive.
     inodes: Arc<Mutex<InodeTable>>,
     handles: Mutex<HandleTable>,
-    namespace: Option<NamespaceJournal>,
-    namespace_publication_gate: Mutex<()>,
-    writes: Option<WriteJournal>,
+    dirs: Mutex<DirHandleTable>,
     read_only: bool,
     scope_path: String,
     mount_id: String,
     active_lock_owners: std::sync::Arc<Mutex<ActiveAdvisoryLocks>>,
-    // Shared per-registry set of every sibling mount's kernel-invalidation hook.
-    // The commit hooks fan out over it on a local publication; the revision
-    // watch fans out over it on a remote one. Held here so the watch's `Weak`
-    // stays upgradeable for this mount's lifetime.
-    invalidators: Arc<MountInvalidators>,
     tokio: Handle,
     uid: u32,
     gid: u32,
 }
 
 impl RemoteFuseFs {
+    /// Scratch-state-directory constructor for the in-crate unit tests, which
+    /// drive callbacks directly without mounting. Production mounts go through
+    /// [`RemoteFuseFs::new_for_mount`], which is handed the mount state
+    /// directory the mount already owns.
+    #[cfg(test)]
     pub fn new(client: RemoteVfsClient, read_only: bool, scope_path: &str, tokio: Handle) -> Self {
+        let local = Self::scratch_local_view(scope_path, read_only, &tokio);
         let (mount_id, active_lock_owners) = Self::start_lock_heartbeat(&client, &tokio);
-        let cache = RemoteFuseCache::shared(&client.coherence_key());
-        let invalidators = MountInvalidators::shared(&client.coherence_key());
-        client.ensure_revision_watch(&tokio, &cache, &invalidators);
         Self {
             client,
-            cache,
-            metadata_batcher: MetadataBatcher::default(),
+            local,
             inodes: Arc::new(Mutex::new(InodeTable::new())),
             handles: Mutex::new(HandleTable::default()),
-            namespace: None,
-            namespace_publication_gate: Mutex::new(()),
-            writes: None,
+            dirs: Mutex::new(DirHandleTable::default()),
             read_only,
             scope_path: scope_path.trim_matches('/').to_string(),
             mount_id,
             active_lock_owners,
-            invalidators,
             tokio,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
         }
     }
 
-    pub fn new_with_namespace_journal(
+    /// Test-only scratch state directory, so a unit test that never mounts still
+    /// gets a real backing tree and WAL. The directory is deliberately leaked:
+    /// it must outlive the filesystem under test, and the OS reclaims it.
+    #[cfg(test)]
+    fn scratch_local_view(
+        scope_path: &str,
+        read_only: bool,
+        tokio: &Handle,
+    ) -> Arc<MountLocalView> {
+        let root = tempfile::Builder::new()
+            .prefix("chevalier-fuse-test-")
+            .tempdir()
+            .expect("create scratch mount state directory");
+        let options = super::local_view::mount::MountLocalViewOptions {
+            layout: super::local_view::MountStateLayout::new(root.path()),
+            scope_path: scope_path.trim_matches('/').to_string(),
+            endpoint: String::new(),
+            mount_tag: "test".to_string(),
+            read_only,
+            tokio: tokio.clone(),
+        };
+        let opened = MountLocalView::open(options).expect("open scratch mount-local view");
+        std::mem::forget(root);
+        opened.view
+    }
+
+    /// The production constructor. `local` is the mount-local view
+    /// `handle::mount_remote_vfs_fuse` has already opened, recovered and
+    /// hydrated, so the filesystem never exists without its authoritative local
+    /// state. Crate-visible because `MountLocalView` is: a mount can only be
+    /// built by the mount path.
+    ///
+    /// There is nothing else to open. The two ordered gateway journals this used
+    /// to construct — and the shared metadata cache, the kernel-invalidation
+    /// registry and the revision watch they were coherent against — are retired:
+    /// every mutation is a WAL event applied to the backing tree, and the
+    /// asynchronous publisher is the only thing that talks to the gateway.
+    pub(crate) fn new_for_mount(
         client: RemoteVfsClient,
         read_only: bool,
         scope_path: &str,
-        journal_path: &Path,
+        local: Arc<MountLocalView>,
         tokio: Handle,
     ) -> Result<Self> {
-        let cache = RemoteFuseCache::shared(&client.coherence_key());
-        let invalidators = MountInvalidators::shared(&client.coherence_key());
-        client.ensure_revision_watch(&tokio, &cache, &invalidators);
-        // The write journal is opened first so the namespace journal's recovery
-        // worker can hold a drain handle onto it (see NamespaceJournal recovery:
-        // it re-drains pending writes before re-issuing a conflicted deletion).
-        let writes = if read_only {
-            None
-        } else {
-            let dead_letter_cache = std::sync::Arc::clone(&cache);
-            let commit_cache = std::sync::Arc::clone(&cache);
-            let commit_invalidators = Arc::clone(&invalidators);
-            Some(WriteJournal::open_with_commit_hook(
-                client.clone(),
-                scope_path,
-                journal_path.with_extension("writes.jsonl").as_path(),
-                tokio.clone(),
-                // A dead-lettered write's content was installed into the read
-                // cache at flush time; drop it so readers converge on the
-                // gateway's authoritative content instead of the dropped bytes.
-                Some(Box::new(move |path: &str| {
-                    dead_letter_cache.invalidate(path)
-                })),
-                Some(Box::new(move |revision, writes, entries| {
-                    let invalidation =
-                        commit_cache.observe_write_publication_snapshot(revision, writes, entries);
-                    // Enqueue and return IMMEDIATELY; never block the publication
-                    // on the kernel revocation. See the namespace commit hook
-                    // below for the deadlock this avoids and why a local
-                    // publication's own revocation is a catch-up, not a barrier.
-                    commit_invalidators.enqueue_revocation(&invalidation);
-                })),
-            )?)
-        };
-        let namespace = if read_only {
-            None
-        } else {
-            let commit_cache = std::sync::Arc::clone(&cache);
-            let commit_invalidators = Arc::clone(&invalidators);
-            let write_drain = writes.as_ref().map(|writes| writes.drain_handle());
-            Some(NamespaceJournal::open_with_commit_hook(
-                client.clone(),
-                scope_path,
-                journal_path,
-                tokio.clone(),
-                Some(Box::new(move |revision, mutations, entries| {
-                    let invalidation = commit_cache
-                        .observe_namespace_publication_snapshot(revision, mutations, entries);
-                    // Enqueue and return IMMEDIATELY. This hook runs on the
-                    // journal worker while the guest's unlink/create op is parked
-                    // in flush_namespace_locked waiting for exactly this
-                    // publication — and the guest kernel holds the parent
-                    // directory's inode lock for that whole op. Calling the
-                    // notifier here would block in fuse_reverse_inval_entry on
-                    // that same parent lock, so the hook never returns, the
-                    // record is never marked committed, the flush never
-                    // completes, the op never releases the lock: a hard deadlock
-                    // broken only by the 30s flush timeout (EIO).
-                    //
-                    // Deferring is sound because this mount's own projection
-                    // already answers reads of the paths it just published
-                    // (read-your-writes), so revoking its kernel entries is a
-                    // catch-up rather than a correctness barrier. The barrier
-                    // that does matter — a cross-process publication's ack —
-                    // still waits for its revocation, on the watch task, which
-                    // holds no FUSE lock (see client::run_revision_watch).
-                    commit_invalidators.enqueue_revocation(&invalidation);
-                })),
-                write_drain,
-            )?)
-        };
         let (mount_id, active_lock_owners) = Self::start_lock_heartbeat(&client, &tokio);
         Ok(Self {
             client,
-            cache,
-            metadata_batcher: MetadataBatcher::default(),
+            local,
             inodes: Arc::new(Mutex::new(InodeTable::new())),
             handles: Mutex::new(HandleTable::default()),
-            namespace,
-            namespace_publication_gate: Mutex::new(()),
-            writes,
+            dirs: Mutex::new(DirHandleTable::default()),
             read_only,
             scope_path: scope_path.trim_matches('/').to_string(),
             mount_id,
             active_lock_owners,
-            invalidators,
             tokio,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
@@ -1617,11 +1180,10 @@ impl RemoteFuseFs {
         }
         let mut config = fuser::Config::default();
         config.mount_options = mount_options;
-        // Package extraction issues large concurrent LOOKUP/CREATE bursts.
-        // Four workers capped MetadataBatcher at roughly four paths per request
-        // and let later FUSE requests sit queued for seconds. Thirty-two keeps
-        // the blocking FUSE callbacks bounded while giving point metadata
-        // reads enough concurrent waiters to form useful wire batches.
+        // Package extraction issues large concurrent LOOKUP/CREATE bursts, and
+        // every callback now runs to completion against local storage. Thirty-two
+        // request threads keep those bursts from queueing behind one another
+        // without oversubscribing the device.
         config.n_threads = Some(32);
         config.clone_fd = true;
         config
@@ -1635,263 +1197,19 @@ impl RemoteFuseFs {
         self.lock_inodes()?.path(ino).ok_or(Errno::ENOENT)
     }
 
-    fn inode_route(&self, ino: INodeNo) -> FuseResult<(String, Option<String>)> {
-        self.lock_inodes()?.route(ino).ok_or(Errno::ENOENT)
-    }
-
-    fn authoritative_file_route(&self, path: &str, file_id: &str) -> FuseResult<StableFileRoute> {
-        self.authoritative_file_route_with_metadata(path, file_id, RouteMetadata::Full)
-    }
-
-    /// The stable route for `file_id` at `path`, proven from this mount's own
-    /// fence rather than re-read over the wire — or `None`, which means the
-    /// caller must resolve it authoritatively.
-    ///
-    /// An open handle's route resolution asks one question: does `path` still
-    /// hold the inode this handle was opened on, and what is its current
-    /// metadata? A cached entry answers it when it carries the same proof
-    /// `stat_path` already serves on, plus one condition stricter:
-    ///
-    ///  * the revision watch is live, so this mount's coherence fence is
-    ///    continuously confirmed (watch down -> `None`, fail closed);
-    ///  * the entry is tagged at exactly that fence, so no publication has
-    ///    landed against it — a remote one evicts the entry (or, unclassified,
-    ///    clears the cache) strictly before its writer is told it is coherent;
-    ///  * no queued namespace mutation of this mount's own could retarget the
-    ///    path, and no unflushed write of its own could supersede the metadata;
-    ///  * the entry is COMPLETE (`full_stat_metadata_is_complete`), because the
-    ///    caller matches loaded bytes against its content hash and chains a CAS
-    ///    base from it, exactly as a full stat's caller does;
-    ///  * and the entry's `file_id` IS this handle's identity. That is the
-    ///    condition a plain full stat does not carry, and it is what makes this
-    ///    serve answer the identity question rather than only the metadata one.
-    ///    Any other answer — a different identity, or no entry at all — means
-    ///    the path may have been retargeted, and only the wire (plus the
-    ///    hard-link alias lookup behind it) can say where the inode went.
-    ///
-    /// Without this, every `open(2)`+`read(2)` cost an unconditional, unbounded
-    /// point `/stat`: `ensure_handle_loaded_locked` resolves the handle's route
-    /// before it may use the buffer, and that route was the one read path with
-    /// no cache serve at all. Measured at 30 point stats per warm `git status`
-    /// phase over 9 `.git` internals — exactly one per open — and invisible to
-    /// every fix aimed at the metadata cache, because this route never consulted
-    /// it.
-    fn cached_stable_file_route(&self, path: &str, file_id: &str) -> Option<LinkedFileRoute> {
-        if !self.client.revision_watch_live() {
-            return None;
-        }
-        if self
-            .namespace
-            .as_ref()
-            .map(|namespace| namespace.has_projection_for_path(path, false))
-            .transpose()
-            .ok()?
-            .unwrap_or(false)
-        {
-            return None;
-        }
-        if self
-            .writes
-            .as_ref()
-            .is_some_and(|writes| writes.has_pending_path(path))
-        {
-            return None;
-        }
-        let revision = self.client.coherence_revision();
-        let metadata = self.cache.get_metadata(path, revision)?;
-        if !full_stat_metadata_is_complete(&metadata)
-            || metadata.file_id.as_deref() != Some(file_id)
-        {
-            return None;
-        }
-        Some(LinkedFileRoute {
-            path: path.to_string(),
-            metadata,
-            revision,
-        })
-    }
-
-    fn authoritative_file_route_with_metadata(
-        &self,
-        path: &str,
-        file_id: &str,
-        metadata: RouteMetadata,
-    ) -> FuseResult<StableFileRoute> {
-        let current = self
-            .tokio
-            .block_on(async {
-                match metadata {
-                    RouteMetadata::Attributes => self.client.stat_attributes_versioned(path).await,
-                    RouteMetadata::Full => self.client.stat_versioned(path).await,
-                    // Same deferral as `stat_path_hashed`: this is the
-                    // hard-link retarget branch of the same open, and it must
-                    // not reintroduce the whole-file hash the open just avoided.
-                    RouteMetadata::FullDeferredHash => {
-                        self.client.stat_bounded_hash_versioned(path).await
-                    }
-                }
-            })
-            .map_err(|error| {
-                tracing::warn!(path, file_id, error = %error, "vfs identity stat failed");
-                Errno::EIO
-            })?;
-        if current
-            .value
-            .as_ref()
-            .and_then(|metadata| metadata.file_id.as_deref())
-            == Some(file_id)
-        {
-            return Ok(StableFileRoute::Linked(LinkedFileRoute {
-                path: path.to_string(),
-                metadata: current.value.expect("matching metadata exists"),
-                revision: current.revision,
-            }));
-        }
-        let Some(alias) = self
-            .tokio
-            .block_on(self.client.find_hard_link_alias(file_id, path))
-            .map_err(|error| {
-                tracing::warn!(
-                    path,
-                    file_id,
-                    error = %error,
-                    "vfs hard-link alias lookup failed"
-                );
-                Errno::EIO
-            })?
-        else {
-            return Ok(StableFileRoute::Unlinked);
-        };
-        let alias_metadata = self
-            .tokio
-            .block_on(async {
-                match metadata {
-                    RouteMetadata::Attributes => {
-                        self.client.stat_attributes_versioned(&alias).await
-                    }
-                    RouteMetadata::Full => self.client.stat_versioned(&alias).await,
-                    RouteMetadata::FullDeferredHash => {
-                        self.client.stat_bounded_hash_versioned(&alias).await
-                    }
-                }
-            })
-            .map_err(|error| {
-                tracing::warn!(
-                    path = alias,
-                    file_id,
-                    error = %error,
-                    "vfs hard-link alias stat failed"
-                );
-                Errno::EIO
-            })?;
-        let revision = alias_metadata.revision;
-        let alias_metadata = alias_metadata.value.ok_or(Errno::EAGAIN)?;
-        if alias_metadata.file_id.as_deref() != Some(file_id) {
-            return Err(Errno::EAGAIN);
-        }
-        Ok(StableFileRoute::Linked(LinkedFileRoute {
-            path: alias,
-            metadata: alias_metadata,
-            revision,
-        }))
-    }
-
-    fn retarget_identity_route(&self, stale_path: &str, route: &LinkedFileRoute) {
-        let Some(file_id) = route.metadata.file_id.as_deref() else {
-            return;
-        };
-        if stale_path != route.path {
-            self.cache.invalidate(stale_path);
-        }
-        if let Ok(mut inodes) = self.lock_inodes() {
-            inodes.retarget_identity_path(stale_path, &route.path, file_id);
-        }
-    }
-
-    fn resolve_inode_file_route(&self, ino: INodeNo) -> FuseResult<LinkedFileRoute> {
-        self.resolve_inode_file_route_with_metadata(ino, RouteMetadata::Full)
-    }
-
-    /// The `open(2)` route for a caller that does not need a content hash now.
-    /// See [`FullStatHash::Deferred`].
-    fn resolve_inode_file_route_deferred_hash(&self, ino: INodeNo) -> FuseResult<LinkedFileRoute> {
-        self.resolve_inode_file_route_with_metadata(ino, RouteMetadata::FullDeferredHash)
-    }
-
-    fn resolve_inode_file_route_attributes(&self, ino: INodeNo) -> FuseResult<LinkedFileRoute> {
-        self.resolve_inode_file_route_with_metadata(ino, RouteMetadata::Attributes)
-    }
-
-    fn resolve_inode_file_route_with_metadata(
-        &self,
-        ino: INodeNo,
-        metadata: RouteMetadata,
-    ) -> FuseResult<LinkedFileRoute> {
-        let (path, identity) = self.inode_route(ino)?;
-        let projected = match metadata {
-            RouteMetadata::Attributes => self.stat_path_attributes(&path)?,
-            RouteMetadata::Full => self.stat_path_hashed(&path, FullStatHash::Required)?,
-            RouteMetadata::FullDeferredHash => {
-                self.stat_path_hashed(&path, FullStatHash::Deferred)?
-            }
-        };
-        let Some(identity) = identity else {
-            let metadata = projected.ok_or(Errno::ENOENT)?;
-            let resolved_ino = self
-                .lock_inodes()?
-                .ensure_with_identity(&path, metadata.file_id.as_deref());
-            if resolved_ino != ino {
-                return Err(Errno::ENOENT);
-            }
-            return Ok(LinkedFileRoute {
-                path,
-                metadata,
-                revision: 0,
-            });
-        };
-        if projected
-            .as_ref()
-            .and_then(|metadata| metadata.file_id.as_deref())
-            == Some(identity.as_str())
-        {
-            return Ok(LinkedFileRoute {
-                path,
-                metadata: projected.expect("matching projected metadata exists"),
-                revision: 0,
-            });
-        }
-        let route = self.authoritative_file_route_with_metadata(&path, &identity, metadata)?;
-        match route {
-            StableFileRoute::Linked(route) => {
-                if !self
-                    .lock_inodes()?
-                    .retarget_identity(ino, &path, &route.path, &identity)
-                {
-                    return Err(Errno::ENOENT);
-                }
-                if path != route.path {
-                    self.cache.invalidate(&path);
-                }
-                Ok(route)
-            }
-            StableFileRoute::Unlinked => Err(Errno::ENOENT),
-        }
-    }
-
-    /// The attribute/entry TTL to hand the kernel for a reply, chosen from live
-    /// watch state at reply time (see `ATTR_ENTRY_LEASE_TTL`).
+    /// The attribute/entry TTL to hand the kernel for a reply. A fixed long
+    /// lease: this mount owns its scope, so nothing can contradict what it just
+    /// answered (see [`REPLY_ATTR_TTL`]).
     fn reply_ttl(&self) -> Duration {
-        lease_ttl_for(self.client.revision_watch_live())
+        REPLY_ATTR_TTL
     }
 
     /// Capture the handles the post-mount kernel-notifier install needs, before
     /// this fs is moved into its FUSE session. Called from mount setup while the
     /// fs is still reachable (see `handle::mount_remote_vfs_fuse`).
-    pub(super) fn kernel_invalidation_registrar(&self) -> KernelInvalidationRegistrar {
-        KernelInvalidationRegistrar {
-            invalidators: Arc::clone(&self.invalidators),
+    pub(super) fn kernel_invalidation_binding(&self) -> KernelInvalidationBinding {
+        KernelInvalidationBinding {
             inodes: Arc::clone(&self.inodes),
-            publications: self.client.in_flight_publications(),
         }
     }
 
@@ -1901,35 +1219,18 @@ impl RemoteFuseFs {
             .unwrap_or(ROOT_INO)
     }
 
-    fn lookup_ino(&self, path: &str) -> INodeNo {
-        self.lock_inodes()
-            .map(|mut inodes| inodes.lookup(path))
-            .unwrap_or(ROOT_INO)
-    }
-
     fn detach_inode_path(&self, path: &str) {
         if let Ok(mut inodes) = self.lock_inodes() {
             inodes.detach_exact(path);
         }
     }
 
-    fn invalidate_inode_aliases(&self, path: &str) {
-        if let Some(file_id) = self
-            .cache
-            .get_metadata(path, self.client.coherence_revision())
-            .and_then(|metadata| metadata.file_id)
-        {
-            self.cache.invalidate_identity(&file_id);
-        }
-        let aliases = self
-            .lock_inodes()
-            .map(|inodes| inodes.aliases_for_path(path))
-            .unwrap_or_else(|_| vec![path.to_string()]);
-        for alias in aliases {
-            self.cache.invalidate(&alias);
-        }
-    }
-
+    /// Re-key the inode table and every open descriptor under a renamed prefix.
+    ///
+    /// The descriptors are retargeted as well as the `FileState` pathnames: the
+    /// content dirty/seal lifecycle is keyed by pathname, so a descriptor still
+    /// naming the source would dirty a name the rename has already removed and
+    /// leave the bytes written after the rename unsealed at close.
     fn rename_inode_path(&self, from: &str, to: &str) {
         if let Ok(mut inodes) = self.lock_inodes() {
             inodes.rename_path(from, to);
@@ -1940,64 +1241,60 @@ impl RemoteFuseFs {
                 if state.path == from || state.path.starts_with(&prefix) {
                     let suffix = state.path.strip_prefix(from).unwrap_or_default();
                     state.path = format!("{to}{suffix}");
+                    state.file.retarget(&state.path);
                 }
             }
         }
     }
 
-    fn attr_for_metadata(
-        &self,
-        ino: INodeNo,
-        metadata: &RemoteMetadata,
-        preserve_zero_links: bool,
-    ) -> FileAttr {
-        let kind = file_type_for_kind(&metadata.kind);
-        let mut mode = metadata_mode(metadata);
+    /// Project one backing-tree `lstat` into the attributes the kernel expects.
+    ///
+    /// `local_identity` (`dev:ino` of the backing entry) is what binds the inode,
+    /// so hard links, rename and unlink-and-recreate are all answered by the
+    /// backing filesystem instead of by a gateway `file_id` that only exists
+    /// after a publication.
+    fn attr_for_metadata(&self, ino: INodeNo, metadata: &LocalMetadata) -> FileAttr {
+        let kind = file_type_for_kind(metadata.kind);
+        let mut mode = metadata.mode;
         if self.read_only && kind != FileType::Symlink {
             mode &= !0o222;
         }
-        let mtime = metadata
-            .updated_at
-            .map(|value| value.into())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
         FileAttr {
             ino,
             size: metadata.size_bytes,
-            blocks: metadata.size_bytes.div_ceil(512),
-            atime: mtime,
-            mtime,
-            ctime: mtime,
-            crtime: mtime,
+            blocks: metadata.blocks,
+            atime: system_time_of(metadata.atime),
+            mtime: system_time_of(metadata.mtime),
+            ctime: system_time_of(metadata.ctime),
+            crtime: system_time_of(metadata.ctime),
             kind,
-            perm: mode as u16,
-            nlink: (if preserve_zero_links {
-                metadata.link_count
-            } else {
-                metadata.link_count.max(1)
-            })
-            .min(u32::MAX as u64) as u32,
-            uid: self.uid,
-            gid: self.gid,
+            perm: (mode & POSIX_MODE_MASK) as u16,
+            nlink: metadata.link_count.min(u32::MAX as u64) as u32,
+            uid: metadata.uid,
+            gid: metadata.gid,
             rdev: 0,
             blksize: 4096,
             flags: 0,
         }
     }
 
-    fn attr_for_path(&self, path: &str, metadata: &RemoteMetadata, lookup: bool) -> FileAttr {
+    fn attr_for_path(&self, path: &str, metadata: &LocalMetadata, lookup: bool) -> FileAttr {
+        let identity = Some(metadata.local_identity.as_str());
         let ino = self
             .lock_inodes()
             .map(|mut inodes| {
                 if lookup {
-                    inodes.lookup_with_identity(path, metadata.file_id.as_deref())
+                    inodes.lookup_with_identity(path, identity)
                 } else {
-                    inodes.ensure_with_identity(path, metadata.file_id.as_deref())
+                    inodes.ensure_with_identity(path, identity)
                 }
             })
             .unwrap_or(ROOT_INO);
-        self.attr_for_metadata(ino, metadata, false)
+        self.attr_for_metadata(ino, metadata)
     }
 
+    /// Synthetic root attributes, used only when the backing tree root cannot be
+    /// stat'd at all (which means the state directory is gone underneath us).
     fn root_attr(&self) -> FileAttr {
         FileAttr {
             ino: ROOT_INO,
@@ -2033,2530 +1330,191 @@ impl RemoteFuseFs {
             .unwrap_or_default()
     }
 
-    fn project_local_directory(
-        &self,
-        path: &str,
-        authoritative_path: &str,
-        entries: Vec<RemoteDirEntry>,
-        revision: u64,
-    ) -> FuseResult<NamespaceProjection<Vec<RemoteDirEntry>>> {
-        let namespace_projection = match self.namespace.as_ref() {
-            Some(namespace) => namespace
-                .project_directory(path, entries, revision)
-                .map_err(|_| Errno::EIO)?,
-            None => NamespaceProjection {
-                value: entries,
-                applied: false,
-            },
-        };
-        let (value, write_applied) = match self.writes.as_ref() {
-            Some(writes) => writes
-                .project_directory(authoritative_path, namespace_projection.value)
-                .map_err(|_| Errno::EIO)?,
-            None => (namespace_projection.value, false),
-        };
-        Ok(NamespaceProjection {
-            value,
-            applied: namespace_projection.applied || write_applied,
-        })
-    }
-
-    fn dir_entries(&self, path: &str) -> FuseResult<Vec<RemoteDirEntry>> {
-        // No namespace or write barrier here. Read-your-writes is the two
-        // journal projections, not a publication wait: namespace mutations and
-        // folded-create write WAL entries are merged over the authoritative
-        // listing, so draining either journal would only add a gateway round
-        // trip to reads that already observe this mount's own pending work.
-        self.assert_namespace_journal_healthy()?;
-        let authoritative_path = self
-            .namespace
-            .as_ref()
-            .map(|namespace| namespace.authoritative_path_for_projection(path))
-            .transpose()
-            .map_err(|_| Errno::EIO)?
-            .unwrap_or_else(|| path.to_string());
-        // While a live revision watch keeps this mount's coherence fence
-        // continuously confirmed, a fence-matched cached listing is valid to
-        // serve without a wire round-trip. With the watch down we fail closed:
-        // the fence only advances on a wire call, so an idle observer that
-        // skipped the fetch could serve a listing a sibling already superseded.
-        if self.client.revision_watch_live()
-            && let Some(entries) = self
-                .cache
-                .get_dir(&authoritative_path, self.client.coherence_revision())
-        {
-            return self
-                .project_local_directory(
-                    path,
-                    &authoritative_path,
-                    entries,
-                    self.client.coherence_revision(),
-                )
-                .map(|projection| projection.value);
-        }
-        let directory_generation = self.cache.directory_generation(path);
-        // With the watch down a directory listing is always fetched over the
-        // wire, never served from get_dir. This mount's coherence fence only
-        // advances when it makes a wire call, so an idle observer that skipped
-        // the fetch would serve a revision-fenced listing a sibling has already
-        // superseded. The wire fetch here advances the fence at the start of
-        // every tree walk. list_dir returns one coherent authoritative snapshot;
-        // concurrent namespace changes may make that snapshot immediately old,
-        // which is normal readdir behavior and must not turn a successful
-        // listing into EAGAIN. The fresh listing is still published back into
-        // the cache below (revision-fenced) for other consumers.
-        let response = self
-            .tokio
-            .block_on(self.client.list_dir_versioned(&authoritative_path))
-            .map_err(|_| Errno::EIO)?;
-        let Some(entries) = response.value else {
-            if let Some(namespace) = self.namespace.as_ref() {
-                namespace
-                    .observe_server_revision(response.revision)
-                    .map_err(|_| Errno::EIO)?;
-            }
-            return Err(Errno::ENOENT);
-        };
-        let projection =
-            self.project_local_directory(path, &authoritative_path, entries, response.revision)?;
-        publish_authoritative_projection(&projection, |entries| {
-            let _ = self.cache.put_dir_if_generation(
-                path,
-                directory_generation,
-                entries.clone(),
-                response.revision,
-            );
-            for entry in entries {
-                let child_path = if path.is_empty() {
-                    entry.name.clone()
-                } else {
-                    format!("{path}/{}", entry.name)
-                };
-                self.cache.put_metadata(
-                    &child_path,
-                    metadata_from_dir_entry(entry),
-                    response.revision,
-                );
-            }
-        });
-        Ok(projection.value)
-    }
-
-    fn stat_path(&self, path: &str) -> FuseResult<Option<RemoteMetadata>> {
-        self.stat_path_hashed(path, FullStatHash::Required)
-    }
-
-    fn stat_path_hashed(
-        &self,
-        path: &str,
-        hash: FullStatHash,
-    ) -> FuseResult<Option<RemoteMetadata>> {
-        // See `dir_entries`: `project_metadata` supplies read-your-writes, so
-        // reads never wait on a publication.
-        self.assert_namespace_journal_healthy()?;
-        if let Some(metadata) = self.open_handle_metadata(path)? {
-            return Ok(Some(metadata));
-        }
-        if let Some(metadata) = self.dirty_handle_committed_metadata(path)? {
-            return Ok(Some(metadata));
-        }
-        // Read-your-writes for an ANCESTOR. A queued write under this pathname
-        // means this mount created the directory and has not published it yet,
-        // so the gateway would answer 404 and a cached negative from an earlier
-        // dispatch would answer ENOENT — for a directory the guest is actively
-        // writing into. Checked before any cache serve because the negative
-        // entry is exactly what would win. Draining instead would defeat the
-        // batching that lets a close return without a round trip.
-        if self
-            .writes
-            .as_ref()
-            .is_some_and(|writes| writes.has_pending_under(path))
-        {
-            if self.client.revision_watch_live() {
-                let revision = self.client.coherence_revision();
-                if let Some(metadata) = self
-                    .cache
-                    .get_metadata(path, revision)
-                    .filter(|metadata| metadata.kind == "directory")
-                {
-                    return Ok(Some(metadata));
-                }
-            }
-            return Ok(Some(projected_directory_metadata()));
-        }
-        let has_projection = self
-            .namespace
-            .as_ref()
-            .map(|namespace| namespace.has_projection_for_path(path, false))
-            .transpose()
-            .map_err(|_| Errno::EIO)?
-            .unwrap_or(false);
-        let authoritative_path = self
-            .namespace
-            .as_ref()
-            .map(|namespace| namespace.authoritative_path_for_projection(path))
-            .transpose()
-            .map_err(|_| Errno::EIO)?
-            .unwrap_or_else(|| path.to_string());
-        // A get_metadata or is_known_missing hit may not be returned on its
-        // own: this mount's revision fence only advances on a wire call, so an
-        // idle observer's fenced cache (or fenced negative entry) can be stale
-        // relative to a sibling's write. The point stat below is the wire
-        // round-trip that revalidates within this dispatch and reprimes the
-        // cache. Read-your-writes was already served above from the open/dirty
-        // handle; namespace projection is applied to the wire response.
-        if self
-            .writes
-            .as_ref()
-            .is_some_and(|writes| writes.has_pending_path(path))
-        {
-            self.flush_writes()?;
-        }
-        // A live revision watch keeps this mount's coherence fence continuously
-        // confirmed, which is exactly the condition under which
-        // `stat_path_attributes` serves without a wire call. The full stat had
-        // no such serve at all, so every open(2) cost a point `/stat` even over
-        // a tree nothing had touched — 47 of them per `git status` phase.
-        //
-        // The one extra condition a full stat carries is completeness: it
-        // promises the content hash its callers use to match cached bytes and
-        // to chain a CAS write. The bulk routes now ask the gateway to supply
-        // that hash for files at or under `BULK_METADATA_MAX_HASH_BYTES`, so a
-        // listing or batched attribute read installs an entry a full stat can be
-        // served from — which is what removes the ~30 point stats a `git status`
-        // phase was paying. Serve only a complete entry; anything less (a file
-        // over the bound, or a gateway that answered without hashes) falls
-        // through to the wire, where it belongs.
-        //
-        // A `FullStatHash::Deferred` caller widens that serve by exactly one
-        // case: a file too large for the content cache, whose hash it has no use
-        // for now (see `deferred_hash_is_safe`). Without it, opening a file past
-        // the bulk hash budget point-stats — and the point stat carries no
-        // budget, so the gateway reads the whole file to hash it.
-        let serveable = |metadata: &RemoteMetadata| {
-            full_stat_metadata_is_complete(metadata)
-                || (hash == FullStatHash::Deferred && deferred_hash_is_safe(metadata))
-        };
-        if self.client.revision_watch_live() {
-            let revision = self.client.coherence_revision();
-            if let Some(metadata) = self
-                .cache
-                .get_metadata(&authoritative_path, revision)
-                .filter(serveable)
-            {
-                if !has_projection {
-                    return Ok(Some(metadata));
-                }
-                if let Some(namespace) = self.namespace.as_ref() {
-                    let projection = namespace
-                        .project_metadata(path, Some(metadata), revision)
-                        .map_err(|_| Errno::EIO)?;
-                    if (projection.applied || authoritative_path == path)
-                        && projection.value.as_ref().is_none_or(serveable)
-                    {
-                        return Ok(projection.value);
-                    }
-                }
-            }
-            if self.cache.is_known_missing(&authoritative_path, revision) {
-                if !has_projection {
-                    return Ok(None);
-                }
-                if let Some(namespace) = self.namespace.as_ref() {
-                    let projection = namespace
-                        .project_metadata(path, None, revision)
-                        .map_err(|_| Errno::EIO)?;
-                    if (projection.applied || authoritative_path == path)
-                        && projection.value.as_ref().is_none_or(serveable)
-                    {
-                        return Ok(projection.value);
-                    }
-                }
-            }
-        }
-        // A deferring caller also bounds what it asks the gateway to hash on the
-        // way through: at or under the content-cache ceiling the hash is still
-        // wanted and cheap, past it the answer comes back hashless and is served
-        // as such. A `Required` caller keeps the unbounded stat — it owes its
-        // caller a hash at any size.
-        let response = self
-            .tokio
-            .block_on(async {
-                match hash {
-                    FullStatHash::Required => self.client.stat_versioned(&authoritative_path).await,
-                    FullStatHash::Deferred => {
-                        self.client
-                            .stat_bounded_hash_versioned(&authoritative_path)
-                            .await
-                    }
-                }
-            })
-            .map_err(|_| Errno::EIO)?;
-        let metadata = response.value;
-        let projection = if let Some(namespace) = self.namespace.as_ref() {
-            namespace
-                .project_metadata(path, metadata, response.revision)
-                .map_err(|_| Errno::EIO)?
-        } else {
-            NamespaceProjection {
-                value: metadata,
-                applied: false,
-            }
-        };
-        publish_authoritative_projection(&projection, |metadata| {
-            if let Some(metadata) = metadata.as_ref() {
-                self.cache
-                    .put_metadata(path, metadata.clone(), response.revision);
-            } else {
-                self.cache.put_missing_metadata(path, response.revision);
-            }
-        });
-        Ok(projection.value)
-    }
-
-    fn stat_path_attributes(&self, path: &str) -> FuseResult<Option<RemoteMetadata>> {
-        // See `dir_entries`: `project_metadata` supplies read-your-writes, so
-        // reads never wait on a publication.
-        self.assert_namespace_journal_healthy()?;
-        if let Some(metadata) = self.open_handle_metadata(path)? {
-            return Ok(Some(metadata));
-        }
-        if let Some(metadata) = self.dirty_handle_committed_metadata(path)? {
-            return Ok(Some(metadata));
-        }
-        // Namespace creations and non-replacing rename roots carry their own
-        // complete projected attributes in the WAL. They do not need an
-        // authoritative base, so serve them before consulting the gateway.
-        // Package extraction creates a directory tree, then immediately stats
-        // and chmods those directories while the namespace batch is still
-        // pending; forcing an authoritative read here serialized that local
-        // phase behind publication of the whole tree.
-        if let Some(metadata) = self.projected_namespace_metadata_without_base(path)? {
-            return Ok(metadata);
-        }
-        // A close may have moved a newly created file from the handle table
-        // into the durable write WAL while its publication is still pending.
-        // LOOKUP needs only attributes, so project that exact local state
-        // instead of forcing a remote flush. Returning gateway ENOENT in this
-        // window made parallel copy report failure even though the queued write
-        // committed moments later and the destination file existed intact.
-        if let Some(created) = self
-            .writes
-            .as_ref()
-            .and_then(|writes| writes.pending_created_file(path))
-        {
-            return Ok(Some(RemoteMetadata {
-                kind: "file".to_string(),
-                size_bytes: created.size_bytes,
-                file_id: created.file_id,
-                link_count: 1,
-                link_target: None,
-                content_hash: None,
-                executable: mode_is_executable(created.mode),
-                mode: Some(created.mode),
-                updated_at: None,
-            }));
-        }
-        // Read-your-writes for an ANCESTOR. A queued write under this pathname
-        // means this mount created the directory and has not published it yet,
-        // so the gateway would answer 404 and a cached negative from an earlier
-        // dispatch would answer ENOENT — for a directory the guest is actively
-        // writing into. Checked before any cache serve because the negative
-        // entry is exactly what would win. Draining instead would defeat the
-        // batching that lets a close return without a round trip.
-        if self
-            .writes
-            .as_ref()
-            .is_some_and(|writes| writes.has_pending_under(path))
-        {
-            if self.client.revision_watch_live() {
-                let revision = self.client.coherence_revision();
-                if let Some(metadata) = self
-                    .cache
-                    .get_metadata(path, revision)
-                    .filter(|metadata| metadata.kind == "directory")
-                {
-                    return Ok(Some(metadata));
-                }
-            }
-            return Ok(Some(projected_directory_metadata()));
-        }
-        let has_projection = self
-            .namespace
-            .as_ref()
-            .map(|namespace| namespace.has_projection_for_path(path, false))
-            .transpose()
-            .map_err(|_| Errno::EIO)?
-            .unwrap_or(false);
-        let authoritative_path = self
-            .namespace
-            .as_ref()
-            .map(|namespace| namespace.authoritative_path_for_projection(path))
-            .transpose()
-            .map_err(|_| Errno::EIO)?
-            .unwrap_or_else(|| path.to_string());
-        // A get_metadata or is_known_missing hit may not be returned on its
-        // own: an idle observer's revision fence lags a sibling's write, so a
-        // fenced cache hit (or fenced negative entry) can be stale. The point
-        // stat is routed through the subtree snapshot (which performs its own
-        // wire fetch) or the metadata batcher below; either supplies the wire
-        // round-trip that revalidates and reprimes the cache within this
-        // dispatch, coalescing a concurrent burst into ~one gateway call. Only
-        // the get_metadata serve that a same-dispatch subtree fetch has just
-        // reprimed is returned here.
-        if self
-            .writes
-            .as_ref()
-            .is_some_and(|writes| writes.has_pending_path(path))
-        {
-            self.flush_writes()?;
-        }
-        // A live revision watch makes a fence-matched cache entry a valid
-        // authoritative BASE even when this mount has a local namespace
-        // projection. In the rename case the base lives under the old source
-        // path; project it onto the destination for this caller, but never put
-        // that mount-local result into the cache shared with sibling mounts.
-        let mut lookup_revision = None;
-        if self.client.revision_watch_live() {
-            // A local publication can advance the shared fence between reading
-            // it and taking the cache lock. The commit hook has already retagged
-            // every unaffected entry/listing at the newer revision in that
-            // case, so an exact-revision cache lookup at the old fence misses
-            // even though the answer is already local. Under a busy tree import
-            // 32 concurrent FUSE callbacks all lost that race on every batch and
-            // fell through to one metadata wave per publication. Retry against
-            // the newly observed fence before paying the wire.
-            for _ in 0..4 {
-                let revision = self.client.coherence_revision();
-                lookup_revision = Some(revision);
-                if let Some(metadata) = self.cache.get_metadata(&authoritative_path, revision) {
-                    if !has_projection {
-                        return Ok(Some(metadata));
-                    }
-                    if let Some(namespace) = self.namespace.as_ref() {
-                        let projection = namespace
-                            .project_metadata(path, Some(metadata), revision)
-                            .map_err(|_| Errno::EIO)?;
-                        if projection.applied || authoritative_path == path {
-                            return Ok(projection.value);
-                        }
-                    }
-                }
-                if self.cache.is_known_missing(&authoritative_path, revision) {
-                    if !has_projection {
-                        return Ok(None);
-                    }
-                    if let Some(namespace) = self.namespace.as_ref() {
-                        let projection = namespace
-                            .project_metadata(path, None, revision)
-                            .map_err(|_| Errno::EIO)?;
-                        if projection.applied || authoritative_path == path {
-                            return Ok(projection.value);
-                        }
-                    }
-                }
-                if self.client.coherence_revision() == revision {
-                    break;
-                }
-            }
-        }
-        if !has_projection {
-            // Watch down: only a snapshot fetch that ran in THIS dispatch may
-            // back a get_metadata serve. A short-circuited begin_subtree_load
-            // (the shared snapshot already tagged for this fence) performs no
-            // wire call, so its fenced entry can be stale relative to a sibling
-            // process's newer publication that this idle mount never observed.
-            // Fall through to the MetadataBatcher, which supplies the wire
-            // round-trip, reprimes, and advances the fence.
-            if self.ensure_subtree_metadata_snapshot()?
-                && let Some(metadata) = self
-                    .cache
-                    .get_metadata(path, self.client.coherence_revision())
-            {
-                return Ok(Some(metadata));
-            }
-        }
-        // A namespace projection still needs an authoritative base, but it
-        // does not need a dedicated point request. Route a pending rename's
-        // destination back to its still-authoritative source and let the same
-        // metadata batcher coalesce it with every concurrent package lookup.
-        let sample = METADATA_WIRE_SAMPLES.fetch_add(1, Ordering::Relaxed);
-        if sample < METADATA_WIRE_SAMPLE_LIMIT {
-            let cache_state = self
-                .cache
-                .diagnostic_lookup_state(&authoritative_path, self.client.coherence_revision());
-            let projection_state = self
-                .namespace
-                .as_ref()
-                .and_then(|namespace| namespace.diagnostic_projection_state(path).ok());
-            tracing::info!(
-                sample,
-                path,
-                authoritative_path,
-                has_projection,
-                lookup_revision,
-                revision = self.client.coherence_revision(),
-                cache_state,
-                projection_state,
-                "vfs attribute read fell through to gateway"
-            );
-        }
-        let response = self
-            .metadata_batcher
-            .stat_attributes(&self.client, &self.tokio, &authoritative_path)
-            .map_err(|error| {
-                tracing::warn!(
-                    path,
-                    authoritative_path,
-                    error,
-                    "vfs batched attribute read failed"
-                );
-                Errno::EIO
-            })?;
-        let metadata = response.value;
-        let projection = if let Some(namespace) = self.namespace.as_ref() {
-            namespace
-                .project_metadata(path, metadata, response.revision)
-                .map_err(|_| Errno::EIO)?
-        } else {
-            NamespaceProjection {
-                value: metadata,
-                applied: false,
-            }
-        };
-        publish_authoritative_projection(&projection, |metadata| {
-            if let Some(metadata) = metadata.as_ref() {
-                self.cache
-                    .put_metadata(path, metadata.clone(), response.revision);
-            } else {
-                self.cache.put_missing_metadata(path, response.revision);
-            }
-        });
-        Ok(projection.value)
-    }
-
-    /// Load one revision-fenced subtree metadata snapshot for the shared cache
-    /// when the miss/quiet heuristic elects to. Returns `true` only when this
-    /// dispatch actually performed the snapshot wire fetch and reprimed the
-    /// cache at the response revision; a short-circuited or below-threshold call
-    /// returns `false`. Callers must not serve a `get_metadata` hit off the
-    /// shared snapshot unless this returned `true`: an idle mount whose fence
-    /// has not advanced would otherwise serve a prior-dispatch snapshot entry
-    /// that a sibling process may have superseded, with zero wire backing.
-    fn ensure_subtree_metadata_snapshot(&self) -> FuseResult<bool> {
-        let prefix = "";
-        let revision = self.client.coherence_revision();
-        if !self.cache.begin_subtree_load(prefix, revision) {
-            return Ok(false);
-        }
-        match self.tokio.block_on(
-            self.client
-                .subtree_metadata_attributes_versioned(prefix, MAX_SUBTREE_METADATA_ENTRIES),
-        ) {
-            Ok(mut response) => {
-                let prefetched = self.tokio.block_on(self.client.prefetch_subtree_versioned(
-                    prefix,
-                    MAX_SUBTREE_METADATA_ENTRIES,
-                    MAX_SUBTREE_PREFETCH_BYTES,
-                ));
-                if let Ok(prefetched) = prefetched
-                    && prefetched.revision == response.revision
-                    && response.revision != 0
-                {
-                    let positions = response
-                        .value
-                        .iter()
-                        .enumerate()
-                        .map(|(index, (path, _))| (path.clone(), index))
-                        .collect::<HashMap<_, _>>();
-                    let mut files = Vec::new();
-                    for (path, bytes) in prefetched.value {
-                        let Some(index) = positions.get(path.as_str()).copied() else {
-                            continue;
-                        };
-                        let metadata = &mut response.value[index].1;
-                        if metadata.kind != "file" || metadata.size_bytes != bytes.len() as u64 {
-                            continue;
-                        }
-                        metadata.content_hash = Some(content_hash_for_bytes(&bytes));
-                        files.push((path, bytes, metadata.clone()));
-                    }
-                    self.cache.finish_subtree_load_with_files(
-                        prefix,
-                        response.revision,
-                        response.value,
-                        files,
-                    );
-                    return Ok(true);
-                }
-                self.cache
-                    .finish_subtree_load(prefix, response.revision, response.value);
-                Ok(true)
-            }
-            Err(error) => {
-                if request_status(&error) == Some(reqwest::StatusCode::NOT_FOUND) {
-                    self.cache.disable_subtree_loads(prefix);
-                } else {
-                    self.cache.abort_subtree_load(prefix);
-                }
-                tracing::debug!(
-                    error = %error,
-                    "vfs subtree metadata snapshot unavailable; falling back to path batches"
-                );
-                Ok(false)
-            }
-        }
-    }
-
-    /// Same-mount readers must continue seeing the last committed bytes while
-    /// an existing file has a dirty private handle. This is the only path that
-    /// may consume metadata embedded in the content cache without a new remote
-    /// stat; other mounts have no such handle and always revalidate.
-    fn dirty_handle_committed_metadata(&self, path: &str) -> FuseResult<Option<RemoteMetadata>> {
-        let preserve_committed = self
-            .lock_handles()?
-            .files
-            .values()
-            .any(|state| state.path == path && !state.created && state.dirty);
-        if preserve_committed {
-            Ok(self.cache.get_committed_file_metadata(path))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn open_handle_metadata(&self, path: &str) -> FuseResult<Option<RemoteMetadata>> {
-        let handles = self.lock_handles()?;
-        let Some(state) = handles
-            .files
-            .values()
-            .find(|state| state.path == path && state.created && !state.unlinked)
-        else {
-            return Ok(None);
-        };
-        Ok(Some(RemoteMetadata {
-            kind: "file".to_string(),
-            size_bytes: state.buffer.len() as u64,
-            file_id: state.file_id.clone(),
-            link_count: state.link_count.max(1),
-            link_target: None,
-            content_hash: Some(content_hash_for_bytes(&state.buffer)),
-            executable: mode_is_executable(state.mode),
-            mode: Some(state.mode),
-            updated_at: None,
-        }))
-    }
-
-    fn metadata_for_handle_state(
-        &self,
-        state: &FileState,
-        authoritative: Option<&RemoteMetadata>,
-    ) -> RemoteMetadata {
-        // A clean loaded handle is only a read cache. Direct gateway and other
-        // mount writers may have advanced the same stable inode since it was
-        // loaded, so fstat must use the freshly resolved authoritative
-        // metadata. Only unpublished/dirty or unlinked handle state is local.
-        let use_buffer = state.dirty || state.created || state.unlinked;
-        RemoteMetadata {
-            kind: "file".to_string(),
-            size_bytes: if use_buffer {
-                state.buffer.len() as u64
-            } else {
-                authoritative
-                    .map(|metadata| metadata.size_bytes)
-                    .unwrap_or(0)
-            },
-            file_id: state.file_id.clone(),
-            link_count: if state.unlinked {
-                0
-            } else {
-                authoritative
-                    .map(|metadata| metadata.link_count.max(1))
-                    .unwrap_or_else(|| state.link_count.max(1))
-            },
-            link_target: None,
-            content_hash: if use_buffer {
-                Some(content_hash_for_bytes(&state.buffer))
-            } else {
-                authoritative.and_then(|metadata| metadata.content_hash.clone())
-            },
-            executable: mode_is_executable(state.mode),
-            mode: Some(state.mode),
-            updated_at: authoritative.and_then(|metadata| metadata.updated_at),
-        }
-    }
-
-    fn handle_metadata_needs_remote_route(state: &FileState) -> bool {
-        // Dirty, newly created, pending-publication, and unlinked handles are
-        // the authoritative open-file description until their publication
-        // barrier completes. Re-statting the pathname cannot improve their
-        // metadata and may observe an older remote version. Clean handles
-        // still revalidate so writes, renames, and unlinks from other mounts
-        // remain visible.
-        !(state.dirty || state.created || state.pending_publication.is_some() || state.unlinked)
-    }
-
-    /// Content counterpart of `open_handle_metadata`: a newly created file
-    /// exists only in its creator's handle buffer until flush, so readers
-    /// that were shown its metadata must also be served its bytes.
-    fn open_handle_content(&self, path: &str) -> FuseResult<Option<Vec<u8>>> {
-        let handles = self.lock_handles()?;
-        Ok(handles
-            .files
-            .values()
-            .find(|state| state.path == path && state.created && !state.unlinked)
-            .map(|state| state.buffer.clone()))
-    }
-
-    /// Apply a pathname-based metadata mutation to a file that exists only in
-    /// this mount's created-handle state. Linux may omit `fh` on chmod/truncate
-    /// immediately after create; routing that operation to the gateway would
-    /// observe ENOENT because the first write has not been flushed yet.
-    fn mutate_created_handle_for_path(
-        &self,
-        path: &str,
-        size: Option<u64>,
-        mode: Option<u32>,
-    ) -> FuseResult<Option<RemoteMetadata>> {
-        // A truncate to ZERO is admitted for ANY open handle, not just a created
-        // one. `cmd > file` opens O_TRUNC, and the kernel delivers that
-        // truncation as a SETATTR with no file handle — before the open
-        // completes — so it used to fall through to `resize_path_immediate` and
-        // publish on its own. The write that follows then published again, and
-        // the guest paid two round trips for one overwrite: an isolated arena
-        // probe measured `: > f` at 28ms and `dd conv=notrunc` at 32ms — one
-        // publication each — against 50ms for `echo y > f`.
-        //
-        // Safe precisely because the size is zero: the buffer ends up empty
-        // whatever the handle had loaded, so nothing unread can be lost. A
-        // non-zero resize still requires a created handle, because it preserves
-        // a prefix this mount may never have read.
-        let truncating_to_empty = size == Some(0);
-        let mut handles = self.lock_handles()?;
-        // A DIRTY, LOADED handle is the authority for this pathname's contents:
-        // it holds bytes the gateway has not seen yet, so a resize applied
-        // anywhere else would publish a size against content that is already
-        // stale. Fold it into the handle and let the close publish once.
-        //
-        // This is the second half of the `cmd > file` cost. The truncation is
-        // consumed by `open` (O_TRUNC), but the kernel still issues a SETATTR
-        // afterwards to settle size/mtime, and that one is NOT zero — so it fell
-        // through to `resize_path_immediate` and published a second time. The
-        // probe shows it plainly: `: > f` 27ms and `dd conv=notrunc` 31ms are one
-        // publication each, while `echo y > f` — the two together — cost 54ms.
-        let Some(fh) = handles
-            .files
-            .iter()
-            .find(|(_, state)| {
-                state.path == path
-                    && (state.created || truncating_to_empty || (state.dirty && state.loaded))
-            })
-            .map(|(fh, _)| *fh)
-        else {
-            return Ok(None);
-        };
-        let state = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
-        if let Some(size) = size {
-            state.buffer.resize(size as usize, 0);
-        }
-        if let Some(mode) = mode {
-            state.mode = normalize_mode(mode);
-        }
-        if size.is_some() || mode.is_some() {
-            state.dirty = true;
-            state.loaded = true;
-            state.revision = state.revision.saturating_add(1);
-        }
-        let metadata = RemoteMetadata {
-            kind: "file".to_string(),
-            size_bytes: state.buffer.len() as u64,
-            file_id: state.file_id.clone(),
-            link_count: state.link_count.max(1),
-            link_target: None,
-            content_hash: Some(content_hash_for_bytes(&state.buffer)),
-            executable: mode_is_executable(state.mode),
-            mode: Some(state.mode),
-            updated_at: None,
-        };
-        Self::mirror_handle_state_locked(&mut handles, fh)?;
-        Ok(Some(metadata))
-    }
-
-    fn read_bytes(&self, path: &str, offset: u64, size: u32) -> FuseResult<Vec<u8>> {
-        // A created-but-unflushed file has no gateway content yet; serve the
-        // creator's buffer (checked first so an oversized created buffer never
-        // routes into the ranged-read path, which would 404).
-        if let Some(bytes) = self.open_handle_content(path)? {
-            let start = (offset as usize).min(bytes.len());
-            let end = start.saturating_add(size as usize).min(bytes.len());
-            return Ok(bytes[start..end].to_vec());
-        }
-        // Large files never need a content hash (ranged reads are pinned by
-        // fingerprint), so route them off the cheap attribute stat before
-        // paying for a hashed stat.
-        if let Some(attributes) = self.stat_path_attributes(path)? {
-            if attributes.kind == "file" && attributes.size_bytes > LARGE_FILE_BYTES {
-                return self
-                    .read_large_range(path, &attributes, offset, size)
-                    .map(|range| range.bytes);
-            }
-        }
-        let metadata = self.stat_path(path)?.ok_or(Errno::ENOENT)?;
-        if let Some(bytes) = self.cache.get_file_matching(path, &metadata) {
-            let start = (offset as usize).min(bytes.len());
-            let end = start.saturating_add(size as usize).min(bytes.len());
-            return Ok(bytes[start..end].to_vec());
-        }
-
-        if metadata.size_bytes > LARGE_FILE_BYTES {
-            return self
-                .read_large_range(path, &metadata, offset, size)
-                .map(|range| range.bytes);
-        }
-        let response = self
-            .tokio
-            .block_on(self.client.read_file_raw_versioned(path))
-            .map_err(|_| Errno::EIO)?;
-        let bytes = response.value.ok_or(Errno::ENOENT)?;
-
-        // The stat and the content fetch are separate requests; if the file
-        // changed between them, cache metadata derived from the bytes we
-        // actually hold so attrs and content can never disagree. Same-size
-        // replacements are common (counters, locks, fixed-width status), so
-        // the hash must be verified, not just the length; a corrected entry
-        // drops updated_at because the pre-replacement mtime no longer
-        // describes these bytes.
-        let fetched_hash = content_hash_for_bytes(&bytes);
-        let metadata = if bytes.len() as u64 == metadata.size_bytes
-            && metadata.content_hash.as_deref() == Some(fetched_hash.as_str())
-        {
-            metadata
-        } else {
-            RemoteMetadata {
-                size_bytes: bytes.len() as u64,
-                content_hash: Some(fetched_hash),
-                updated_at: None,
-                ..metadata
-            }
-        };
-        self.cache
-            .put_metadata(path, metadata.clone(), response.revision);
-        self.cache.put_file(path, bytes.clone(), Some(metadata));
-        let start = (offset as usize).min(bytes.len());
-        let end = start.saturating_add(size as usize).min(bytes.len());
-        Ok(bytes[start..end].to_vec())
-    }
-
-    fn read_large_range(
-        &self,
-        path: &str,
-        metadata: &RemoteMetadata,
-        offset: u64,
-        size: u32,
-    ) -> FuseResult<LargeRangeRead> {
-        let mut metadata = metadata.clone();
-        let mut fingerprint = range_fingerprint(&metadata);
-        let mut retry_delay = Duration::from_millis(10);
-        for _ in 0..4 {
-            let outcome = self
-                .tokio
-                .block_on(self.client.read_file_range(
-                    path,
-                    offset,
-                    size as u64,
-                    Some(fingerprint.as_str()),
-                ))
-                .map_err(|_| Errno::EIO)?;
-            match outcome {
-                RangeRead::Bytes(bytes) => return Ok(LargeRangeRead { bytes, metadata }),
-                RangeRead::NotFound => return Err(Errno::ENOENT),
-                RangeRead::Stale => {
-                    // The file was replaced under the read; refresh identity
-                    // and retry so the kernel sees one file, never a splice.
-                    // The cached fingerprint can be up to ATTR_TTL stale, so
-                    // budget enough attempts to converge under write churn.
-                    std::thread::sleep(retry_delay);
-                    retry_delay = retry_delay
-                        .saturating_mul(2)
-                        .min(Duration::from_millis(100));
-                    self.cache.invalidate(path);
-                    let refreshed = self.stat_path_attributes(path)?.ok_or(Errno::ENOENT)?;
-                    fingerprint = range_fingerprint(&refreshed);
-                    metadata = refreshed;
-                }
-            }
-        }
-        Err(Errno::EIO)
-    }
-
-    fn read_large_handle_range_locked(
-        &self,
-        fh: u64,
-        route: &LinkedFileRoute,
-        offset: u64,
-        size: u32,
-    ) -> FuseResult<Vec<u8>> {
-        if offset >= route.metadata.size_bytes || size == 0 {
-            return Ok(Vec::new());
-        }
-        let fingerprint = range_fingerprint(&route.metadata);
-        let requested_end = offset
-            .saturating_add(size as u64)
-            .min(route.metadata.size_bytes);
-        {
-            let handles = self.lock_handles()?;
-            let state = handles.files.get(&fh).ok_or(Errno::ENOENT)?;
-            if let Some(window) = state.range_window.as_ref()
-                && window.fingerprint == fingerprint
-                && window.offset <= offset
-                && window.offset.saturating_add(window.bytes.len() as u64) >= requested_end
-            {
-                let start = (offset - window.offset) as usize;
-                let end = (requested_end - window.offset) as usize;
-                return Ok(window.bytes[start..end].to_vec());
-            }
-        }
-
-        let fetch_size = route
-            .metadata
-            .size_bytes
-            .saturating_sub(offset)
-            .min(LARGE_READ_AHEAD_BYTES.max(size as u64)) as u32;
-        let range =
-            self.read_large_range(route.path.as_str(), &route.metadata, offset, fetch_size)?;
-        let actual_fingerprint = range_fingerprint(&range.metadata);
-        let answer_len = (requested_end - offset) as usize;
-        if range.bytes.len() < answer_len {
-            return Err(Errno::EIO);
-        }
-        let answer = range.bytes[..answer_len].to_vec();
-        let mut handles = self.lock_handles()?;
-        let state = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
-        if !state.dirty
-            && !state.created
-            && !state.unlinked
-            && state.path == route.path
-            && state.file_id == range.metadata.file_id
-        {
-            state.range_window = Some(LargeReadWindow {
-                offset,
-                bytes: range.bytes,
-                fingerprint: actual_fingerprint,
-            });
-        }
-        Ok(answer)
-    }
-
-    fn next_handle(
-        &self,
-        path: &str,
-        initial: Vec<u8>,
-        loaded: bool,
-        base_content_hash: Option<String>,
-        mode: u32,
-        created: bool,
-        file_id: Option<String>,
-        link_count: u64,
-    ) -> FuseResult<u64> {
+    /// Register one open backing descriptor and return the FUSE handle for it.
+    ///
+    /// Two descriptors on one inode need no coordination any more: they share
+    /// the backing file itself, so there is nothing to donate between them and
+    /// nothing to mirror after a write.
+    fn next_handle(&self, file: MountFile, path: &str, flags: i32) -> FuseResult<u64> {
         let mut handles = self.lock_handles()?;
         if handles.files.len() >= MAX_OPEN_HANDLES {
             return Err(Errno::EMFILE);
         }
-        let sibling = handles
-            .files
-            .values()
-            .find(|state| Self::same_open_file(state, path, file_id.as_deref()))
-            .cloned();
-        let coherent_sibling = sibling
-            .as_ref()
-            .filter(|state| state.loaded && (state.dirty || state.created));
-        // An O_EXCL create can already have an empty gateway placeholder while
-        // its creator still owns handle-local bytes and pathname mutations.
-        // Presence of an authoritative content hash distinguishes that case
-        // from the older fully-local create whose first publication is absent.
-        let has_remote_baseline = !created || base_content_hash.is_some();
-        let initial = coherent_sibling
-            .map(|state| state.buffer.clone())
-            .unwrap_or(initial);
-        let mode = coherent_sibling
-            .map(|state| state.mode)
-            .unwrap_or_else(|| normalize_mode(mode));
-        let base_mode = coherent_sibling
-            .map(|state| state.base_mode)
-            .unwrap_or_else(|| has_remote_baseline.then_some(mode));
-        let created = coherent_sibling
-            .map(|state| state.created)
-            .unwrap_or(created);
-        let dirty = coherent_sibling.is_some_and(|state| state.dirty);
-        let loaded = coherent_sibling.is_some() || loaded;
-        let base_content_hash = coherent_sibling
-            .map(|state| state.base_content_hash.clone())
-            .unwrap_or_else(|| {
-                if created && base_content_hash.is_none() {
-                    Some("absent".to_string())
-                } else {
-                    base_content_hash
-                }
-            });
-        let publication_acknowledged =
-            coherent_sibling.is_some_and(|state| state.publication_acknowledged);
-        let pending_publication =
-            coherent_sibling.and_then(|state| state.pending_publication.clone());
-        let publication_gate = sibling
-            .as_ref()
-            .map(|state| Arc::clone(&state.publication_gate))
-            .unwrap_or_else(|| Arc::new(Mutex::new(())));
-        let revision = coherent_sibling.map(|state| state.revision).unwrap_or(0);
         let fh = handles.next;
         handles.next += 1;
         handles.files.insert(
             fh,
             FileState {
+                file: Arc::new(file),
                 path: path.to_string(),
-                file_id,
-                link_count,
-                unlinked: false,
-                buffer: initial,
-                mode,
-                base_mode,
-                created,
-                dirty,
-                loaded,
-                loaded_coherence_revision: 0,
-                range_window: None,
-                base_content_hash,
-                publication_acknowledged,
-                pending_publication,
-                publication_gate,
-                revision,
+                flags,
             },
         );
         Ok(fh)
     }
 
-    fn same_open_file(state: &FileState, path: &str, file_id: Option<&str>) -> bool {
-        match (state.file_id.as_deref(), file_id) {
-            (Some(left), Some(right)) => left == right,
-            _ => !state.unlinked && state.path == path,
-        }
-    }
-
-    /// Linux may omit `fh` from `getattr` even when servicing `fstat(2)`.
-    /// Recover the open file description from the inode's stable identity so
-    /// an unlinked-but-open file remains observable until its final release.
-    fn open_handle_for_inode(&self, ino: INodeNo) -> FuseResult<Option<u64>> {
-        let Some((path, identity)) = self.lock_inodes()?.route(ino) else {
-            return Ok(None);
-        };
-        let handles = self.lock_handles()?;
-        Ok(handles.files.iter().find_map(|(fh, state)| {
-            let matches = match identity.as_deref() {
-                Some(identity) => state.file_id.as_deref() == Some(identity),
-                None => !state.unlinked && state.path == path,
-            };
-            matches.then_some(*fh)
-        }))
-    }
-
-    /// All open handles for one inode share a publication gate. Mirroring the
-    /// mutable inode state after each ordered mutation gives pathname
-    /// truncate/chmod and descriptor writes the same coherent view without
-    /// weakening gateway CAS across independent mounts.
-    fn mirror_handle_state_locked(handles: &mut HandleTable, source_fh: u64) -> FuseResult<()> {
-        let (source_path, source_file_id) = {
-            let source = handles.files.get(&source_fh).ok_or(Errno::ENOENT)?;
-            (source.path.clone(), source.file_id.clone())
-        };
-        let siblings = handles
-            .files
-            .iter()
-            .filter_map(|(fh, state)| {
-                (*fh != source_fh
-                    && Self::same_open_file(state, &source_path, source_file_id.as_deref()))
-                .then_some(*fh)
-            })
-            .collect::<Vec<_>>();
-        if siblings.is_empty() {
-            return Ok(());
-        }
-        let source = handles
-            .files
-            .get(&source_fh)
-            .cloned()
-            .ok_or(Errno::ENOENT)?;
-        for fh in siblings {
-            let state = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
-            state.file_id = source.file_id.clone();
-            state.link_count = source.link_count;
-            state.buffer = source.buffer.clone();
-            state.mode = source.mode;
-            state.base_mode = source.base_mode;
-            state.publication_acknowledged = source.publication_acknowledged;
-            state.pending_publication = source.pending_publication.clone();
-            state.created = source.created;
-            state.dirty = source.dirty;
-            state.loaded = source.loaded;
-            state.loaded_coherence_revision = source.loaded_coherence_revision;
-            state.range_window = source.range_window.clone();
-            state.base_content_hash = source.base_content_hash.clone();
-            state.revision = source.revision;
-        }
-        Ok(())
-    }
-
-    fn stat_published_file(
-        &self,
-        path: &str,
-        size_bytes: u64,
-        content_hash: &str,
-        mode: u32,
-        expected_file_id: Option<&str>,
-    ) -> FuseResult<LinkedFileRoute> {
-        let mut retry_delay = Duration::from_millis(10);
-        for _ in 0..4 {
-            let route = if let Some(file_id) = expected_file_id {
-                match self.authoritative_file_route(path, file_id) {
-                    Ok(StableFileRoute::Linked(route)) => Some(route),
-                    Ok(StableFileRoute::Unlinked) => None,
-                    Err(error) if error.code() == Errno::EAGAIN.code() => None,
-                    Err(error) => return Err(error),
-                }
-            } else {
-                self.tokio
-                    .block_on(self.client.stat_versioned(path))
-                    .map_err(|_| Errno::EIO)
-                    .map(|response| {
-                        response.value.map(|metadata| LinkedFileRoute {
-                            path: path.to_string(),
-                            metadata,
-                            revision: response.revision,
-                        })
-                    })?
-            };
-            if let Some(route) = route {
-                let metadata = &route.metadata;
-                if Self::published_file_matches(
-                    metadata,
-                    size_bytes,
-                    content_hash,
-                    mode,
-                    expected_file_id,
-                ) {
-                    return Ok(route);
-                }
-                return Err(Errno::EIO);
-            }
-            std::thread::sleep(retry_delay);
-            retry_delay = retry_delay.saturating_mul(2);
-        }
-        Err(Errno::EIO)
-    }
-
-    fn published_file_matches(
-        metadata: &RemoteMetadata,
-        size_bytes: u64,
-        content_hash: &str,
-        mode: u32,
-        expected_file_id: Option<&str>,
-    ) -> bool {
-        metadata.kind == "file"
-            && metadata.size_bytes == size_bytes
-            && metadata.content_hash.as_deref() == Some(content_hash)
-            && metadata_mode(metadata) == mode
-            && metadata.file_id.is_some()
-            && expected_file_id.is_none_or(|file_id| metadata.file_id.as_deref() == Some(file_id))
-    }
-
-    fn cached_published_file(
-        &self,
-        path: &str,
-        size_bytes: u64,
-        content_hash: &str,
-        mode: u32,
-        expected_file_id: Option<&str>,
-    ) -> FuseResult<Option<LinkedFileRoute>> {
-        let revision = self.client.coherence_revision();
-        let Some(metadata) = self.cache.get_metadata(path, revision) else {
-            return Ok(None);
-        };
-        if !Self::published_file_matches(
-            &metadata,
-            size_bytes,
-            content_hash,
-            mode,
-            expected_file_id,
-        ) {
-            return Err(Errno::EIO);
-        }
-        Ok(Some(LinkedFileRoute {
-            path: path.to_string(),
-            metadata,
-            revision,
-        }))
-    }
-
-    fn acknowledge_pending_publication_locked(&self, fh: u64) -> FuseResult<()> {
-        let pending = {
-            let handles = self.lock_handles()?;
-            handles
-                .files
-                .get(&fh)
-                .ok_or(Errno::ENOENT)?
-                .pending_publication
-                .clone()
-        };
-        let Some(pending) = pending else {
-            return Ok(());
-        };
-        self.writes
-            .as_ref()
-            .ok_or(Errno::EIO)?
-            .flush_through(pending.id)
-            .map_err(|error| {
-                tracing::warn!(
-                    fh,
-                    path = pending.path,
-                    publication_id = pending.id,
-                    error = %error,
-                    "vfs handle publication drain failed"
-                );
-                Errno::EIO
-            })?;
-        let route = match self.cached_published_file(
-            &pending.path,
-            pending.size_bytes,
-            &pending.content_hash,
-            pending.mode,
-            pending.file_id.as_deref(),
-        ) {
-            Ok(Some(route)) => route,
-            Ok(None) => self
-                .stat_published_file(
-                    &pending.path,
-                    pending.size_bytes,
-                    &pending.content_hash,
-                    pending.mode,
-                    pending.file_id.as_deref(),
-                )
-                .map_err(|error| {
-                    tracing::warn!(
-                        fh,
-                        path = pending.path,
-                        publication_id = pending.id,
-                        expected_size = pending.size_bytes,
-                        expected_hash = pending.content_hash,
-                        expected_mode = pending.mode,
-                        expected_file_id = pending.file_id,
-                        ?error,
-                        "vfs handle publication could not verify through authoritative stat"
-                    );
-                    error
-                })?,
-            Err(error) => {
-                tracing::warn!(
-                    fh,
-                    path = pending.path,
-                    publication_id = pending.id,
-                    expected_size = pending.size_bytes,
-                    expected_hash = pending.content_hash,
-                    expected_mode = pending.mode,
-                    expected_file_id = pending.file_id,
-                    ?error,
-                    "vfs handle publication cache verification failed"
-                );
-                return Err(error);
-            }
-        };
-        let published_file_id = route
-            .metadata
-            .file_id
-            .clone()
-            .or_else(|| pending.file_id.clone());
-        let published_link_count = route.metadata.link_count.max(1);
-        let cache_bytes = {
-            let mut handles = self.lock_handles()?;
-            let handle = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
-            if handle
-                .pending_publication
-                .as_ref()
-                .is_none_or(|current| current.id != pending.id)
-            {
-                return Err(Errno::EAGAIN);
-            }
-            handle.path = route.path.clone();
-            handle.file_id = published_file_id.clone();
-            handle.link_count = published_link_count;
-            handle.unlinked = false;
-            handle.base_content_hash = Some(pending.content_hash.clone());
-            handle.base_mode = Some(pending.mode);
-            handle.created = false;
-            handle.publication_acknowledged = false;
-            handle.pending_publication = None;
-            handle.loaded_coherence_revision = 0;
-            let cache_bytes = if handle.revision == pending.revision {
-                handle.dirty = false;
-                Some(handle.buffer.clone())
-            } else {
-                None
-            };
-            Self::mirror_handle_state_locked(&mut handles, fh)?;
-            cache_bytes
-        };
-        self.invalidate_inode_aliases(&pending.path);
-        if pending.path != route.path {
-            self.cache.invalidate(&pending.path);
-        }
-        if let Some(bytes) = cache_bytes {
-            self.cache
-                .put_file(&route.path, bytes, Some(route.metadata.clone()));
-        } else {
-            self.cache.invalidate(&route.path);
-        }
-        if let Some(file_id) = published_file_id {
-            self.lock_inodes()?
-                .ensure_with_identity(&route.path, Some(&file_id));
-            self.retarget_identity_route(&pending.path, &route);
-        }
-        Ok(())
-    }
-
-    fn publication_gate_for_handle(&self, fh: u64) -> FuseResult<Arc<Mutex<()>>> {
+    /// Clone one handle's state out from under the handle table lock, so the
+    /// caller does its I/O with no mount lock held at all.
+    fn handle_state(&self, fh: u64) -> FuseResult<FileState> {
         self.lock_handles()?
             .files
             .get(&fh)
-            .map(|state| Arc::clone(&state.publication_gate))
-            .ok_or(Errno::ENOENT)
-    }
-
-    fn publication_gates_for_subtrees(
-        &self,
-        paths: &[&str],
-    ) -> FuseResult<Vec<(u64, Arc<Mutex<()>>)>> {
-        let handles = self.lock_handles()?;
-        let mut gates = handles
-            .files
-            .iter()
-            .filter(|(_, state)| {
-                paths.iter().any(|path| {
-                    state.path == *path
-                        || state
-                            .path
-                            .strip_prefix(path)
-                            .is_some_and(|suffix| suffix.starts_with('/'))
-                })
-            })
-            .map(|(fh, state)| (*fh, Arc::clone(&state.publication_gate)))
-            .collect::<Vec<_>>();
-        // Overlapping renames can share more than one handle. One global
-        // acquisition order prevents an AB/BA deadlock without serializing
-        // unrelated files or mounts. The list keeps one entry per handle (fh) so
-        // the caller can flush each descriptor, but several of those entries can
-        // name the SAME gate: all handles for one inode share a single gate Arc
-        // (see next_handle). `lock_publication_gates` collapses those repeats so
-        // the non-reentrant gate is never locked twice on one thread.
-        gates.sort_unstable_by_key(|(fh, _)| *fh);
-        Ok(gates)
-    }
-
-    fn lock_publication_gates<'a>(
-        gates: &'a [(u64, Arc<Mutex<()>>)],
-    ) -> FuseResult<Vec<MutexGuard<'a, ()>>> {
-        // Same-inode handles share one publication gate, so `gates` may list the
-        // same Arc more than once (two descriptors on a file, hard-link aliases).
-        // std::sync::Mutex is not reentrant: locking a repeat on this thread
-        // would self-deadlock the rename. Acquire each DISTINCT gate exactly
-        // once, in the caller's stable fh order — that still serializes every
-        // listed handle against its inode's publications and keeps the global
-        // order that prevents an AB/BA deadlock between overlapping renames.
-        let mut seen: Vec<*const Mutex<()>> = Vec::with_capacity(gates.len());
-        let mut guards = Vec::with_capacity(gates.len());
-        for (_, gate) in gates {
-            let identity = Arc::as_ptr(gate);
-            if seen.contains(&identity) {
-                continue;
-            }
-            guards.push(gate.lock().map_err(|_| Errno::EIO)?);
-            seen.push(identity);
-        }
-        Ok(guards)
-    }
-
-    /// `barrier` decides whether this flush WAITS for its own publication.
-    ///
-    /// `Close` does not. `close(2)` is not a durability point — the bytes are
-    /// already in the write journal's WAL (staged file fsynced, journal line
-    /// appended and fsynced) before this returns — and waiting there was costing
-    /// a full round trip PER FILE while also calling `force_flush`, which shuts
-    /// the journal's batch window. Between them a sequential create/write/close
-    /// loop could never have more than one write in flight, so the journal's
-    /// batching (MAX_BATCH_WRITES, sharded, concurrent) had nothing to batch:
-    /// `create_write_close` measured 1.02 round trips per file against
-    /// `create_journaled`'s 0.04, which is the same journal amortizing 25:1 when
-    /// nobody blocks it. A 40k-file install paid 40k round trips.
-    ///
-    /// What close gives up is learning its own publication's result inline. That
-    /// is recovered on the journal worker: the commit hook already receives the
-    /// publication snapshot and installs each entry's metadata — `file_id`
-    /// included — into the shared cache, and the dead-letter hook already
-    /// invalidates a rejected path so no reader serves dropped bytes. A
-    /// dead-lettered write still reports through `flush()`, which every
-    /// `flush_writes()` caller reaches, including `stat_path_attributes` for any
-    /// path with a pending write.
-    ///
-    /// `Durable` (fsync, and every caller that reports authoritative
-    /// post-publication state) is unchanged and still waits.
-    fn flush_handle_locked(&self, fh: u64, barrier: FlushBarrier) -> FuseResult<()> {
-        if self.read_only {
-            return Ok(());
-        }
-        {
-            let handles = self.lock_handles()?;
-            // A duplicate FLUSH may have captured this handle's gate before a
-            // concurrent RELEASE removed the table entry. That authorized
-            // waiter is already satisfied by the releasing flush.
-            if !handles.files.contains_key(&fh) {
-                return Ok(());
-            }
-        }
-        let pending = self
-            .lock_handles()?
-            .files
-            .get(&fh)
-            .and_then(|state| state.pending_publication.clone());
-        if let Some(pending) = pending {
-            let newer_dirty_revision = self
-                .lock_handles()?
-                .files
-                .get(&fh)
-                .is_some_and(|state| state.dirty && state.revision != pending.revision);
-            if barrier == FlushBarrier::Durable || newer_dirty_revision {
-                // fsync must wait for the exact queued publication. A duplicated
-                // descriptor may also write again after an earlier FLUSH; settle
-                // that predecessor before enqueueing the newer revision so its
-                // CAS base and stable identity are authoritative.
-                self.acknowledge_pending_publication_locked(fh)?;
-            } else {
-                // FLUSH and RELEASE are both parts of close(2). Once this exact
-                // revision is in the durable WAL, neither callback may enqueue it
-                // again or force the worker's batch window closed.
-                return Ok(());
-            }
-        }
-        // Fold this handle's own undrained creation into the write that is
-        // about to publish its contents. `create(2)+write(2)+close(2)` costs two
-        // publications otherwise — a `namespace-many` for the creation and a
-        // `write-many` for the content — and the second can carry the first:
-        // `write-many` already takes a create mode, and a pathname whose
-        // creation has not reached the gateway needs no CAS base because there
-        // is nothing there to guard against.
-        //
-        // Deliberately attempted BEFORE the ordering fence below, because
-        // withdrawing the creation is exactly what makes the fence unnecessary.
-        // Best-effort by design: `false` means the creation already published
-        // (or is on the wire, or never existed), the fence then does its normal
-        // job, and the pair costs what it always did.
-        // Does this write CREATE the file? The handle already knows: `created`
-        // is set by `create(2)` when this mount reserved the pathname, and
-        // `file_id` stays absent until a publication answers.
-        //
-        // Nothing is withdrawn any more. `reserve_file_if_absent` no longer
-        // journals a namespace record for a non-exclusive create, so there is no
-        // record to race — the write IS the creation. Racing to withdraw one
-        // before the namespace worker drained it is what this used to do, and on
-        // a real mount it lost every time: 200 creates measured 200
-        // `namespace-many` publications on top of 200 `write-many`.
-        //
-        let folded_creation = {
-            let handles = self.lock_handles()?;
-            let state = handles.files.get(&fh).ok_or(Errno::ENOENT)?;
-            state.dirty && !state.unlinked && owns_unpublished_creation(state)
-        };
-        // A queued namespace mutation that establishes or retargets this exact
-        // pathname must reach the gateway before the handle's content does:
-        // `write-many` carries a CAS base the gateway can only evaluate against
-        // the intended entry, so a content publication that overtook an exact
-        // creation or an ancestor rename could target the wrong incarnation.
-        //
-        // This is an ORDERING fence, not a durability barrier, so it is taken
-        // only when this pathname has non-commuting namespace work, and only
-        // when there is content to publish. Parent directory creations commute
-        // with backend writes (all backends create or infer parents), so closing
-        // a file does not wait out the tree's directory journal. This is the
-        // difference between close and fsync (see
-        // `flush_handle_immediate_locked`). A folded creation is not queued and
-        // therefore needs no separate fence.
-        let ordering_fence_required = {
-            let handles = self.lock_handles()?;
-            let state = handles.files.get(&fh).ok_or(Errno::ENOENT)?;
-            state.dirty
-                && !state.unlinked
-                && self.namespace_write_ordering_pending_for(&state.path)?
-        };
-        if ordering_fence_required {
-            self.flush_namespace()?;
-        }
-        let state = self
-            .lock_handles()?
-            .files
-            .get(&fh)
             .cloned()
-            .ok_or(Errno::ENOENT)?;
-        if !state.dirty {
-            return Ok(());
-        }
-        if state.unlinked {
-            if let Some(handle) = self.lock_handles()?.files.get_mut(&fh) {
-                if handle.revision == state.revision {
-                    handle.dirty = false;
-                }
-            }
-            return Ok(());
-        }
+            .ok_or(Errno::EBADF)
+    }
 
-        // Do not preflight the pathname before publishing an identified
-        // inode. write-many carries the expected file identity and content
-        // base in the same atomic mutation; a separate stat is both redundant
-        // and a TOCTOU window. A real cross-mount rename/unlink is handled by
-        // the journal's rejected-write resolver, which retargets a surviving
-        // alias or retires the write without recreating the pathname.
-        let next_content_hash = content_hash_for_bytes(&state.buffer);
-        let authoritative_route = if !folded_creation && state.base_mode != Some(state.mode) {
-            let lease = self
-                .tokio
-                .block_on(self.client.acquire_lease(
-                    &state.path,
-                    1,
-                    "flush exact-mode vfs fuse write",
-                ))
-                .map_err(|_| Errno::EIO)?;
-            let surface = self.surface_kind_for_path(&state.path);
-            let result = (|| -> FuseResult<LinkedFileRoute> {
-                if !state.publication_acknowledged {
-                    let write = self.tokio.block_on(self.client.write_file(
-                        &state.path,
-                        &state.buffer,
-                        mode_is_executable(state.mode),
-                        Some(state.mode),
-                        &lease,
-                        surface,
-                        VFS_OPERATION_WRITE_THROUGH,
-                        state.base_content_hash.as_deref(),
-                        state.file_id.as_deref(),
-                    ));
-                    if write.is_err() {
-                        // A lost response is indistinguishable from a failed
-                        // write until the exact identity/content/mode tuple is
-                        // re-read. Never advance the handle on a mismatch.
-                        return self.stat_published_file(
-                            &state.path,
-                            state.buffer.len() as u64,
-                            &next_content_hash,
-                            state.mode,
-                            state.file_id.as_deref(),
-                        );
-                    }
-                    if state.file_id.is_none()
-                        && let Some(handle) = self.lock_handles()?.files.get_mut(&fh)
-                    {
-                        handle.publication_acknowledged = true;
-                    }
-                }
-                self.stat_published_file(
-                    &state.path,
-                    state.buffer.len() as u64,
-                    &next_content_hash,
-                    state.mode,
-                    state.file_id.as_deref(),
-                )
-            })();
-            let _ = self.tokio.block_on(self.client.release_lease(&lease));
-            result?
-        } else {
-            // A write that owns an unpublished creation names the mode the
-            // creation would have applied and drops both preconditions. There is
-            // no separate namespace record: this WAL entry is the creation.
-            let (base_content_hash, expected_file_id, create_mode) = if folded_creation {
-                // The create is write-behind, not create-or-replace. Preserve
-                // the kernel's successful negative lookup as an expect-absent
-                // precondition so a cross-mount winner rejects this journal
-                // entry instead of being overwritten.
-                (Some("absent".to_string()), None, Some(state.mode))
-            } else {
-                (state.base_content_hash.clone(), state.file_id.clone(), None)
-            };
-            let publication_id = self
-                .writes
-                .as_ref()
-                .ok_or(Errno::EIO)?
-                .enqueue_with_mode(
-                    state.path.as_str(),
-                    state.buffer.as_slice(),
-                    base_content_hash,
-                    expected_file_id,
-                    create_mode,
-                )
-                .map_err(|_| Errno::EIO)?;
-            {
-                let mut handles = self.lock_handles()?;
-                let handle = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
-                if handle.revision != state.revision
-                    || handle.path != state.path
-                    || handle.file_id != state.file_id
-                {
-                    return Err(Errno::EAGAIN);
-                }
-                handle.pending_publication = Some(HandlePublication {
-                    id: publication_id,
-                    revision: state.revision,
-                    path: state.path.clone(),
-                    file_id: state.file_id.clone(),
-                    size_bytes: state.buffer.len() as u64,
-                    content_hash: next_content_hash.clone(),
-                    mode: state.mode,
-                });
-            }
-            if barrier == FlushBarrier::Durable {
-                // The helper retains the exact id and all dirty/base state when
-                // either the journal barrier or authoritative verification fails.
-                self.acknowledge_pending_publication_locked(fh)?;
-            }
-            return Ok(());
+    /// Recover the open file description for an inode whose name no longer
+    /// resolves.
+    ///
+    /// That is exactly the unlinked-but-open case: the backing entry survives
+    /// its last link natively, but a pathname `lstat` cannot see it, and Linux
+    /// omits `fh` from `getattr` even when servicing `fstat(2)`. The inode's
+    /// bound identity picks the right descriptor when one name has held more
+    /// than one inode over the mount's life.
+    fn open_handle_for_inode(&self, ino: INodeNo) -> FuseResult<Option<FileState>> {
+        let Some((path, identity)) = self.lock_inodes()?.route(ino) else {
+            return Ok(None);
         };
-
-        let authoritative_metadata = &authoritative_route.metadata;
-        let published_file_id = authoritative_metadata
-            .file_id
-            .clone()
-            .or_else(|| state.file_id.clone());
-        let published_link_count = authoritative_metadata.link_count.max(1);
-        self.invalidate_inode_aliases(&state.path);
-        self.cache.put_file(
-            &authoritative_route.path,
-            state.buffer.clone(),
-            Some(RemoteMetadata {
-                kind: "file".to_string(),
-                size_bytes: state.buffer.len() as u64,
-                file_id: published_file_id.clone(),
-                link_count: published_link_count,
-                link_target: None,
-                content_hash: Some(next_content_hash.clone()),
-                executable: mode_is_executable(state.mode),
-                mode: Some(state.mode),
-                updated_at: authoritative_metadata.updated_at,
-            }),
-        );
-        {
-            let mut handles = self.lock_handles()?;
-            let handle = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
-            handle.path = authoritative_route.path.clone();
-            handle.loaded = true;
-            handle.base_content_hash = Some(next_content_hash);
-            handle.base_mode = Some(state.mode);
-            handle.file_id = published_file_id.clone();
-            handle.link_count = published_link_count;
-            handle.created = false;
-            handle.publication_acknowledged = false;
-            if handle.revision == state.revision {
-                handle.dirty = false;
-            }
-            Self::mirror_handle_state_locked(&mut handles, fh)?;
-        }
-        if let Some(file_id) = published_file_id {
-            self.lock_inodes()?
-                .ensure_with_identity(&authoritative_route.path, Some(&file_id));
-            self.retarget_identity_route(&state.path, &authoritative_route);
-        }
-        Ok(())
-    }
-
-    fn flush_handle(&self, fh: u64) -> FuseResult<()> {
-        if self.read_only {
-            return Ok(());
-        }
-        let gate = self.publication_gate_for_handle(fh)?;
-        let _guard = gate.lock().map_err(|_| Errno::EIO)?;
-        self.flush_handle_locked(fh, FlushBarrier::Durable)
-    }
-
-    fn flush_handle_immediate_locked(&self, fh: u64, barrier: FlushBarrier) -> FuseResult<()> {
-        let had_dirty_data = self
-            .lock_handles()?
-            .files
-            .get(&fh)
-            .is_some_and(|state| state.dirty);
-        self.flush_handle_locked(fh, barrier)?;
-        if !had_dirty_data {
-            return Ok(());
-        }
-        if barrier == FlushBarrier::Close {
-            // POSIX does not make close(2) a durability point, and the FUSE
-            // FLUSH/RELEASE pair the kernel sends on every close is not a
-            // request for one. This handle's bytes are already durably in the
-            // write journal's WAL (staged file fsynced, journal line appended
-            // and fsynced by `WriteJournal::enqueue`) and its pathname's queued
-            // namespace work was ordered ahead of them by the fence in
-            // `flush_handle_locked`; publishing the rest of the namespace
-            // journal is not this close's business.
-            //
-            // Making it this close's business is what kept the journal from
-            // ever accumulating a batch: with a full drain on every close, each
-            // creation published alone, so 1,000 creates cost 1,000
-            // publications instead of the handful the batch window is for.
-            //
-            // What is still owed to the caller is a *terminal* failure that has
-            // already happened — a dead-lettered publication must not be
-            // silently swallowed just because this close does not wait. That is
-            // surfaced without a wire call.
-            return self.assert_namespace_journal_healthy();
-        }
-        // fsync(2) IS a durability point. A file can be renamed between its data
-        // flush and the fsync, so the barrier is not complete until BOTH ordered
-        // journals are remotely acknowledged: the content above, and every
-        // namespace mutation that could have retargeted it.
-        self.flush_namespace()
-    }
-
-    fn flush_handle_immediate(&self, fh: u64, barrier: FlushBarrier) -> FuseResult<()> {
-        if self.read_only {
-            return Ok(());
-        }
-        let gate = self.publication_gate_for_handle(fh)?;
-        let _guard = gate.lock().map_err(|_| Errno::EIO)?;
-        self.flush_handle_immediate_locked(fh, barrier)
-    }
-
-    fn advisory_lock_target(&self, fh: u64) -> FuseResult<AdvisoryLockTarget> {
-        let state = {
-            let handles = self.lock_handles()?;
-            handles.files.get(&fh).cloned().ok_or(Errno::ENOENT)?
-        };
-        if let Some(file_id) = state.file_id {
-            return Ok(AdvisoryLockTarget {
-                path: state.path,
-                file_id,
-            });
-        }
-
-        // create(2) is intentionally handle-local until a publication point.
-        // POSIX/OFD/flock operations need the gateway's stable identity, so
-        // publish the exact handle bytes and mode before asking for a lock.
-        self.flush_handle_immediate(fh, FlushBarrier::Durable)?;
-        for _ in 0..4 {
-            let state = {
-                let handles = self.lock_handles()?;
-                handles.files.get(&fh).cloned().ok_or(Errno::ENOENT)?
-            };
-            if let Some(file_id) = state.file_id {
-                return Ok(AdvisoryLockTarget {
-                    path: state.path,
-                    file_id,
-                });
-            }
-            let metadata = self
-                .tokio
-                .block_on(self.client.stat_attributes(&state.path))
-                .map_err(|_| Errno::EIO)?
-                .ok_or(Errno::ENOENT)?;
-            if metadata.kind != "file" {
-                return Err(Errno::EINVAL);
-            }
-            let file_id = metadata.file_id.ok_or(Errno::EOPNOTSUPP)?;
-            {
-                let mut handles = self.lock_handles()?;
-                let handle = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
-                if handle.path != state.path {
-                    continue;
-                }
-                handle.file_id = Some(file_id.clone());
-                handle.link_count = metadata.link_count.max(1);
-            }
-            self.lock_inodes()?
-                .ensure_with_identity(&state.path, Some(&file_id));
-            return Ok(AdvisoryLockTarget {
-                path: state.path,
-                file_id,
-            });
-        }
-        Err(Errno::EAGAIN)
-    }
-
-    fn flush_handles_for_path(&self, path: &str) -> FuseResult<()> {
-        let handles = self
-            .lock_handles()?
-            .files
-            .iter()
-            .filter(|(_, state)| state.path == path)
-            .map(|(fh, _)| *fh)
-            .collect::<Vec<_>>();
-        for fh in handles {
-            let gate = self.publication_gate_for_handle(fh)?;
-            let _guard = gate.lock().map_err(|_| Errno::EIO)?;
-            // Preserve a clean open descriptor's content before deleting its
-            // final remotely addressable pathname.
-            self.ensure_handle_loaded_locked(fh)?;
-            self.flush_handle_locked(fh, FlushBarrier::Durable)?;
-        }
-        Ok(())
-    }
-
-    fn resize_path_immediate(&self, path: &str, size: u64) -> FuseResult<FileAttr> {
-        if self.read_only {
-            return Err(Errno::EROFS);
-        }
-        // A path-based truncate must never race the ordered write journal
-        // with a side-channel PUT: the PUT commits a new content hash at the
-        // gateway while journaled writes still carry the pre-truncate base,
-        // permanently 409ing them (the original stale-precondition wedge).
-        //
-        // If any open handle owns this path, resize its buffer; the normal
-        // flush publishes it through the journal with correct base chaining.
-        let open_handle = {
+        let candidates: Vec<FileState> = {
             let handles = self.lock_handles()?;
             handles
                 .files
-                .iter()
-                .find(|(_, state)| state.path == path)
-                .map(|(fh, _)| *fh)
-        };
-        if let Some(fh) = open_handle {
-            self.ensure_handle_loaded(fh)?;
-            let mut handles = self.lock_handles()?;
-            if let Some(state) = handles.files.get_mut(&fh) {
-                state.buffer.resize(size as usize, 0);
-                state.dirty = true;
-                state.loaded = true;
-                state.revision = state.revision.saturating_add(1);
-                let metadata = RemoteMetadata {
-                    kind: "file".to_string(),
-                    size_bytes: size,
-                    file_id: state.file_id.clone(),
-                    link_count: state.link_count.max(1),
-                    link_target: None,
-                    content_hash: Some(content_hash_for_bytes(&state.buffer)),
-                    executable: mode_is_executable(state.mode),
-                    mode: Some(state.mode),
-                    updated_at: None,
-                };
-                Self::mirror_handle_state_locked(&mut handles, fh)?;
-                return Ok(self.attr_for_path(path, &metadata, false));
-            }
-        }
-        // No open handle: read the current content (draining any pending
-        // journal writes first so the gateway is current), then publish the
-        // resized content through the same journal as ordinary writes.
-        self.flush_namespace()?;
-        self.flush_writes()?;
-        let prior = self.stat_path(path)?.ok_or(Errno::ENOENT)?;
-        let mut bytes = self
-            .tokio
-            .block_on(self.client.read_file_raw(path))
-            .map_err(|_| Errno::EIO)?
-            .ok_or(Errno::ENOENT)?;
-        bytes.resize(size as usize, 0);
-        let next_hash = content_hash_for_bytes(&bytes);
-        if let Some(writes) = self.writes.as_ref() {
-            writes
-                .enqueue(
-                    path,
-                    bytes.as_slice(),
-                    prior.content_hash.clone(),
-                    prior.file_id.clone(),
-                )
-                .map_err(|_| Errno::EIO)?;
-        } else {
-            let lease = self
-                .tokio
-                .block_on(self.client.acquire_lease(path, 1, "resize vfs fuse file"))
-                .map_err(|_| Errno::EIO)?;
-            let surface = self.surface_kind_for_path(path);
-            let write_result = self.tokio.block_on(self.client.write_file(
-                path,
-                &bytes,
-                prior.executable,
-                None,
-                &lease,
-                surface,
-                VFS_OPERATION_SETATTR_SIZE,
-                prior.content_hash.as_deref(),
-                prior.file_id.as_deref(),
-            ));
-            let _ = self.tokio.block_on(self.client.release_lease(&lease));
-            write_result.map_err(|_| Errno::EIO)?;
-        }
-        self.invalidate_inode_aliases(path);
-        let metadata = RemoteMetadata {
-            kind: "file".to_string(),
-            size_bytes: size,
-            file_id: prior.file_id,
-            link_count: prior.link_count,
-            link_target: None,
-            content_hash: Some(next_hash.clone()),
-            executable: prior.executable,
-            mode: prior.mode,
-            updated_at: None,
-        };
-        self.cache.put_file(path, bytes, Some(metadata.clone()));
-        Ok(self.attr_for_path(path, &metadata, false))
-    }
-
-    fn set_mode_path_immediate(&self, path: &str, mode: u32) -> FuseResult<FileAttr> {
-        if self.read_only {
-            return Err(Errno::EROFS);
-        }
-        let mode = normalize_mode(mode);
-        // `copyFile` commonly follows close with chmod to the mode CREATE
-        // already supplied. The close has durably queued both bytes and that
-        // mode in the write WAL, so this is a true no-op and must not force the
-        // batch onto the wire merely to rediscover the same answer.
-        if let Some(created) = self
-            .writes
-            .as_ref()
-            .and_then(|writes| writes.pending_created_file(path))
-            .filter(|created| created.mode == mode)
-        {
-            let metadata = RemoteMetadata {
-                kind: "file".to_string(),
-                size_bytes: created.size_bytes,
-                file_id: created.file_id,
-                link_count: 1,
-                link_target: None,
-                content_hash: None,
-                executable: mode_is_executable(mode),
-                mode: Some(mode),
-                updated_at: None,
-            };
-            return Ok(self.attr_for_path(path, &metadata, false));
-        }
-        // The namespace counterpart of the pending-created-write fast path.
-        // Installers commonly chmod a directory to the exact mode supplied to
-        // mkdir while that creation is still queued. The WAL projection is the
-        // authoritative local state for that syscall; an unchanged mode is a
-        // no-op and must not drain thousands of unrelated namespace records.
-        if let Some(metadata) = self
-            .projected_namespace_metadata_without_base(path)?
-            .flatten()
-            && (metadata.kind == "symlink" || metadata_mode(&metadata) == mode)
-        {
-            return Ok(self.attr_for_path(path, &metadata, false));
-        }
-        // Package importers may apply modes in a second phase, after the write
-        // batch has already published. A watch-fenced publication snapshot is
-        // just as authoritative as the pending WAL above, so repeating its
-        // exact mode is also a no-op. Without this serve, each ordinary 0644
-        // file paid a point stat and a SetMode publication even though neither
-        // changed a bit.
-        if self.client.revision_watch_live() {
-            let revision = self.client.coherence_revision();
-            if let Some(metadata) = self.cache.get_metadata(path, revision)
-                && (metadata.kind == "symlink" || metadata_mode(&metadata) == mode)
-            {
-                return Ok(self.attr_for_path(path, &metadata, false));
-            }
-        }
-        self.flush_namespace()?;
-        self.flush_writes()?;
-        // The write worker removes an entry from `pending` before publishing
-        // it. A chmod racing that in-flight window misses both fast paths
-        // above, but the drain has now waited for the worker and its commit
-        // snapshot. Re-check that authoritative result before invalidating it
-        // and performing the exact point stat the drain just made unnecessary.
-        if self.client.revision_watch_live() {
-            let revision = self.client.coherence_revision();
-            if let Some(metadata) = self.cache.get_metadata(path, revision)
-                && (metadata.kind == "symlink" || metadata_mode(&metadata) == mode)
-            {
-                return Ok(self.attr_for_path(path, &metadata, false));
-            }
-        }
-        self.cache.invalidate(path);
-        let response = self
-            .tokio
-            .block_on(self.client.stat_versioned(path))
-            .map_err(|error| {
-                tracing::warn!(path, error = %error, "vfs setattr stat failed");
-                Errno::EIO
-            })?;
-        let metadata = response.value.ok_or(Errno::ENOENT)?;
-        if metadata.kind == "symlink" || metadata_mode(&metadata) == mode {
-            self.cache
-                .put_metadata(path, metadata.clone(), response.revision);
-            return Ok(self.attr_for_path(path, &metadata, false));
-        }
-
-        self.commit_namespace(VfsNamespaceMutation::SetMode {
-            path: path.to_string(),
-            mode,
-        })?;
-        let mut updated = metadata;
-        updated.mode = Some(mode);
-        updated.executable = mode_is_executable(mode);
-        if let Ok(mut handles) = self.lock_handles() {
-            for state in handles
-                .files
-                .values_mut()
+                .values()
                 .filter(|state| state.path == path)
-            {
-                state.mode = mode;
-                state.base_mode = Some(mode);
-            }
-        }
-        Ok(self.attr_for_path(path, &updated, false))
-    }
-
-    fn reserve_file_if_absent(
-        &self,
-        path: &str,
-        mode: u32,
-        exclusive: bool,
-    ) -> FuseResult<RemoteMetadata> {
-        if self.read_only {
-            return Err(Errno::EROFS);
-        }
-        if exclusive {
-            // O_EXCL is arbitrated by the gateway's expect-absent precondition,
-            // so the mount must drain ahead of it and publish synchronously to
-            // learn the verdict. Ordinary creates skip both drains: the
-            // namespace journal is FIFO (a queued mutation for this path stays
-            // ordered ahead of this one) and content writes are already fenced
-            // by the delete/rename barriers, so neither drain adds ordering the
-            // journal does not already provide.
-            self.flush_namespace()?;
-            self.flush_writes()?;
-        }
-        let empty_hash = content_hash_for_bytes(&[]);
-        let projected = RemoteMetadata {
-            kind: "file".to_string(),
-            size_bytes: 0,
-            file_id: None,
-            link_count: 1,
-            link_target: None,
-            content_hash: Some(empty_hash.clone()),
-            executable: mode_is_executable(mode),
-            mode: Some(mode),
-            updated_at: None,
+                .cloned()
+                .collect()
         };
-        if !exclusive {
-            // NOT journaled as a namespace mutation. The file is created by the
-            // CONTENT write that follows, which already carries the mode and
-            // needs no CAS base for a pathname nothing has published yet.
-            //
-            // Journaling it and then trying to WITHDRAW the record before it
-            // drained (which is what this used to do) is a race the mount loses
-            // as soon as the namespace worker's batch window fires first — and
-            // on a real mount it lost every time: 200 creates measured 200
-            // `namespace-many` publications on top of 200 `write-many`, so the
-            // creation cost a full round trip per file that the write was about
-            // to pay again. Not creating the record removes the race instead of
-            // running it.
-            //
-            // Final RELEASE marks an otherwise-clean created handle dirty, so a
-            // file closed without a write still publishes as one empty content
-            // write rather than a namespace mutation.
-            //
-            // Reads are unaffected: an open handle answers for its own path
-            // (`open_handle_metadata` / `dirty_handle_committed_metadata`)
-            // before any cache or wire lookup, which is the same
-            // read-your-writes the namespace projection was providing.
-            return Ok(projected);
-        }
-        let mutation = VfsNamespaceMutation::CreateFile {
-            path: path.to_string(),
-            mode: Some(mode),
+        let Some(identity) = identity else {
+            return Ok(candidates.into_iter().next());
         };
-        let published = self.commit_namespace_with_metadata(mutation, Some(projected));
-        if let Err(error) = published {
-            if self
-                .tokio
-                .block_on(self.client.stat_attributes(path))
-                .ok()
-                .flatten()
-                .is_some()
-            {
-                return Err(Errno::EEXIST);
+        let mut fallback = None;
+        for state in candidates {
+            let matches = state
+                .file
+                .metadata()
+                .map(|metadata| metadata.local_identity == identity)
+                .unwrap_or(false);
+            if matches {
+                return Ok(Some(state));
             }
-            return Err(error);
+            fallback = fallback.or(Some(state));
         }
-        self.cached_published_file(path, 0, &empty_hash, mode, None)?
-            .map(|route| route.metadata)
-            .map(Ok)
-            .unwrap_or_else(|| {
-                self.stat_published_file(path, 0, &empty_hash, mode, None)
-                    .map(|route| route.metadata)
-            })
+        Ok(fallback)
     }
 
-    fn enqueue_namespace(
-        &self,
-        mutation: VfsNamespaceMutation,
-        projected_metadata: Option<RemoteMetadata>,
-    ) -> FuseResult<()> {
-        if self.read_only {
-            return Err(Errno::EROFS);
+    fn next_dir_handle(&self, path: &str) -> FuseResult<u64> {
+        let mut dirs = self.lock_dirs()?;
+        if dirs.dirs.len() >= MAX_OPEN_HANDLES {
+            return Err(Errno::EMFILE);
         }
-        if matches!(
-            &mutation,
-            VfsNamespaceMutation::DeleteFile { .. }
-                | VfsNamespaceMutation::RemoveDirectory { .. }
-                | VfsNamespaceMutation::SetMode { .. }
-                | VfsNamespaceMutation::Rename { .. }
-        ) {
-            self.flush_writes()?;
-        }
-        let namespace = self.namespace.as_ref().ok_or(Errno::EIO)?;
-        namespace
-            .enqueue_with_metadata(mutation, projected_metadata)
-            .map_err(|_| Errno::EIO)
-    }
-
-    fn commit_namespace(&self, mutation: VfsNamespaceMutation) -> FuseResult<()> {
-        self.commit_namespace_with_metadata(mutation, None)
-    }
-
-    fn commit_namespace_with_metadata(
-        &self,
-        mutation: VfsNamespaceMutation,
-        projected_metadata: Option<RemoteMetadata>,
-    ) -> FuseResult<()> {
-        let _publication = self
-            .namespace_publication_gate
-            .lock()
-            .map_err(|_| Errno::EIO)?;
-        // Bar new content writes to the delete/rename target subtree for the
-        // life of this mutation. Installed before enqueue_namespace's
-        // flush_writes drain, so a racing descendant write is either drained
-        // (ordered ahead of the mutation) or blocked (ordered strictly behind
-        // it) and can never be applied server-side after the RemoveDirectory to
-        // resurrect the subtree. The guard clears on drop once the mutation has
-        // been applied or resolved below.
-        //
-        // No deadlock. A barred write parks without holding the write-journal
-        // lock, so it never wedges the flush_writes drain below. A parked writer
-        // may still hold its per-handle publication gate, but nothing between
-        // installing this barrier and dropping it (the flush_writes drain, the
-        // namespace enqueue, and flush_namespace_locked) ever acquires a handle
-        // gate — and Rename, the only namespace mutation that touches handle
-        // gates, takes them BEFORE it reaches this barrier and holds them
-        // throughout, so it can never be the parked writer. The barrier's owner
-        // therefore always makes progress and drops it, unparking the writer.
-        let _write_barrier = self.install_descendant_write_barrier(&mutation);
-        self.enqueue_namespace(mutation, projected_metadata)?;
-        // Namespace syscalls are publication points. Serialize enqueue+flush
-        // so a terminal journal result is returned to the mutation that
-        // caused it instead of being consumed by an unrelated waiter.
-        self.flush_namespace_locked()?;
-        // A successful barrier has itself observed every committed mutation
-        // through the gateway response. Retire their local projections now,
-        // even when a rolling/partial response omitted enough snapshot entries
-        // for the worker to retire them immediately. Leaving those committed
-        // records projected made every concurrent getattr of a just-created
-        // directory bypass its fenced cache and issue a point stat.
-        if let Some(namespace) = self.namespace.as_ref() {
-            namespace
-                .observe_server_revision(self.client.coherence_revision())
-                .map_err(|_| Errno::EIO)?;
-        }
-        Ok(())
-    }
-
-    /// Enqueue a rename without turning the syscall into a per-path remote
-    /// publication.
-    ///
-    /// The write barrier is installed and transferred into the namespace
-    /// journal with the durable mutation. It therefore spans both workers:
-    /// old-path writes already admitted are drained by the namespace worker
-    /// before its batch publishes, while new writes to either endpoint park
-    /// until that exact rename commits. The syscall itself does not drain —
-    /// doing so serialized every package before the rename batch could form.
-    /// The namespace WAL projection makes the destination visible to this mount
-    /// as soon as the local append is durable.
-    fn enqueue_ordered_rename(
-        &self,
-        mutation: VfsNamespaceMutation,
-        projected_metadata: RemoteMetadata,
-    ) -> FuseResult<()> {
-        debug_assert!(matches!(mutation, VfsNamespaceMutation::Rename { .. }));
-        // The namespace WAL mutex provides the operation order. Do not hold the
-        // synchronous-publication gate around this asynchronous append: doing
-        // so serializes callers before the journal's durable group commit can
-        // share its fdatasync.
-        let write_barrier = self.install_descendant_write_barrier(&mutation);
-        self.namespace
-            .as_ref()
-            .ok_or(Errno::EIO)?
-            .enqueue_with_metadata_and_barrier(mutation, Some(projected_metadata), write_barrier)
-            .map_err(|_| Errno::EIO)
-    }
-
-    /// Enqueue a creation without waiting for the gateway to publish it.
-    ///
-    /// The record is durably journaled (`enqueue_with_metadata` fsyncs the WAL
-    /// line) and projected before this returns, so the guest observes the new
-    /// entry immediately and the journal worker batches the publication behind
-    /// it. This is the ordinary journaled-filesystem contract: creation latency
-    /// is a local durable append, and a publication failure surfaces at the
-    /// next barrier (fsync/close, or any delete/rename/set-mode) as EIO rather
-    /// than at the creating syscall.
-    ///
-    /// Only creations may take this path. Deletes, renames and set-mode remain
-    /// synchronous publication points, and an exclusive create still publishes
-    /// synchronously because cross-mount O_EXCL arbitration is the gateway's
-    /// `expect_absent` precondition, not a mount-local decision.
-    fn enqueue_namespace_creation(
-        &self,
-        mutation: VfsNamespaceMutation,
-        projected_metadata: Option<RemoteMetadata>,
-    ) -> FuseResult<()> {
-        debug_assert!(
-            matches!(
-                &mutation,
-                VfsNamespaceMutation::CreateFile { .. }
-                    | VfsNamespaceMutation::CreateDirectory { .. }
-                    | VfsNamespaceMutation::CreateSymlink { .. }
-                    | VfsNamespaceMutation::CreateHardLink { .. }
-            ),
-            "only creations may publish asynchronously",
+        let fh = dirs.next;
+        dirs.next += 1;
+        dirs.dirs.insert(
+            fh,
+            DirState {
+                path: path.to_string(),
+                entries: None,
+            },
         );
-        // Concurrent asynchronous creations are ordered by the namespace WAL
-        // mutex and become visible only after their grouped append is durable.
-        // The publication gate remains reserved for syscalls that enqueue and
-        // synchronously drain so terminal errors stay attributed to their owner.
-        self.enqueue_namespace(mutation, projected_metadata)
+        Ok(fh)
     }
 
-    /// Install a write-barrier over the descendant subtree(s) a delete/rename
-    /// mutation targets, or `None` for mutations that cannot be contaminated by
-    /// a racing content write (creations, set-mode). Rename bars both endpoints.
-    fn install_descendant_write_barrier(
-        &self,
-        mutation: &VfsNamespaceMutation,
-    ) -> Option<WriteBarrierGuard> {
-        let prefixes = descendant_write_barrier_prefixes(mutation);
-        if prefixes.is_empty() {
-            return None;
-        }
-        self.writes
-            .as_ref()
-            .map(|writes| writes.install_descendant_barrier(prefixes))
-    }
-
-    fn flush_namespace(&self) -> FuseResult<()> {
-        let _publication = self
-            .namespace_publication_gate
-            .lock()
-            .map_err(|_| Errno::EIO)?;
-        self.flush_namespace_locked()
-    }
-
-    /// Whether this mount has a namespace mutation queued that must publish
-    /// before a content write to `path`.
+    /// The listing one `readdir`/`readdirplus` round serves from.
     ///
-    /// Parent directory creations are not fences: every backend creates or
-    /// infers parents while installing a content write, and the later directory
-    /// mutation idempotently applies its mode. Rename/delete ancestors and exact
-    /// entry creations still require strict ordering.
-    fn namespace_write_ordering_pending_for(&self, path: &str) -> FuseResult<bool> {
-        let Some(namespace) = self.namespace.as_ref() else {
-            return Ok(false);
-        };
-        namespace
-            .has_pending_write_ordering_for_path(path)
-            .map_err(|error| {
-                tracing::warn!(error = %error, "vfs namespace journal state unavailable");
-                Errno::EIO
-            })
-    }
-
-    /// Return attributes that a pending namespace record can establish without
-    /// any gateway base. Create records and rename roots carry those attributes
-    /// directly; a delete, set-mode of an existing path, or rename descendant
-    /// returns no value and therefore keeps the ordinary authoritative path.
-    fn projected_namespace_metadata_without_base(
+    /// At offset 0 the directory is re-read and the snapshot replaced, so an
+    /// `opendir`+`rewinddir` sequence sees current contents. At any other offset
+    /// the existing snapshot is reused, which is what makes the offset a real
+    /// cursor instead of a fresh O(n) listing per kernel round.
+    ///
+    /// A `readdir` the kernel issued without a matching `opendir` (or after the
+    /// handle was released) falls back to a one-shot listing rather than failing.
+    fn dir_listing(
         &self,
+        fh: u64,
         path: &str,
-    ) -> FuseResult<Option<Option<RemoteMetadata>>> {
-        let Some(namespace) = self.namespace.as_ref() else {
+        offset: u64,
+    ) -> FuseResult<Option<Arc<Vec<LocalDirEntry>>>> {
+        if offset != 0 {
+            let dirs = self.lock_dirs()?;
+            if let Some(state) = dirs.dirs.get(&fh)
+                && state.path == path
+                && let Some(entries) = state.entries.as_ref()
+            {
+                return Ok(Some(Arc::clone(entries)));
+            }
+        }
+        let Some(entries) = self.local.tree().read_dir(path).map_err(errno_for)? else {
             return Ok(None);
         };
-        namespace
-            .project_metadata_without_base(path)
-            .map_err(|error| {
-                tracing::warn!(
-                    path,
-                    error = %error,
-                    "vfs namespace metadata projection failed"
-                );
-                Errno::EIO
-            })
+        let entries = Arc::new(entries);
+        let mut dirs = self.lock_dirs()?;
+        if let Some(state) = dirs.dirs.get_mut(&fh)
+            && state.path == path
+        {
+            state.entries = Some(Arc::clone(&entries));
+        }
+        Ok(Some(entries))
     }
 
-    /// Read-side barrier for one namespace location. Namespace mutations remain
-    /// durably journaled and mutation syscalls still synchronously publish, but
-    /// a deep, unrelated rename/create must not globally stop every lookup on
-    /// the mount while its HTTP publication is in flight.
-    /// Surface a dead-lettered publication to a read without draining.
+    /// The path an advisory lock is taken against, made visible to the gateway
+    /// first.
     ///
-    /// Reads project this mount's queued mutations over authoritative state
-    /// rather than waiting for them to publish, so the only journal state a
-    /// read must consult is whether a publication has already failed
-    /// terminally — otherwise a read could keep reporting an entry whose
-    /// creation the gateway rejected.
-    fn assert_namespace_journal_healthy(&self) -> FuseResult<()> {
-        let Some(namespace) = self.namespace.as_ref() else {
-            return Ok(());
-        };
-        namespace.take_terminal_error().map_err(|error| {
-            tracing::warn!(error = %error, "vfs namespace publication dead-lettered");
-            Errno::EIO
-        })
+    /// Advisory locks are cross-VM POSIX arbitration, not mount-local content,
+    /// so they are the one deliberate synchronous gateway user on a callback
+    /// (they are rare and off the throughput path). They no longer depend on a
+    /// published `file_id`: a mount-local file exists the instant the guest
+    /// creates it, long before the publisher has replicated it, so asking the
+    /// gateway to identify it first would answer `ENOENT` for every freshly
+    /// created lock file — which is every lock file a package manager makes.
+    ///
+    /// Instead the path's own publication is drained under a bound, and the
+    /// gateway's answer to the lock request is taken as authoritative. A drain
+    /// that times out or is blocked still issues the request: the path may
+    /// already be remote from an earlier generation, and parking a guest syscall
+    /// on a replication outage is exactly what this architecture forbids.
+    fn advisory_lock_target(&self, fh: u64) -> FuseResult<String> {
+        let state = self.handle_state(fh)?;
+        let path = state.path;
+        let metadata = state.file.metadata().map_err(errno_for)?;
+        if !metadata.is_file() {
+            return Err(Errno::EINVAL);
+        }
+        let drained = self
+            .tokio
+            .block_on(self.local.drain_path(&path, ADVISORY_LOCK_DRAIN_TIMEOUT));
+        match drained {
+            Ok(outcome) if outcome.is_drained() => {}
+            Ok(outcome) => tracing::warn!(
+                path,
+                ?outcome,
+                "vfs advisory lock is being taken on a path whose publication has not caught up"
+            ),
+            Err(error) => tracing::warn!(
+                path,
+                error = %format!("{error:#}"),
+                "vfs advisory lock could not drain its path's publication"
+            ),
+        }
+        Ok(path)
     }
 
-    fn flush_namespace_locked(&self) -> FuseResult<()> {
-        match self.namespace.as_ref() {
-            Some(namespace) => namespace.flush().map_err(|error| {
-                tracing::warn!(error = %error, "vfs namespace barrier failed");
-                Errno::EIO
-            }),
-            None => Ok(()),
-        }
-    }
-
-    fn flush_writes(&self) -> FuseResult<()> {
-        match self.writes.as_ref() {
-            Some(writes) => writes.flush().map_err(|error| {
-                tracing::warn!(error = %error, "vfs write barrier failed");
-                Errno::EIO
-            }),
-            None => Ok(()),
-        }
-    }
-
-    fn resolve_handle_route_locked(&self, fh: u64) -> FuseResult<StableFileRoute> {
-        let state = {
-            let handles = self.lock_handles()?;
-            FileStateView::capture(handles.files.get(&fh).ok_or(Errno::ENOENT)?)
-        };
-        if state.unlinked {
-            return Ok(StableFileRoute::Unlinked);
-        }
-        let Some(file_id) = state.file_id.as_deref() else {
-            return Ok(StableFileRoute::Linked(LinkedFileRoute {
-                path: state.path,
-                metadata: RemoteMetadata {
-                    kind: "file".to_string(),
-                    size_bytes: state.buffer_len as u64,
-                    file_id: None,
-                    link_count: state.link_count.max(1),
-                    link_target: None,
-                    content_hash: state.base_content_hash,
-                    executable: mode_is_executable(state.mode),
-                    mode: Some(state.mode),
-                    updated_at: None,
-                },
-                revision: 0,
-            }));
-        };
-        let route = match self.cached_stable_file_route(&state.path, file_id) {
-            Some(route) => StableFileRoute::Linked(route),
-            None => self.authoritative_file_route(&state.path, file_id)?,
-        };
-        let mut handles = self.lock_handles()?;
-        let handle = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
-        if handle.path != state.path || handle.file_id != state.file_id {
-            return Err(Errno::EAGAIN);
-        }
-        let retarget = match &route {
-            StableFileRoute::Linked(route) => {
-                handle.path = route.path.clone();
-                handle.link_count = route.metadata.link_count.max(1);
-                handle.unlinked = false;
-                Some(route.clone())
-            }
-            StableFileRoute::Unlinked => {
-                handle.unlinked = true;
-                handle.link_count = 0;
-                None
-            }
-        };
-        drop(handles);
-        if let Some(route) = retarget.as_ref() {
-            self.retarget_identity_route(&state.path, route);
-        }
-        Ok(route)
-    }
-
-    fn read_verified_handle_bytes(
-        &self,
-        mut route: LinkedFileRoute,
-        file_id: &str,
-    ) -> FuseResult<(LinkedFileRoute, Vec<u8>)> {
-        for _ in 0..4 {
-            // The route's revision is the fence the route metadata was read at.
-            // Under a live watch every publication advances that fence before
-            // the publishing writer is allowed to return, so an unadvanced
-            // fence is proof that nothing has been published against this path
-            // since — which is exactly what the verifying stat below re-checks.
-            // Skipping it halves the round trips of every whole-file read (the
-            // dominant cost of scanning a working tree) without weakening the
-            // check: any publication either advanced the fence already, or the
-            // writer that made it has not yet been told it is coherent.
-            let fence = self.client.coherence_revision();
-            let fence_proves_unchanged = self.client.revision_watch_live()
-                && route.revision != 0
-                && route.revision == fence
-                && route.metadata.file_id.as_deref() == Some(file_id);
-            let bytes = self
-                .tokio
-                .block_on(self.client.read_file_raw(&route.path))
-                .map_err(|_| Errno::EIO)?;
-            if let Some(bytes) = bytes {
-                if fence_proves_unchanged && self.client.coherence_revision() == fence {
-                    return Ok((route, bytes));
-                }
-                let verified = self
-                    .tokio
-                    .block_on(self.client.stat_versioned(&route.path))
-                    .map_err(|_| Errno::EIO)?;
-                if let Some(metadata) = verified.value
-                    && metadata.file_id.as_deref() == Some(file_id)
-                    && metadata
-                        .content_hash
-                        .as_deref()
-                        .is_none_or(|hash| hash == content_hash_for_bytes(&bytes))
-                {
-                    return Ok((
-                        LinkedFileRoute {
-                            path: route.path,
-                            metadata,
-                            revision: verified.revision,
-                        },
-                        bytes,
-                    ));
-                }
-            }
-            route = match self.authoritative_file_route(&route.path, file_id)? {
-                StableFileRoute::Linked(route) => route,
-                StableFileRoute::Unlinked => return Err(Errno::ENOENT),
-            };
-        }
-        Err(Errno::EAGAIN)
-    }
-
-    fn ensure_handle_loaded_locked(&self, fh: u64) -> FuseResult<()> {
-        let state = {
-            let handles = self.lock_handles()?;
-            let state = handles.files.get(&fh).ok_or(Errno::ENOENT)?;
-            if state.loaded && (state.dirty || state.unlinked || state.file_id.is_none()) {
-                return Ok(());
-            }
-            if state.loaded
-                && state.loaded_coherence_revision != 0
-                && state.loaded_coherence_revision == self.client.coherence_revision()
-            {
-                return Ok(());
-            }
-            FileStateView::capture(state)
-        };
-        self.assert_namespace_journal_healthy()?;
-        // A created-but-unflushed file exists only in its creator's buffer;
-        // seed this handle from it instead of 404ing at the gateway.
-        let (route, bytes) = if state.file_id.is_none() {
-            let bytes = self
-                .open_handle_content(&state.path)?
-                .ok_or(Errno::ENOENT)?;
-            (
-                LinkedFileRoute {
-                    path: state.path.clone(),
-                    metadata: RemoteMetadata {
-                        kind: "file".to_string(),
-                        size_bytes: bytes.len() as u64,
-                        file_id: None,
-                        link_count: state.link_count.max(1),
-                        link_target: None,
-                        content_hash: Some(content_hash_for_bytes(&bytes)),
-                        executable: mode_is_executable(state.mode),
-                        mode: Some(state.mode),
-                        updated_at: None,
-                    },
-                    revision: 0,
-                },
-                bytes,
-            )
-        } else {
-            let file_id = state.file_id.as_deref().expect("checked stable identity");
-            let route = match self.resolve_handle_route_locked(fh)? {
-                StableFileRoute::Linked(route) => route,
-                StableFileRoute::Unlinked if state.loaded => return Ok(()),
-                StableFileRoute::Unlinked => return Err(Errno::ENOENT),
-            };
-            if state.loaded
-                && route.metadata.content_hash.is_some()
-                && route.metadata.content_hash == state.base_content_hash
-                && route.metadata.size_bytes == state.buffer_len as u64
-            {
-                let mut handles = self.lock_handles()?;
-                let handle = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
-                if handle.revision != state.revision
-                    || handle.file_id != state.file_id
-                    || handle.dirty
-                {
-                    return Ok(());
-                }
-                handle.path = route.path.clone();
-                handle.link_count = route.metadata.link_count.max(1);
-                handle.mode = metadata_mode(&route.metadata);
-                handle.base_mode = Some(handle.mode);
-                handle.loaded_coherence_revision = route.revision;
-                return Ok(());
-            }
-            self.read_verified_handle_bytes(route, file_id)?
-        };
-        let content_hash = route
-            .metadata
-            .content_hash
-            .clone()
-            .unwrap_or_else(|| content_hash_for_bytes(&bytes));
-        let mut handles = self.lock_handles()?;
-        let handle = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
-        // A clean loaded handle is a read cache, not a snapshot. If the
-        // authoritative hash changed while another mount wrote the inode,
-        // replace its stale buffer. Dirty/unlinked or concurrently revised
-        // handles still retain their private open-file state.
-        if handle.dirty || handle.unlinked || handle.revision != state.revision {
-            return Ok(());
-        }
-        if handle.file_id != state.file_id {
-            return Err(Errno::EAGAIN);
-        }
-        handle.path = route.path.clone();
-        handle.buffer = bytes.clone();
-        handle.loaded = true;
-        handle.range_window = None;
-        handle.link_count = route.metadata.link_count.max(1);
-        handle.mode = metadata_mode(&route.metadata);
-        handle.base_mode = Some(handle.mode);
-        handle.base_content_hash = Some(content_hash);
-        handle.loaded_coherence_revision = route.revision;
-        drop(handles);
-        self.cache
-            .put_file(&route.path, bytes, Some(route.metadata.clone()));
-        self.retarget_identity_route(&state.path, &route);
-        Ok(())
-    }
-
-    fn ensure_handle_loaded(&self, fh: u64) -> FuseResult<()> {
-        let gate = self.publication_gate_for_handle(fh)?;
-        let _guard = gate.lock().map_err(|_| Errno::EIO)?;
-        self.ensure_handle_loaded_locked(fh)
-    }
-
+    /// This mount's scope-qualified form of a mount-relative path.
+    ///
+    /// Nothing in `fs.rs` needs it any more: `RemoteVfsClient` scopes every
+    /// request it issues, so the publisher, the hydrator and the advisory-lock
+    /// callbacks all pass mount-relative paths. Retired with the rest of the
+    /// gateway-on-a-callback surface.
+    #[allow(dead_code)]
     fn scoped_path(&self, path: &str) -> String {
         scoped_vfs_path(self.scope_path.as_str(), path)
     }
 
+    #[allow(dead_code)]
     fn surface_kind_for_path(&self, path: &str) -> &'static str {
         Self::surface_kind_for_scoped_path(self.scoped_path(path).as_str())
     }
 
+    #[allow(dead_code)]
     fn surface_kind_for_scoped_path(path: &str) -> &'static str {
         if path.contains("/shared") {
             VFS_SURFACE_KIND_VM_SHARED
@@ -4571,6 +1529,10 @@ impl RemoteFuseFs {
 
     fn lock_handles(&self) -> FuseResult<MutexGuard<'_, HandleTable>> {
         self.handles.lock().map_err(|_| Errno::EIO)
+    }
+
+    fn lock_dirs(&self) -> FuseResult<MutexGuard<'_, DirHandleTable>> {
+        self.dirs.lock().map_err(|_| Errno::EIO)
     }
 
     fn advisory_lock_owner_key(&self, lock_owner: fuser::LockOwner) -> String {
@@ -4672,7 +1634,7 @@ impl RemoteFuseFs {
 
     fn set_advisory_lock(
         &self,
-        target: &AdvisoryLockTarget,
+        path: &str,
         lock_owner: fuser::LockOwner,
         namespace: LockNamespace,
         start: u64,
@@ -4696,7 +1658,7 @@ impl RemoteFuseFs {
                 .tokio
                 .block_on(self.client.advisory_lock(
                     "set",
-                    &target.path,
+                    path,
                     &self.mount_id,
                     &owner,
                     Self::advisory_lock_namespace(namespace),
@@ -4706,9 +1668,6 @@ impl RemoteFuseFs {
                     pid,
                 ))
                 .map_err(|error| Self::advisory_lock_error(&error))?;
-            if response.file_id.as_deref() != Some(target.file_id.as_str()) {
-                return Err(Errno::EIO);
-            }
             if response.acquired {
                 return if kind == "unlock" {
                     Ok(None)
@@ -4724,7 +1683,7 @@ impl RemoteFuseFs {
                 slow_warned = true;
                 tracing::warn!(
                     waited_secs = waited.as_secs(),
-                    path = %target.path,
+                    path,
                     kind,
                     "vfs advisory lock still blocked awaiting the gateway grant"
                 );
@@ -4756,69 +1715,8 @@ impl Drop for RemoteFuseFs {
     }
 }
 
-#[cfg(test)]
-fn content_hash_conflicts(base: Option<&str>, current: Option<&str>) -> bool {
-    matches!((base, current), (Some(base), Some(current)) if base != current)
-}
-
-/// Cheap file-identity fingerprint for pinning ranged reads; must mirror
-/// `rangeFingerprint` in ts/vfs-gateway-server.ts exactly (epoch millis).
-fn range_fingerprint(metadata: &RemoteMetadata) -> String {
-    let millis = metadata
-        .updated_at
-        .map(|updated| updated.timestamp_millis())
-        .unwrap_or(-1);
-    format!("{}:{millis}", metadata.size_bytes)
-}
-
-/// VFS content identity, from the crate chevalier-vfs hashes with. vmd sends
-/// these as CAS preconditions and the gateway compares them against its own
-/// hashes, so sharing the implementation is what keeps a divergence from
-/// failing every precondition-bearing write as EIO in the guest.
-fn content_hash_for_bytes(bytes: &[u8]) -> String {
-    chevalier_vfs_hash::hash_bytes(bytes)
-}
-
-/// Descendant write-barrier prefixes for a namespace mutation: the subtree(s) a
-/// racing content write could resurrect. Only deletes and renames qualify;
-/// creations and set-mode leave nothing for a write to contaminate.
-fn descendant_write_barrier_prefixes(mutation: &VfsNamespaceMutation) -> Vec<String> {
-    match mutation {
-        VfsNamespaceMutation::RemoveDirectory { path }
-        | VfsNamespaceMutation::DeleteFile { path, .. } => {
-            vec![path.trim_matches('/').to_string()]
-        }
-        VfsNamespaceMutation::Rename { from, to } => vec![
-            from.trim_matches('/').to_string(),
-            to.trim_matches('/').to_string(),
-        ],
-        _ => Vec::new(),
-    }
-}
-
 fn normalize_mode(mode: u32) -> u32 {
     mode & POSIX_MODE_MASK
-}
-
-fn mode_is_executable(mode: u32) -> bool {
-    mode & 0o111 != 0
-}
-
-fn mode_change_required(current: u32, requested: Option<u32>) -> bool {
-    requested.is_some_and(|requested| requested != current)
-}
-
-fn metadata_mode(metadata: &RemoteMetadata) -> u32 {
-    if metadata.kind == "symlink" {
-        return 0o777;
-    }
-    metadata.mode.map(normalize_mode).unwrap_or_else(|| {
-        if metadata.kind == "directory" || metadata.executable {
-            0o755
-        } else {
-            0o644
-        }
-    })
 }
 
 fn creation_mode(mode: u32, _umask: u32) -> u32 {
@@ -4827,11 +1725,66 @@ fn creation_mode(mode: u32, _umask: u32) -> u32 {
     normalize_mode(mode)
 }
 
-fn file_type_for_kind(kind: &str) -> FileType {
+fn file_type_for_kind(kind: LocalKind) -> FileType {
     match kind {
-        "directory" => FileType::Directory,
-        "symlink" => FileType::Symlink,
-        _ => FileType::RegularFile,
+        LocalKind::Directory => FileType::Directory,
+        LocalKind::Symlink => FileType::Symlink,
+        LocalKind::File => FileType::RegularFile,
+    }
+}
+
+fn system_time_of(timestamp: LocalTimestamp) -> SystemTime {
+    let nanos = u32::min(timestamp.nanos, 999_999_999);
+    if timestamp.secs >= 0 {
+        SystemTime::UNIX_EPOCH + Duration::new(timestamp.secs as u64, nanos)
+    } else {
+        SystemTime::UNIX_EPOCH
+            .checked_sub(Duration::new(timestamp.secs.unsigned_abs(), 0))
+            .map(|base| base + Duration::new(0, nanos))
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+    }
+}
+
+/// The kernel's requested timestamp, in the WAL's wall-clock form.
+fn local_timestamp_of(value: TimeOrNow) -> LocalTimestamp {
+    let time = match value {
+        TimeOrNow::SpecificTime(time) => time,
+        TimeOrNow::Now => SystemTime::now(),
+    };
+    match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(since) => LocalTimestamp {
+            secs: since.as_secs() as i64,
+            nanos: since.subsec_nanos(),
+        },
+        Err(before) => {
+            let before = before.duration();
+            // A pre-epoch timestamp is `-secs` plus a positive nanosecond
+            // remainder, exactly as `utimensat` expects it.
+            match before.subsec_nanos() {
+                0 => LocalTimestamp {
+                    secs: -(before.as_secs() as i64),
+                    nanos: 0,
+                },
+                nanos => LocalTimestamp {
+                    secs: -(before.as_secs() as i64) - 1,
+                    nanos: 1_000_000_000 - nanos,
+                },
+            }
+        }
+    }
+}
+
+/// Map a backing-tree failure onto the errno the local filesystem produced, so
+/// the guest sees `ENOTEMPTY`, `EEXIST`, `ENOSPC` or `EROFS` rather than a
+/// blanket `EIO`. Every syscall failure in `local_view` keeps its
+/// `std::io::Error` in the context chain for exactly this reason.
+fn errno_for(error: anyhow::Error) -> Errno {
+    match errno_of(&error) {
+        Some(code) => Errno::from_i32(code),
+        None => {
+            tracing::warn!(error = %format!("{error:#}"), "vfs mount-local operation failed");
+            Errno::EIO
+        }
     }
 }
 
@@ -4839,11 +1792,11 @@ impl RemoteFuseFs {
     fn requested_init_capabilities_for(read_only: bool) -> InitFlags {
         let locks = InitFlags::FUSE_POSIX_LOCKS | InitFlags::FUSE_FLOCK_LOCKS;
         let directory_prefetch = InitFlags::FUSE_DO_READDIRPLUS | InitFlags::FUSE_READDIRPLUS_AUTO;
-        // FUSE_WRITEBACK_CACHE is never requested: under writeback the kernel
-        // treats i_size as kernel-authoritative and ignores the daemon's fresh
-        // size in getattr replies, so a sibling mount's extend stays invisible
-        // to this mount's kernel regardless of attr TTL. Every open already
-        // forces FOPEN_DIRECT_IO, so writeback buys nothing here.
+        // FUSE_WRITEBACK_CACHE is deliberately still not requested. It changes
+        // write semantics (the kernel becomes authoritative for i_size and
+        // batches writeback behind the daemon's back) and needs measurement
+        // before it can be trusted; direct I/O is no longer forced, so the
+        // ordinary page cache already covers the read path it would help.
         let _ = read_only;
         InitFlags::FUSE_AUTO_INVAL_DATA | locks | directory_prefetch
     }
@@ -4852,1690 +1805,18 @@ impl RemoteFuseFs {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use std::collections::HashMap;
-    use std::ffi::OsStr;
-    use std::sync::Barrier;
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-    use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
-    use axum::body::{Body, to_bytes};
-    use axum::extract::State;
-    use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode};
-    use axum::response::{IntoResponse, Response};
-    use axum::routing::any;
-    use axum::{Json, Router};
-    use chevalier_sandbox::vfs::{
-        VfsCasPredicate, VfsMetadata as RemoteMetadata, VfsMetadataManyRequest,
-        VfsMetadataManyResponse, VfsNamespaceMutation, VfsSubtreeMetadataEntry,
-        VfsSubtreeMetadataResponse,
-    };
-    use fuser::{FopenFlags, InitFlags, LockNamespace};
+    use fuser::{InitFlags, LockNamespace};
     use tokio::runtime::Builder;
-    use tokio::sync::Notify;
 
-    use super::super::cache::{
-        KernelInvalidator, MountInvalidators, PublicationInvalidation, RemoteFuseCache,
-        SUBTREE_LOAD_REVISION_QUIET_PERIOD,
-    };
-    use super::super::client::{
-        BULK_METADATA_MAX_HASH_BYTES, InFlightPublications, RemoteVfsClient,
-    };
-    use super::super::namespace::NamespaceProjection;
+    use super::super::client::RemoteVfsClient;
+    use super::super::local_view::types::{LocalKind, LocalMetadata, LocalTimestamp};
     use super::{
-        ATTR_ENTRY_LEASE_TTL, ActiveAdvisoryLockFile, ActiveAdvisoryLocks, FlushBarrier,
-        FullStatHash, HandlePublication, InodeTable, KernelInvalTarget, LARGE_FILE_BYTES,
-        LockWaitCancellation, ROOT_INO, RemoteFuseFs, active_advisory_lock_identities,
-        combine_flush_and_lock_cleanup, content_hash_conflicts, content_hash_for_bytes,
-        creation_mode, has_invalidation_targets, lease_ttl_for, mode_change_required,
-        owns_unpublished_creation, publish_authoritative_projection, range_fingerprint,
-        remote_file_open_flags, resolve_invalidation_targets, take_active_advisory_lock_file_id,
-        take_active_posix_handle_locks,
+        ActiveAdvisoryLockFile, ActiveAdvisoryLocks, InodeTable, LockWaitCancellation, ROOT_INO,
+        RemoteFuseFs, active_advisory_lock_identities, combine_flush_and_lock_cleanup,
+        creation_mode, take_active_advisory_lock_file_id, take_active_posix_handle_locks,
     };
-
-    #[derive(Default)]
-    struct LockPublicationGateway {
-        stat_requests: usize,
-        write_batches: Vec<Vec<u8>>,
-        write_preconditions: Vec<Option<String>>,
-    }
-
-    #[derive(Default)]
-    struct MetadataBatchGateway {
-        batches: Vec<Vec<String>>,
-        queries: Vec<Option<String>>,
-        sizes: HashMap<String, u64>,
-        stat_requests: usize,
-    }
-
-    struct ContentRefreshGateway {
-        bytes: Vec<u8>,
-    }
-
-    struct SubtreeSnapshotGateway {
-        revision: u64,
-        size_offset: u64,
-        subtree_requests: usize,
-        fallback_requests: usize,
-        /// When false the /watch route errors so the revision watch stays down
-        /// and serves stay strict (wire-backed). When true the first poll
-        /// confirms the fence (flipping watch_live) and later polls hold open.
-        watch_serves: bool,
-        watch_requests: usize,
-    }
-
-    /// 200 body for the revision-watch route, stamped with the namespace
-    /// revision header exactly as the real gateway does.
-    fn watch_ok_response(revision: u64) -> Response {
-        let mut response = Json(serde_json::json!({ "revision": revision })).into_response();
-        response.headers_mut().insert(
-            HeaderName::from_static("x-chevalier-vfs-namespace-revision"),
-            HeaderValue::from_str(revision.to_string().as_str()).unwrap(),
-        );
-        response
-    }
-
-    /// Shared /watch behavior for the stub gateways. `watch_serves` false keeps
-    /// the watch down (500 -> strict serves). Otherwise the first poll returns
-    /// 200 with the current revision so `watch_live` flips deterministically,
-    /// and subsequent polls hold open (mimicking a real long poll) so the fence
-    /// is confirmed exactly once and the test controls all later advances.
-    async fn serve_revision_watch(
-        watch_serves: bool,
-        watch_requests: usize,
-        revision: u64,
-    ) -> Response {
-        if !watch_serves {
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        if watch_requests <= 1 {
-            return watch_ok_response(revision);
-        }
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        StatusCode::NO_CONTENT.into_response()
-    }
-
-    /// Spin until the revision watch has confirmed the fence, or panic on
-    /// timeout. Tests that assert amortized serves must wait for this so the
-    /// gate is genuinely exercised under a live watch.
-    fn await_watch_live(client: &RemoteVfsClient) {
-        for _ in 0..200 {
-            if client.revision_watch_live() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        panic!("revision watch never went live");
-    }
-
-    async fn subtree_snapshot_gateway(
-        State(state): State<Arc<Mutex<SubtreeSnapshotGateway>>>,
-        request: Request<Body>,
-    ) -> Response {
-        match (request.method(), request.uri().path()) {
-            (&Method::POST, "/subtree-metadata") => {
-                let (revision, size_offset) = {
-                    let mut state = state.lock().unwrap();
-                    state.subtree_requests += 1;
-                    (state.revision, state.size_offset)
-                };
-                let entries = (0..1_000)
-                    .map(|index| VfsSubtreeMetadataEntry {
-                        path: format!("test-scope/file-{index}"),
-                        kind: "file".to_string(),
-                        size_bytes: size_offset + index,
-                        file_id: Some(format!("identity-{index}")),
-                        link_count: 1,
-                        link_target: None,
-                        content_hash: None,
-                        executable: false,
-                        mode: Some(0o644),
-                        token_count: None,
-                        version: None,
-                        updated_at: None,
-                        object_state: None,
-                    })
-                    .collect();
-                let mut response = Json(VfsSubtreeMetadataResponse { entries }).into_response();
-                response.headers_mut().insert(
-                    HeaderName::from_static("x-chevalier-vfs-namespace-revision"),
-                    HeaderValue::from_str(revision.to_string().as_str()).unwrap(),
-                );
-                response
-            }
-            (&Method::POST, "/metadata-many") => {
-                let body = to_bytes(request.into_body(), 1024 * 1024)
-                    .await
-                    .expect("read metadata-many request");
-                let payload: VfsMetadataManyRequest =
-                    serde_json::from_slice(&body).expect("decode metadata-many request");
-                let (revision, size_offset) = {
-                    let mut state = state.lock().unwrap();
-                    state.fallback_requests += 1;
-                    (state.revision, state.size_offset)
-                };
-                let entries = payload
-                    .paths
-                    .iter()
-                    .map(|path| {
-                        path.strip_prefix("test-scope/file-")
-                            .and_then(|index| index.parse::<u64>().ok())
-                            .map(|index| RemoteMetadata {
-                                kind: "file".to_string(),
-                                size_bytes: size_offset + index,
-                                file_id: Some(format!("identity-{index}")),
-                                link_count: 1,
-                                link_target: None,
-                                content_hash: None,
-                                executable: false,
-                                mode: Some(0o644),
-                                updated_at: None,
-                            })
-                    })
-                    .collect();
-                let mut response = Json(VfsMetadataManyResponse { entries }).into_response();
-                response.headers_mut().insert(
-                    HeaderName::from_static("x-chevalier-vfs-namespace-revision"),
-                    HeaderValue::from_str(revision.to_string().as_str()).unwrap(),
-                );
-                response
-            }
-            (&Method::GET, "/stat") => {
-                state.lock().unwrap().fallback_requests += 1;
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            }
-            (&Method::GET, "/watch") => {
-                let (serves, count, revision) = {
-                    let mut state = state.lock().unwrap();
-                    state.watch_requests += 1;
-                    (state.watch_serves, state.watch_requests, state.revision)
-                };
-                serve_revision_watch(serves, count, revision).await
-            }
-            _ => StatusCode::NOT_FOUND.into_response(),
-        }
-    }
-
-    async fn metadata_batch_gateway(
-        State(state): State<Arc<Mutex<MetadataBatchGateway>>>,
-        request: Request<Body>,
-    ) -> Response {
-        let method = request.method().clone();
-        let path = request.uri().path().to_string();
-        match (method, path.as_str()) {
-            (Method::POST, "/metadata-many") => {
-                let query = request.uri().query().map(str::to_string);
-                let body = to_bytes(request.into_body(), 1024 * 1024)
-                    .await
-                    .expect("read metadata-many request");
-                let payload: VfsMetadataManyRequest =
-                    serde_json::from_slice(&body).expect("decode metadata-many request");
-                let entries = {
-                    let mut state = state.lock().unwrap();
-                    state.batches.push(payload.paths.clone());
-                    state.queries.push(query);
-                    payload
-                        .paths
-                        .iter()
-                        .map(|path| {
-                            state
-                                .sizes
-                                .get(path)
-                                .copied()
-                                .map(|size_bytes| RemoteMetadata {
-                                    kind: "file".to_string(),
-                                    size_bytes,
-                                    file_id: Some(format!("identity-{path}")),
-                                    link_count: 1,
-                                    link_target: None,
-                                    content_hash: None,
-                                    executable: false,
-                                    mode: Some(0o644),
-                                    updated_at: None,
-                                })
-                        })
-                        .collect()
-                };
-                Json(VfsMetadataManyResponse { entries }).into_response()
-            }
-            (Method::GET, "/stat") => {
-                state.lock().unwrap().stat_requests += 1;
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            }
-            _ => StatusCode::NOT_FOUND.into_response(),
-        }
-    }
-
-    async fn lock_publication_gateway(
-        State(state): State<Arc<Mutex<LockPublicationGateway>>>,
-        request: Request<Body>,
-    ) -> Response {
-        let method = request.method().clone();
-        let path = request.uri().path().to_string();
-        match (method, path.as_str()) {
-            (Method::POST, "/lease") => Json(serde_json::json!({
-                "resource_key": "lock-publication-test",
-                "owner_token": "00000000-0000-0000-0000-000000000001",
-                "task_id": null
-            }))
-            .into_response(),
-            (Method::DELETE, "/lease") => StatusCode::NO_CONTENT.into_response(),
-            (Method::PUT, "/file") => {
-                let precondition = request
-                    .headers()
-                    .get("x-chevalier-vfs-precondition-kind")
-                    .or_else(|| {
-                        request
-                            .headers()
-                            .get("x-chevalier-vfs-precondition-fingerprint")
-                    })
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_string);
-                let body = to_bytes(request.into_body(), 1024 * 1024)
-                    .await
-                    .expect("read write request");
-                let mut state = state.lock().unwrap();
-                state.write_preconditions.push(precondition);
-                state.write_batches.push(body.to_vec());
-                StatusCode::NO_CONTENT.into_response()
-            }
-            (Method::POST, "/write-many") => {
-                let body = to_bytes(request.into_body(), 1024 * 1024)
-                    .await
-                    .expect("read write-many request");
-                let payload: chevalier_sandbox::vfs::VfsWriteManyBody =
-                    serde_json::from_slice(&body).expect("decode write-many request");
-                let write = payload.writes.first().expect("one journaled write");
-                let precondition = write
-                    .precondition
-                    .as_ref()
-                    .and_then(|precondition| precondition.effective_predicate())
-                    .map(|precondition| match precondition {
-                        VfsCasPredicate::Absent => "absent".to_string(),
-                        VfsCasPredicate::ContentFingerprint { fingerprint } => fingerprint,
-                    });
-                let content_hash = content_hash_for_bytes(&write.body);
-                {
-                    let mut state = state.lock().unwrap();
-                    state.write_preconditions.push(precondition);
-                    state.write_batches.push(write.body.clone());
-                }
-                with_revision_header(
-                    Json(chevalier_sandbox::vfs::VfsWriteManyPublicationResponse {
-                        results: vec![chevalier_sandbox::vfs::VfsWriteManyResult {
-                            path: write.path.clone(),
-                            content_hash: content_hash.clone(),
-                            previous_hash: None,
-                            changed: true,
-                        }],
-                        entries: vec![chevalier_sandbox::vfs::VfsPublicationSnapshotEntry {
-                            path: write.path.clone(),
-                            metadata: Some(RemoteMetadata {
-                                kind: "file".to_string(),
-                                size_bytes: write.body.len() as u64,
-                                file_id: Some("stable-new-file".to_string()),
-                                link_count: 1,
-                                link_target: None,
-                                content_hash: Some(content_hash),
-                                executable: false,
-                                mode: write.mode,
-                                updated_at: None,
-                            }),
-                        }],
-                    })
-                    .into_response(),
-                    1,
-                )
-            }
-            (Method::GET, "/stat") => {
-                state.lock().unwrap().stat_requests += 1;
-                Json(serde_json::json!({
-                    "kind": "file",
-                    "size_bytes": 0,
-                    "file_id": "stable-new-file",
-                    "link_count": 1,
-                    "link_target": null,
-                    // The empty-file content hash under whatever algorithm this
-                    // process is configured with: this stands in for the remote's
-                    // view of the same zero bytes the mount holds, so a digest
-                    // from the other algorithm reads as a conflicting concurrent
-                    // write and fails the publish with EIO.
-                    "content_hash": chevalier_vfs_hash::algorithm().empty_vector(),
-                    "executable": false,
-                    "mode": 416,
-                    "updated_at": null
-                }))
-                .into_response()
-            }
-            (Method::POST, "/posix-lock/v1") => StatusCode::NO_CONTENT.into_response(),
-            _ => StatusCode::NOT_FOUND.into_response(),
-        }
-    }
-
-    async fn content_refresh_gateway(
-        State(state): State<Arc<Mutex<ContentRefreshGateway>>>,
-        request: Request<Body>,
-    ) -> Response {
-        let bytes = state.lock().unwrap().bytes.clone();
-        match (request.method(), request.uri().path()) {
-            (&Method::GET, "/stat") => Json(serde_json::json!({
-                "kind": "file",
-                "size_bytes": bytes.len(),
-                "file_id": "stable-shared-file",
-                "link_count": 1,
-                "link_target": null,
-                "content_hash": content_hash_for_bytes(&bytes),
-                "executable": false,
-                "mode": 420,
-                "updated_at": null
-            }))
-            .into_response(),
-            (&Method::GET, "/file/raw") => bytes.into_response(),
-            _ => StatusCode::NOT_FOUND.into_response(),
-        }
-    }
-
-    #[test]
-    fn attr_entry_lease_is_watch_bounded_not_a_correctness_boundary() {
-        // Superseded design: the mount once replied TTL=0 everywhere to keep the
-        // kernel metadata/entry cache disabled, because there was no
-        // kernel-to-kernel invalidation path. There is one now (the fuser
-        // notifier, driven by the commit hooks and the revision watch), so the
-        // mount hands the kernel a positive attr/entry lease WHILE the watch is
-        // live — a liveness-bounded lease, not a correctness boundary — and
-        // fails closed to Duration::ZERO the moment the watch drops.
-        assert_eq!(lease_ttl_for(true), ATTR_ENTRY_LEASE_TTL);
-        assert!(ATTR_ENTRY_LEASE_TTL > Duration::ZERO);
-        assert_eq!(lease_ttl_for(false), Duration::ZERO);
-    }
-
-    #[test]
-    fn mount_local_projection_is_never_published_to_sibling_cache() {
-        let key = format!("projection-publication-test-{}", uuid::Uuid::new_v4());
-        let origin = RemoteFuseCache::shared(&key);
-        let sibling = RemoteFuseCache::shared(&key);
-        let metadata = RemoteMetadata {
-            kind: "file".to_string(),
-            size_bytes: 4,
-            file_id: Some("shared-file".to_string()),
-            link_count: 1,
-            link_target: None,
-            content_hash: Some("hash".to_string()),
-            executable: false,
-            mode: Some(0o644),
-            updated_at: None,
-        };
-
-        let projected = NamespaceProjection {
-            value: Some(metadata.clone()),
-            applied: true,
-        };
-        publish_authoritative_projection(&projected, |value| {
-            origin.put_metadata("tree/file", value.clone().expect("projected metadata"), 17);
-        });
-        assert!(sibling.get_metadata("tree/file", 17).is_none());
-
-        let authoritative = NamespaceProjection {
-            value: Some(metadata.clone()),
-            applied: false,
-        };
-        publish_authoritative_projection(&authoritative, |value| {
-            origin.put_metadata(
-                "tree/file",
-                value.clone().expect("authoritative metadata"),
-                17,
-            );
-        });
-        assert_eq!(sibling.get_metadata("tree/file", 17), Some(metadata));
-    }
-
-    #[test]
-    fn concurrent_attribute_reads_batch_without_retaining_stale_metadata() {
-        const PATH_COUNT: usize = 32;
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let gateway = Arc::new(Mutex::new(MetadataBatchGateway::default()));
-        {
-            let mut state = gateway.lock().unwrap();
-            for index in 0..PATH_COUNT {
-                state
-                    .sizes
-                    .insert(format!("test-scope/file-{index}"), index as u64);
-            }
-        }
-        let server_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", any(metadata_batch_gateway))
-                    .with_state(server_gateway),
-            )
-            .await
-            .unwrap();
-        });
-        let client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
-        let fs = Arc::new(RemoteFuseFs::new(
-            client,
-            false,
-            "test-scope",
-            runtime.handle().clone(),
-        ));
-        let barrier = Arc::new(Barrier::new(PATH_COUNT + 1));
-        let readers = (0..PATH_COUNT)
-            .map(|index| {
-                let fs = Arc::clone(&fs);
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    fs.stat_path_attributes(&format!("file-{index}"))
-                        .unwrap()
-                        .unwrap()
-                        .size_bytes
-                })
-            })
-            .collect::<Vec<_>>();
-        barrier.wait();
-        for (index, reader) in readers.into_iter().enumerate() {
-            assert_eq!(reader.join().unwrap(), index as u64);
-        }
-
-        {
-            let state = gateway.lock().unwrap();
-            assert!(
-                state.batches.len() <= 4,
-                "{} concurrent stats fragmented into {} batches",
-                PATH_COUNT,
-                state.batches.len()
-            );
-            assert_eq!(
-                state.batches.iter().map(Vec::len).sum::<usize>(),
-                PATH_COUNT
-            );
-            // The batched attribute read asks the gateway for a bounded content
-            // hash, not for none at all: an entry that carries one is complete
-            // enough for `stat_path` (the open(2) route) to serve, which is what
-            // keeps open off a point stat. The bound is what stops a metadata
-            // sweep from becoming a full content read of the tree.
-            let expected_query = format!("max_hash_bytes={BULK_METADATA_MAX_HASH_BYTES}");
-            assert!(
-                state
-                    .queries
-                    .iter()
-                    .all(|query| query.as_deref() == Some(expected_query.as_str()))
-            );
-            assert_eq!(state.stat_requests, 0);
-        }
-
-        gateway
-            .lock()
-            .unwrap()
-            .sizes
-            .insert("test-scope/file-0".to_string(), 9_999);
-        assert_eq!(
-            fs.stat_path_attributes("file-0")
-                .unwrap()
-                .unwrap()
-                .size_bytes,
-            9_999,
-            "a later authoritative batch must observe a cross-mount replacement"
-        );
-        server.abort();
-    }
-
-    #[test]
-    fn sequential_thousand_file_stats_use_one_revision_fenced_subtree_snapshot() {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let gateway = Arc::new(Mutex::new(SubtreeSnapshotGateway {
-            revision: 17,
-            size_offset: 0,
-            subtree_requests: 0,
-            fallback_requests: 0,
-            watch_serves: false,
-            watch_requests: 0,
-        }));
-        let server_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", any(subtree_snapshot_gateway))
-                    .with_state(server_gateway),
-            )
-            .await
-            .unwrap();
-        });
-        let first_client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
-        first_client.observe_published_revision(17);
-        let first = RemoteFuseFs::new(
-            first_client.clone(),
-            false,
-            "test-scope",
-            runtime.handle().clone(),
-        );
-
-        for index in 0..7 {
-            assert_eq!(
-                first
-                    .stat_path_attributes(&format!("file-{index}"))
-                    .unwrap()
-                    .unwrap()
-                    .size_bytes,
-                index
-            );
-        }
-        std::thread::sleep(SUBTREE_LOAD_REVISION_QUIET_PERIOD);
-        for index in 7..1_000 {
-            assert_eq!(
-                first
-                    .stat_path_attributes(&format!("file-{index}"))
-                    .unwrap()
-                    .unwrap()
-                    .size_bytes,
-                index
-            );
-        }
-        {
-            // One shared subtree snapshot is fetched (the eighth miss past the
-            // quiet period). Only that dispatch may serve get_metadata off the
-            // snapshot; every other sequential stat reconfirms through the
-            // coalescing metadata batcher rather than serving a fence that a
-            // sibling process could have advanced past with zero wire backing.
-            // These sequential stats do not overlap, so each takes its own
-            // batched wire (real FUSE dispatch runs getattr concurrently, where
-            // the batcher folds a scan burst back into a handful of wires). The
-            // seven warm-up stats plus the 992 post-snapshot stats each wire.
-            let state = gateway.lock().unwrap();
-            assert_eq!(state.subtree_requests, 1);
-            assert_eq!(state.fallback_requests, 999);
-        }
-
-        {
-            let mut state = gateway.lock().unwrap();
-            state.revision = 18;
-            state.size_offset = 10_000;
-        }
-        let second_client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
-        second_client.observe_published_revision(18);
-        let second =
-            RemoteFuseFs::new(second_client, false, "test-scope", runtime.handle().clone());
-        for index in 992..999 {
-            assert_eq!(
-                second
-                    .stat_path_attributes(&format!("file-{index}"))
-                    .unwrap()
-                    .unwrap()
-                    .size_bytes,
-                10_000 + index
-            );
-        }
-        std::thread::sleep(SUBTREE_LOAD_REVISION_QUIET_PERIOD);
-        for index in 999..1_000 {
-            assert_eq!(
-                second
-                    .stat_path_attributes(&format!("file-{index}"))
-                    .unwrap()
-                    .unwrap()
-                    .size_bytes,
-                10_000 + index
-            );
-        }
-        {
-            // The second mount clears the stale revision-17 snapshot on its
-            // first fenced access, wires its seven warm-up stats, then fetches a
-            // second snapshot at revision 18. No stat serves the earlier
-            // snapshot without a wire, so the reconfirmation count is the first
-            // mount's 999 plus these seven warm-up wires.
-            let state = gateway.lock().unwrap();
-            assert_eq!(state.subtree_requests, 2);
-            assert_eq!(state.fallback_requests, 1_006);
-        }
-        server.abort();
-    }
-
-    // Watch-live counterpart of the strict thousand-file scan. A live revision
-    // watch keeps each mount's coherence fence continuously confirmed, so after
-    // one mount warms the shared subtree snapshot every remaining fence-matched
-    // stat serves get_metadata with zero wire calls. The amortized fallbacks
-    // return near the pre-strict counts (seven warm-up wires per mount) while
-    // the strict variant above wires all 999.
-    #[test]
-    fn sequential_thousand_file_stats_amortize_under_a_live_watch() {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let gateway = Arc::new(Mutex::new(SubtreeSnapshotGateway {
-            revision: 17,
-            size_offset: 0,
-            subtree_requests: 0,
-            fallback_requests: 0,
-            watch_serves: true,
-            watch_requests: 0,
-        }));
-        let server_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", any(subtree_snapshot_gateway))
-                    .with_state(server_gateway),
-            )
-            .await
-            .unwrap();
-        });
-        let first_client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
-        first_client.observe_published_revision(17);
-        let first = RemoteFuseFs::new(
-            first_client.clone(),
-            false,
-            "test-scope",
-            runtime.handle().clone(),
-        );
-        await_watch_live(&first_client);
-
-        for index in 0..7 {
-            assert_eq!(
-                first
-                    .stat_path_attributes(&format!("file-{index}"))
-                    .unwrap()
-                    .unwrap()
-                    .size_bytes,
-                index
-            );
-        }
-        std::thread::sleep(SUBTREE_LOAD_REVISION_QUIET_PERIOD);
-        for index in 7..1_000 {
-            assert_eq!(
-                first
-                    .stat_path_attributes(&format!("file-{index}"))
-                    .unwrap()
-                    .unwrap()
-                    .size_bytes,
-                index
-            );
-        }
-        {
-            // Seven warm-up stats wire before the eighth trips the shared
-            // snapshot (one subtree fetch). Under the live watch every stat
-            // after the snapshot serves get_metadata off the revision-17 fence
-            // with zero wire calls, so the fallbacks stop at the seven warm-ups.
-            let state = gateway.lock().unwrap();
-            assert_eq!(state.subtree_requests, 1);
-            assert_eq!(state.fallback_requests, 7);
-        }
-
-        {
-            let mut state = gateway.lock().unwrap();
-            state.revision = 18;
-            state.size_offset = 10_000;
-        }
-        let second_client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
-        second_client.observe_published_revision(18);
-        let second =
-            RemoteFuseFs::new(second_client, false, "test-scope", runtime.handle().clone());
-        for index in 992..999 {
-            assert_eq!(
-                second
-                    .stat_path_attributes(&format!("file-{index}"))
-                    .unwrap()
-                    .unwrap()
-                    .size_bytes,
-                10_000 + index
-            );
-        }
-        std::thread::sleep(SUBTREE_LOAD_REVISION_QUIET_PERIOD);
-        for index in 999..1_000 {
-            assert_eq!(
-                second
-                    .stat_path_attributes(&format!("file-{index}"))
-                    .unwrap()
-                    .unwrap()
-                    .size_bytes,
-                10_000 + index
-            );
-        }
-        {
-            // The second mount's first fenced stat clears the stale revision-17
-            // snapshot (its fence is already 18 from the local publication),
-            // wires its seven warm-ups, then trips a second snapshot at 18. The
-            // amortized fallback total is the first mount's seven plus these
-            // seven, never the strict variant's 1,006.
-            let state = gateway.lock().unwrap();
-            assert_eq!(state.subtree_requests, 2);
-            assert_eq!(state.fallback_requests, 14);
-        }
-        server.abort();
-    }
-
-    #[test]
-    fn clean_loaded_handle_refreshes_after_cross_mount_write() {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let gateway = Arc::new(Mutex::new(ContentRefreshGateway {
-            bytes: b"A".to_vec(),
-        }));
-        let server_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", any(content_refresh_gateway))
-                    .with_state(server_gateway),
-            )
-            .await
-            .unwrap();
-        });
-        let client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
-        let fs = RemoteFuseFs::new(client, false, "test-scope", runtime.handle().clone());
-        let old_bytes = Vec::new();
-        let handle = fs
-            .next_handle(
-                "shared",
-                old_bytes.clone(),
-                true,
-                Some(content_hash_for_bytes(&old_bytes)),
-                0o644,
-                false,
-                Some("stable-shared-file".to_string()),
-                1,
-            )
-            .unwrap();
-
-        fs.ensure_handle_loaded(handle).unwrap();
-
-        let handles = fs.lock_handles().unwrap();
-        let state = handles.files.get(&handle).unwrap();
-        assert_eq!(state.buffer, b"A");
-        assert_eq!(
-            state.base_content_hash.as_deref(),
-            Some(content_hash_for_bytes(b"A").as_str())
-        );
-        assert!(state.loaded);
-        assert!(!state.dirty);
-        drop(handles);
-        server.abort();
-    }
-
-    // Two mounts of the same logical tree that live in different VMs each hold
-    // a process-local coherence fence and cache (keyed by endpoint+scope), so a
-    // sibling's write never advances the other's fence in-process. This gateway
-    // is scope-agnostic: it serves one file's state to whichever mount asks, so
-    // a distinct-scope client models a distinct-VM sibling against shared data.
-    struct CrossVmGateway {
-        content: Vec<u8>,
-        revision: u64,
-        present: bool,
-        tree_requests: usize,
-        metadata_many_requests: usize,
-    }
-
-    fn cross_vm_metadata(content: &[u8]) -> RemoteMetadata {
-        RemoteMetadata {
-            kind: "file".to_string(),
-            size_bytes: content.len() as u64,
-            file_id: Some("stable-cross-vm-file".to_string()),
-            link_count: 1,
-            link_target: None,
-            content_hash: Some(content_hash_for_bytes(content)),
-            executable: false,
-            mode: Some(0o644),
-            updated_at: None,
-        }
-    }
-
-    fn with_revision_header(mut response: Response, revision: u64) -> Response {
-        response.headers_mut().insert(
-            HeaderName::from_static("x-chevalier-vfs-namespace-revision"),
-            HeaderValue::from_str(revision.to_string().as_str()).unwrap(),
-        );
-        response
-    }
-
-    async fn cross_vm_gateway(
-        State(state): State<Arc<Mutex<CrossVmGateway>>>,
-        request: Request<Body>,
-    ) -> Response {
-        let method = request.method().clone();
-        let path = request.uri().path().to_string();
-        match (method, path.as_str()) {
-            (Method::GET, "/tree") => {
-                let (entries, revision) = {
-                    let mut state = state.lock().unwrap();
-                    state.tree_requests += 1;
-                    let entries: Vec<chevalier_sandbox::vfs::VfsDirEntry> = if state.present {
-                        vec![chevalier_sandbox::vfs::VfsDirEntry {
-                            name: "file".to_string(),
-                            kind: "file".to_string(),
-                            size_bytes: state.content.len() as u64,
-                            file_id: Some("stable-cross-vm-file".to_string()),
-                            link_count: 1,
-                            link_target: None,
-                            content_hash: Some(content_hash_for_bytes(&state.content)),
-                            executable: false,
-                            mode: Some(0o644),
-                            updated_at: None,
-                        }]
-                    } else {
-                        Vec::new()
-                    };
-                    (entries, state.revision)
-                };
-                with_revision_header(Json(entries).into_response(), revision)
-            }
-            (Method::GET, "/stat") => {
-                let (present, content, revision) = {
-                    let state = state.lock().unwrap();
-                    (state.present, state.content.clone(), state.revision)
-                };
-                if present {
-                    with_revision_header(
-                        Json(cross_vm_metadata(&content)).into_response(),
-                        revision,
-                    )
-                } else {
-                    with_revision_header(StatusCode::NOT_FOUND.into_response(), revision)
-                }
-            }
-            (Method::POST, "/metadata-many") => {
-                let body = to_bytes(request.into_body(), 1024 * 1024)
-                    .await
-                    .expect("read metadata-many request");
-                let payload: VfsMetadataManyRequest =
-                    serde_json::from_slice(&body).expect("decode metadata-many request");
-                let (present, content, revision) = {
-                    let mut state = state.lock().unwrap();
-                    state.metadata_many_requests += 1;
-                    (state.present, state.content.clone(), state.revision)
-                };
-                let entries = payload
-                    .paths
-                    .iter()
-                    .map(|_| present.then(|| cross_vm_metadata(&content)))
-                    .collect();
-                with_revision_header(
-                    Json(VfsMetadataManyResponse { entries }).into_response(),
-                    revision,
-                )
-            }
-            (Method::GET, "/file/raw") => {
-                let (present, content, revision) = {
-                    let state = state.lock().unwrap();
-                    (state.present, state.content.clone(), state.revision)
-                };
-                if present {
-                    with_revision_header(content.into_response(), revision)
-                } else {
-                    with_revision_header(StatusCode::NOT_FOUND.into_response(), revision)
-                }
-            }
-            _ => StatusCode::NOT_FOUND.into_response(),
-        }
-    }
-
-    #[test]
-    fn idle_observer_metadata_refreshes_across_distinct_revision_registries() {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let gateway = Arc::new(Mutex::new(CrossVmGateway {
-            content: b"01234".to_vec(),
-            revision: 17,
-            present: true,
-            tree_requests: 0,
-            metadata_many_requests: 0,
-        }));
-        let server_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", any(cross_vm_gateway))
-                    .with_state(server_gateway),
-            )
-            .await
-            .unwrap();
-        });
-
-        // Client B mounts one VM; its coherence fence and cache are keyed by
-        // endpoint+scope, so they are distinct from any other-VM sibling.
-        let observer_client = RemoteVfsClient::new(&endpoint, "token", "vm-b").unwrap();
-        let observer = RemoteFuseFs::new(
-            observer_client.clone(),
-            false,
-            "vm-b",
-            runtime.handle().clone(),
-        );
-
-        // B warms its cache and fence at the pre-write revision.
-        let warm_dir = observer.dir_entries("").unwrap();
-        assert_eq!(warm_dir.len(), 1);
-        assert_eq!(warm_dir[0].size_bytes, 5);
-        assert_eq!(
-            observer
-                .stat_path_attributes("file")
-                .unwrap()
-                .unwrap()
-                .size_bytes,
-            5
-        );
-        assert_eq!(
-            observer.read_bytes("file", 0, 64).unwrap(),
-            b"01234".to_vec()
-        );
-        assert_eq!(observer_client.coherence_revision(), 17);
-
-        // A sibling on another VM extends the file and publishes R_write. Its
-        // SharedRevisionState registry is distinct, so its read does not touch
-        // B's fence.
-        {
-            let mut state = gateway.lock().unwrap();
-            state.content = b"0123456789".to_vec();
-            state.revision = 18;
-        }
-        let writer_client = RemoteVfsClient::new(&endpoint, "token", "vm-a").unwrap();
-        assert_ne!(
-            writer_client.coherence_key(),
-            observer_client.coherence_key()
-        );
-        assert_eq!(
-            runtime
-                .block_on(writer_client.stat_attributes("file"))
-                .unwrap()
-                .unwrap()
-                .size_bytes,
-            10
-        );
-        assert_eq!(writer_client.coherence_revision(), 18);
-        // B issued no wire call since R_write, so its fence is still stale.
-        assert_eq!(observer_client.coherence_revision(), 17);
-
-        // B repeats scandir + stat + read with no manual fence poke.
-        let refreshed_dir = observer.dir_entries("").unwrap();
-        assert_eq!(refreshed_dir[0].size_bytes, 10);
-        assert_eq!(
-            observer
-                .stat_path_attributes("file")
-                .unwrap()
-                .unwrap()
-                .size_bytes,
-            10,
-            "an idle observer's stat must reflect the sibling extension"
-        );
-        assert_eq!(
-            observer.read_bytes("file", 0, 64).unwrap(),
-            b"0123456789".to_vec(),
-            "the fresh read must not be truncated by a stale cached size"
-        );
-        assert_eq!(observer_client.coherence_revision(), 18);
-        server.abort();
-    }
-
-    #[test]
-    fn dir_entries_refetches_when_local_coherence_lags_the_gateway() {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let gateway = Arc::new(Mutex::new(CrossVmGateway {
-            content: b"01234".to_vec(),
-            revision: 17,
-            present: true,
-            tree_requests: 0,
-            metadata_many_requests: 0,
-        }));
-        let server_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", any(cross_vm_gateway))
-                    .with_state(server_gateway),
-            )
-            .await
-            .unwrap();
-        });
-        let client = RemoteVfsClient::new(&endpoint, "token", "vm-b").unwrap();
-        let fs = RemoteFuseFs::new(client.clone(), false, "vm-b", runtime.handle().clone());
-
-        let first = fs.dir_entries("").unwrap();
-        assert_eq!(first[0].size_bytes, 5);
-        assert_eq!(client.coherence_revision(), 17);
-
-        // The gateway advances while this mount stays idle: its fence lags at 17
-        // and it holds a revision-fenced directory entry for that revision.
-        {
-            let mut state = gateway.lock().unwrap();
-            state.content = b"0123456789".to_vec();
-            state.revision = 18;
-        }
-        assert_eq!(client.coherence_revision(), 17);
-        let tree_requests_before = gateway.lock().unwrap().tree_requests;
-
-        let second = fs.dir_entries("").unwrap();
-        assert_eq!(
-            second[0].size_bytes, 10,
-            "a lagging mount must re-fetch the listing over the wire, not serve get_dir"
-        );
-        assert_eq!(
-            gateway.lock().unwrap().tree_requests,
-            tree_requests_before + 1
-        );
-        assert_eq!(client.coherence_revision(), 18);
-        server.abort();
-    }
-
-    #[test]
-    fn negative_metadata_entry_is_reconfirmed_over_the_wire_after_sibling_create() {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let gateway = Arc::new(Mutex::new(CrossVmGateway {
-            content: b"hello".to_vec(),
-            revision: 41,
-            present: false,
-            tree_requests: 0,
-            metadata_many_requests: 0,
-        }));
-        let server_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", any(cross_vm_gateway))
-                    .with_state(server_gateway),
-            )
-            .await
-            .unwrap();
-        });
-        let client = RemoteVfsClient::new(&endpoint, "token", "vm-b").unwrap();
-        let fs = RemoteFuseFs::new(client.clone(), false, "vm-b", runtime.handle().clone());
-
-        // B observes the file missing and caches a revision-fenced ENOENT.
-        assert!(fs.stat_path_attributes("file").unwrap().is_none());
-        assert_eq!(client.coherence_revision(), 41);
-
-        // A sibling creates the file and publishes R_write; B stays idle.
-        {
-            let mut state = gateway.lock().unwrap();
-            state.present = true;
-            state.revision = 42;
-        }
-        assert_eq!(client.coherence_revision(), 41);
-        let metadata_requests_before = gateway.lock().unwrap().metadata_many_requests;
-
-        // B's next lookup must reconfirm over the wire and find the file, not
-        // serve the stale negative entry as ENOENT.
-        let metadata = fs
-            .stat_path_attributes("file")
-            .unwrap()
-            .expect("sibling-created file must be visible after a wire reconfirmation");
-        assert_eq!(metadata.size_bytes, 5);
-        assert_eq!(
-            gateway.lock().unwrap().metadata_many_requests,
-            metadata_requests_before + 1
-        );
-        assert_eq!(client.coherence_revision(), 42);
-        server.abort();
-    }
-
-    // Hole #2 reproduction (cross-process subtree-snapshot fast path). An idle
-    // mount warms a revision-fenced subtree snapshot in one dispatch, then a
-    // sibling in ANOTHER process extends every file and publishes R_write. The
-    // idle mount never observes that publication, so its fence stays at the old
-    // revision and the shared subtree snapshot is still tagged for it. Its next
-    // getattr must reconfirm over the wire (the MetadataBatcher) rather than
-    // serving the stale prior-dispatch snapshot entry with zero wire calls.
-    #[test]
-    fn idle_observer_subtree_snapshot_stat_reconfirms_over_the_wire_after_sibling_write() {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let gateway = Arc::new(Mutex::new(SubtreeSnapshotGateway {
-            revision: 17,
-            size_offset: 0,
-            subtree_requests: 0,
-            fallback_requests: 0,
-            watch_serves: false,
-            watch_requests: 0,
-        }));
-        let server_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", any(subtree_snapshot_gateway))
-                    .with_state(server_gateway),
-            )
-            .await
-            .unwrap();
-        });
-        let client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
-        client.observe_published_revision(17);
-        let fs = RemoteFuseFs::new(
-            client.clone(),
-            false,
-            "test-scope",
-            runtime.handle().clone(),
-        );
-
-        // Warm a revision-17 subtree snapshot: seven sub-threshold point stats,
-        // then one past the miss threshold and quiet period triggers the shared
-        // snapshot that primes every file at revision 17.
-        for index in 0..7 {
-            assert_eq!(
-                fs.stat_path_attributes(&format!("file-{index}"))
-                    .unwrap()
-                    .unwrap()
-                    .size_bytes,
-                index
-            );
-        }
-        std::thread::sleep(SUBTREE_LOAD_REVISION_QUIET_PERIOD);
-        assert_eq!(
-            fs.stat_path_attributes("file-7")
-                .unwrap()
-                .unwrap()
-                .size_bytes,
-            7
-        );
-        assert_eq!(gateway.lock().unwrap().subtree_requests, 1);
-        assert_eq!(client.coherence_revision(), 17);
-
-        // A sibling in another process extends every file and publishes
-        // R_write = 18. This idle mount never observes that publication.
-        {
-            let mut state = gateway.lock().unwrap();
-            state.revision = 18;
-            state.size_offset = 10_000;
-        }
-        let fallback_before = gateway.lock().unwrap().fallback_requests;
-
-        // The idle observer's next stat must reconfirm over the wire, not serve
-        // the stale revision-17 snapshot entry with zero wire calls.
-        assert_eq!(
-            fs.stat_path_attributes("file-3")
-                .unwrap()
-                .unwrap()
-                .size_bytes,
-            10_003,
-            "an idle mount must not serve a prior-dispatch subtree snapshot entry \
-             without a wire reconfirmation"
-        );
-        assert_eq!(
-            gateway.lock().unwrap().fallback_requests,
-            fallback_before + 1,
-            "the reconfirmation must be a single coalesced metadata wire call"
-        );
-        assert_eq!(client.coherence_revision(), 18);
-        server.abort();
-    }
-
-    struct RevisionWatchGateway {
-        revision: u64,
-        present: bool,
-        size_bytes: u64,
-        tree_requests: usize,
-        metadata_many_requests: usize,
-        watch_serves: bool,
-        watch_requests: usize,
-    }
-
-    async fn revision_watch_gateway(
-        State(state): State<Arc<Mutex<RevisionWatchGateway>>>,
-        request: Request<Body>,
-    ) -> Response {
-        let method = request.method().clone();
-        let path = request.uri().path().to_string();
-        match (method, path.as_str()) {
-            (Method::GET, "/tree") => {
-                let (present, size_bytes, revision) = {
-                    let mut state = state.lock().unwrap();
-                    state.tree_requests += 1;
-                    (state.present, state.size_bytes, state.revision)
-                };
-                let entries: Vec<chevalier_sandbox::vfs::VfsDirEntry> = if present {
-                    vec![chevalier_sandbox::vfs::VfsDirEntry {
-                        name: "file".to_string(),
-                        kind: "file".to_string(),
-                        size_bytes,
-                        file_id: Some("watch-file".to_string()),
-                        link_count: 1,
-                        link_target: None,
-                        content_hash: None,
-                        executable: false,
-                        mode: Some(0o644),
-                        updated_at: None,
-                    }]
-                } else {
-                    Vec::new()
-                };
-                with_revision_header(Json(entries).into_response(), revision)
-            }
-            (Method::POST, "/metadata-many") => {
-                let body = to_bytes(request.into_body(), 1024 * 1024)
-                    .await
-                    .expect("read metadata-many request");
-                let payload: VfsMetadataManyRequest =
-                    serde_json::from_slice(&body).expect("decode metadata-many request");
-                let (present, size_bytes, revision) = {
-                    let mut state = state.lock().unwrap();
-                    state.metadata_many_requests += 1;
-                    (state.present, state.size_bytes, state.revision)
-                };
-                let entries = payload
-                    .paths
-                    .iter()
-                    .map(|_| {
-                        present.then(|| RemoteMetadata {
-                            kind: "file".to_string(),
-                            size_bytes,
-                            file_id: Some("watch-file".to_string()),
-                            link_count: 1,
-                            link_target: None,
-                            content_hash: None,
-                            executable: false,
-                            mode: Some(0o644),
-                            updated_at: None,
-                        })
-                    })
-                    .collect();
-                with_revision_header(
-                    Json(VfsMetadataManyResponse { entries }).into_response(),
-                    revision,
-                )
-            }
-            (Method::GET, "/watch") => {
-                let (serves, count, revision) = {
-                    let mut state = state.lock().unwrap();
-                    state.watch_requests += 1;
-                    (state.watch_serves, state.watch_requests, state.revision)
-                };
-                serve_revision_watch(serves, count, revision).await
-            }
-            _ => StatusCode::NOT_FOUND.into_response(),
-        }
-    }
-
-    // Test 4a: the watch task drives the shared fence and fails the cache closed.
-    // A 200 carrying a newer owner revision must advance coherence and clear a
-    // stale prior-revision entry through the audited authoritative path, so it
-    // can never be served again.
-    #[test]
-    fn watch_task_advances_fence_and_clears_stale_cache() {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let gateway = Arc::new(Mutex::new(RevisionWatchGateway {
-            revision: 18,
-            present: true,
-            size_bytes: 10,
-            tree_requests: 0,
-            metadata_many_requests: 0,
-            watch_serves: true,
-            watch_requests: 0,
-        }));
-        let server_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", any(revision_watch_gateway))
-                    .with_state(server_gateway),
-            )
-            .await
-            .unwrap();
-        });
-        let client = RemoteVfsClient::new(&endpoint, "token", "test-scope").unwrap();
-        client.observe_published_revision(17);
-        let cache = RemoteFuseCache::shared(&client.coherence_key());
-        cache.put_metadata(
-            "file",
-            RemoteMetadata {
-                kind: "file".to_string(),
-                size_bytes: 5,
-                file_id: Some("watch-file".to_string()),
-                link_count: 1,
-                link_target: None,
-                content_hash: None,
-                executable: false,
-                mode: Some(0o644),
-                updated_at: None,
-            },
-            17,
-        );
-        assert_eq!(
-            cache
-                .get_metadata("file", 17)
-                .map(|metadata| metadata.size_bytes),
-            Some(5)
-        );
-
-        // Start the watch directly against the shared cache; no mount involved.
-        let invalidators = MountInvalidators::shared(&client.coherence_key());
-        client.ensure_revision_watch(runtime.handle(), &cache, &invalidators);
-        await_watch_live(&client);
-
-        assert_eq!(client.coherence_revision(), 18);
-        assert!(
-            cache.get_metadata("file", 17).is_none(),
-            "the stale revision-17 entry must be cleared once the watch observes revision 18"
-        );
-        server.abort();
-    }
-
-    // Test 4b: under a live watch, a fence-matched listing and attribute stat
-    // serve from cache with zero additional wire calls.
-    #[test]
-    fn live_watch_serves_dir_and_metadata_without_wire() {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let gateway = Arc::new(Mutex::new(RevisionWatchGateway {
-            revision: 17,
-            present: true,
-            size_bytes: 5,
-            tree_requests: 0,
-            metadata_many_requests: 0,
-            watch_serves: true,
-            watch_requests: 0,
-        }));
-        let server_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", any(revision_watch_gateway))
-                    .with_state(server_gateway),
-            )
-            .await
-            .unwrap();
-        });
-        let client = RemoteVfsClient::new(&endpoint, "token", "test-scope").unwrap();
-        client.observe_published_revision(17);
-        let fs = RemoteFuseFs::new(
-            client.clone(),
-            false,
-            "test-scope",
-            runtime.handle().clone(),
-        );
-        await_watch_live(&client);
-
-        // Under a live watch, replies hand the kernel the positive attr/entry
-        // lease (the kernel becomes a fast tier of the fence-gated cache).
-        assert_eq!(fs.reply_ttl(), ATTR_ENTRY_LEASE_TTL);
-
-        // One wire listing warms the cache (and primes the child's metadata).
-        let dir = fs.dir_entries("").unwrap();
-        assert_eq!(dir.len(), 1);
-        assert_eq!(dir[0].size_bytes, 5);
-        assert_eq!(gateway.lock().unwrap().tree_requests, 1);
-
-        // The second listing serves get_dir off the confirmed fence: no /tree.
-        let dir_again = fs.dir_entries("").unwrap();
-        assert_eq!(dir_again[0].size_bytes, 5);
-        assert_eq!(
-            gateway.lock().unwrap().tree_requests,
-            1,
-            "a live watch must let dir_entries serve get_dir without a wire refetch"
-        );
-
-        // Attribute stats serve get_metadata off the same fence: no /metadata-many.
-        assert_eq!(
-            fs.stat_path_attributes("file").unwrap().unwrap().size_bytes,
-            5
-        );
-        assert_eq!(
-            fs.stat_path_attributes("file").unwrap().unwrap().size_bytes,
-            5
-        );
-        assert_eq!(
-            gateway.lock().unwrap().metadata_many_requests,
-            0,
-            "a live watch must let stat_path_attributes serve get_metadata without a wire"
-        );
-        assert_eq!(client.coherence_revision(), 17);
-        server.abort();
-    }
-
-    // Test 4c: with the watch down (the endpoint errors), watch_live stays false
-    // and every serve reconfirms over the wire (exactly today's strict behavior).
-    #[test]
-    fn watch_down_forces_strict_serves() {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let gateway = Arc::new(Mutex::new(RevisionWatchGateway {
-            revision: 17,
-            present: true,
-            size_bytes: 5,
-            tree_requests: 0,
-            metadata_many_requests: 0,
-            watch_serves: false,
-            watch_requests: 0,
-        }));
-        let server_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", any(revision_watch_gateway))
-                    .with_state(server_gateway),
-            )
-            .await
-            .unwrap();
-        });
-        let client = RemoteVfsClient::new(&endpoint, "token", "test-scope").unwrap();
-        client.observe_published_revision(17);
-        let fs = RemoteFuseFs::new(
-            client.clone(),
-            false,
-            "test-scope",
-            runtime.handle().clone(),
-        );
-        assert!(!client.revision_watch_live());
-
-        // Fail-closed: with the watch down every reply hands the kernel a zero
-        // TTL, so no lease can outlive the confirmed fence and every op reaches
-        // userspace to reconfirm.
-        assert_eq!(fs.reply_ttl(), Duration::ZERO);
-
-        // Warm the caches with one listing and one attribute stat.
-        assert_eq!(fs.dir_entries("").unwrap()[0].size_bytes, 5);
-        assert_eq!(
-            fs.stat_path_attributes("file").unwrap().unwrap().size_bytes,
-            5
-        );
-        assert_eq!(gateway.lock().unwrap().tree_requests, 1);
-        assert_eq!(gateway.lock().unwrap().metadata_many_requests, 1);
-
-        // With the watch down, every repeat reconfirms over the wire.
-        assert_eq!(fs.dir_entries("").unwrap()[0].size_bytes, 5);
-        assert_eq!(
-            fs.stat_path_attributes("file").unwrap().unwrap().size_bytes,
-            5
-        );
-        assert_eq!(
-            gateway.lock().unwrap().tree_requests,
-            2,
-            "strict mode must refetch the listing over the wire"
-        );
-        assert_eq!(
-            gateway.lock().unwrap().metadata_many_requests,
-            2,
-            "strict mode must reconfirm attributes over the wire"
-        );
-        assert!(!client.revision_watch_live());
-        server.abort();
-    }
-
-    // Hole #1 coherence guarantee (in-process shared cache write publication).
-    // Two mounts of the SAME scope in one vmd process share one RemoteFuseCache
-    // and one SharedRevisionState. When the actor mount's write journal commits
-    // a content extension, its commit hook publishes the write onto the shared
-    // cache (observe_write_publication_snapshot) and write_many advances the
-    // shared coherence fence. The observer mount must then reflect the new size.
-    // This drives the exact commit-hook effect and inputs the write journal
-    // produces for a content write, including the deployed gateway's empty
-    // publication-snapshot entry set.
-    #[test]
-    fn in_process_observer_reflects_sibling_write_publication_on_the_shared_cache() {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let gateway = Arc::new(Mutex::new(CrossVmGateway {
-            content: b"01234".to_vec(),
-            revision: 17,
-            present: true,
-            tree_requests: 0,
-            metadata_many_requests: 0,
-        }));
-        let server_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", any(cross_vm_gateway))
-                    .with_state(server_gateway),
-            )
-            .await
-            .unwrap();
-        });
-
-        // Observer and actor share one scope, hence one coherence key, hence one
-        // shared cache and revision fence.
-        let observer_client = RemoteVfsClient::new(&endpoint, "token", "test-scope").unwrap();
-        let observer = RemoteFuseFs::new(
-            observer_client.clone(),
-            false,
-            "test-scope",
-            runtime.handle().clone(),
-        );
-        let actor_client = RemoteVfsClient::new(&endpoint, "token", "test-scope").unwrap();
-        assert_eq!(
-            actor_client.coherence_key(),
-            observer_client.coherence_key()
-        );
-        let shared_cache = RemoteFuseCache::shared(&actor_client.coherence_key());
-
-        // Observer warms its cache and the shared fence at revision 17.
-        assert_eq!(observer.dir_entries("").unwrap().len(), 1);
-        assert_eq!(
-            observer
-                .stat_path_attributes("file")
-                .unwrap()
-                .unwrap()
-                .size_bytes,
-            5
-        );
-        assert_eq!(observer_client.coherence_revision(), 17);
-
-        // The actor extends the file to ten bytes and publishes R_write = 18.
-        {
-            let mut state = gateway.lock().unwrap();
-            state.content = b"0123456789".to_vec();
-            state.revision = 18;
-        }
-        // The write journal's commit hook publishes the content write onto the
-        // shared cache. The deployed gateway returns no publication-snapshot
-        // entries for a content write, so the affected entry must be dropped
-        // (invalidate-or-replace) and the next read must wire.
-        shared_cache.observe_write_publication_snapshot(
-            18,
-            &[("file".to_string(), Some("stable-cross-vm-file".to_string()))],
-            &[],
-        );
-        // write_many advanced the shared coherence fence to R_write.
-        actor_client.observe_published_revision(18);
-
-        // The in-process observer must reflect the sibling extension.
-        assert_eq!(
-            observer
-                .stat_path_attributes("file")
-                .unwrap()
-                .unwrap()
-                .size_bytes,
-            10,
-            "an in-process observer must reflect a sibling's committed write \
-             through the shared cache"
-        );
-        assert_eq!(observer_client.coherence_revision(), 18);
-        server.abort();
-    }
 
     #[test]
     fn surface_kind_uses_scoped_path_not_mount_relative_path() {
@@ -6570,15 +1851,6 @@ mod tests {
                 | InitFlags::FUSE_FLOCK_LOCKS
                 | InitFlags::FUSE_DO_READDIRPLUS
                 | InitFlags::FUSE_READDIRPLUS_AUTO
-        );
-    }
-
-    #[test]
-    fn remote_file_handles_bypass_uncoordinated_kernel_page_caches() {
-        assert_eq!(
-            remote_file_open_flags(),
-            FopenFlags::FOPEN_DIRECT_IO,
-            "cross-mount coherence must stay in the revision-aware FUSE layer"
         );
     }
 
@@ -6696,501 +1968,6 @@ mod tests {
         assert!(completed.finish());
         assert!(!completed.cancel());
         assert!(!completed.wait_cancelled(Duration::ZERO));
-    }
-
-    #[test]
-    fn open_handles_track_exact_mode_and_created_publication_baselines() {
-        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
-        let client =
-            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
-        let fs = RemoteFuseFs::new(client, false, "test-scope", runtime.handle().clone());
-        let existing_handle = fs
-            .next_handle("existing", Vec::new(), true, None, 0o751, false, None, 1)
-            .unwrap();
-        let created_handle = fs
-            .next_handle("created", Vec::new(), true, None, 0o640, true, None, 1)
-            .unwrap();
-        let reserved_handle = fs
-            .next_handle(
-                "reserved",
-                Vec::new(),
-                true,
-                Some("empty-hash".to_string()),
-                0o644,
-                true,
-                Some("inode-reserved".to_string()),
-                1,
-            )
-            .unwrap();
-
-        let handles = fs.lock_handles().unwrap();
-        let existing = handles.files.get(&existing_handle).unwrap();
-        assert_eq!(existing.mode, 0o751);
-        assert_eq!(existing.base_mode, Some(0o751));
-        let authoritative = RemoteMetadata {
-            kind: "file".to_string(),
-            size_bytes: 6,
-            file_id: None,
-            link_count: 1,
-            link_target: None,
-            content_hash: Some(content_hash_for_bytes(b"short\n")),
-            executable: false,
-            mode: Some(0o644),
-            updated_at: None,
-        };
-        assert_eq!(
-            fs.metadata_for_handle_state(existing, Some(&authoritative))
-                .size_bytes,
-            6,
-            "a clean loaded handle must not hide a shorter gateway replacement"
-        );
-        assert!(
-            RemoteFuseFs::handle_metadata_needs_remote_route(existing),
-            "clean handles must revalidate cross-mount changes"
-        );
-
-        let created = handles.files.get(&created_handle).unwrap();
-        assert_eq!(created.mode, 0o640);
-        assert!(
-            !RemoteFuseFs::handle_metadata_needs_remote_route(created),
-            "a new open-file description is locally authoritative"
-        );
-        assert_eq!(
-            created.base_mode, None,
-            "a newly created file has no exact gateway mode baseline"
-        );
-        assert_eq!(
-            created.base_content_hash.as_deref(),
-            Some("absent"),
-            "first publication must use an if-absent CAS"
-        );
-        let mut mode_adjusted_creation = created.clone();
-        mode_adjusted_creation.mode = 0o664;
-        mode_adjusted_creation.dirty = true;
-        assert!(
-            owns_unpublished_creation(&mode_adjusted_creation),
-            "chmod before first write must remain a folded expect-absent creation"
-        );
-
-        let reserved = handles.files.get(&reserved_handle).unwrap();
-        assert!(
-            reserved.created,
-            "the creator still owns pathname mutations"
-        );
-        assert_eq!(reserved.base_mode, Some(0o644));
-        assert_eq!(
-            reserved.base_content_hash.as_deref(),
-            Some("empty-hash"),
-            "an O_EXCL placeholder is the creator's authoritative CAS baseline"
-        );
-        assert!(
-            !owns_unpublished_creation(reserved),
-            "an already-published O_EXCL placeholder is not a folded creation"
-        );
-
-        let mut dirty = existing.clone();
-        dirty.dirty = true;
-        assert!(
-            !RemoteFuseFs::handle_metadata_needs_remote_route(&dirty),
-            "dirty open-file metadata must not re-stat an older pathname"
-        );
-        let mut pending = existing.clone();
-        pending.pending_publication = Some(HandlePublication {
-            id: 7,
-            revision: 3,
-            path: "existing".to_string(),
-            file_id: None,
-            size_bytes: 0,
-            content_hash: content_hash_for_bytes(&[]),
-            mode: 0o751,
-        });
-        assert!(
-            !RemoteFuseFs::handle_metadata_needs_remote_route(&pending),
-            "pending publication remains authoritative until its exact barrier completes"
-        );
-    }
-
-    #[test]
-    fn same_inode_handles_share_dirty_state_and_publication_gate() {
-        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
-        let client =
-            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
-        let fs = RemoteFuseFs::new(client, false, "test-scope", runtime.handle().clone());
-        let first = fs
-            .next_handle(
-                "value",
-                Vec::new(),
-                true,
-                Some("empty-hash".to_string()),
-                0o644,
-                true,
-                Some("inode-value".to_string()),
-                1,
-            )
-            .unwrap();
-        {
-            let mut handles = fs.lock_handles().unwrap();
-            let state = handles.files.get_mut(&first).unwrap();
-            state.buffer = b"dirty".to_vec();
-            state.mode = 0o755;
-            state.dirty = true;
-            state.revision = 1;
-        }
-        let second = fs
-            .next_handle(
-                "value",
-                Vec::new(),
-                false,
-                Some("empty-hash".to_string()),
-                0o644,
-                false,
-                Some("inode-value".to_string()),
-                1,
-            )
-            .unwrap();
-        {
-            let mut handles = fs.lock_handles().unwrap();
-            let first_state = handles.files.get(&first).unwrap().clone();
-            let second_state = handles.files.get(&second).unwrap();
-            assert_eq!(second_state.buffer, b"dirty");
-            assert_eq!(second_state.mode, 0o755);
-            assert!(second_state.created);
-            assert!(second_state.dirty);
-            assert!(Arc::ptr_eq(
-                &first_state.publication_gate,
-                &second_state.publication_gate
-            ));
-
-            let second_state = handles.files.get_mut(&second).unwrap();
-            second_state.buffer.truncate(3);
-            second_state.dirty = false;
-            second_state.base_content_hash = Some("published-hash".to_string());
-            second_state.base_mode = Some(0o755);
-            second_state.created = false;
-            RemoteFuseFs::mirror_handle_state_locked(&mut handles, second).unwrap();
-            let first_state = handles.files.get(&first).unwrap();
-            assert_eq!(first_state.buffer, b"dir");
-            assert!(!first_state.dirty);
-            assert!(!first_state.created);
-            assert_eq!(
-                first_state.base_content_hash.as_deref(),
-                Some("published-hash")
-            );
-        }
-    }
-
-    #[test]
-    fn rename_serializes_with_inflight_and_duplicate_handle_publication() {
-        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
-        let client =
-            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
-        let fs = Arc::new(RemoteFuseFs::new(
-            client,
-            false,
-            "test-scope",
-            runtime.handle().clone(),
-        ));
-        let handle = fs
-            .next_handle(
-                "repo/config.lock",
-                Vec::new(),
-                true,
-                None,
-                0o644,
-                false,
-                Some("stable-config".to_string()),
-                1,
-            )
-            .unwrap();
-        let inflight_gate = fs.publication_gate_for_handle(handle).unwrap();
-        let inflight = inflight_gate.lock().unwrap();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (completed_tx, completed_rx) = mpsc::channel();
-        let rename_fs = Arc::clone(&fs);
-        let rename = std::thread::spawn(move || {
-            let gates = rename_fs
-                .publication_gates_for_subtrees(&["repo/config.lock", "repo/config"])
-                .unwrap();
-            started_tx.send(()).unwrap();
-            let _guards = RemoteFuseFs::lock_publication_gates(&gates).unwrap();
-            rename_fs.rename_inode_path("repo/config.lock", "repo/config");
-            completed_tx.send(()).unwrap();
-        });
-
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(
-            completed_rx
-                .recv_timeout(Duration::from_millis(50))
-                .is_err(),
-            "rename must wait for the in-flight handle publication"
-        );
-        drop(inflight);
-        completed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        rename.join().unwrap();
-        assert_eq!(
-            fs.lock_handles().unwrap().files.get(&handle).unwrap().path,
-            "repo/config"
-        );
-
-        // Model a duplicate FLUSH that captured the gate before RELEASE
-        // removed the handle. Once admitted, missing table state is an
-        // idempotent success rather than a spurious close error.
-        let duplicate_gate = fs.publication_gate_for_handle(handle).unwrap();
-        let duplicate = duplicate_gate.lock().unwrap();
-        fs.lock_handles().unwrap().files.remove(&handle);
-        drop(duplicate);
-        assert!(
-            fs.flush_handle_locked(handle, FlushBarrier::Durable)
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn advisory_lock_publishes_a_brand_new_empty_file_once() {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let gateway = Arc::new(Mutex::new(LockPublicationGateway::default()));
-        let server_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", any(lock_publication_gateway))
-                    .with_state(server_gateway),
-            )
-            .await
-            .unwrap();
-        });
-        let journal_dir = tempfile::tempdir().unwrap();
-        let client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
-        let fs = RemoteFuseFs::new_with_namespace_journal(
-            client,
-            false,
-            "test-scope",
-            &journal_dir.path().join("namespace.jsonl"),
-            runtime.handle().clone(),
-        )
-        .unwrap();
-        let handle = fs
-            .next_handle("fresh.lock", Vec::new(), true, None, 0o640, true, None, 1)
-            .unwrap();
-        {
-            let mut handles = fs.lock_handles().unwrap();
-            handles.files.get_mut(&handle).unwrap().dirty = true;
-        }
-
-        let first = fs.advisory_lock_target(handle).unwrap();
-        let second = fs.advisory_lock_target(handle).unwrap();
-
-        assert_eq!(first.path, "fresh.lock");
-        assert_eq!(first.file_id, "stable-new-file");
-        assert_eq!(second.file_id, first.file_id);
-        {
-            let handles = fs.lock_handles().unwrap();
-            let state = handles.files.get(&handle).unwrap();
-            assert!(!state.dirty);
-            assert_eq!(state.file_id.as_deref(), Some("stable-new-file"));
-            assert_eq!(state.mode, 0o640);
-        }
-        let gateway = gateway.lock().unwrap();
-        assert_eq!(gateway.write_batches, vec![Vec::<u8>::new()]);
-        assert_eq!(
-            gateway.write_preconditions,
-            vec![Some("absent".to_string())],
-            "first publication must be an atomic if-absent write"
-        );
-        assert_eq!(
-            gateway.stat_requests, 0,
-            "the write publication snapshot must bind stable identity without a follow-up stat"
-        );
-        drop(gateway);
-        drop(fs);
-        server.abort();
-    }
-
-    #[test]
-    fn advisory_lock_reuses_an_existing_stable_identity_without_flushing() {
-        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
-        let client =
-            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
-        let fs = RemoteFuseFs::new(client, false, "test-scope", runtime.handle().clone());
-        let handle = fs
-            .next_handle(
-                "existing.lock",
-                b"dirty local bytes".to_vec(),
-                true,
-                Some(content_hash_for_bytes(b"committed")),
-                0o644,
-                false,
-                Some("stable-existing-file".to_string()),
-                1,
-            )
-            .unwrap();
-        {
-            let mut handles = fs.lock_handles().unwrap();
-            handles.files.get_mut(&handle).unwrap().dirty = true;
-        }
-
-        let target = fs.advisory_lock_target(handle).unwrap();
-
-        assert_eq!(target.path, "existing.lock");
-        assert_eq!(target.file_id, "stable-existing-file");
-        assert!(
-            fs.lock_handles().unwrap().files.get(&handle).unwrap().dirty,
-            "an existing stable identity must not force unrelated dirty bytes to flush"
-        );
-    }
-
-    /// A mount that never handed its kernel the affected path OR its parent has
-    /// nothing it could serve stale for the publication, so it resolves no
-    /// targets — which is what lets a publication skip the revocation queue and
-    /// ack immediately instead of paying a worker hop it cannot need.
-    #[test]
-    fn ack_targets_are_empty_for_a_mount_that_never_cached_the_affected_paths() {
-        let mut table = InodeTable::new();
-        table.lookup("unrelated/file");
-        let publications = Arc::new(InFlightPublications::default());
-        // A publication's affected set names the changed path and its parent
-        // directory. Both are nested here: the scope ROOT is always in the
-        // table, so a top-level path always resolves a target (the mount may
-        // hold a negative dentry for it under the root) and could never
-        // demonstrate the empty case.
-        let invalidation = PublicationInvalidation {
-            paths: vec!["work/many/file-0000".to_string(), "work/many".to_string()],
-            relisted: Vec::new(),
-            subtrees: Vec::new(),
-            identities: Vec::new(),
-        };
-
-        assert!(
-            resolve_invalidation_targets(&table, &invalidation, Some(publications.as_ref()))
-                .is_empty(),
-            "a mount holding neither the changed path nor its parent has nothing to revoke"
-        );
-        assert!(
-            !has_invalidation_targets(&table, &invalidation, Some(publications.as_ref())),
-            "the short-circuit the watch task uses must agree with the full resolution"
-        );
-
-        // The same mount once it HAS looked the parent up: now it holds a
-        // dentry the publication supersedes, and the revocation is ack-critical.
-        table.lookup("work/many");
-        assert!(
-            !resolve_invalidation_targets(&table, &invalidation, Some(publications.as_ref()))
-                .is_empty(),
-            "a mount that cached the affected parent must still gate the ack"
-        );
-        assert!(
-            has_invalidation_targets(&table, &invalidation, Some(publications.as_ref())),
-            "the short-circuit the watch task uses must agree with the full resolution"
-        );
-    }
-
-    /// A child content publication refreshes the parent directory's listing,
-    /// but it does not remove or replace that directory in its own parent.
-    /// Therefore the parent needs an inode invalidation only. Repeatedly
-    /// invalidating its dentry is both unnecessary and unsafe under concurrent
-    /// CREATE fan-out: FORGET can retire the daemon's parent mapping while
-    /// sibling requests still carry that inode.
-    #[test]
-    fn relisted_directory_invalidation_keeps_its_parent_dentry() {
-        let mut table = InodeTable::new();
-        let grandparent = table.lookup("tree");
-        let directory = table.lookup("tree/icons");
-        table.lookup("tree/icons/file.js");
-        let invalidation = PublicationInvalidation {
-            paths: vec!["tree/icons/file.js".to_string()],
-            relisted: vec!["tree/icons".to_string()],
-            subtrees: Vec::new(),
-            identities: Vec::new(),
-        };
-
-        let targets = resolve_invalidation_targets(&table, &invalidation, None);
-        assert!(
-            targets
-                .iter()
-                .any(|target| { target.ino == Some(directory) && target.parent.is_none() })
-        );
-        assert!(
-            !targets.iter().any(|target| {
-                target.parent == Some(grandparent) && target.name == OsStr::new("icons")
-            }),
-            "a listing-only refresh must not drop the hot directory dentry"
-        );
-        assert!(targets.iter().any(|target| {
-            target.parent == Some(directory) && target.name == OsStr::new("file.js")
-        }));
-    }
-
-    /// A path this mount is publishing itself is off the ack path: the op parked
-    /// on that publication holds the path's parent inode lock for its whole
-    /// duration, and `fuse_reverse_inval_entry` takes the same lock, so the
-    /// revocation cannot land until the publication returns — which it cannot do
-    /// until the ack does. The mount's own commit hook revokes it afterwards, so
-    /// the FULL revocation must still contain it.
-    #[test]
-    fn ack_targets_exclude_the_paths_the_mount_is_publishing_itself() {
-        let mut table = InodeTable::new();
-        let parent = table.lookup("many");
-        table.lookup("many/file-0000");
-        let publications = Arc::new(InFlightPublications::default());
-        let invalidation = PublicationInvalidation {
-            paths: vec!["many/file-0000".to_string(), "many".to_string()],
-            relisted: Vec::new(),
-            subtrees: Vec::new(),
-            identities: Vec::new(),
-        };
-
-        let dentries_under_parent = |targets: &[KernelInvalTarget]| {
-            targets
-                .iter()
-                .filter(|target| target.parent == Some(parent))
-                .count()
-        };
-
-        // Nothing in flight: the ack-scoped resolution is the full one.
-        assert_eq!(
-            resolve_invalidation_targets(&table, &invalidation, Some(publications.as_ref())).len(),
-            resolve_invalidation_targets(&table, &invalidation, None).len(),
-            "with nothing in flight the ack-scoped revocation must not be narrower"
-        );
-
-        let in_flight = publications.begin(vec!["many/file-0000".to_string()]);
-        let ack = resolve_invalidation_targets(&table, &invalidation, Some(publications.as_ref()));
-        assert_eq!(
-            dentries_under_parent(&ack),
-            0,
-            "the dentry whose parent lock the publishing op holds must not gate its own ack"
-        );
-        assert!(
-            !ack.is_empty(),
-            "the published directory's own dentry hangs off the root and stays ack-critical"
-        );
-        assert!(
-            has_invalidation_targets(&table, &invalidation, Some(publications.as_ref())),
-            "the short-circuit the watch task uses must agree with the full resolution"
-        );
-        let full = resolve_invalidation_targets(&table, &invalidation, None);
-        assert_eq!(
-            dentries_under_parent(&full),
-            1,
-            "the full revocation — the one this mount's commit hook enqueues once the \
-             publication returns — must still drop that dentry"
-        );
-
-        drop(in_flight);
-        assert_eq!(
-            resolve_invalidation_targets(&table, &invalidation, Some(publications.as_ref())).len(),
-            full.len(),
-            "the exclusion must last exactly as long as the publication is in flight"
-        );
     }
 
     #[test]
@@ -7417,1286 +2194,24 @@ mod tests {
     }
 
     #[test]
-    fn dirty_open_unlinked_handle_is_never_published_by_deleted_path() {
-        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
-        let client =
-            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
-        let fs = RemoteFuseFs::new(client, false, "test-scope", runtime.handle().clone());
-        let handle = fs
-            .next_handle(
-                "deleted",
-                b"private dirty bytes".to_vec(),
-                true,
-                Some(content_hash_for_bytes(b"committed")),
-                0o644,
-                false,
-                Some("inode-1".to_string()),
-                0,
-            )
-            .unwrap();
-        {
-            let mut handles = fs.lock_handles().unwrap();
-            let state = handles.files.get_mut(&handle).unwrap();
-            state.dirty = true;
-            state.unlinked = true;
-        }
-
-        fs.flush_handle(handle)
-            .expect("unlinked flush is a local lifetime barrier");
-        let handles = fs.lock_handles().unwrap();
-        let state = handles.files.get(&handle).unwrap();
-        assert!(!state.dirty);
-        assert_eq!(state.path, "deleted");
-        assert_eq!(state.buffer, b"private dirty bytes");
-    }
-
-    struct BarrierGateway {
-        namespace_hit: Arc<Notify>,
-        release_namespace: Arc<Notify>,
-    }
-
-    async fn descendant_barrier_gateway(
-        State(state): State<Arc<BarrierGateway>>,
-        request: Request<Body>,
-    ) -> Response {
-        let method = request.method().clone();
-        let path = request.uri().path().to_string();
-        let revision = |mut response: Response| -> Response {
-            response.headers_mut().insert(
-                HeaderName::from_static("x-chevalier-vfs-namespace-revision"),
-                HeaderValue::from_static("1"),
-            );
-            response
-        };
-        match (method, path.as_str()) {
-            (Method::POST, "/lease") => Json(serde_json::json!({
-                "resource_key": "descendant-barrier-test",
-                "owner_token": "00000000-0000-0000-0000-000000000001",
-                "task_id": null
-            }))
-            .into_response(),
-            (Method::DELETE, "/lease") => StatusCode::NO_CONTENT.into_response(),
-            (Method::POST, "/namespace-many") => {
-                // Hold the RemoveDirectory publication open so the descendant
-                // write-barrier it installed stays active while the test probes
-                // concurrent write enqueues.
-                state.namespace_hit.notify_one();
-                state.release_namespace.notified().await;
-                revision(StatusCode::OK.into_response())
-            }
-            (Method::POST, "/write-many") => {
-                revision(Json(serde_json::json!({"results": [], "entries": []})).into_response())
-            }
-            _ => StatusCode::NOT_FOUND.into_response(),
-        }
-    }
-
-    /// A full stat (`stat_path`, the route open(2) resolves through) must serve
-    /// from the same fence-matched cache the attribute stat does — but only from
-    /// an entry complete enough to keep the promise a full stat makes.
-    ///
-    /// Without this, every open(2) cost a point `/stat` even over a tree nothing
-    /// had touched: 47 of them per measured `git status` phase.
-    ///
-    /// An open handle's stable route — "does my path still hold my inode, and
-    /// what is its metadata now" — is answered from this mount's own confirmed
-    /// fence when, and only when, that fence proves it.
-    ///
-    /// This route (`resolve_handle_route_locked`, which every first `read(2)`
-    /// and every `getattr` on an open handle goes through) was the last read
-    /// path with NO cache serve at all: an unconditional, unbounded point
-    /// `/stat` per open. It cost a warm `git status` 30 of them over 9 `.git`
-    /// internals — one per open(2) — and was invisible to every fix aimed at
-    /// the metadata cache, because it never consulted the cache.
-    ///
-    /// The serve carries one condition a full stat does not: the entry's
-    /// `file_id` must BE the handle's identity. That is what makes it answer
-    /// the identity question rather than only the metadata one. Every other
-    /// answer wires, and so does a fence this mount cannot prove.
-    #[test]
-    fn handle_route_serves_a_fence_matched_identity_and_wires_when_it_cannot() {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let oversized = vec![b'x'; BULK_METADATA_MAX_HASH_BYTES as usize + 1];
-        let gateway = Arc::new(Mutex::new(RoundTripGateway {
-            scope: "test-scope".to_string(),
-            files: std::collections::BTreeMap::from([
-                ("test-scope/seed/file".to_string(), b"content".to_vec()),
-                ("test-scope/seed/oversized".to_string(), oversized),
-            ]),
-            revision: 17,
-            publications: Vec::new(),
-            acked: 0,
-            hashed_bytes: AtomicU64::new(0),
-            watch_serves: true,
-            counts: RouteCounts::default(),
-        }));
-        let server_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", any(round_trip_gateway))
-                    .with_state(server_gateway),
-            )
-            .await
-            .unwrap();
-        });
-        let client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
-        let fs = RemoteFuseFs::new(
-            client.clone(),
-            false,
-            "test-scope",
-            runtime.handle().clone(),
-        );
-        await_watch_live(&client);
-
-        let metadata = fs
-            .stat_path("seed/file")
-            .unwrap()
-            .expect("the seeded file exists");
-        let identity = metadata.file_id.clone().expect("the gateway supplies one");
-
-        // The entry a batched read installed is complete and fence-matched, and
-        // it carries this identity: the route is proven locally.
-        let route = fs
-            .cached_stable_file_route("seed/file", identity.as_str())
-            .expect("a complete fence-matched entry with this identity");
-        assert_eq!(route.path, "seed/file");
-        assert_eq!(route.metadata, metadata);
-        assert_eq!(
-            route.revision,
-            client.coherence_revision(),
-            "the served route must carry the fence it was proven at, so a \
-             following whole-file read can skip its verifying stat"
-        );
-
-        // A different identity is the retarget case: the path may no longer
-        // hold this inode, and only the wire (and the hard-link alias lookup
-        // behind it) can say where it went.
-        assert!(
-            fs.cached_stable_file_route("seed/file", "identity:somewhere-else")
-                .is_none(),
-            "a cached entry for another inode must not be served as this handle's route"
-        );
-
-        // An entry with no content hash is not serveable here for the same
-        // reason it is not serveable to a full stat: the caller matches loaded
-        // bytes against that hash and chains a CAS base from it.
-        let oversized = fs
-            .stat_path_attributes("seed/oversized")
-            .unwrap()
-            .expect("the oversized file exists");
-        assert!(oversized.content_hash.is_none());
-        assert!(
-            fs.cached_stable_file_route(
-                "seed/oversized",
-                oversized.file_id.as_deref().expect("identity"),
-            )
-            .is_none(),
-            "an incomplete entry must not stand in for the handle's route"
-        );
-
-        // A path this mount holds nothing for wires, rather than guessing.
-        assert!(
-            fs.cached_stable_file_route("seed/never-seen", identity.as_str())
-                .is_none()
-        );
-
-        drop(fs);
-        server.abort();
-    }
-
-    /// The same serve, fail-closed: with the revision watch down this mount
-    /// cannot prove its fence is current, so the handle route wires even when
-    /// the cache holds a complete, identity-matching entry for the path.
-    #[test]
-    fn handle_route_wires_when_the_revision_watch_is_down() {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let gateway = Arc::new(Mutex::new(RoundTripGateway {
-            scope: "test-scope".to_string(),
-            files: std::collections::BTreeMap::from([(
-                "test-scope/seed/file".to_string(),
-                b"content".to_vec(),
-            )]),
-            revision: 17,
-            publications: Vec::new(),
-            acked: 0,
-            hashed_bytes: AtomicU64::new(0),
-            // The watch never confirms this mount's fence.
-            watch_serves: false,
-            counts: RouteCounts::default(),
-        }));
-        let server_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", any(round_trip_gateway))
-                    .with_state(server_gateway),
-            )
-            .await
-            .unwrap();
-        });
-        let client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
-        let fs = RemoteFuseFs::new(
-            client.clone(),
-            false,
-            "test-scope",
-            runtime.handle().clone(),
-        );
-
-        // Warm the cache by hand at the exact fence the serve would check, so
-        // the only thing standing between it and a hit is watch liveness.
-        let metadata = fs
-            .stat_path("seed/file")
-            .unwrap()
-            .expect("the seeded file exists");
-        let identity = metadata.file_id.clone().expect("the gateway supplies one");
-        let revision = client.coherence_revision();
-        assert!(revision != 0);
-        fs.cache
-            .put_metadata("seed/file", metadata.clone(), revision);
-        assert_eq!(
-            fs.cache.get_metadata("seed/file", revision),
-            Some(metadata),
-            "the entry the serve would read is present and fence-matched"
-        );
-        assert!(
-            !client.revision_watch_live(),
-            "this arm is only meaningful with the watch down"
-        );
-        assert!(
-            fs.cached_stable_file_route("seed/file", identity.as_str())
-                .is_none(),
-            "an unconfirmed fence must not back a handle's route"
-        );
-
-        drop(fs);
-        server.abort();
-    }
-
-    /// Completeness is the content hash, and the bulk routes now ask the gateway
-    /// for one up to `BULK_METADATA_MAX_HASH_BYTES` — so a batched attribute
-    /// read already installs an entry an open can be served from, which is what
-    /// removed the last ~30 point stats a `git status` phase paid. Both halves
-    /// are pinned here: inside the bound the open is free, past it the entry is
-    /// still incomplete and the full stat still wires rather than hand a caller
-    /// a hashless entry to match cached bytes or chain a CAS write against.
-    #[test]
-    fn full_stat_serves_a_complete_fence_matched_entry_and_wires_for_an_incomplete_one() {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let oversized = vec![b'x'; BULK_METADATA_MAX_HASH_BYTES as usize + 1];
-        let gateway = Arc::new(Mutex::new(RoundTripGateway {
-            scope: "test-scope".to_string(),
-            files: std::collections::BTreeMap::from([
-                ("test-scope/seed/file".to_string(), b"content".to_vec()),
-                ("test-scope/seed/oversized".to_string(), oversized.clone()),
-            ]),
-            revision: 17,
-            publications: Vec::new(),
-            acked: 0,
-            hashed_bytes: AtomicU64::new(0),
-            watch_serves: true,
-            counts: RouteCounts::default(),
-        }));
-        let server_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", any(round_trip_gateway))
-                    .with_state(server_gateway),
-            )
-            .await
-            .unwrap();
-        });
-        let client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
-        let fs = RemoteFuseFs::new(
-            client.clone(),
-            false,
-            "test-scope",
-            runtime.handle().clone(),
-        );
-        await_watch_live(&client);
-
-        // A batched attribute read of a file inside the hash budget installs a
-        // COMPLETE entry: the gateway hashed it because the mount asked it to.
-        let attributes = fs
-            .stat_path_attributes("seed/file")
-            .unwrap()
-            .expect("file exists");
-        assert_eq!(
-            attributes.content_hash,
-            Some(content_hash_for_bytes(b"content")),
-            "a bulk metadata read must carry the content hash inside the budget"
-        );
-        assert_eq!(gateway.lock().unwrap().counts.stat, 0);
-
-        // So every open of that file at the same fence is served from it,
-        // including the first: no point stat is ever issued for this path.
-        for _ in 0..8 {
-            assert_eq!(fs.stat_path("seed/file").unwrap(), Some(attributes.clone()));
-        }
-        assert_eq!(
-            gateway.lock().unwrap().counts.stat,
-            0,
-            "a complete fence-matched entry must be served without a point stat"
-        );
-
-        // Past the budget the gateway declines to hash, so the bulk entry is
-        // incomplete and cannot stand in for a full stat: callers match cached
-        // bytes and chain CAS writes off that hash. It must wire.
-        assert!(
-            fs.stat_path_attributes("seed/oversized")
-                .unwrap()
-                .is_some_and(|metadata| metadata.content_hash.is_none()),
-            "a file over the hash budget must come back without a content hash"
-        );
-        let stats_before = gateway.lock().unwrap().counts.stat;
-        let complete = fs
-            .stat_path("seed/oversized")
-            .unwrap()
-            .expect("file exists");
-        assert_eq!(
-            complete.content_hash,
-            Some(content_hash_for_bytes(&oversized))
-        );
-        assert_eq!(
-            gateway.lock().unwrap().counts.stat,
-            stats_before + 1,
-            "an incomplete entry must fall through to the wire"
-        );
-
-        // And the entry that point stat installed is complete, so the file is
-        // only ever paid for once per fence.
-        for _ in 0..8 {
-            assert_eq!(
-                fs.stat_path("seed/oversized").unwrap(),
-                Some(complete.clone())
-            );
-        }
-        assert_eq!(
-            gateway.lock().unwrap().counts.stat,
-            stats_before + 1,
-            "a complete fence-matched entry must be served without a point stat"
-        );
-
-        drop(fs);
-        server.abort();
-    }
-
-    /// Opening a file too large for the whole-file content cache must not make
-    /// the gateway read it.
-    ///
-    /// The point `/stat` an open falls through to carries no hashing budget, and
-    /// hashing IS the gateway reading the file — so an `open(2)` of a 5 GiB
-    /// dataset made the gateway read 5 GiB, to produce a hash the open cannot
-    /// use: nothing is cached to match it against, and ranged reads are pinned by
-    /// fingerprint. Its one remaining consumer, the CAS base a write chains from,
-    /// is established when the handle loads for that write.
-    ///
-    /// Both edges of the deferral are pinned here — past the bound the hash is
-    /// deferred and the gateway never reads the file; at or under it the hash is
-    /// still fetched, because there the open really does use it.
-    #[test]
-    fn opening_a_file_past_the_content_cache_defers_its_hash_instead_of_reading_it() {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        // Past the whole-file content cache, and so past the point stat's budget.
-        let huge = vec![b'd'; LARGE_FILE_BYTES as usize + 1];
-        // Past the BULK budget but INSIDE the content cache: the open still needs
-        // this hash to match cached bytes, so it must still be fetched.
-        let middling = vec![b'm'; BULK_METADATA_MAX_HASH_BYTES as usize + 1];
-        let gateway = Arc::new(Mutex::new(RoundTripGateway {
-            scope: "test-scope".to_string(),
-            files: std::collections::BTreeMap::from([
-                ("test-scope/data/huge.bin".to_string(), huge.clone()),
-                ("test-scope/data/middling.bin".to_string(), middling.clone()),
-            ]),
-            revision: 17,
-            publications: Vec::new(),
-            acked: 0,
-            hashed_bytes: AtomicU64::new(0),
-            watch_serves: true,
-            counts: RouteCounts::default(),
-        }));
-        let server_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", any(round_trip_gateway))
-                    .with_state(server_gateway),
-            )
-            .await
-            .unwrap();
-        });
-        let client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
-        let fs = RemoteFuseFs::new(
-            client.clone(),
-            false,
-            "test-scope",
-            runtime.handle().clone(),
-        );
-        await_watch_live(&client);
-
-        let hashed = || {
-            gateway
-                .lock()
-                .unwrap()
-                .hashed_bytes
-                .load(AtomicOrdering::Relaxed)
-        };
-        let stats = || gateway.lock().unwrap().counts.stat;
-
-        // Cold: nothing cached, so the open point-stats — but with a bounded
-        // budget, so the gateway answers from metadata alone and never reads the
-        // file. One round trip, zero bytes hashed.
-        let before = hashed();
-        let cold = fs
-            .stat_path_hashed("data/huge.bin", FullStatHash::Deferred)
-            .unwrap()
-            .expect("the file exists");
-        assert_eq!(stats(), 1);
-        assert!(
-            cold.content_hash.is_none(),
-            "a file past the budget must come back hashless"
-        );
-        assert_eq!(
-            hashed(),
-            before,
-            "the gateway read the file to hash it for an open that cannot use it"
-        );
-
-        // Warm: the hashless entry is serveable for this caller at the same
-        // fence, so re-opening costs nothing at all.
-        for _ in 0..8 {
-            assert_eq!(
-                fs.stat_path_hashed("data/huge.bin", FullStatHash::Deferred)
-                    .unwrap(),
-                Some(cold.clone())
-            );
-        }
-        assert_eq!(stats(), 1, "a deferred-hash entry must be reserveable");
-        assert_eq!(hashed(), before);
-
-        // A caller that genuinely needs the hash now (O_TRUNC, whose CAS base is
-        // fixed at open) still gets it, at the cost the file dictates. Deferral
-        // postpones the hash; it never drops it.
-        let required = fs
-            .stat_path("data/huge.bin")
-            .unwrap()
-            .expect("the file exists");
-        assert_eq!(
-            required.content_hash,
-            Some(content_hash_for_bytes(&huge)),
-            "a Required caller must still be answered with a hash"
-        );
-        assert_eq!(hashed(), before + huge.len() as u64);
-
-        // And inside the content cache the deferral does not apply: the open
-        // needs this hash to match cached bytes, so it is fetched even for a
-        // deferring caller.
-        let before = hashed();
-        let cached_size = fs
-            .stat_path_hashed("data/middling.bin", FullStatHash::Deferred)
-            .unwrap()
-            .expect("the file exists");
-        assert_eq!(
-            cached_size.content_hash,
-            Some(content_hash_for_bytes(&middling)),
-            "a file the content cache can hold must not be served hashless"
-        );
-        assert_eq!(hashed(), before + middling.len() as u64);
-
-        drop(fs);
-        server.abort();
-    }
-
-    /// Gateway for `close_is_not_a_namespace_barrier_but_fsync_is`: content
-    /// publishes freely while namespace publications park until released, so a
-    /// flush's dependence on the namespace journal is directly observable.
-    struct HeldNamespaceGateway {
-        release_namespace: Arc<Notify>,
-        release_first_write: Arc<Notify>,
-        namespace_requests: Mutex<usize>,
-        write_requests: Mutex<usize>,
-    }
-
-    async fn held_namespace_gateway(
-        State(state): State<Arc<HeldNamespaceGateway>>,
-        request: Request<Body>,
-    ) -> Response {
-        let method = request.method().clone();
-        let route = request.uri().path().to_string();
-        let revision = |mut response: Response| -> Response {
-            response.headers_mut().insert(
-                HeaderName::from_static("x-chevalier-vfs-namespace-revision"),
-                HeaderValue::from_static("1"),
-            );
-            response
-        };
-        match (method, route.as_str()) {
-            (Method::POST, "/lease") => Json(serde_json::json!({
-                "resource_key": "held-namespace-test",
-                "owner_token": "00000000-0000-0000-0000-000000000001",
-                "task_id": null
-            }))
-            .into_response(),
-            (Method::DELETE, "/lease") => StatusCode::NO_CONTENT.into_response(),
-            (Method::POST, "/namespace-many") => {
-                *state.namespace_requests.lock().unwrap() += 1;
-                state.release_namespace.notified().await;
-                revision(
-                    Json(chevalier_sandbox::vfs::VfsNamespaceMutationBatchResponse::default())
-                        .into_response(),
-                )
-            }
-            (Method::POST, "/write-many") => {
-                let hold = {
-                    let mut requests = state.write_requests.lock().unwrap();
-                    *requests += 1;
-                    *requests == 1
-                };
-                if hold {
-                    state.release_first_write.notified().await;
-                }
-                revision(Json(serde_json::json!({"results": [], "entries": []})).into_response())
-            }
-            // Every handle this test flushes carries the same payload, so one
-            // authoritative answer verifies each publication.
-            (Method::GET, "/stat") => {
-                let scoped = round_trip_query_path(&request);
-                let path = scoped
-                    .strip_prefix("test-scope/")
-                    .unwrap_or(scoped.as_str());
-                revision(
-                    Json(RemoteMetadata {
-                        kind: "file".to_string(),
-                        size_bytes: b"payload".len() as u64,
-                        file_id: Some(format!("identity:{path}")),
-                        link_count: 1,
-                        link_target: None,
-                        content_hash: Some(content_hash_for_bytes(b"payload")),
-                        executable: false,
-                        mode: Some(0o644),
-                        updated_at: None,
-                    })
-                    .into_response(),
-                )
-            }
-            _ => StatusCode::NOT_FOUND.into_response(),
-        }
-    }
-
-    /// close(2) must not be a namespace publication barrier; fsync(2) must be.
-    ///
-    /// The handle here is dirty on a pathname with no queued namespace work of
-    /// its own, while an unrelated creation sits unpublished in the journal.
-    /// A close owes that creation nothing — its own bytes are already in the
-    /// write journal's durable WAL — so it must complete while the namespace
-    /// publication is still parked at the gateway. An fsync owes it everything:
-    /// a rename can land between the data flush and the fsync, so the barrier is
-    /// not met until both ordered journals are remotely acknowledged.
-    ///
-    /// This is the difference that lets creations batch at all: when every close
-    /// drained the journal, each queued creation published alone.
-    #[test]
-    fn close_is_not_a_namespace_barrier_but_fsync_is() {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let gateway = Arc::new(HeldNamespaceGateway {
-            release_namespace: Arc::new(Notify::new()),
-            release_first_write: Arc::new(Notify::new()),
-            namespace_requests: Mutex::new(0),
-            write_requests: Mutex::new(0),
-        });
-        let server_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", any(held_namespace_gateway))
-                    .with_state(server_gateway),
-            )
-            .await
-            .unwrap();
-        });
-        let journal_dir = tempfile::tempdir().unwrap();
-        let client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
-        let fs = Arc::new(
-            RemoteFuseFs::new_with_namespace_journal(
-                client,
-                false,
-                "test-scope",
-                &journal_dir.path().join("namespace.jsonl"),
-                runtime.handle().clone(),
-            )
-            .unwrap(),
-        );
-
-        // An unrelated creation, journaled and unpublished: the worker picks it
-        // up and parks in the gateway.
-        fs.enqueue_namespace_creation(
-            VfsNamespaceMutation::CreateFile {
-                path: "unrelated/new".to_string(),
-                mode: Some(0o644),
-            },
-            None,
-        )
-        .unwrap();
-        for _ in 0..200 {
-            if *gateway.namespace_requests.lock().unwrap() > 0 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(
-            *gateway.namespace_requests.lock().unwrap(),
-            1,
-            "the journal worker must have the unrelated creation in flight"
-        );
-
-        let dirty_handle = |path: &str| {
-            let fh = fs
-                .next_handle(
-                    path,
-                    Vec::new(),
-                    true,
-                    Some(content_hash_for_bytes(b"base")),
-                    0o644,
-                    false,
-                    Some(format!("identity:{path}")),
-                    1,
-                )
-                .unwrap();
-            let mut handles = fs.lock_handles().unwrap();
-            let state = handles.files.get_mut(&fh).unwrap();
-            state.buffer = b"payload".to_vec();
-            state.dirty = true;
-            state.revision = state.revision.saturating_add(1);
-            RemoteFuseFs::mirror_handle_state_locked(&mut handles, fh).unwrap();
-            fh
-        };
-
-        // close: must complete with the namespace publication still parked.
-        let closing = dirty_handle("published/file");
-        let (done, closed) = mpsc::channel();
-        let close_fs = Arc::clone(&fs);
-        let closer = std::thread::spawn(move || {
-            let result = close_fs.flush_handle_immediate(closing, FlushBarrier::Close);
-            let _ = done.send(result.is_ok());
-        });
-        assert_eq!(
-            closed.recv_timeout(Duration::from_secs(10)),
-            Ok(true),
-            "an ordinary close must not wait on an unrelated namespace publication"
-        );
-        closer.join().unwrap();
-        assert_eq!(
-            *gateway.namespace_requests.lock().unwrap(),
-            1,
-            "a close must not force a namespace publication of its own"
-        );
-        for _ in 0..200 {
-            if *gateway.write_requests.lock().unwrap() > 0 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(
-            *gateway.write_requests.lock().unwrap(),
-            1,
-            "close must return while its content publication is still in flight"
-        );
-
-        // fsync: must NOT complete while that publication is parked.
-        let syncing = dirty_handle("published/other");
-        let (done, synced) = mpsc::channel();
-        let fsync_fs = Arc::clone(&fs);
-        let syncer = std::thread::spawn(move || {
-            let result = fsync_fs.flush_handle_immediate(syncing, FlushBarrier::Durable);
-            let _ = done.send(result.is_ok());
-        });
-        assert_eq!(
-            synced.recv_timeout(Duration::from_millis(750)),
-            Err(mpsc::RecvTimeoutError::Timeout),
-            "fsync must hold until both ordered journals are remotely acknowledged"
-        );
-        gateway.release_first_write.notify_waiters();
-        gateway.release_namespace.notify_waiters();
-        assert_eq!(
-            synced.recv_timeout(Duration::from_secs(10)),
-            Ok(true),
-            "fsync must complete once the namespace journal drains"
-        );
-        syncer.join().unwrap();
-
-        drop(fs);
-        server.abort();
-    }
-
-    #[test]
-    fn descendant_write_barrier_blocks_only_the_deleted_subtree_until_rmdir_resolves() {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let gateway = Arc::new(BarrierGateway {
-            namespace_hit: Arc::new(Notify::new()),
-            release_namespace: Arc::new(Notify::new()),
-        });
-        let server_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", any(descendant_barrier_gateway))
-                    .with_state(server_gateway),
-            )
-            .await
-            .unwrap();
-        });
-        let journal_dir = tempfile::tempdir().unwrap();
-        let client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
-        let fs = Arc::new(
-            RemoteFuseFs::new_with_namespace_journal(
-                client,
-                false,
-                "test-scope",
-                &journal_dir.path().join("namespace.jsonl"),
-                runtime.handle().clone(),
-            )
-            .unwrap(),
-        );
-
-        // A RemoveDirectory{doomed} publication held in flight by the gateway,
-        // so its descendant write-barrier stays installed for the probes below.
-        let commit_fs = Arc::clone(&fs);
-        let remover = std::thread::spawn(move || {
-            commit_fs.commit_namespace(VfsNamespaceMutation::RemoveDirectory {
-                path: "doomed".to_string(),
-            })
-        });
-        runtime.block_on(async { gateway.namespace_hit.notified().await });
-
-        // A write to a descendant of the deleted directory must block behind the
-        // barrier; a write to an unrelated path must not.
-        let (barred_tx, barred_rx) = mpsc::channel();
-        let barred_fs = Arc::clone(&fs);
-        let barred_writer = std::thread::spawn(move || {
-            let result = barred_fs.writes.as_ref().unwrap().enqueue(
-                "doomed/child.rs",
-                b"resurrect",
-                None,
-                None,
-            );
-            barred_tx.send(result.is_ok()).unwrap();
-        });
-
-        fs.writes
-            .as_ref()
-            .unwrap()
-            .enqueue("elsewhere/keep.rs", b"unrelated", None, None)
-            .expect("a write outside the deleted subtree is never barred");
-        assert!(
-            barred_rx.recv_timeout(Duration::from_millis(500)).is_err(),
-            "a write into the in-flight RemoveDirectory subtree must block on the barrier"
-        );
-
-        // Let the RemoveDirectory finish; the barrier clears and the parked
-        // descendant write proceeds.
-        gateway.release_namespace.notify_one();
-        remover
-            .join()
-            .unwrap()
-            .expect("RemoveDirectory publication completes once released");
-        assert_eq!(
-            barred_rx.recv_timeout(Duration::from_secs(5)),
-            Ok(true),
-            "the barred write unblocks and completes after the rmdir resolves"
-        );
-        barred_writer.join().unwrap();
-
-        drop(fs);
-        server.abort();
-    }
-
-    /// Publishes every namespace batch immediately, so the only thing a
-    /// publication can wait on in the test below is its own commit hook.
-    async fn always_ok_namespace_gateway(request: Request<Body>) -> Response {
-        let revision = |mut response: Response| -> Response {
-            response.headers_mut().insert(
-                HeaderName::from_static("x-chevalier-vfs-namespace-revision"),
-                HeaderValue::from_static("7"),
-            );
-            response
-        };
-        match (request.method().clone(), request.uri().path()) {
-            (Method::POST, "/lease") => Json(serde_json::json!({
-                "resource_key": "commit-hook-revocation-test",
-                "owner_token": "00000000-0000-0000-0000-000000000001",
-                "task_id": null
-            }))
-            .into_response(),
-            (Method::DELETE, "/lease") => StatusCode::NO_CONTENT.into_response(),
-            (Method::POST, "/namespace-many") => revision(StatusCode::OK.into_response()),
-            (Method::POST, "/write-many") => {
-                revision(Json(serde_json::json!({"results": [], "entries": []})).into_response())
-            }
-            _ => StatusCode::NOT_FOUND.into_response(),
-        }
-    }
-
-    /// Kernel-invalidation double that parks *inside* the notifier call, exactly
-    /// as `fuse_reverse_inval_entry` parks on the parent inode lock the in-flight
-    /// FUSE op holds. Anything that waits on this revocation never returns until
-    /// the test releases it.
-    struct BlockingInvalidator {
-        entered: mpsc::Sender<()>,
-        released: Arc<(Mutex<bool>, std::sync::Condvar)>,
-        completed: Arc<Mutex<usize>>,
-    }
-
-    impl BlockingInvalidator {
-        fn park(&self) -> bool {
-            let _ = self.entered.send(());
-            let (lock, condvar) = &*self.released;
-            let mut released = lock.lock().unwrap();
-            while !*released {
-                released = condvar.wait(released).unwrap();
-            }
-            *self.completed.lock().unwrap() += 1;
-            true
-        }
-    }
-
-    impl KernelInvalidator for BlockingInvalidator {
-        fn invalidate(&self, _: &PublicationInvalidation) -> bool {
-            self.park()
-        }
-
-        fn invalidate_all(&self) -> bool {
-            self.park()
-        }
-    }
-
-    /// Regression for the publish/revoke deadlock. A guest unlink parks in
-    /// `flush_namespace_locked` while the guest kernel holds the parent
-    /// directory's inode lock for the whole op; the journal worker's commit hook
-    /// fires before the record is marked committed. If that hook waited for the
-    /// kernel revocation — which blocks on the very inode lock the op holds —
-    /// nothing would ever return and the op would fail at the 30s flush timeout.
-    /// So the hook must enqueue and return while the revocation is still parked.
-    #[test]
-    fn namespace_commit_hook_publishes_without_waiting_for_the_kernel_revocation() {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new().route("/{*path}", any(always_ok_namespace_gateway)),
-            )
-            .await
-            .unwrap();
-        });
-        let journal_dir = tempfile::tempdir().unwrap();
-        let client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
-
-        // Park every revocation this registry issues. Registered before the mount
-        // so the publication below cannot slip past it.
-        let invalidators = MountInvalidators::shared(&client.coherence_key());
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let released = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-        let completed = Arc::new(Mutex::new(0usize));
-        let parked: Arc<dyn KernelInvalidator> = Arc::new(BlockingInvalidator {
-            entered: entered_tx,
-            released: Arc::clone(&released),
-            completed: Arc::clone(&completed),
-        });
-        invalidators.register(Arc::downgrade(&parked));
-
-        let fs = Arc::new(
-            RemoteFuseFs::new_with_namespace_journal(
-                client,
-                false,
-                "test-scope",
-                &journal_dir.path().join("namespace.jsonl"),
-                runtime.handle().clone(),
-            )
-            .unwrap(),
-        );
-
-        // Publish on its own thread so a regression to a synchronous revocation
-        // fails this test on a timeout instead of hanging the suite.
-        let commit_fs = Arc::clone(&fs);
-        let (published_tx, published_rx) = mpsc::channel();
-        let publisher = std::thread::spawn(move || {
-            let result = commit_fs.commit_namespace(VfsNamespaceMutation::DeleteFile {
-                path: "probe/doomed".to_string(),
-                precondition: None,
-            });
-            published_tx.send(result).unwrap();
-        });
-
-        entered_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the queued revocation must reach the invalidation worker");
-        published_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the publication must not wait for the kernel revocation")
-            .expect("the publication itself succeeds");
-        assert_eq!(
-            *completed.lock().unwrap(),
-            0,
-            "the publication completed while its revocation was still parked in the notifier"
-        );
-
-        // Releasing proves the revocation is genuinely queued, not dropped: the
-        // worker finishes it off the publication path.
-        {
-            let (lock, condvar) = &*released;
-            *lock.lock().unwrap() = true;
-            condvar.notify_all();
-        }
-        publisher.join().unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while *completed.lock().unwrap() == 0 && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(
-            *completed.lock().unwrap(),
-            1,
-            "the deferred revocation still runs, just not on the publication's thread"
-        );
-
-        drop(parked);
-        drop(fs);
-        drop(invalidators);
-        server.abort();
-    }
-
-    async fn always_ok_write_gateway(request: Request<Body>) -> Response {
-        let revision = |mut response: Response| -> Response {
-            response.headers_mut().insert(
-                HeaderName::from_static("x-chevalier-vfs-namespace-revision"),
-                HeaderValue::from_static("1"),
-            );
-            response
-        };
-        match (request.method().clone(), request.uri().path()) {
-            (Method::POST, "/lease") => Json(serde_json::json!({
-                "resource_key": "barrier-gate-holder-test",
-                "owner_token": "00000000-0000-0000-0000-000000000001",
-                "task_id": null
-            }))
-            .into_response(),
-            (Method::DELETE, "/lease") => StatusCode::NO_CONTENT.into_response(),
-            (Method::POST, "/write-many") => {
-                revision(Json(serde_json::json!({"results": [], "entries": []})).into_response())
-            }
-            _ => StatusCode::NOT_FOUND.into_response(),
-        }
-    }
-
-    /// Regression for the descendant write-barrier's interaction with the
-    /// per-handle publication gate. A content flush parks in `enqueue` on a
-    /// barred subtree *while still holding that handle's publication gate*
-    /// (exactly what `flush_handle_locked` does). A namespace rename's gate
-    /// collection (`publication_gates_for_subtrees` + `lock_publication_gates`)
-    /// then needs that same gate. The barred write must stay strictly ordered
-    /// behind the barrier (never slip past), and the whole interleaving must
-    /// resolve in bounded time once the barrier clears: the barrier owner
-    /// (a delete/rmdir) never needs the gate, so dropping the barrier unparks
-    /// the writer, which releases the gate to the rename. No cycle.
-    #[test]
-    fn descendant_write_barrier_gate_holder_orders_behind_namespace_without_deadlock() {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new().route("/{*path}", any(always_ok_write_gateway)),
-            )
-            .await
-            .unwrap();
-        });
-        let journal_dir = tempfile::tempdir().unwrap();
-        let client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
-        let fs = Arc::new(
-            RemoteFuseFs::new_with_namespace_journal(
-                client,
-                false,
-                "test-scope",
-                &journal_dir.path().join("namespace.jsonl"),
-                runtime.handle().clone(),
-            )
-            .unwrap(),
-        );
-        // An open handle under the doomed subtree; its publication gate is the
-        // one both the parked writer and the rename contend for.
-        let handle = fs
-            .next_handle(
-                "doomed/child.rs",
-                Vec::new(),
-                true,
-                None,
-                0o644,
-                false,
-                Some("doomed-child".to_string()),
-                1,
-            )
-            .unwrap();
-
-        // Model an in-flight RemoveDirectory{doomed}: its descendant
-        // write-barrier is installed and stays active for the probes below.
-        // (A real rmdir/delete installs this from inside commit while holding
-        // `namespace_publication_gate`; it never acquires a handle gate.)
-        let barrier = fs
-            .writes
-            .as_ref()
-            .unwrap()
-            .install_descendant_barrier(vec!["doomed".to_string()]);
-
-        // The writer takes the handle's publication gate (as flush_handle_locked
-        // does) and then enqueues into the barred subtree, parking on the barrier
-        // while still holding the gate.
-        let (gate_held_tx, gate_held_rx) = mpsc::channel();
-        let (enqueued_tx, enqueued_rx) = mpsc::channel();
-        let writer_fs = Arc::clone(&fs);
-        let writer = std::thread::spawn(move || {
-            let gate = writer_fs.publication_gate_for_handle(handle).unwrap();
-            let held = gate.lock().unwrap();
-            // Announce ownership so the rename below deterministically contends
-            // for a gate the writer already holds (no acquisition-order race).
-            gate_held_tx.send(()).unwrap();
-            let result = writer_fs.writes.as_ref().unwrap().enqueue(
-                "doomed/child.rs",
-                b"resurrect",
-                None,
-                None,
-            );
-            drop(held);
-            enqueued_tx.send(result.is_ok()).unwrap();
-        });
-        // Only start the rename once the writer owns the gate.
-        gate_held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-
-        // A concurrent rename over the doomed subtree collects and locks the
-        // publication gates its handles share — exactly the multi-gate
-        // acquisition rename performs before it commits.
-        let (renamed_tx, renamed_rx) = mpsc::channel();
-        let rename_fs = Arc::clone(&fs);
-        let rename = std::thread::spawn(move || {
-            let gates = rename_fs
-                .publication_gates_for_subtrees(&["doomed"])
-                .unwrap();
-            let _guards = RemoteFuseFs::lock_publication_gates(&gates).unwrap();
-            renamed_tx.send(gates.len()).unwrap();
-        });
-
-        // While the barrier is active the write is parked (strictly ordered
-        // behind the namespace mutation) and the rename cannot acquire the gate
-        // the parked writer holds.
-        assert!(
-            enqueued_rx
-                .recv_timeout(Duration::from_millis(300))
-                .is_err(),
-            "a write into a barred subtree must park behind the barrier"
-        );
-        assert!(
-            renamed_rx.recv_timeout(Duration::from_millis(100)).is_err(),
-            "rename's gate collection must wait for the gate-holding writer"
-        );
-
-        // Dropping the barrier (as the delete/rmdir commit does on return)
-        // unparks the writer; it appends and releases the gate, and the rename
-        // then acquires it. The whole graph drains in bounded time.
-        drop(barrier);
-        assert_eq!(
-            enqueued_rx.recv_timeout(Duration::from_secs(5)),
-            Ok(true),
-            "the barred write completes once the barrier clears"
-        );
-        assert_eq!(
-            renamed_rx.recv_timeout(Duration::from_secs(5)),
-            Ok(1),
-            "rename acquires the freed gate after the writer releases it"
-        );
-        writer.join().unwrap();
-        rename.join().unwrap();
-
-        drop(fs);
-        server.abort();
-    }
-
-    /// A rename over a subtree collects the publication gate of every handle it
-    /// contains (publication_gates_for_subtrees) and then locks them in fh order
-    /// (lock_publication_gates). All handles for one inode SHARE a single gate
-    /// (next_handle clones the sibling's Arc), so two such handles under the
-    /// renamed subtree — two descriptors on one file, or two hard-link aliases —
-    /// yield the same non-reentrant `Mutex` twice in that list. Locking it a
-    /// second time on the same thread self-deadlocks the rename. The collection
-    /// must therefore acquire each distinct gate exactly once.
-    #[test]
-    fn rename_gate_collection_locks_each_shared_gate_once_without_self_deadlock() {
-        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
-        let client =
-            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
-        let fs = Arc::new(RemoteFuseFs::new(
-            client,
-            false,
-            "test-scope",
-            runtime.handle().clone(),
-        ));
-        // Two open descriptors on the same inode under the renamed subtree. They
-        // share one publication gate, exactly as next_handle wires siblings.
-        let first = fs
-            .next_handle(
-                "doomed/child.rs",
-                Vec::new(),
-                true,
-                None,
-                0o644,
-                false,
-                Some("doomed-child".to_string()),
-                1,
-            )
-            .unwrap();
-        let second = fs
-            .next_handle(
-                "doomed/child.rs",
-                Vec::new(),
-                true,
-                None,
-                0o644,
-                false,
-                Some("doomed-child".to_string()),
-                1,
-            )
-            .unwrap();
-        assert!(
-            Arc::ptr_eq(
-                &fs.publication_gate_for_handle(first).unwrap(),
-                &fs.publication_gate_for_handle(second).unwrap(),
-            ),
-            "same-inode handles must share one publication gate"
-        );
-
-        // Acquire the subtree's gates on a worker thread so a self-deadlock
-        // surfaces as a bounded timeout rather than hanging the test binary.
-        let (done_tx, done_rx) = mpsc::channel();
-        let probe_fs = Arc::clone(&fs);
-        let probe = std::thread::spawn(move || {
-            let gates = probe_fs
-                .publication_gates_for_subtrees(&["doomed"])
-                .unwrap();
-            let guards = RemoteFuseFs::lock_publication_gates(&gates).unwrap();
-            // Both descriptors are collected (so rename can flush each), but the
-            // shared gate is locked once — the pair that would self-deadlock.
-            done_tx.send((gates.len(), guards.len())).unwrap();
-        });
-        assert_eq!(
-            done_rx.recv_timeout(Duration::from_secs(3)),
-            Ok((2, 1)),
-            "rename's multi-gate acquisition must lock each shared gate once, not self-deadlock"
-        );
-        probe.join().unwrap();
-    }
-
-    #[test]
-    fn content_hash_conflict_requires_two_different_known_hashes() {
-        assert!(content_hash_conflicts(Some("base"), Some("current")));
-        assert!(!content_hash_conflicts(Some("same"), Some("same")));
-        assert!(!content_hash_conflicts(None, Some("current")));
-        assert!(!content_hash_conflicts(Some("base"), None));
-        assert!(!content_hash_conflicts(None, None));
-    }
-
-    /// Pins the same vector as `pack.rs` in chevalier-vfs. If the gateway ever
-    /// changes content-hash algorithm without vmd following, this fails instead
-    /// of every mounted delete/overwrite failing at runtime.
-    #[test]
-    fn content_hash_for_bytes_matches_the_configured_algorithms_vector() {
-        assert_eq!(
-            content_hash_for_bytes(b""),
-            chevalier_vfs_hash::algorithm().empty_vector(),
-            "the mount must hash with the algorithm the gateway is configured for"
-        );
-    }
-
-    #[test]
     fn attrs_preserve_exact_mode_and_read_only_clears_only_write_bits() {
         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
         let client =
             RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
-        let metadata = RemoteMetadata {
-            kind: "file".to_string(),
+        let metadata = LocalMetadata {
+            kind: LocalKind::File,
             size_bytes: 0,
-            file_id: None,
+            blocks: 0,
+            mode: 0o100_3751,
+            uid: 0,
+            gid: 0,
             link_count: 1,
+            local_identity: "unix:1:42".to_string(),
+            backing_ino: 42,
             link_target: None,
-            content_hash: None,
-            executable: true,
-            mode: Some(0o3751),
-            updated_at: None,
+            atime: LocalTimestamp::default(),
+            mtime: LocalTimestamp::default(),
+            ctime: LocalTimestamp::default(),
         };
 
         let writable = RemoteFuseFs::new(
@@ -8724,2179 +2239,19 @@ mod tests {
             0o750,
             "FUSE_DONT_MASK is not requested, so userspace must not apply umask twice"
         );
-        assert!(
-            !mode_change_required(0o644, Some(0o644)),
-            "copyFile's repeated mode must not become a durability barrier"
-        );
-        assert!(mode_change_required(0o644, Some(0o755)));
-        assert!(!mode_change_required(0o644, None));
-    }
-
-    #[test]
-    fn path_readers_keep_committed_bytes_while_existing_file_is_replaced() {
-        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
-        let client =
-            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
-        let fs = RemoteFuseFs::new(client, false, "test-scope", runtime.handle().clone());
-        let path = "api/nym.toml";
-        let committed = vec![b'a'; 64 * 1024];
-        let committed_metadata = RemoteMetadata {
-            kind: "file".to_string(),
-            size_bytes: committed.len() as u64,
-            file_id: None,
-            link_count: 1,
-            link_target: None,
-            content_hash: Some(content_hash_for_bytes(&committed)),
-            executable: false,
-            mode: Some(0o640),
-            updated_at: None,
-        };
-        fs.cache
-            .put_file(path, committed.clone(), Some(committed_metadata.clone()));
-
-        let writer = fs
-            .next_handle(
-                path,
-                Vec::new(),
-                true,
-                committed_metadata.content_hash.clone(),
-                0o640,
-                false,
-                None,
-                1,
-            )
-            .unwrap();
-        {
-            let mut handles = fs.lock_handles().unwrap();
-            let state = handles.files.get_mut(&writer).unwrap();
-            state.buffer = vec![b'b'; 2 * 1024];
-            state.dirty = true;
-            state.revision += 1;
-        }
-
-        assert_eq!(
-            fs.stat_path(path).unwrap(),
-            Some(committed_metadata.clone())
-        );
-        assert_eq!(
-            fs.stat_path_attributes(path).unwrap(),
-            Some(committed_metadata)
-        );
-        assert_eq!(
-            fs.read_bytes(path, 0, committed.len() as u32).unwrap(),
-            committed
-        );
-
-        let handles = fs.lock_handles().unwrap();
-        assert_eq!(handles.files.get(&writer).unwrap().buffer.len(), 2 * 1024);
-    }
-
-    #[test]
-    fn clean_created_handle_is_visible_before_its_first_write() {
-        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
-        let client =
-            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
-        let fs = RemoteFuseFs::new(client, false, "test-scope", runtime.handle().clone());
-        let path = "node_modules/pkg_tmp/LICENSE";
-        let fh = fs
-            .next_handle(path, Vec::new(), true, None, 0o640, true, None, 1)
-            .unwrap();
-
-        assert!(
-            !fs.lock_handles().unwrap().files.get(&fh).unwrap().dirty,
-            "CREATE returns before the first WRITE dirties the new handle"
-        );
-        let metadata = fs
-            .stat_path_attributes(path)
-            .unwrap()
-            .expect("the locally reserved pathname must already exist");
-        assert_eq!(metadata.kind, "file");
-        assert_eq!(metadata.size_bytes, 0);
-        assert_eq!(metadata.mode, Some(0o640));
-        assert_eq!(fs.read_bytes(path, 0, 4096).unwrap(), Vec::<u8>::new());
-    }
-
-    #[test]
-    fn range_fingerprint_matches_gateway_epoch_millis_contract() {
-        // Vector shared with ts/test/basic.test.cjs — both sides must produce
-        // exactly this string for the same instant.
-        let updated_at = chrono::DateTime::parse_from_rfc3339("2026-07-17T23:26:26.500Z")
-            .expect("parse")
-            .with_timezone(&chrono::Utc);
-        let metadata = RemoteMetadata {
-            kind: "file".to_string(),
-            size_bytes: 123,
-            file_id: None,
-            link_count: 1,
-            link_target: None,
-            content_hash: None,
-            executable: false,
-            mode: Some(0o640),
-            updated_at: Some(updated_at),
-        };
-        assert_eq!(range_fingerprint(&metadata), "123:1784330786500");
-
-        let unstamped = RemoteMetadata {
-            updated_at: None,
-            ..metadata
-        };
-        assert_eq!(range_fingerprint(&unstamped), "123:-1");
-    }
-
-    #[test]
-    fn path_truncate_resizes_open_handle_buffer_instead_of_racing_the_journal() {
-        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
-        let client =
-            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
-        let fs = RemoteFuseFs::new(client, false, "test-scope", runtime.handle().clone());
-        let path = "api/nym.toml";
-        let content = b"committed contents".to_vec();
-        let writer = fs
-            .next_handle(
-                path,
-                content.clone(),
-                true,
-                Some(content_hash_for_bytes(&content)),
-                0o640,
-                false,
-                None,
-                1,
-            )
-            .unwrap();
-
-        // Must resolve entirely against the open handle — any network call
-        // would error against the unroutable endpoint and fail the resize.
-        let attr = fs.resize_path_immediate(path, 4).unwrap();
-        assert_eq!(attr.size, 4);
-
-        let handles = fs.lock_handles().unwrap();
-        let state = handles.files.get(&writer).unwrap();
-        assert_eq!(state.buffer, content[..4].to_vec());
-        assert!(state.dirty, "resize must flow through the ordinary flush");
-    }
-
-    #[test]
-    fn path_readers_can_see_an_uncommitted_new_file() {
-        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
-        let client =
-            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
-        let fs = RemoteFuseFs::new(client, false, "test-scope", runtime.handle().clone());
-        let path = "new-file.txt";
-        let bytes = b"new file contents".to_vec();
-        let writer = fs
-            .next_handle(path, bytes.clone(), true, None, 0o640, true, None, 1)
-            .unwrap();
-        {
-            let mut handles = fs.lock_handles().unwrap();
-            let state = handles.files.get_mut(&writer).unwrap();
-            state.dirty = true;
-            state.revision += 1;
-        }
-
-        let metadata = fs.stat_path(path).unwrap().unwrap();
-        assert_eq!(metadata.size_bytes, bytes.len() as u64);
-        assert_eq!(metadata.content_hash, Some(content_hash_for_bytes(&bytes)));
-        // Content must match the visible metadata: a reader that was shown the
-        // created file's stat must get its bytes, not gateway ENOENT.
-        assert_eq!(
-            fs.read_bytes(path, 0, bytes.len() as u32).unwrap(),
-            bytes,
-            "path readers must be served a created file's uncommitted bytes"
-        );
-    }
-
-    #[test]
-    fn pathname_mutations_update_an_uncommitted_created_file_without_gateway_io() {
-        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
-        let client =
-            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
-        let fs = RemoteFuseFs::new(client, false, "test-scope", runtime.handle().clone());
-        let path = "git-meta/config.lock";
-        let bytes = b"created contents".to_vec();
-        let writer = fs
-            .next_handle(path, bytes.clone(), true, None, 0o640, true, None, 1)
-            .unwrap();
-        {
-            let mut handles = fs.lock_handles().unwrap();
-            let state = handles.files.get_mut(&writer).unwrap();
-            state.dirty = true;
-            state.revision += 1;
-        }
-
-        // The endpoint is deliberately unroutable. A gateway stat/write would
-        // fail this test; created-inode chmod/truncate must stay handle-local.
-        let metadata = fs
-            .mutate_created_handle_for_path(path, Some(7), Some(0o751))
-            .unwrap()
-            .unwrap();
-        assert_eq!(metadata.size_bytes, 7);
-        assert_eq!(metadata.mode, Some(0o751));
-        assert!(metadata.executable);
-        assert_eq!(
-            metadata.content_hash,
-            Some(content_hash_for_bytes(&bytes[..7]))
-        );
-        assert_eq!(fs.read_bytes(path, 0, 64).unwrap(), bytes[..7]);
-
-        let handles = fs.lock_handles().unwrap();
-        let state = handles.files.get(&writer).unwrap();
-        assert_eq!(state.buffer, bytes[..7]);
-        assert_eq!(state.mode, 0o751);
-        assert!(state.dirty);
-        assert!(state.loaded);
-    }
-
-    /// Gateway requests per route, the unit `op_class_round_trips` measures.
-    ///
-    /// Round trips x network RTT is a filesystem operation's user-visible
-    /// latency, so the benchmark counts requests per route rather than wall
-    /// clock against a loopback stub (which would report a link that does not
-    /// exist).
-    #[derive(Clone, Copy, Debug, Default)]
-    struct RouteCounts {
-        tree: usize,
-        stat: usize,
-        metadata_many: usize,
-        subtree_metadata: usize,
-        prefetch_subtree: usize,
-        namespace_many: usize,
-        write_many: usize,
-        file: usize,
-        lease: usize,
-        /// The revision watch is a background long poll no operation waits on,
-        /// so it is recorded but never charged to an operation.
-        watch: usize,
-    }
-
-    impl RouteCounts {
-        /// Round trips charged to the operations of a class.
-        fn charged(&self) -> usize {
-            self.tree
-                + self.stat
-                + self.metadata_many
-                + self.subtree_metadata
-                + self.prefetch_subtree
-                + self.namespace_many
-                + self.write_many
-                + self.file
-                + self.lease
-        }
-
-        fn since(&self, base: &Self) -> Self {
-            Self {
-                tree: self.tree - base.tree,
-                stat: self.stat - base.stat,
-                metadata_many: self.metadata_many - base.metadata_many,
-                subtree_metadata: self.subtree_metadata - base.subtree_metadata,
-                prefetch_subtree: self.prefetch_subtree - base.prefetch_subtree,
-                namespace_many: self.namespace_many - base.namespace_many,
-                write_many: self.write_many - base.write_many,
-                file: self.file - base.file,
-                lease: self.lease - base.lease,
-                watch: self.watch - base.watch,
-            }
-        }
-
-        fn breakdown(&self) -> String {
-            let routes = [
-                ("/tree", self.tree),
-                ("/stat", self.stat),
-                ("/metadata-many", self.metadata_many),
-                ("/subtree-metadata", self.subtree_metadata),
-                ("/prefetch-subtree", self.prefetch_subtree),
-                ("/namespace-many", self.namespace_many),
-                ("/write-many", self.write_many),
-                ("/file", self.file),
-                ("/lease", self.lease),
-            ];
-            let breakdown = routes
-                .iter()
-                .filter(|(_, count)| *count > 0)
-                .map(|(route, count)| format!("{route}={count}"))
-                .collect::<Vec<_>>();
-            if breakdown.is_empty() {
-                "-".to_string()
-            } else {
-                breakdown.join(" ")
-            }
-        }
-    }
-
-    /// Stub gateway for `op_class_round_trips`: an authoritative namespace plus
-    /// a per-route request counter. Faithful to the production gateway
-    /// (ts/vfs-gateway-server.ts) on the two behaviors that change the
-    /// round-trip count — leases are advertised implicit, so the client stops
-    /// issuing them after the first grant, and every response carries the
-    /// namespace revision header.
-    struct RoundTripGateway {
-        scope: String,
-        /// Scoped path -> file content. Directories are implied by their
-        /// entries, exactly as the production gateway's namespace is.
-        files: std::collections::BTreeMap<String, Vec<u8>>,
-        revision: u64,
-        /// Recent publications, newest last — the history the production
-        /// gateway retains so a watcher is told exactly what to revoke instead
-        /// of "something changed". Without it the benchmark cannot measure what
-        /// a publication actually costs the mount that observes it.
-        publications: Vec<RoundTripPublication>,
-        /// Highest revision the watcher has acked. A poll's `since` IS the ack
-        /// of that revision, exactly as the production gateway treats it.
-        acked: u64,
-        /// Bytes this gateway has HASHED, which is bytes it has read. A hash is
-        /// not free server-side work the mount may ask for at will: an open that
-        /// point-stats a 5 GiB dataset with no hashing budget makes the gateway
-        /// read 5 GiB. Round trips alone cannot see that cost, so it is counted
-        /// separately.
-        hashed_bytes: AtomicU64,
-        /// When false the /watch route errors, so the revision watch stays down
-        /// and every serve must fail closed to a wire read.
-        watch_serves: bool,
-        counts: RouteCounts,
-    }
-
-    /// One publication's affected set, split exactly as the production gateway
-    /// splits it: the paths it touched, and the prefixes whose WHOLE subtree it
-    /// superseded (`RemoveDirectory` / `Rename` only).
-    #[derive(Clone, Debug, Default)]
-    struct RoundTripPublication {
-        revision: u64,
-        paths: Vec<String>,
-        subtrees: Vec<String>,
-    }
-
-    impl RoundTripGateway {
-        /// Record one publication's affected set against the revision it
-        /// produced, and return that revision. `subtrees` is the subset of
-        /// `paths` whose whole subtree the publication superseded.
-        fn publish(&mut self, paths: Vec<String>) -> u64 {
-            self.publish_with_subtrees(paths, Vec::new())
-        }
-
-        fn publish_with_subtrees(&mut self, paths: Vec<String>, subtrees: Vec<String>) -> u64 {
-            self.revision += 1;
-            let revision = self.revision;
-            self.publications.push(RoundTripPublication {
-                revision,
-                paths,
-                subtrees,
-            });
-            revision
-        }
-
-        /// The union of paths published in `(since, revision]`, or `None` when
-        /// the watcher is behind the retained history and the answer cannot be
-        /// claimed exhaustive. Mirrors `#pathsPublishedSince` in
-        /// ts/vfs-gateway-server.ts, truncation semantics included.
-        fn published_since(&self, since: u64) -> Option<(Vec<String>, Vec<String>)> {
-            // The history must account for the revision being reported. A
-            // revision the stub advanced without recording an affected set
-            // models exactly what the production gateway reports as truncated:
-            // "something changed and I cannot tell you what".
-            if self.publications.last().map(|entry| entry.revision) != Some(self.revision) {
-                return None;
-            }
-            let oldest = self.publications.first()?;
-            if since < oldest.revision {
-                return None;
-            }
-            let mut seen = std::collections::BTreeSet::new();
-            let mut union = Vec::new();
-            let mut seen_subtrees = std::collections::BTreeSet::new();
-            let mut subtrees = Vec::new();
-            for entry in &self.publications {
-                if entry.revision <= since {
-                    continue;
-                }
-                for path in &entry.paths {
-                    if seen.insert(path.clone()) {
-                        union.push(path.clone());
-                    }
-                }
-                for prefix in &entry.subtrees {
-                    if seen_subtrees.insert(prefix.clone()) {
-                        subtrees.push(prefix.clone());
-                    }
-                }
-            }
-            Some((union, subtrees))
-        }
-    }
-
-    /// A file's authoritative metadata, derived from its stored bytes:
-    /// `published_file_matches` verifies size, hash, mode and identity against
-    /// this, so a flush that publishes content must see the content back.
-    ///
-    /// `max_hash_bytes` is the gateway's hashing budget, and the mount asks for
-    /// zero on every bulk/attribute route (`/tree`, `/metadata-many`,
-    /// `/subtree-metadata`, and the attribute `/stat`). Those answers therefore
-    /// carry NO content hash, which is what makes an attributes-only cache entry
-    /// unable to stand in for a full stat. A stub that hashed unconditionally
-    /// would report a cache that is warmer than the real one ever is.
-    fn round_trip_file_metadata(
-        path: &str,
-        bytes: &[u8],
-        max_hash_bytes: Option<u64>,
-        hashed_bytes: &AtomicU64,
-    ) -> RemoteMetadata {
-        let hashed = max_hash_bytes.is_none_or(|budget| bytes.len() as u64 <= budget);
-        if hashed {
-            // Hashing is the gateway READING the file. Charge it, so a route
-            // that quietly asks for an unbounded hash of a multi-GB file is
-            // visible even though it costs exactly one round trip.
-            hashed_bytes.fetch_add(bytes.len() as u64, AtomicOrdering::Relaxed);
-        }
-        RemoteMetadata {
-            kind: "file".to_string(),
-            size_bytes: bytes.len() as u64,
-            file_id: Some(format!("identity:{path}")),
-            link_count: 1,
-            link_target: None,
-            content_hash: hashed.then(|| content_hash_for_bytes(bytes)),
-            executable: false,
-            mode: Some(0o644),
-            updated_at: None,
-        }
-    }
-
-    /// Directory metadata for an implied directory. The production gateway
-    /// answers `/stat` and `/metadata-many` for directories the same way it
-    /// answers for files, which is what makes a publication snapshot's parent
-    /// entry usable as cached metadata.
-    fn round_trip_directory_metadata() -> RemoteMetadata {
-        RemoteMetadata {
-            kind: "directory".to_string(),
-            size_bytes: 0,
-            file_id: None,
-            link_count: 1,
-            link_target: None,
-            content_hash: None,
-            executable: false,
-            mode: Some(0o755),
-            updated_at: None,
-        }
-    }
-
-    /// Authoritative metadata for any path the stub's namespace holds: a stored
-    /// file, an implied directory (the scope root, or any prefix of a stored
-    /// path), or absent.
-    fn round_trip_metadata(
-        state: &RoundTripGateway,
-        path: &str,
-        max_hash_bytes: Option<u64>,
-    ) -> Option<RemoteMetadata> {
-        if let Some(bytes) = state.files.get(path) {
-            return Some(round_trip_file_metadata(
-                path,
-                bytes,
-                max_hash_bytes,
-                &state.hashed_bytes,
-            ));
-        }
-        if path == state.scope {
-            return Some(round_trip_directory_metadata());
-        }
-        let prefix = format!("{path}/");
-        state
-            .files
-            .keys()
-            .any(|stored| stored.starts_with(prefix.as_str()))
-            .then(round_trip_directory_metadata)
-    }
-
-    /// The gateway's `namespace_snapshot_paths`: every mutated path plus its
-    /// immediate parent, so the publishing mount learns the resulting state of
-    /// both without a follow-up read.
-    fn round_trip_snapshot_paths(paths: &[String]) -> Vec<String> {
-        let mut seen = std::collections::BTreeSet::new();
-        let mut ordered = Vec::new();
-        for path in paths {
-            let parent = path
-                .trim_matches('/')
-                .rsplit_once('/')
-                .map(|(parent, _)| parent.to_string())
-                .unwrap_or_default();
-            for candidate in [path.clone(), parent] {
-                if seen.insert(candidate.clone()) {
-                    ordered.push(candidate);
-                }
-            }
-        }
-        ordered
-    }
-
-    /// Direct children of `dir`, or `None` when the directory does not exist.
-    fn round_trip_children(
-        state: &RoundTripGateway,
-        dir: &str,
-        max_hash_bytes: Option<u64>,
-    ) -> Option<Vec<chevalier_sandbox::vfs::VfsDirEntry>> {
-        let prefix = format!("{dir}/");
-        let mut files = Vec::new();
-        let mut directories = std::collections::BTreeSet::new();
-        for (path, bytes) in &state.files {
-            let Some(rest) = path.strip_prefix(prefix.as_str()) else {
-                continue;
-            };
-            match rest.split_once('/') {
-                Some((name, _)) => {
-                    directories.insert(name.to_string());
-                }
-                None => {
-                    let metadata =
-                        round_trip_file_metadata(path, bytes, max_hash_bytes, &state.hashed_bytes);
-                    files.push(chevalier_sandbox::vfs::VfsDirEntry {
-                        name: rest.to_string(),
-                        kind: metadata.kind,
-                        size_bytes: metadata.size_bytes,
-                        file_id: metadata.file_id,
-                        link_count: metadata.link_count,
-                        link_target: metadata.link_target,
-                        content_hash: metadata.content_hash,
-                        executable: metadata.executable,
-                        mode: metadata.mode,
-                        updated_at: metadata.updated_at,
-                    })
-                }
-            }
-        }
-        if files.is_empty() && directories.is_empty() && dir != state.scope {
-            return None;
-        }
-        for name in directories {
-            files.push(chevalier_sandbox::vfs::VfsDirEntry {
-                name,
-                kind: "directory".to_string(),
-                size_bytes: 0,
-                file_id: None,
-                link_count: 1,
-                link_target: None,
-                content_hash: None,
-                executable: false,
-                mode: Some(0o755),
-                updated_at: None,
-            });
-        }
-        Some(files)
-    }
-
-    /// Minimal percent-decoder for the stub's query parameters: the client
-    /// encodes path separators and vmd carries no urlencoding dependency.
-    fn decode_query_value(value: &str) -> String {
-        let bytes = value.as_bytes();
-        let mut decoded = String::with_capacity(value.len());
-        let mut index = 0;
-        while index < bytes.len() {
-            match bytes[index] {
-                b'%' if index + 3 <= bytes.len() => {
-                    match u8::from_str_radix(&value[index + 1..index + 3], 16) {
-                        Ok(byte) => {
-                            decoded.push(byte as char);
-                            index += 3;
-                        }
-                        Err(_) => {
-                            decoded.push('%');
-                            index += 1;
-                        }
-                    }
-                }
-                byte => {
-                    decoded.push(byte as char);
-                    index += 1;
-                }
-            }
-        }
-        decoded
-    }
-
-    fn round_trip_query_value(request: &Request<Body>, name: &str) -> String {
-        request
-            .uri()
-            .query()
-            .unwrap_or_default()
-            .split('&')
-            .filter_map(|pair| pair.split_once('='))
-            .find(|(key, _)| *key == name)
-            .map(|(_, value)| decode_query_value(value))
-            .unwrap_or_default()
-    }
-
-    fn round_trip_query_path(request: &Request<Body>) -> String {
-        round_trip_query_value(request, "path")
-    }
-
-    fn round_trip_query_max_hash_bytes(request: &Request<Body>) -> Option<u64> {
-        let raw = round_trip_query_value(request, "max_hash_bytes");
-        (!raw.is_empty()).then(|| raw.parse().unwrap_or_default())
-    }
-
-    fn round_trip_query_since(request: &Request<Body>) -> u64 {
-        round_trip_query_value(request, "since")
-            .parse()
-            .unwrap_or_default()
-    }
-
-    /// The watch answer shape the production gateway sends: the revision plus
-    /// the affected set, or `truncated` when the set cannot be claimed
-    /// exhaustive (which sends the watcher down its conservative fallback).
-    fn round_trip_watch_response(
-        revision: u64,
-        published: Option<(Vec<String>, Vec<String>)>,
-    ) -> Response {
-        let body = match published {
-            // `subtrees` is serialized on the same always-when-known terms as
-            // `paths`: an absent field means "this gateway cannot tell you which
-            // affected paths were directories", which sends the watcher back to
-            // reading every path as a prefix.
-            Some((paths, subtrees)) => {
-                serde_json::json!({ "revision": revision, "paths": paths, "subtrees": subtrees })
-            }
-            None => {
-                serde_json::json!({
-                    "revision": revision,
-                    "paths": [],
-                    "subtrees": [],
-                    "truncated": true,
-                })
-            }
-        };
-        with_revision_header(Json(body).into_response(), revision)
-    }
-
-    /// Hold a publication until the revision watch has acked it, which is the
-    /// gateway's `commit_and_await_acks_for`.
-    ///
-    /// This ordering is the whole reason a mount observes its OWN publications
-    /// on its own watch: the answer (and the cache/kernel work it triggers)
-    /// lands strictly before the publishing request's response does. A stub that
-    /// returned immediately would let the publisher's response-header revision
-    /// beat the watch, the watch would then see nothing to report, and the
-    /// benchmark would measure a coherence protocol nobody runs. Fails open on
-    /// timeout, as the gateway does, so a test without a live watcher still
-    /// makes progress.
-    async fn await_watch_ack(state: &Arc<Mutex<RoundTripGateway>>, revision: u64) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if state.lock().unwrap().acked >= revision {
-                return;
-            }
-            if std::time::Instant::now() >= deadline {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    }
-
-    /// A real long poll against the recorded publication history: park until the
-    /// revision passes `since`, then answer with the exact affected union (or
-    /// report truncation when the watcher is behind the history). Parking on a
-    /// fixed sleep instead — which is what the other stubs in this file do —
-    /// would hide the cost every publication imposes on the mount that observes
-    /// it, which is precisely what this benchmark exists to measure.
-    async fn round_trip_watch(state: &Arc<Mutex<RoundTripGateway>>, since: u64) -> Response {
-        {
-            // This poll's `since` IS the watcher's ack of that revision.
-            let mut state = state.lock().unwrap();
-            state.counts.watch += 1;
-            state.acked = state.acked.max(since);
-        }
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            let answer = {
-                let state = state.lock().unwrap();
-                (state.revision > since).then(|| (state.revision, state.published_since(since)))
-            };
-            if let Some((revision, published)) = answer {
-                return round_trip_watch_response(revision, published);
-            }
-            if std::time::Instant::now() >= deadline {
-                return StatusCode::NO_CONTENT.into_response();
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    }
-
-    async fn round_trip_gateway(
-        State(state_handle): State<Arc<Mutex<RoundTripGateway>>>,
-        request: Request<Body>,
-    ) -> Response {
-        let state = &state_handle;
-        let method = request.method().clone();
-        let route = request.uri().path().to_string();
-        let path = round_trip_query_path(&request);
-        // Absent means "hash whatever it costs"; present (always 0 from this
-        // mount) means "do not hash".
-        let max_hash_bytes = round_trip_query_max_hash_bytes(&request);
-        match (method, route.as_str()) {
-            (Method::GET, "/tree") => {
-                let mut state = state.lock().unwrap();
-                state.counts.tree += 1;
-                let revision = state.revision;
-                match round_trip_children(&state, path.as_str(), max_hash_bytes) {
-                    Some(entries) => with_revision_header(Json(entries).into_response(), revision),
-                    None => with_revision_header(StatusCode::NOT_FOUND.into_response(), revision),
-                }
-            }
-            (Method::GET, "/stat") => {
-                let mut state = state.lock().unwrap();
-                state.counts.stat += 1;
-                let revision = state.revision;
-                match round_trip_metadata(&state, path.as_str(), max_hash_bytes) {
-                    Some(metadata) => {
-                        with_revision_header(Json(metadata).into_response(), revision)
-                    }
-                    None => with_revision_header(StatusCode::NOT_FOUND.into_response(), revision),
-                }
-            }
-            (Method::POST, "/metadata-many") => {
-                let body = to_bytes(request.into_body(), 4 * 1024 * 1024)
-                    .await
-                    .expect("read metadata-many request");
-                let payload: VfsMetadataManyRequest =
-                    serde_json::from_slice(&body).expect("decode metadata-many request");
-                let mut state = state.lock().unwrap();
-                state.counts.metadata_many += 1;
-                let revision = state.revision;
-                let entries = payload
-                    .paths
-                    .iter()
-                    .map(|path| round_trip_metadata(&state, path.as_str(), max_hash_bytes))
-                    .collect();
-                with_revision_header(
-                    Json(VfsMetadataManyResponse { entries }).into_response(),
-                    revision,
-                )
-            }
-            (Method::POST, "/subtree-metadata") => {
-                let body = to_bytes(request.into_body(), 4 * 1024 * 1024)
-                    .await
-                    .expect("read subtree-metadata request");
-                let payload: chevalier_sandbox::vfs::VfsSubtreeMetadataRequest =
-                    serde_json::from_slice(&body).expect("decode subtree-metadata request");
-                let prefix = if payload.prefix.is_empty() {
-                    String::new()
-                } else {
-                    format!("{}/", payload.prefix)
-                };
-                let mut state = state.lock().unwrap();
-                state.counts.subtree_metadata += 1;
-                let revision = state.revision;
-                let entries = state
-                    .files
-                    .iter()
-                    .filter(|(path, _)| path.starts_with(prefix.as_str()))
-                    .map(|(path, bytes)| {
-                        let metadata = round_trip_file_metadata(
-                            path,
-                            bytes,
-                            payload.max_hash_bytes,
-                            &state.hashed_bytes,
-                        );
-                        VfsSubtreeMetadataEntry {
-                            path: path.clone(),
-                            kind: metadata.kind,
-                            size_bytes: metadata.size_bytes,
-                            file_id: metadata.file_id,
-                            link_count: metadata.link_count,
-                            link_target: metadata.link_target,
-                            content_hash: metadata.content_hash,
-                            executable: metadata.executable,
-                            mode: metadata.mode,
-                            token_count: None,
-                            version: None,
-                            updated_at: None,
-                            object_state: None,
-                        }
-                    })
-                    .collect();
-                with_revision_header(
-                    Json(VfsSubtreeMetadataResponse { entries }).into_response(),
-                    revision,
-                )
-            }
-            (Method::POST, "/prefetch-subtree") => {
-                let mut state = state.lock().unwrap();
-                state.counts.prefetch_subtree += 1;
-                let revision = state.revision;
-                // Every file the stub serves is empty, so a warmed-bytes pack
-                // carries nothing; the route still round-trips, which is the
-                // point of counting it.
-                with_revision_header(
-                    Json(chevalier_sandbox::vfs::VfsPrefetchSubtreeResponse {
-                        warmed_file_bytes: Vec::new(),
-                    })
-                    .into_response(),
-                    revision,
-                )
-            }
-            (Method::POST, "/namespace-many") => {
-                let body = to_bytes(request.into_body(), 4 * 1024 * 1024)
-                    .await
-                    .expect("read namespace-many request");
-                let payload: chevalier_sandbox::vfs::VfsNamespaceMutationBatchBody =
-                    serde_json::from_slice(&body).expect("decode namespace-many request");
-                let (entries, revision) = {
-                    let mut state = state.lock().unwrap();
-                    state.counts.namespace_many += 1;
-                    let mut mutated = Vec::new();
-                    for mutation in &payload.mutations {
-                        match mutation {
-                            VfsNamespaceMutation::CreateFile { path, .. } => {
-                                state.files.insert(path.clone(), Vec::new());
-                                mutated.push(path.clone());
-                            }
-                            VfsNamespaceMutation::DeleteFile { path, .. } => {
-                                state.files.remove(path.as_str());
-                                mutated.push(path.clone());
-                            }
-                            _ => {}
-                        }
-                    }
-                    // The gateway answers a namespace publication with a
-                    // snapshot of every mutated path AND its immediate parent
-                    // (see `namespace_snapshot_paths` in
-                    // crates/sandbox/src/vfs.rs), so the publishing mount never
-                    // has to re-read what it just changed.
-                    let snapshot_paths = round_trip_snapshot_paths(&mutated);
-                    let entries = snapshot_paths
-                        .iter()
-                        .map(|path| chevalier_sandbox::vfs::VfsPublicationSnapshotEntry {
-                            metadata: round_trip_metadata(&state, path.as_str(), None),
-                            path: path.clone(),
-                        })
-                        .collect::<Vec<_>>();
-                    // Every publication advances the namespace revision and
-                    // records its affected set, exactly as the gateway's
-                    // publication sequencer does — including the split between
-                    // the paths it touched and the prefixes whose whole subtree
-                    // it superseded (`namespace_superseded_subtrees` in
-                    // crates/sandbox/src/vfs.rs). A create/delete supersedes no
-                    // subtree, which is what keeps it from evicting the cached
-                    // metadata of every sibling in its directory.
-                    let superseded = payload
-                        .mutations
-                        .iter()
-                        .filter(|mutation| {
-                            matches!(
-                                mutation,
-                                VfsNamespaceMutation::RemoveDirectory { .. }
-                                    | VfsNamespaceMutation::Rename { .. }
-                            )
-                        })
-                        .flat_map(|mutation| {
-                            mutation
-                                .paths()
-                                .into_iter()
-                                .filter(|path| !path.is_empty())
-                                .map(str::to_string)
-                                .collect::<Vec<_>>()
-                        })
-                        .collect::<Vec<_>>();
-                    let revision = state.publish_with_subtrees(snapshot_paths, superseded);
-                    (entries, revision)
-                };
-                await_watch_ack(state, revision).await;
-                with_revision_header(
-                    Json(chevalier_sandbox::vfs::VfsNamespaceMutationBatchResponse { entries })
-                        .into_response(),
-                    revision,
-                )
-            }
-            (Method::POST, "/write-many") => {
-                let body = to_bytes(request.into_body(), 4 * 1024 * 1024)
-                    .await
-                    .expect("read write-many request");
-                let payload: chevalier_sandbox::vfs::VfsWriteManyBody =
-                    serde_json::from_slice(&body).expect("decode write-many request");
-                let published = {
-                    let mut state = state.lock().unwrap();
-                    state.counts.write_many += 1;
-                    // Content preconditions are the gateway's, not a
-                    // convenience: a write whose CAS base does not match
-                    // (including a write that reached the gateway before the
-                    // creation it depends on) is rejected atomically for the
-                    // whole batch.
-                    let rejected = payload
-                        .writes
-                        .iter()
-                        .find(|write| {
-                            let Some(predicate) = write
-                                .precondition
-                                .as_ref()
-                                .and_then(|precondition| precondition.predicate.as_ref())
-                            else {
-                                return false;
-                            };
-                            match predicate {
-                                VfsCasPredicate::Absent => {
-                                    state.files.contains_key(write.path.as_str())
-                                }
-                                VfsCasPredicate::ContentFingerprint { fingerprint } => {
-                                    state.files.get(write.path.as_str()).is_none_or(|bytes| {
-                                        content_hash_for_bytes(bytes) != *fingerprint
-                                    })
-                                }
-                            }
-                        })
-                        .map(|write| write.path.clone());
-                    match rejected {
-                        Some(rejected) => Err((state.revision, rejected)),
-                        None => {
-                            let mut results = Vec::new();
-                            let mut written = Vec::new();
-                            for write in payload.writes {
-                                let previous_hash = state
-                                    .files
-                                    .get(write.path.as_str())
-                                    .map(|bytes| content_hash_for_bytes(bytes));
-                                let content_hash = content_hash_for_bytes(write.body.as_slice());
-                                state.files.insert(write.path.clone(), write.body);
-                                results.push(chevalier_sandbox::vfs::VfsWriteManyResult {
-                                    changed: previous_hash.as_deref()
-                                        != Some(content_hash.as_str()),
-                                    previous_hash,
-                                    content_hash,
-                                    path: write.path.clone(),
-                                });
-                                written.push(write.path);
-                            }
-                            // A content publication's snapshot names the written
-                            // paths, plus the parent of any write that CREATED
-                            // its path (see `post_write_many` in
-                            // crates/sandbox/src/vfs.rs). An OVERWRITE names no
-                            // parent, which is exactly why a write must not
-                            // evict its parent directory's cached metadata; a
-                            // create-carrying write did change that directory,
-                            // and a watcher holding the parent's cached absence
-                            // has no other way to learn it now exists.
-                            let created_parents = results
-                                .iter()
-                                .filter(|result| result.previous_hash.is_none())
-                                .filter_map(|result| {
-                                    result
-                                        .path
-                                        .trim_matches('/')
-                                        .rsplit_once('/')
-                                        .map(|(parent, _)| parent.to_string())
-                                })
-                                .collect::<std::collections::BTreeSet<_>>();
-                            let written = written
-                                .into_iter()
-                                .chain(
-                                    created_parents
-                                        .into_iter()
-                                        .filter(|parent| !parent.is_empty()),
-                                )
-                                .collect::<Vec<_>>();
-                            let entries = written
-                                .iter()
-                                .map(|path| chevalier_sandbox::vfs::VfsPublicationSnapshotEntry {
-                                    metadata: round_trip_metadata(&state, path.as_str(), None),
-                                    path: path.clone(),
-                                })
-                                .collect::<Vec<_>>();
-                            let revision = state.publish(written);
-                            Ok((results, entries, revision))
-                        }
-                    }
-                };
-                match published {
-                    Err((revision, rejected)) => with_revision_header(
-                        (
-                            StatusCode::CONFLICT,
-                            format!("write precondition failed for {rejected}"),
-                        )
-                            .into_response(),
-                        revision,
-                    ),
-                    Ok((results, entries, revision)) => {
-                        await_watch_ack(state, revision).await;
-                        with_revision_header(
-                            Json(chevalier_sandbox::vfs::VfsWriteManyPublicationResponse {
-                                results,
-                                entries,
-                            })
-                            .into_response(),
-                            revision,
-                        )
-                    }
-                }
-            }
-            (Method::GET, "/file/raw") => {
-                let mut state = state.lock().unwrap();
-                state.counts.file += 1;
-                let revision = state.revision;
-                match state.files.get(path.as_str()) {
-                    Some(bytes) => with_revision_header(bytes.clone().into_response(), revision),
-                    None => with_revision_header(StatusCode::NOT_FOUND.into_response(), revision),
-                }
-            }
-            (Method::PUT, "/file") => {
-                let body = to_bytes(request.into_body(), 4 * 1024 * 1024)
-                    .await
-                    .expect("read file body");
-                let revision = {
-                    let mut state = state.lock().unwrap();
-                    state.counts.file += 1;
-                    state.files.insert(path.clone(), body.to_vec());
-                    state.publish(vec![path.clone()])
-                };
-                await_watch_ack(state, revision).await;
-                with_revision_header(StatusCode::NO_CONTENT.into_response(), revision)
-            }
-            (Method::POST, "/lease") => {
-                state.lock().unwrap().counts.lease += 1;
-                // The production gateway answers with implicit lease mode, which
-                // tells the client to stop issuing lease round trips entirely.
-                let mut response = Json(serde_json::json!({
-                    "resource_key": "round-trip-benchmark",
-                    "owner_token": "00000000-0000-0000-0000-000000000001",
-                    "task_id": null
-                }))
-                .into_response();
-                response.headers_mut().insert(
-                    HeaderName::from_static("x-chevalier-vfs-lease-mode"),
-                    HeaderValue::from_static("implicit"),
-                );
-                response
-            }
-            (Method::DELETE, "/lease") => {
-                state.lock().unwrap().counts.lease += 1;
-                StatusCode::NO_CONTENT.into_response()
-            }
-            // A real long poll against the recorded publication history: park
-            // until the revision passes `since`, then answer with the exact
-            // affected union (or report truncation when the watcher is behind
-            // the history). Parking on a fixed sleep instead — which is what the
-            // other stubs in this file do — would hide the cost every
-            // publication imposes on the mount that observes it, which is
-            // precisely what this benchmark exists to measure.
-            (Method::GET, "/watch") => {
-                if !state.lock().unwrap().watch_serves {
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-                round_trip_watch(state, round_trip_query_since(&request)).await
-            }
-            _ => StatusCode::NOT_FOUND.into_response(),
-        }
-    }
-
-    /// Gateway round trips per filesystem operation class.
-    ///
-    /// Round trips x network RTT is what a user actually waits for, so this is
-    /// the measurement that predicts whether an operation clears the 100-500ms
-    /// bar over a real link — wall clock against a loopback stub would report a
-    /// link that does not exist. The table is printed for
-    /// `cargo test -p vmd op_class_round_trips -- --nocapture`; the assertions
-    /// below pin the properties each amortization mechanism is supposed to
-    /// guarantee so a regression fails the build instead of silently costing
-    /// every operation another RTT.
-    ///
-    /// Not covered: content flushes, whose plumbing needs a handle table set up
-    /// by `create` dispatch rather than an fs-level entry point.
-    #[test]
-    fn op_class_round_trips() {
-        const CREATE_OPS: usize = 50;
-        const STAT_OPS: usize = 50;
-        const SEED_FILES: usize = 64;
-        /// The `.git` internals a warm `git status` re-opens: measured at 30
-        /// point `/stat` calls across these 9 paths per phase, every one of them
-        /// collateral damage from git creating and removing `index.lock` in the
-        /// same directory.
-        const GIT_INTERNALS: [&str; 9] = [
-            "gitdir/config",
-            "gitdir/HEAD",
-            "gitdir/info/exclude",
-            "gitdir/refs/heads/main",
-            "gitdir/refs/stash",
-            "gitdir/index",
-            "gitdir/objects/ab/cdef",
-            "gitdir/objects/12/3456",
-            "gitdir/packed-refs",
-        ];
-        /// How many times a warm `git status` phase OPENS each of those paths,
-        /// as counted per path on the mounted repo: 9 for `config`, 4 each for
-        /// `HEAD` and `info/exclude`, 3 for the branch ref and for each loose
-        /// object, 2 for `index`, 1 each for `refs/stash` and `packed-refs`.
-        /// They sum to 30, which is exactly the number of point `/stat` calls
-        /// the phase issued — one per open(2), which is what identified the
-        /// route that was paying for them (see `status_open_warm`).
-        const GIT_INTERNAL_OPENS: [usize; 9] = [9, 4, 4, 3, 1, 2, 3, 3, 1];
-        const GIT_INTERNAL_TOTAL_OPENS: usize = 30;
-        const _: () = assert!(GIT_INTERNAL_OPENS.len() == GIT_INTERNALS.len());
-        /// A file past both the bulk hashing budget AND the mount's whole-file
-        /// content cache — the shape of an ML dataset in a sandbox, only smaller
-        /// so the stub can hold it. Its open must cost neither a point stat nor a
-        /// server-side hash of its contents.
-        const LARGE_FILE: &str = "large/dataset.bin";
-
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let mut files = std::collections::BTreeMap::new();
-        for index in 0..SEED_FILES {
-            // Non-empty, and well inside `BULK_METADATA_MAX_HASH_BYTES`: the
-            // ordinary source-file shape, whose hash a bulk route supplies so an
-            // open never has to point-stat for it. The oversized case — past the
-            // budget, where the entry stays incomplete and the full stat still
-            // wires — is pinned by
-            // `full_stat_serves_a_complete_fence_matched_entry_and_wires_for_an_incomplete_one`.
-            files.insert(
-                format!("test-scope/seed/file-{index}"),
-                format!("seed file {index}").into_bytes(),
-            );
-        }
-        for name in GIT_INTERNALS {
-            files.insert(
-                format!("test-scope/{name}"),
-                format!("{name} contents").into_bytes(),
-            );
-        }
-        files.insert(
-            format!("test-scope/{LARGE_FILE}"),
-            vec![b'd'; LARGE_FILE_BYTES as usize + 1],
-        );
-        let gateway = Arc::new(Mutex::new(RoundTripGateway {
-            scope: "test-scope".to_string(),
-            files,
-            revision: 17,
-            publications: Vec::new(),
-            acked: 0,
-            hashed_bytes: AtomicU64::new(0),
-            watch_serves: true,
-            counts: RouteCounts::default(),
-        }));
-        let server_gateway = Arc::clone(&gateway);
-        let server = runtime.spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", any(round_trip_gateway))
-                    .with_state(server_gateway),
-            )
-            .await
-            .unwrap();
-        });
-        let journal_dir = tempfile::tempdir().unwrap();
-        let client = RemoteVfsClient::new(&endpoint, "test-token", "test-scope").unwrap();
-        let fs = RemoteFuseFs::new_with_namespace_journal(
-            client.clone(),
-            false,
-            "test-scope",
-            &journal_dir.path().join("namespace.jsonl"),
-            runtime.handle().clone(),
-        )
-        .unwrap();
-        // Every amortized serve path (cached attrs, cached listings, positive
-        // kernel leases) is gated on a live revision watch, so the whole table
-        // must be measured under one.
-        await_watch_live(&client);
-
-        let sample = || gateway.lock().unwrap().counts;
-        // Wait until this mount has observed every publication the gateway has
-        // made. The stub holds each publication until the watcher acks it (see
-        // `await_watch_ack`), exactly as the gateway's
-        // `commit_and_await_acks_for` does, so this is normally already true the
-        // moment a publishing call returns — the wait exists so a "warm" phase
-        // can never be measured against a fence the watch has not applied.
-        let await_watch_catch_up = || {
-            let target = gateway.lock().unwrap().revision;
-            for _ in 0..600 {
-                if client.coherence_revision() >= target {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            panic!("revision watch never caught up to gateway revision {target}");
-        };
-        // Start each class from a fresh fence: advance the gateway's revision
-        // and take one throwaway wire call so this mount observes it. That
-        // clears the shared cache (so a "cold" class really is cold) and
-        // restarts the subtree-snapshot miss/quiet window, so no class inherits
-        // another's warmth or trips a bulk snapshot mid-class. The bulk snapshot
-        // has its own coverage in
-        // `sequential_thousand_file_stats_amortize_under_a_live_watch`.
-        let settle = || {
-            gateway.lock().unwrap().revision += 1;
-            assert!(fs.stat_path_attributes("settle-probe").unwrap().is_none());
-        };
-        // (class, ops, round-trip budget, measured counts). The budget is the
-        // regression gate: what the class is allowed to cost, set at the
-        // measured number plus only the slack a documented scheduling detail
-        // needs, so a change that adds a round trip to a class fails the test.
-        let mut rows: Vec<(&'static str, usize, usize, RouteCounts)> = Vec::new();
-
-        // create_journaled: what a create costs when it is only the journaled
-        // append it is designed to be — `enqueue_namespace_creation` for each
-        // path, then the drain that publishes them. Enqueue and drain are
-        // measured as one class on purpose: the worker's 8ms batch window may
-        // fire partway through the loop, so how many batches the 50 creations
-        // split into (one to a handful, plus the one-time lease grant) is a
-        // scheduling detail, while their sum staying near one publication —
-        // rather than one per creation — is the property that matters.
-        let base = sample();
-        for index in 0..CREATE_OPS {
-            fs.enqueue_namespace_creation(
-                VfsNamespaceMutation::CreateFile {
-                    path: format!("queued/new-{index}"),
-                    mode: Some(0o644),
-                },
-                None,
-            )
-            .unwrap();
-        }
-        let journaled_enqueue = sample().since(&base);
-        fs.flush_namespace().unwrap();
-        let create_journaled = sample().since(&base);
-        // Budget 11: at most ten batched publications (the gate against one
-        // publication per creation) plus the one-time /lease grant.
-        rows.push(("create_journaled", CREATE_OPS, 11, create_journaled));
-
-        // create (non-exclusive), the real syscall path: `reserve_file_if_absent`
-        // journals the creation and then confirms the reservation.
-        let base = sample();
-        for index in 0..CREATE_OPS {
-            let metadata = fs
-                .reserve_file_if_absent(&format!("created/new-{index}"), 0o644, false)
-                .unwrap();
-            assert_eq!(metadata.kind, "file");
-        }
-        let create = sample().since(&base);
-        // MEASURED GAP, not a target: this settles at three round trips per
-        // create (two confirmation stats and the publication each create ends
-        // up waiting for). The budget is the structural ceiling of the poll
-        // loop `stat_published_file` runs — four stats plus one publication —
-        // so a slow machine that misses a poll window does not fail the test
-        // while a new round-trip class does. See the assertions below.
-        rows.push(("create", CREATE_OPS, CREATE_OPS / 2, create));
-
-        // create_drain: what is left to publish once those creates return.
-        // Nothing is, because each create already waited out its own
-        // publication.
-        let base = sample();
-        fs.flush_namespace().unwrap();
-        let create_drain = sample().since(&base);
-        // A genuinely deferred create leaves a tail for the drain to publish.
-        rows.push(("create_drain", CREATE_OPS, 2, create_drain));
-
-        // create_write_close: the composite syscall shape the 1,000-file
-        // workload actually runs — create(2), write(2), close(2) per file — as
-        // opposed to the isolated `create` class above. This is the class whose
-        // round trips the user waits on when a build tool or `git checkout`
-        // materializes a tree, so it is the one the per-create budget is set
-        // against.
-        let base = sample();
-        for index in 0..CREATE_OPS {
-            let path = format!("many/file-{index}");
-            // Every publication revokes the parent directory's dentry and inode
-            // in the guest kernel (`PublicationInvalidation::paths` carries the
-            // changed path AND its parent), so the guest must re-LOOKUP the
-            // parent before it can create the next child. That re-lookup is a
-            // FUSE op this mount serves — from cache if the publication it
-            // originated left the parent's metadata serveable, over the wire if
-            // it dropped it. Modelling it here is what makes this class the
-            // measured workload rather than half of it.
-            assert!(fs.stat_path_attributes("many").unwrap().is_some() || index == 0);
-            let metadata = fs.reserve_file_if_absent(&path, 0o644, false).unwrap();
-            fs.cache.put_file(&path, Vec::new(), Some(metadata.clone()));
-            let fh = fs
-                .next_handle(
-                    &path,
-                    Vec::new(),
-                    true,
-                    // Match `create`: a non-exclusive reservation has no
-                    // gateway content baseline. `next_handle` converts this to
-                    // the expect-absent marker carried by the first write.
-                    None,
-                    0o644,
-                    true,
-                    metadata.file_id.clone(),
-                    metadata.link_count,
-                )
-                .unwrap();
-            {
-                let mut handles = fs.lock_handles().unwrap();
-                let state = handles.files.get_mut(&fh).unwrap();
-                state.buffer = format!("contents of {path}").into_bytes();
-                state.dirty = true;
-                state.loaded = true;
-                state.revision = state.revision.saturating_add(1);
-                RemoteFuseFs::mirror_handle_state_locked(&mut handles, fh).unwrap();
-            }
-            // close(2) is a FLUSH followed by a RELEASE; neither is an fsync.
-            fs.flush_handle_immediate(fh, FlushBarrier::Close).unwrap();
-            {
-                let gate = fs.publication_gate_for_handle(fh).unwrap();
-                let _guard = gate.lock().unwrap();
-                fs.flush_handle_immediate_locked(fh, FlushBarrier::Close)
-                    .unwrap();
-                fs.lock_handles().unwrap().files.remove(&fh);
-            }
-        }
-        let create_write_close = sample().since(&base);
-        // `close(2)` no longer waits for its own publication, so this class ends
-        // with writes still queued. Drain them here — OUTSIDE the sample — or
-        // they publish during a later class, advance the revision, and clear the
-        // cache entries that class is measuring (`stat_warm` went 0 -> 25).
-        fs.writes
-            .as_ref()
-            .expect("write journal")
-            .flush()
-            .expect("created files must publish before later operation classes");
-        // Budget ONE publication per create plus the one cold lookup of the
-        // parent directory before it exists. The write carries the creation
-        // (`withdraw_pending_creation` in fuse/namespace.rs), so there is no
-        // namespace publication and no ordering fence to owe it — the class is
-        // exactly its content writes. Anything beyond that is a regression:
-        // this cost 3.00 per op while every create re-stat'd the directory it
-        // had just written into, and 2.02 while the creation still published
-        // separately from the content it was immediately superseded by.
-        rows.push((
-            "create_write_close",
-            CREATE_OPS,
-            CREATE_OPS + 1,
-            create_write_close,
-        ));
-
-        // stat_cold: first touch of a path this mount has never seen.
-        settle();
-        let base = sample();
-        for index in 0..STAT_OPS {
-            assert!(
-                fs.stat_path_attributes(&format!("seed/file-{index}"))
-                    .unwrap()
-                    .is_some()
-            );
-        }
-        let stat_cold = sample().since(&base);
-        // Budget 1 per op: one batched attribute read per unseen path. The two
-        // spare trips tolerate a bulk subtree snapshot being elected inside the
-        // class (/subtree-metadata + /prefetch-subtree), which can only ever
-        // lower the per-path cost.
-        rows.push(("stat_cold", STAT_OPS, STAT_OPS + 2, stat_cold));
-
-        // stat_warm: the same paths again on the same fence. No settle — the
-        // point is that a live watch keeps the fence confirmed so the attrs the
-        // cold pass installed stay servable.
-        let base = sample();
-        for index in 0..STAT_OPS {
-            assert!(
-                fs.stat_path_attributes(&format!("seed/file-{index}"))
-                    .unwrap()
-                    .is_some()
-            );
-        }
-        let stat_warm = sample().since(&base);
-        // Budget 0: the whole point of the fence-confirmed serve.
-        rows.push(("stat_warm", STAT_OPS, 0, stat_warm));
-
-        // readdir: one full directory listing, cold.
-        settle();
-        let base = sample();
-        assert_eq!(fs.dir_entries("seed").unwrap().len(), SEED_FILES);
-        let readdir = sample().since(&base);
-        // Budget 1: one listing, regardless of how many entries it holds.
-        rows.push(("readdir", 1, 1, readdir));
-
-        // readdir_warm: the same listing on the same fence.
-        let base = sample();
-        assert_eq!(fs.dir_entries("seed").unwrap().len(), SEED_FILES);
-        let readdir_warm = sample().since(&base);
-        // Budget 0: a fence-matched listing is served without a wire call.
-        rows.push(("readdir_warm", 1, 0, readdir_warm));
-
-        // readdir_stat: the `ls -l` shape — stat every entry the listing just
-        // returned. The listing installed each child's metadata fenced, so the
-        // whole directory costs the one /tree above and nothing more.
-        let base = sample();
-        for index in 0..SEED_FILES {
-            assert!(
-                fs.stat_path_attributes(&format!("seed/file-{index}"))
-                    .unwrap()
-                    .is_some()
-            );
-        }
-        let readdir_stat = sample().since(&base);
-        rows.push(("readdir_stat", SEED_FILES, 0, readdir_stat));
-
-        // open_cold / open_warm: the FULL stat (`stat_path`), which is what
-        // open(2) resolves through — as opposed to the attribute stat every
-        // class above measures. A full stat promises a content hash, so it can
-        // only be served from a cached entry that carries one.
-        //
-        // Both halves of this used to cost a point `/stat` per file. The warm
-        // half did because the full-stat route had no cache serve at all — 47 of
-        // them per measured `git status` phase. The cold half did because every
-        // bulk route asked the gateway NOT to hash (`max_hash_bytes=0`), so the
-        // /tree listing above installed hashless entries and every open fell
-        // through anyway — the ~30 point stats a status phase still paid after
-        // the warm serve landed. The bulk routes now request a bounded hash, so
-        // the listing's entries are complete and BOTH passes are free: the
-        // budget here is 0, not one stat per file.
-        let base = sample();
-        for index in 0..SEED_FILES {
-            assert!(
-                fs.stat_path(&format!("seed/file-{index}"))
-                    .unwrap()
-                    .is_some()
-            );
-        }
-        let open_cold = sample().since(&base);
-        rows.push(("open_cold", SEED_FILES, 0, open_cold));
-
-        let base = sample();
-        for index in 0..SEED_FILES {
-            assert!(
-                fs.stat_path(&format!("seed/file-{index}"))
-                    .unwrap()
-                    .is_some()
-            );
-        }
-        let open_warm = sample().since(&base);
-        rows.push(("open_warm", SEED_FILES, 0, open_warm));
-
-        // lookup_miss: a negative lookup, the dominant cost of a build tool's
-        // include/module search.
-        settle();
-        let base = sample();
-        for index in 0..STAT_OPS {
-            assert!(
-                fs.stat_path_attributes(&format!("absent/missing-{index}"))
-                    .unwrap()
-                    .is_none()
-            );
-        }
-        let lookup_miss = sample().since(&base);
-        // Budget 1 per op: one batched attribute read, negative-cached fenced.
-        // Same two-trip snapshot tolerance as `stat_cold`.
-        rows.push(("lookup_miss", STAT_OPS, STAT_OPS + 2, lookup_miss));
-
-        // lookup_miss_listed: the SAME negative lookup, but into a directory this
-        // mount has already listed — which is the shape that actually dominates.
-        // Nothing creates a file without the kernel first LOOKUPing the name, and
-        // anything writing a tree (an installer, `git checkout`, a build) lists
-        // the directory on its way in. That listing is a complete, revision-
-        // fenced statement of what the directory contains, so a name absent from
-        // it is absent: answerable locally, no wire call.
-        //
-        // Distinct from `lookup_miss` above on purpose. That one searches
-        // directories it has never read (a compiler's include path, most of which
-        // do not exist), where there is nothing to answer from and a round trip is
-        // the honest cost. Conflating the two hid a per-create round trip behind a
-        // budget that was correct for the other shape.
-        settle();
-        assert!(!fs.dir_entries("seed").unwrap().is_empty());
-        let base = sample();
-        for index in 0..STAT_OPS {
-            assert!(
-                fs.stat_path_attributes(&format!("seed/never-written-{index}"))
-                    .unwrap()
-                    .is_none()
-            );
-        }
-        let lookup_miss_listed = sample().since(&base);
-        // Budget 0: the listing already answered. Anything above this is a round
-        // trip spent re-learning what the mount was just told.
-        rows.push(("lookup_miss_listed", STAT_OPS, 0, lookup_miss_listed));
-
-        // status_cold / status_warm: the `git status` shape. A sequential sweep
-        // over a tree nothing changed — lstat(2) on every path, then open(2) on
-        // it, because git does not stop at the lstat: it opens the entries whose
-        // stat data cannot settle them, plus every .gitignore and ref it walks.
-        // Run twice, with the one write git actually performs mid-status in
-        // between — rewriting its index, which is a namespace publication plus a
-        // content publication on a path unrelated to the tree being scanned.
-        //
-        // Both halves of the sweep must reach the gateway at most once per
-        // unseen path, and the warm sweep not at all.
-        //
-        // The warm sweep was not free: every publication, including this mount's
-        // own, came back on its revision watch as a bare revision and wiped the
-        // entire shared cache, so the second sweep re-read the whole tree. That
-        // is why a measured warm `git status` cost MORE wire calls than a cold
-        // one (179 batched attribute reads against 124).
-        //
-        // The open half then stayed expensive on its own: a full stat is the
-        // only route that promises a content hash, the bulk routes asked the
-        // gateway not to hash, so every open fell through to a point `/stat` —
-        // 30 of them per measured status phase, warm and cold alike. The bulk
-        // routes now request a bounded hash, so the open half rides the lstat
-        // half's batched read and adds nothing.
-        settle();
-        let base = sample();
-        for index in 0..CREATE_OPS {
-            let path = format!("many/file-{index}");
-            assert!(fs.stat_path_attributes(&path).unwrap().is_some());
-            assert!(fs.stat_path(&path).unwrap().is_some());
-        }
-        let status_cold = sample().since(&base);
-        rows.push(("status_cold", CREATE_OPS, CREATE_OPS + 2, status_cold));
-
-        let index_path = "status-index".to_string();
-        let metadata = fs
-            .reserve_file_if_absent(&index_path, 0o644, false)
-            .unwrap();
-        let index_handle = fs
-            .next_handle(
-                &index_path,
-                Vec::new(),
-                true,
-                None,
-                0o644,
-                true,
-                metadata.file_id.clone(),
-                metadata.link_count,
-            )
-            .unwrap();
-        {
-            let mut handles = fs.lock_handles().unwrap();
-            let state = handles.files.get_mut(&index_handle).unwrap();
-            state.buffer = b"index contents".to_vec();
-            state.dirty = true;
-            state.loaded = true;
-            state.revision = state.revision.saturating_add(1);
-            RemoteFuseFs::mirror_handle_state_locked(&mut handles, index_handle).unwrap();
-        }
-        fs.flush_handle_immediate(index_handle, FlushBarrier::Close)
-            .unwrap();
-        fs.lock_handles().unwrap().files.remove(&index_handle);
-        await_watch_catch_up();
-
-        let base = sample();
-        for index in 0..CREATE_OPS {
-            let path = format!("many/file-{index}");
-            assert!(fs.stat_path_attributes(&path).unwrap().is_some());
-            assert!(fs.stat_path(&path).unwrap().is_some());
-        }
-        let status_warm = sample().since(&base);
-        // Budget 0: an unrelated local publication must leave every path it did
-        // not touch serveable at the new fence — for the open half of the sweep
-        // as well as the lstat half.
-        rows.push(("status_warm", CREATE_OPS, 0, status_warm));
-
-        // publish_siblings: what a publication costs the OTHER entries of the
-        // directory it landed in. This is the `.git` shape of a real `git
-        // status`: git creates and removes `index.lock` inside `.git/`, and a
-        // publication's affected set names the changed path AND its parent
-        // directory. A watcher that cannot tell a touched path from a superseded
-        // subtree has to read that parent as a prefix, so one lock file drops the
-        // cached metadata of `config`, `HEAD`, `info/exclude`, every ref and
-        // every loose object — and the next phase re-reads all of them. Measured:
-        // 30 point `/stat` calls over 9 unique `.git` paths per warm status,
-        // against exactly 2 `/namespace-many`, both for `index.lock`.
-        settle();
-        for name in GIT_INTERNALS {
-            assert!(fs.stat_path_attributes(name).unwrap().is_some());
-            assert!(fs.stat_path(name).unwrap().is_some());
-        }
-        await_watch_catch_up();
-        // The lock file's whole life cycle: created, then removed, exactly the
-        // two publications a status phase issues.
-        fs.reserve_file_if_absent("gitdir/index.lock", 0o644, false)
-            .unwrap();
-        fs.flush_namespace().unwrap();
-        fs.enqueue_namespace(
-            VfsNamespaceMutation::DeleteFile {
-                path: "gitdir/index.lock".to_string(),
-                precondition: None,
-            },
-            None,
-        )
-        .unwrap();
-        fs.flush_namespace().unwrap();
-        await_watch_catch_up();
-        let base = sample();
-        for name in GIT_INTERNALS {
-            assert!(fs.stat_path_attributes(name).unwrap().is_some());
-            assert!(fs.stat_path(name).unwrap().is_some());
-        }
-        let publish_siblings = sample().since(&base);
-        // Budget 0: a point mutation supersedes its own path and its parent's
-        // listing. Its siblings' metadata is untouched and must stay serveable.
-        rows.push(("publish_siblings", GIT_INTERNALS.len(), 0, publish_siblings));
-
-        // status_open_cold / status_open_warm: the rest of what a `git status`
-        // does to those same `.git` internals — the full open(2)/read(2)/
-        // close(2) cycle, at the per-path multiplicity a real status showed,
-        // rather than only the metadata resolution the classes above measure.
-        //
-        // This is where the last 30 point `/stat` calls per warm status phase
-        // lived, and neither of the two cache fixes above could reach them:
-        // `open(2)` resolves its path through `stat_path` (served from cache),
-        // but the first `read(2)` then makes the handle resolve its STABLE
-        // ROUTE — "does my path still hold my inode, and what is its metadata
-        // now" — and that route went straight to an unconditional, unbounded
-        // point `/stat` with no cache serve at all. One per open(2), which is
-        // exactly the 30 measured over these 9 paths, and exactly why the count
-        // did not move when the metadata cache got warmer.
-        //
-        // The `.git` internals' bytes are already in the content cache from the
-        // cold pass, so the warm pass owes nothing on any route.
-        let open_read_close = |path: &str, ino: fuser::INodeNo| {
-            let route = fs.resolve_inode_file_route_deferred_hash(ino).unwrap();
-            assert_eq!(route.path, path);
-            let metadata = route.metadata;
-            let (initial, loaded) = fs
-                .cache
-                .get_file_matching(&route.path, &metadata)
-                .map(|bytes| (bytes, true))
-                .unwrap_or_else(|| (Vec::new(), false));
-            let fh = fs
-                .next_handle(
-                    &route.path,
-                    initial,
-                    loaded,
-                    metadata.content_hash.clone(),
-                    super::metadata_mode(&metadata),
-                    false,
-                    metadata.file_id.clone(),
-                    metadata.link_count,
-                )
-                .unwrap();
-            {
-                let gate = fs.publication_gate_for_handle(fh).unwrap();
-                let _guard = gate.lock().unwrap();
-                fs.ensure_handle_loaded_locked(fh).unwrap();
-            }
-            // close(2): FLUSH then RELEASE, neither an fsync.
-            fs.flush_handle_immediate(fh, FlushBarrier::Close).unwrap();
-            fs.lock_handles().unwrap().files.remove(&fh);
-        };
-        // LOOKUP once per path, as the guest kernel does before it leases the
-        // dentry, so the inode carries the identity the handle route checks.
-        let git_internal_inodes = GIT_INTERNALS.map(|name| {
-            let metadata = fs.stat_path_attributes(name).unwrap().expect("exists");
-            fs.attr_for_path(name, &metadata, true).ino
-        });
-        let base = sample();
-        for (index, name) in GIT_INTERNALS.iter().enumerate() {
-            for _ in 0..GIT_INTERNAL_OPENS[index] {
-                open_read_close(name, git_internal_inodes[index]);
-            }
-        }
-        let status_open_cold = sample().since(&base);
-        // Budget: one whole-file read per path the content cache has never held.
-        rows.push((
-            "status_open_cold",
-            GIT_INTERNAL_TOTAL_OPENS,
-            GIT_INTERNALS.len(),
-            status_open_cold,
-        ));
-
-        let base = sample();
-        for (index, name) in GIT_INTERNALS.iter().enumerate() {
-            for _ in 0..GIT_INTERNAL_OPENS[index] {
-                open_read_close(name, git_internal_inodes[index]);
-            }
-        }
-        let status_open_warm = sample().since(&base);
-        // Budget 0: every open(2)/read(2)/close(2) of a path this mount already
-        // holds, at a fence a live watch keeps confirmed, is answered locally.
-        rows.push((
-            "status_open_warm",
-            GIT_INTERNAL_TOTAL_OPENS,
-            0,
-            status_open_warm,
-        ));
-
-        // open_large_cold / open_large: opening a file past the bulk hashing
-        // budget. The bulk routes answer hashless past 1 MiB, so such an entry
-        // cannot stand in for a full stat and the open falls through to a point
-        // `/stat` — which carries no hashing budget, so the gateway reads the
-        // ENTIRE file to hash it. For the multi-GB datasets these sandboxes hold,
-        // an open of a 5 GiB file made the gateway read 5 GiB.
-        //
-        // A file this large is never held in the whole-file content cache, so the
-        // hash has nothing to match; its only remaining consumer is the CAS base
-        // a write chains from, which is established when the handle loads. So the
-        // open serves the hashless entry and bounds what it asks the gateway to
-        // hash on the way through.
-        settle();
-        let hashed_before = gateway
-            .lock()
-            .unwrap()
-            .hashed_bytes
-            .load(AtomicOrdering::Relaxed);
-        let base = sample();
-        let cold = fs
-            .stat_path_hashed(LARGE_FILE, FullStatHash::Deferred)
-            .unwrap()
-            .expect("the large file exists");
-        let open_large_cold = sample().since(&base);
-        assert!(cold.content_hash.is_none());
-        // Budget 1: the one point stat a never-seen path owes, now bounded.
-        rows.push(("open_large_cold", 1, 1, open_large_cold));
-
-        let base = sample();
-        for _ in 0..8 {
-            assert!(
-                fs.stat_path_hashed(LARGE_FILE, FullStatHash::Deferred)
-                    .unwrap()
-                    .is_some()
-            );
-        }
-        let open_large = sample().since(&base);
-        // Budget 0: the hashless entry the bounded stat installed is servable for
-        // this caller at the same fence, so re-opening is free.
-        rows.push(("open_large", 8, 0, open_large));
-        let hashed_large = gateway
-            .lock()
-            .unwrap()
-            .hashed_bytes
-            .load(AtomicOrdering::Relaxed)
-            - hashed_before;
-
-        // ---- INVENTORY: the mutating classes the table previously omitted ----
-        //
-        // The table covered creates and reads but not rewrite, unlink, mkdir,
-        // rename, or chmod, so their round-trip cost was unknown while their
-        // latency was being argued about. A class with no row here is a class
-        // whose cost nobody is watching.
-
-        // rewrite: overwrite an EXISTING file. Measured at ~2x a create in the
-        // arena (48ms vs 21.8ms), which this row either explains as a second
-        // round trip or exonerates.
-        // Modelled as a WARM rewrite: the file was just looked up, so the
-        // handle carries the metadata an open(2) would already have supplied.
-        // Passing None here instead would force a cold load and measure this
-        // test's construction rather than the rewrite path — the exact
-        // instrument-versus-subject confusion that produced two retracted
-        // findings earlier.
-        // Metadata is gathered BEFORE the measurement starts: an open(2) has
-        // already paid for it, and counting it here would attribute this test's
-        // setup to the rewrite path.
-        let known_metadata: Vec<RemoteMetadata> = (0..CREATE_OPS)
-            .map(|index| {
-                fs.stat_path(&format!("many/file-{index}"))
-                    .unwrap()
-                    .expect("file exists")
-            })
-            .collect();
-        let base = sample();
-        for index in 0..CREATE_OPS {
-            let path = format!("many/file-{index}");
-            let known = &known_metadata[index];
-            let fh = fs
-                .next_handle(
-                    &path,
-                    Vec::new(),
-                    true,
-                    known.content_hash.clone(),
-                    0o644,
-                    true,
-                    known.file_id.clone(),
-                    known.link_count,
-                )
-                .unwrap();
-            {
-                let mut handles = fs.lock_handles().unwrap();
-                let state = handles.files.get_mut(&fh).unwrap();
-                state.buffer = format!("rewritten {index}").into_bytes();
-                state.dirty = true;
-                state.loaded = true;
-                state.revision = state.revision.saturating_add(1);
-                RemoteFuseFs::mirror_handle_state_locked(&mut handles, fh).unwrap();
-            }
-            fs.flush_handle_immediate(fh, FlushBarrier::Close).unwrap();
-        }
-        fs.flush_writes().ok();
-        let rewrite = sample().since(&base);
-        rows.push(("rewrite", CREATE_OPS, CREATE_OPS * 2, rewrite));
-
-        // rewrite_trunc_open: `cmd > file` on a file that already exists — the
-        // most common write shape there is, and the one the class above does not
-        // measure. `rewrite` hands `next_handle` a route it resolved BEFORE the
-        // timed window, so it never exercises what `open(2)` with O_TRUNC
-        // actually costs. On the mounted arena that difference is the whole
-        // story: `rewrite` reports one round trip here and 48.5ms — two — there.
-        //
-        // O_TRUNC resolves a FULL route (`RouteMetadata::Full`), which a cached
-        // entry can only satisfy when it carries a content hash
-        // (`full_stat_metadata_is_complete`). So this class answers a specific
-        // question: does the mount's own cache carry hashes for files it just
-        // published, or does every overwrite re-stat over the wire?
-        // Warm exactly as the mounted harness does: it runs a `stat` loop over
-        // these files before its `rewrite` loop, so the entries are cached and
-        // fence-matched when the overwrite starts. Without this the class would
-        // just re-measure `stat_cold`.
-        for index in 0..CREATE_OPS {
-            assert!(
-                fs.stat_path(&format!("many/file-{index}"))
-                    .unwrap()
-                    .is_some()
-            );
-        }
-        // Start quiescent. `close(2)` is async, so the preceding class can still
-        // have writes in flight; a read of a path with a pending write drains the
-        // journal, which would charge this class for the previous one's work.
-        fs.flush_writes().ok();
-        let base = sample();
-        for index in 0..CREATE_OPS {
-            let path = format!("many/file-{index}");
-            // The route an O_TRUNC open must resolve before it may publish. Warm
-            // and fence-matched, so a complete cached entry should answer it.
-            let known = fs.stat_path(&path).unwrap().expect("file exists");
-            let fh = fs
-                .next_handle(
-                    &path,
-                    Vec::new(),
-                    true,
-                    known.content_hash.clone(),
-                    0o644,
-                    true,
-                    known.file_id.clone(),
-                    known.link_count,
-                )
-                .unwrap();
-            {
-                let mut handles = fs.lock_handles().unwrap();
-                let state = handles.files.get_mut(&fh).unwrap();
-                state.buffer = format!("truncated {index}").into_bytes();
-                state.dirty = true;
-                state.loaded = true;
-                state.revision = state.revision.saturating_add(1);
-                RemoteFuseFs::mirror_handle_state_locked(&mut handles, fh).unwrap();
-            }
-            fs.flush_handle_immediate(fh, FlushBarrier::Close).unwrap();
-        }
-        fs.flush_writes().ok();
-        let rewrite_trunc_open = sample().since(&base);
-        // Budget one publication per op plus a small settle allowance. Two per op
-        // means every overwrite is paying a wire stat to re-learn a file this
-        // mount itself last wrote.
-        // MEASURED, and the number is the finding: 3.00 per op — a wire `/stat`
-        // to resolve the O_TRUNC route, plus TWO publications. `close(2)` no
-        // longer forces or waits for its own publication, so the second one is
-        // not the close; it is the journal's 8ms batch window expiring between
-        // iterations because the per-iteration `/stat` outlasts it. Removing the
-        // forced flush was necessary but is not sufficient: a SEQUENTIAL writer
-        // that does any per-file wire work still publishes one file at a time,
-        // because a time window only batches writers that overlap in time.
-        //
-        // Batching this shape needs the write to be enqueued and the NEXT file
-        // started without a wire round trip in between — i.e. it is gated on the
-        // read-side round trips (the negative lookup and this `/stat`), not on
-        // the journal. Budgeted at what it costs today so the gate is honest.
-        rows.push((
-            "rewrite_trunc_open",
-            CREATE_OPS,
-            CREATE_OPS * 3,
-            rewrite_trunc_open,
-        ));
-
-        // unlink: the delete half of the create/delete cycle every build runs.
-        // NOT batchable: `enqueue_namespace_creation` asserts "only creations
-        // may publish asynchronously", so every delete is its own synchronous
-        // publication. That asymmetry — creates amortize to ~0.06 round trips
-        // each, deletes cost a full one — is the finding, not an implementation
-        // detail. A `rm -rf` pays one round trip per file.
-        let base = sample();
-        for index in 0..CREATE_OPS {
-            fs.commit_namespace(VfsNamespaceMutation::DeleteFile {
-                path: format!("queued/new-{index}"),
-                precondition: None,
-            })
-            .ok();
-        }
-        let unlink = sample().since(&base);
-        rows.push(("unlink_sync", CREATE_OPS, CREATE_OPS * 2, unlink));
-
-        // mkdir: directory creation, which a checkout does once per tree level.
-        let base = sample();
-        for index in 0..CREATE_OPS {
-            fs.enqueue_namespace_creation(
-                VfsNamespaceMutation::CreateDirectory {
-                    path: format!("dirs/d-{index}"),
-                    mode: Some(0o755),
-                },
-                None,
-            )
-            .unwrap();
-        }
-        fs.flush_namespace().unwrap();
-        let mkdir_journaled = sample().since(&base);
-        rows.push(("mkdir_journaled", CREATE_OPS, 11, mkdir_journaled));
-
-        // rename: the atomic-replace shape every editor and compiler uses to
-        // write a file safely (write temp, rename over target).
-        // Also synchronous, for the same reason. This is the atomic-replace
-        // shape every editor and compiler uses (write temp, rename over target).
-        let base = sample();
-        for index in 0..CREATE_OPS {
-            fs.commit_namespace(VfsNamespaceMutation::Rename {
-                from: format!("many/file-{index}"),
-                to: format!("many/renamed-{index}"),
-            })
-            .ok();
-        }
-        let rename_sync = sample().since(&base);
-        rows.push(("rename_sync", CREATE_OPS, CREATE_OPS * 2, rename_sync));
-
-        // chmod: `chmod +x` after a build, and the mode-preservation path that
-        // any create/write merge must not regress.
-        // `chmod +x` after a build. Synchronous too, and the mode-preservation
-        // path any create/write merge must not regress.
-        let base = sample();
-        for index in 0..CREATE_OPS {
-            fs.commit_namespace(VfsNamespaceMutation::SetMode {
-                path: format!("many/renamed-{index}"),
-                mode: 0o755,
-            })
-            .ok();
-        }
-        let chmod_sync = sample().since(&base);
-        rows.push(("chmod_sync", CREATE_OPS, CREATE_OPS * 2, chmod_sync));
-
-        println!("\ngateway round trips per filesystem operation");
-        println!(
-            "{:<15} {:>5} {:>12} {:>8}  {}",
-            "class", "ops", "round_trips", "per_op", "routes"
-        );
-        for (class, ops, _, counts) in &rows {
-            println!(
-                "{:<15} {:>5} {:>12} {:>8.2}  {}",
-                class,
-                ops,
-                counts.charged(),
-                counts.charged() as f64 / *ops as f64,
-                counts.breakdown()
-            );
-        }
-        println!(
-            "(revision-watch long polls, never on an operation's path: {})",
-            sample().watch
-        );
-
-        // Mechanism: `enqueue_namespace_creation` durably journals and projects
-        // the creation and returns; publishing it is the journal worker's job,
-        // behind the syscall. The enqueue path itself never stats — that is the
-        // exact contrast with the create syscall measured below, and unlike the
-        // publication count it cannot be perturbed by the worker's batch window
-        // firing mid-loop.
-        assert_eq!(
-            journaled_enqueue.stat, 0,
-            "a journaled creation must be a local append, not a confirmation stat"
-        );
-        // Mechanism: the journal worker coalesces every mutation queued inside
-        // its batch window into one /namespace-many. 50 queued creations must
-        // not become 50 publications.
-        assert!(
-            create_journaled.namespace_many <= 10,
-            "50 queued creations published as {} batches",
-            create_journaled.namespace_many
-        );
-
-        // Mechanism: an ordinary create is a durable journal append answered
-        // from its own projection, so the syscall reaches the gateway not at
-        // all. What remains on this row is the journal worker's batched
-        // publications landing while the loop runs — off the syscall path, and
-        // far fewer than one per create.
-        //
-        // This previously cost 3.00 round trips per create: the reservation was
-        // confirmed through `cached_published_file`, whose cache the projection
-        // never populates (siblings must not observe an unpublished mutation),
-        // so it fell through to polling `/stat` until the worker published.
-        // That made every create wait out its own publication and sleep through
-        // the batch window, so each mutation published alone.
-        assert_eq!(
-            create.charged(),
-            create.stat + create.namespace_many,
-            "the create path must reach only /stat and /namespace-many: {}",
-            create.breakdown()
-        );
-        // Publications must batch: one per create means the deferral is not
-        // working, even when the syscall itself no longer blocks on it.
-        assert!(
-            create.namespace_many <= CREATE_OPS / 2,
-            "creates published {} batches for {CREATE_OPS} creates",
-            create.namespace_many
-        );
-        // A create must never confirm itself through the gateway: the moment it
-        // does, it waits out its own publication and publishes alone.
-        assert_eq!(
-            create.stat,
-            0,
-            "creates must not issue confirmation stats: {}",
-            create.breakdown()
-        );
-        // Mechanism: a content publication supersedes the file it wrote and, when
-        // that write CREATED the file, its parent — which the gateway then
-        // snapshots back in the same response (`post_write_many` in
-        // crates/sandbox/src/vfs.rs). Evicting the parent without seeding it
-        // back, or an overwrite naming a parent it did not change, both show up
-        // here as a wire round trip per create to re-learn one directory.
-        assert!(
-            create_write_close.metadata_many <= 1,
-            "creates re-stat'd their parent directory {} times: {}",
-            create_write_close.metadata_many,
-            create_write_close.breakdown()
-        );
-        // Mechanism: the write carries the creation, so a create/write/close
-        // publishes ONCE. A namespace publication here means the fold stopped
-        // working — either the creation drained before the write could withdraw
-        // it, or the withdrawal is no longer attempted — and the class silently
-        // doubles.
-        assert_eq!(
-            create_write_close.namespace_many,
-            0,
-            "create/write/close published its creation separately from the content \
-             that supersedes it: {}",
-            create_write_close.breakdown()
-        );
-        // Mechanism: an ordinary close is not a publication barrier, so the only
-        // traffic a create/write/close owes is its own content write.
-        assert_eq!(
-            create_write_close.charged(),
-            create_write_close.write_many + create_write_close.metadata_many,
-            "create/write/close reached a route it has no business on: {}",
-            create_write_close.breakdown()
-        );
-        // Mechanism: a live revision watch keeps this mount's coherence fence
-        // continuously confirmed, so `stat_path_attributes` serves a
-        // fence-matched cached attribute with no wire call at all.
-        assert_eq!(
-            stat_warm.charged(),
-            0,
-            "warm stats under a live watch must not touch the gateway"
-        );
-        // Mechanism: the full stat (`stat_path`, the open(2) route) serves from
-        // the same fence-matched cache as the attribute stat, provided the
-        // cached entry is complete. The listing above installed each child's
-        // content hash, so it is — that is the whole point of the bulk routes
-        // asking for a bounded hash instead of none. Assert on the COLD pass:
-        // an open of a file this mount has never point-stat'd, only listed,
-        // must not reach the gateway at all. This class cost one /stat per file
-        // while the bulk routes sent `max_hash_bytes=0`.
-        assert_eq!(
-            open_cold.charged(),
-            0,
-            "opening files a listing already described must not point-stat them: {}",
-            open_cold.breakdown()
-        );
-        assert_eq!(
-            open_warm.charged(),
-            0,
-            "opening files a listing already described must not re-stat them: {}",
-            open_warm.breakdown()
-        );
-        // Mechanism: a publication reports its exact affected set on the
-        // revision watch, and the shared cache applies that set instead of
-        // clearing itself. An unrelated local write — git rewriting its index
-        // mid-status — must leave every other path serveable, or a warm status
-        // re-reads the entire tree and costs MORE than a cold one.
-        assert_eq!(
-            status_warm.charged(),
-            0,
-            "a warm status sweep after an unrelated publication cost {}",
-            status_warm.breakdown()
-        );
-        // Mechanism: the open half of a status sweep rides the batched read the
-        // lstat half already paid for, because that read now carries the content
-        // hash a full stat owes. A status phase must issue NO point stats — this
-        // was 30 of them per measured phase, cold and warm alike.
-        assert_eq!(
-            (status_cold.stat, status_warm.stat),
-            (0, 0),
-            "status sweeps point-stat'd for their opens: cold {} / warm {}",
-            status_cold.breakdown(),
-            status_warm.breakdown()
-        );
-        // Mechanism: a publication reports the paths it TOUCHED separately from
-        // the prefixes whose whole subtree it SUPERSEDED, and only the second
-        // set may evict descendants. Without the split every affected path is a
-        // prefix, and a publication's affected set always names the changed
-        // path's parent directory — so creating and removing `.git/index.lock`
-        // wipes every `.git` internal this mount had cached, twice per status.
-        assert_eq!(
-            publish_siblings.charged(),
-            0,
-            "a lock file's publication cost its {} innocent siblings {}",
-            GIT_INTERNALS.len(),
-            publish_siblings.breakdown()
-        );
-        // Mechanism: an open handle's route resolution answers "does my path
-        // still hold my inode" from a fence-matched, complete cache entry whose
-        // file_id IS that inode, instead of re-reading it over the wire. This
-        // was the last unconditional point `/stat` on a read path: 30 per warm
-        // status phase, one per open(2), unmoved by every cache fix because the
-        // route never consulted the cache.
-        assert_eq!(
-            status_open_warm.charged(),
-            0,
-            "warm open/read/close of {GIT_INTERNAL_TOTAL_OPENS} already-held opens cost {}",
-            status_open_warm.breakdown()
-        );
-        assert_eq!(
-            status_open_cold.stat,
-            0,
-            "opening files a batched read already described must not point-stat them: {}",
-            status_open_cold.breakdown()
-        );
-        // Mechanism: a file past the whole-file content cache has no use for a
-        // content hash at open, so the open serves the hashless entry and bounds
-        // the hashing budget of the point stat it falls through to. The gateway
-        // must therefore never read the file's contents to answer an open.
-        assert_eq!(
-            (open_large_cold.stat, open_large.stat),
-            (1, 0),
-            "opening a large file cost point stats: cold {} / warm {}",
-            open_large_cold.breakdown(),
-            open_large.breakdown()
-        );
-        assert_eq!(
-            hashed_large, 0,
-            "opening a large file made the gateway hash (i.e. read) {hashed_large} bytes of it"
-        );
-        // Mechanism: `dir_entries` takes one authoritative listing and installs
-        // both the listing and every child's metadata, so a directory costs one
-        // round trip regardless of how many entries it holds.
-        assert!(
-            readdir.tree <= 1,
-            "readdir issued {} /tree requests",
-            readdir.tree
-        );
-        assert_eq!(
-            readdir_warm.charged(),
-            0,
-            "a fence-matched listing must be served without a wire call"
-        );
-        assert_eq!(
-            readdir_stat.charged(),
-            0,
-            "stat of every listed child must be served off the listing's metadata"
-        );
-        // Mechanism: `MetadataBatcher` routes a negative lookup through the same
-        // batched attribute read as a positive one, and the negative result is
-        // cached fenced, so a miss is one round trip and never a per-path stat.
-        assert_eq!(
-            lookup_miss.stat, 0,
-            "negative lookups must not fall back to point stats"
-        );
-        // Per-class gate. Every read class is at or under two round trips per
-        // op — the bar a 100-500ms budget needs to survive a realistic RTT —
-        // and `create` is pinned at the gap documented above.
-        for (class, ops, budget, counts) in &rows {
-            assert!(
-                counts.charged() <= *budget,
-                "{class} cost {} round trips for {ops} ops (budget {budget}): {}",
-                counts.charged(),
-                counts.breakdown()
-            );
-        }
-
-        drop(fs);
-        server.abort();
     }
 }
 
 /// FUSE operation bodies. Dispatched concurrently by `SpawnedFuseFs`
 /// (fuse/dispatch.rs), which owns the actual `fuser::Filesystem` impl —
 /// every method here may run on a worker thread and must stay `&self`-safe.
+///
+/// Every one of them is served by the mount-local view: reads go straight to the
+/// backing tree and take no journal, cache or ordering lock at all, and every
+/// mutation is `validate -> WAL prepare -> one atomic backing syscall ->
+/// commit`. No ordinary callback calls the gateway. The two exceptions are
+/// deliberate and documented where they occur: `getlk`/`setlk`, which are
+/// cross-VM POSIX arbitration rather than mount-local state.
 impl RemoteFuseFs {
     pub(super) fn init_op(&self, config: &mut KernelConfig) -> io::Result<()> {
         let requested = self.requested_init_capabilities();
@@ -10938,68 +2293,43 @@ impl RemoteFuseFs {
                 error
             })?;
             let child_path = Self::child_path(parent_path.as_str(), name)?;
-            let was_known = self
-                .lock_inodes()
-                .map(|inodes| inodes.knows_path(&child_path))
-                .unwrap_or(false);
-            let Some(metadata) = self.stat_path_attributes(&child_path)? else {
-                if was_known {
-                    tracing::warn!(
-                        path = child_path,
-                        parent_ino = parent.0,
-                        "vfs known pathname became absent during lookup"
-                    );
-                }
+            let Some(metadata) = self.local.tree().lstat(&child_path).map_err(errno_for)? else {
                 return Err(Errno::ENOENT);
             };
             Ok(self.attr_for_path(&child_path, &metadata, true))
         })();
         match result {
-            // A positive hit is leased to the kernel (watch-gated). ENOENT is
-            // deliberately NOT negatively cached (no ino=0 + TTL reply): a
-            // negative dentry carries no inode this mount tracks, so the remote
-            // full-sweep path (which walks this mount's inodes) could not revoke
-            // it, leaving a cross-process create invisible for up to the lease.
-            // Leaving it uncached keeps negative lookups strict; the dominant
-            // cost the lease targets is warm stats of paths that exist.
+            // A positive hit is leased for `REPLY_ATTR_TTL`. ENOENT is still not
+            // negatively cached: a negative dentry carries no inode this mount
+            // tracks, so a read-only observer's follower could not revoke it, and
+            // for a writable mount a local `lstat` miss is already free.
             Ok(attr) => reply.entry(&self.reply_ttl(), &attr, Generation(0)),
             Err(err) => reply.error(err),
         }
     }
 
     pub(super) fn getattr(&self, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
-        if ino == ROOT_INO {
-            reply.attr(&self.reply_ttl(), &self.root_attr());
-            return;
-        }
         let result: FuseResult<FileAttr> = (|| {
-            let handle = match fh {
-                Some(fh) if self.lock_handles()?.files.contains_key(&fh.0) => Some(fh.0),
-                _ => self.open_handle_for_inode(ino)?,
-            };
-            if let Some(fh) = handle {
-                let gate = self.publication_gate_for_handle(fh)?;
-                let _guard = gate.lock().map_err(|_| Errno::EIO)?;
-                let state = self
-                    .lock_handles()?
-                    .files
-                    .get(&fh)
-                    .cloned()
-                    .ok_or(Errno::ENOENT)?;
-                let route = if Self::handle_metadata_needs_remote_route(&state) {
-                    Some(self.resolve_handle_route_locked(fh)?)
-                } else {
-                    None
-                };
-                let authoritative = match route.as_ref() {
-                    Some(StableFileRoute::Linked(route)) => Some(&route.metadata),
-                    Some(StableFileRoute::Unlinked) | None => None,
-                };
-                let metadata = self.metadata_for_handle_state(&state, authoritative);
-                return Ok(self.attr_for_metadata(ino, &metadata, true));
+            // An explicit descriptor is authoritative: `fstat(2)` describes the
+            // open file description, not whatever the name holds now.
+            if let Some(fh) = fh
+                && let Ok(state) = self.handle_state(fh.0)
+            {
+                let metadata = state.file.metadata().map_err(errno_for)?;
+                return Ok(self.attr_for_metadata(ino, &metadata));
             }
-            let route = self.resolve_inode_file_route_attributes(ino)?;
-            Ok(self.attr_for_metadata(ino, &route.metadata, false))
+            if ino == ROOT_INO {
+                return Ok(self.root_attributes());
+            }
+            let path = self.path_for_ino(ino)?;
+            if let Some(metadata) = self.local.tree().lstat(&path).map_err(errno_for)? {
+                return Ok(self.attr_for_metadata(ino, &metadata));
+            }
+            // The name is gone. Recover the description from the inode rather
+            // than answering ENOENT for a file the guest still holds open.
+            let state = self.open_handle_for_inode(ino)?.ok_or(Errno::ENOENT)?;
+            let metadata = state.file.metadata().map_err(errno_for)?;
+            Ok(self.attr_for_metadata(ino, &metadata))
         })();
         match result {
             Ok(attr) => reply.attr(&self.reply_ttl(), &attr),
@@ -11010,11 +2340,12 @@ impl RemoteFuseFs {
     pub(super) fn readlink(&self, ino: INodeNo, reply: ReplyData) {
         let result: FuseResult<Vec<u8>> = (|| {
             let path = self.path_for_ino(ino)?;
-            let metadata = self.stat_path_attributes(&path)?.ok_or(Errno::ENOENT)?;
-            if metadata.kind != "symlink" {
-                return Err(Errno::EINVAL);
-            }
-            let target = metadata.link_target.ok_or(Errno::EINVAL)?;
+            let target = self
+                .local
+                .tree()
+                .read_link(&path)
+                .map_err(errno_for)?
+                .ok_or(Errno::ENOENT)?;
             Ok(target.into_bytes())
         })();
         match result {
@@ -11023,15 +2354,22 @@ impl RemoteFuseFs {
         }
     }
 
+    /// `setattr`. Every field the kernel sends is now applied to the backing
+    /// tree and journalled, including the ones this filesystem used to drop on
+    /// the floor: `uid`/`gid` become `SetOwner` and `atime`/`mtime` become
+    /// `SetTimes`. Both are classified local-only by the publisher (the gateway
+    /// contract has no field for either), so the divergence is recorded in the
+    /// log instead of being invisible.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn setattr(
         &self,
         ino: INodeNo,
         mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
@@ -11042,97 +2380,85 @@ impl RemoteFuseFs {
     ) {
         let result: FuseResult<FileAttr> = (|| {
             if ino == ROOT_INO {
+                // The mount root is the mountpoint, not an entry in the scope:
+                // no mutation can name it, so a setattr against it reports the
+                // root's attributes and changes nothing.
                 if size.is_some() {
                     return Err(Errno::EISDIR);
                 }
-                return Ok(self.root_attr());
+                return Ok(self.root_attributes());
             }
+            let handle = fh.and_then(|fh| self.handle_state(fh.0).ok());
+            let path = match handle.as_ref() {
+                Some(state) => state.path.clone(),
+                None => self.path_for_ino(ino)?,
+            };
+            // A descriptor whose name no longer resolves is an unlinked-but-open
+            // file. Its metadata is observable only through that descriptor and
+            // has no remote name to be published under, so it is applied to the
+            // descriptor directly and deliberately not journalled.
+            let detached = match handle.as_ref() {
+                Some(_) => self.local.tree().lstat(&path).map_err(errno_for)?.is_none(),
+                None => false,
+            };
 
-            if let Some(fh) = fh {
-                if self.lock_handles()?.files.contains_key(&fh.0) {
-                    let gate = self.publication_gate_for_handle(fh.0)?;
-                    let _guard = gate.lock().map_err(|_| Errno::EIO)?;
-                    let requested_mode = mode.map(normalize_mode);
-                    let mode_change_required = {
-                        let handles = self.lock_handles()?;
-                        let state = handles.files.get(&fh.0).ok_or(Errno::ENOENT)?;
-                        mode_change_required(state.mode, requested_mode)
-                    };
-                    if size.is_some() || mode_change_required {
-                        // Truncating to ZERO discards every existing byte, so
-                        // loading them first is a wire round trip spent fetching
-                        // data the very next line drops. `cmd > file` is exactly
-                        // this shape — the kernel truncates through setattr — and
-                        // it is why a rewrite cost two round trips while an
-                        // append to the same warm file cost one. Any other size
-                        // keeps the load: a shrink or a grow preserves the
-                        // surviving prefix, so those bytes must be present.
-                        if size != Some(0) {
-                            self.ensure_handle_loaded_locked(fh.0)?;
-                        }
-                        let mut handles = self.lock_handles()?;
-                        let state = handles.files.get_mut(&fh.0).ok_or(Errno::ENOENT)?;
-                        if let Some(size) = size {
-                            state.buffer.resize(size as usize, 0);
-                        }
-                        if let Some(mode) = requested_mode {
-                            state.mode = mode;
-                        }
-                        state.dirty = true;
-                        state.loaded = true;
-                        state.revision = state.revision.saturating_add(1);
-                        Self::mirror_handle_state_locked(&mut handles, fh.0)?;
-                    }
-                    // A real fchmod is a publication point. Repeating the mode
-                    // already established by CREATE/open is not: for a new file
-                    // that exact mode is already carried by its durable content
-                    // WAL entry, and forcing it through here collapses the
-                    // package installer's whole write batch to one file.
-                    if mode_change_required {
-                        self.flush_handle_immediate_locked(fh.0, FlushBarrier::Durable)?;
-                    }
-
-                    let state = {
-                        let handles = self.lock_handles()?;
-                        handles.files.get(&fh.0).cloned()
-                    }
-                    .ok_or(Errno::ENOENT)?;
-                    let route = if Self::handle_metadata_needs_remote_route(&state) {
-                        Some(self.resolve_handle_route_locked(fh.0)?)
-                    } else {
-                        None
-                    };
-                    let authoritative = match route.as_ref() {
-                        Some(StableFileRoute::Linked(route)) => Some(&route.metadata),
-                        Some(StableFileRoute::Unlinked) | None => None,
-                    };
-                    let metadata = self.metadata_for_handle_state(&state, authoritative);
-                    return Ok(self.attr_for_metadata(ino, &metadata, true));
-                }
-            }
-
-            let path = self.path_for_ino(ino)?;
-            if let Some(metadata) =
-                self.mutate_created_handle_for_path(&path, size, mode.map(normalize_mode))?
-            {
-                return Ok(self.attr_for_path(&path, &metadata, false));
-            }
+            // Size first: POSIX applies these independently, and ordering a
+            // truncate behind a chmod in the log would describe a generation the
+            // guest never observed.
             if let Some(size) = size {
-                let mut attr = self.resize_path_immediate(&path, size)?;
-                if let Some(mode) = mode {
-                    attr.perm = self.set_mode_path_immediate(&path, mode)?.perm;
+                match handle.as_ref() {
+                    Some(state) if detached => state.file.truncate(size).map_err(errno_for)?,
+                    Some(state) => {
+                        self.local.truncate(&state.file, size).map_err(errno_for)?;
+                    }
+                    None => {
+                        self.local.truncate_path(&path, size).map_err(errno_for)?;
+                    }
                 }
-                return Ok(attr);
             }
             if let Some(mode) = mode {
-                return self.set_mode_path_immediate(&path, mode);
+                let mode = normalize_mode(mode);
+                match handle.as_ref() {
+                    Some(state) if detached => state.file.set_mode(mode).map_err(errno_for)?,
+                    _ => {
+                        self.local.set_mode(&path, mode).map_err(errno_for)?;
+                    }
+                }
             }
-            // atime/mtime-only SETATTR is intentionally metadata-neutral in
-            // this VFS implementation. It needs attributes for the reply, not a
-            // content hash, so use the attribute route: it can serve a pending
-            // namespace/write projection locally and never hashes file bytes.
-            let metadata = self.stat_path_attributes(&path)?.ok_or(Errno::ENOENT)?;
-            Ok(self.attr_for_path(&path, &metadata, false))
+            if uid.is_some() || gid.is_some() {
+                match handle.as_ref() {
+                    Some(state) if detached => state.file.set_owner(uid, gid).map_err(errno_for)?,
+                    _ => {
+                        self.local.set_owner(&path, uid, gid).map_err(errno_for)?;
+                    }
+                }
+            }
+            if atime.is_some() || mtime.is_some() {
+                let atime = atime.map(local_timestamp_of);
+                let mtime = mtime.map(local_timestamp_of);
+                match handle.as_ref() {
+                    Some(state) if detached => {
+                        state.file.set_times(atime, mtime).map_err(errno_for)?
+                    }
+                    _ => {
+                        self.local
+                            .set_times(&path, atime, mtime)
+                            .map_err(errno_for)?;
+                    }
+                }
+            }
+
+            if let Some(state) = handle.as_ref() {
+                let metadata = state.file.metadata().map_err(errno_for)?;
+                return Ok(self.attr_for_metadata(ino, &metadata));
+            }
+            let metadata = self
+                .local
+                .tree()
+                .lstat(&path)
+                .map_err(errno_for)?
+                .ok_or(Errno::ENOENT)?;
+            Ok(self.attr_for_metadata(ino, &metadata))
         })();
         match result {
             Ok(attr) => reply.attr(&self.reply_ttl(), &attr),
@@ -11140,48 +2466,70 @@ impl RemoteFuseFs {
         }
     }
 
-    pub(super) fn opendir(&self, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        reply.opened(FileHandle(0), FopenFlags::empty());
+    pub(super) fn opendir(&self, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let result: FuseResult<u64> = (|| {
+            let path = self.path_for_ino(ino)?;
+            self.next_dir_handle(&path)
+        })();
+        match result {
+            Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
+            Err(err) => reply.error(err),
+        }
+    }
+
+    pub(super) fn releasedir(&self, _ino: INodeNo, fh: FileHandle, reply: ReplyEmpty) {
+        if let Ok(mut dirs) = self.lock_dirs() {
+            dirs.dirs.remove(&fh.0);
+        }
+        reply.ok();
     }
 
     pub(super) fn readdir(
         &self,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
         let result: FuseResult<()> = (|| {
             let path = self.path_for_ino(ino)?;
-            let mut entries: Vec<(INodeNo, FileType, String)> = vec![
-                (ino, FileType::Directory, ".".to_string()),
-                (
-                    self.ensure_ino(Self::parent_path(&path).as_str()),
-                    FileType::Directory,
-                    "..".to_string(),
-                ),
-            ];
-            for entry in self.dir_entries(&path)? {
-                let child_path = if path.is_empty() {
-                    entry.name.clone()
-                } else {
-                    format!("{}/{}", path, entry.name)
+            let entries = self
+                .dir_listing(fh.0, &path, offset)?
+                .ok_or(Errno::ENOENT)?;
+            let parent_ino = self.ensure_ino(Self::parent_path(&path).as_str());
+            // Offsets index `[".", "..", <sorted children>]`, and the children
+            // come from the cursor's snapshot, so a continuation round addresses
+            // the same child it did on the previous one.
+            let mut index = offset;
+            loop {
+                let full = match index {
+                    0 => (ino, FileType::Directory, ".".to_string()),
+                    1 => (parent_ino, FileType::Directory, "..".to_string()),
+                    _ => {
+                        let Some(entry) = entries.get((index - 2) as usize) else {
+                            break;
+                        };
+                        let child_path = Self::join_child(&path, &entry.name);
+                        let child_ino = self
+                            .lock_inodes()
+                            .map(|mut inodes| {
+                                inodes.ensure_with_identity(
+                                    &child_path,
+                                    Some(entry.metadata.local_identity.as_str()),
+                                )
+                            })
+                            .unwrap_or(ROOT_INO);
+                        (
+                            child_ino,
+                            file_type_for_kind(entry.metadata.kind),
+                            entry.name.clone(),
+                        )
+                    }
                 };
-                let child_ino = self
-                    .lock_inodes()
-                    .map(|mut inodes| {
-                        inodes.ensure_with_identity(&child_path, entry.file_id.as_deref())
-                    })
-                    .unwrap_or(ROOT_INO);
-                let file_type = file_type_for_kind(&entry.kind);
-                entries.push((child_ino, file_type, entry.name));
-            }
-            for (index, (entry_ino, kind, name)) in
-                entries.into_iter().enumerate().skip(offset as usize)
-            {
-                if reply.add(entry_ino, (index + 1) as u64, kind, name) {
+                if reply.add(full.0, index + 1, full.1, full.2) {
                     break;
                 }
+                index += 1;
             }
             Ok(())
         })();
@@ -11191,89 +2539,50 @@ impl RemoteFuseFs {
         }
     }
 
-    /// One directory listing primes every child's inode and metadata cache
-    /// entry, so a tree scan costs one wire call per directory instead of one
-    /// per file (the kernel skips per-child lookup/getattr for entries
-    /// returned here).
+    /// One directory listing primes every child's inode and attributes, so a
+    /// tree scan costs one `read_dir` per directory instead of a lookup plus a
+    /// getattr per file (the kernel skips both for entries returned here).
     pub(super) fn readdirplus(
         &self,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         mut reply: fuser::ReplyDirectoryPlus,
     ) {
-        let directory_metadata = || RemoteMetadata {
-            kind: "directory".to_string(),
-            size_bytes: 0,
-            file_id: None,
-            link_count: 2,
-            link_target: None,
-            content_hash: None,
-            executable: false,
-            mode: Some(0o755),
-            updated_at: None,
-        };
         let result: FuseResult<()> = (|| {
             let path = self.path_for_ino(ino)?;
-            let parent_ino = self.ensure_ino(Self::parent_path(&path).as_str());
-            let mut entries: Vec<(INodeNo, String, RemoteMetadata)> = vec![
-                (ino, ".".to_string(), directory_metadata()),
-                (parent_ino, "..".to_string(), directory_metadata()),
-            ];
-            for entry in self.dir_entries(&path)? {
-                let child_path = if path.is_empty() {
-                    entry.name.clone()
-                } else {
-                    format!("{}/{}", path, entry.name)
-                };
-                let metadata = RemoteMetadata {
-                    kind: entry.kind,
-                    size_bytes: entry.size_bytes,
-                    file_id: entry.file_id,
-                    link_count: entry.link_count,
-                    link_target: entry.link_target,
-                    content_hash: entry.content_hash,
-                    executable: entry.executable,
-                    mode: entry.mode,
-                    updated_at: entry.updated_at,
-                };
-                let child_ino = self
-                    .lock_inodes()
-                    .map(|mut inodes| {
-                        inodes.ensure_with_identity(&child_path, metadata.file_id.as_deref())
-                    })
-                    .unwrap_or(ROOT_INO);
-                entries.push((child_ino, entry.name, metadata));
-            }
-            // Readdirplus hands the kernel a dentry AND attrs per child; lease
-            // them exactly as lookup/getattr do (watch-gated), chosen once for
-            // this reply's assembly.
+            let entries = self
+                .dir_listing(fh.0, &path, offset)?
+                .ok_or(Errno::ENOENT)?;
+            let parent_path = Self::parent_path(&path);
+            let parent_ino = self.ensure_ino(parent_path.as_str());
             let ttl = self.reply_ttl();
-            for (index, (_entry_ino, name, metadata)) in
-                entries.into_iter().enumerate().skip(offset as usize)
-            {
-                let dot_entry = name == "." || name == "..";
-                let entry_path = if dot_entry {
-                    path.clone()
-                } else if path.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{}/{}", path, name)
+            let mut index = offset;
+            loop {
+                // Dot entries never count as kernel lookups (no FORGET arrives
+                // for them); every named child does.
+                let (entry_ino, name, attr) = match index {
+                    0 => {
+                        let attr = self.directory_attributes(ino, &path);
+                        (ino, ".".to_string(), attr)
+                    }
+                    1 => {
+                        let attr = self.directory_attributes(parent_ino, &parent_path);
+                        (parent_ino, "..".to_string(), attr)
+                    }
+                    _ => {
+                        let Some(entry) = entries.get((index - 2) as usize) else {
+                            break;
+                        };
+                        let child_path = Self::join_child(&path, &entry.name);
+                        let attr = self.attr_for_path(&child_path, &entry.metadata, true);
+                        (attr.ino, entry.name.clone(), attr)
+                    }
                 };
-                // Children count as kernel lookups (a forget arrives for each
-                // later); dot entries never do.
-                let attr = self.attr_for_path(&entry_path, &metadata, !dot_entry);
-                let entry_ino = attr.ino;
-                if reply.add(
-                    entry_ino,
-                    (index + 1) as u64,
-                    name,
-                    &ttl,
-                    &attr,
-                    Generation(0),
-                ) {
+                if reply.add(entry_ino, index + 1, name, &ttl, &attr, Generation(0)) {
                     break;
                 }
+                index += 1;
             }
             Ok(())
         })();
@@ -11285,95 +2594,12 @@ impl RemoteFuseFs {
 
     pub(super) fn open(&self, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let result: FuseResult<u64> = (|| {
-            let truncate = flags.0 & libc::O_TRUNC != 0;
-            // An ordinary open uses the content hash for two things, and neither
-            // applies to a file the whole-file cache cannot hold: matching
-            // cached bytes (`get_file_matching`, which has nothing to match) and
-            // seeding the handle's CAS base — which, for a handle that must load
-            // before it can be written, is re-established authoritatively by
-            // that load. So such an open defers the hash rather than making the
-            // gateway read a multi-GB file to produce one.
-            //
-            // O_TRUNC used to be the exception and keep the unbounded stat, to
-            // preserve the content CAS base it publishes from. That cost a wire
-            // round trip on the single most common write shape there is:
-            // `cmd > file` opens O_TRUNC, and an unbounded stat cannot be served
-            // from a cached entry that carries no hash. It is why a rewrite
-            // measured 48.6ms against a 24ms single round trip on the mounted
-            // arena — one stat, then the publication.
-            //
-            // A content fingerprint is also the wrong guard here. O_TRUNC
-            // discards the file's contents before a single byte is written, so
-            // there is no read-modify-write to protect: the caller has already
-            // declared the previous bytes irrelevant. What still matters is that
-            // the pathname denotes the SAME inode it did at open — an unlink and
-            // recreate underneath must not be silently overwritten — and that is
-            // the identity precondition, which needs no hash.
-            //
-            // Deferring the hash is NOT enough, which cost a round of measurement
-            // to learn: `deferred_hash_is_safe` admits a hashless cached entry
-            // only for files ABOVE the content-cache ceiling, so an ordinary
-            // small file still demanded a hash-bearing entry — and the entry a
-            // `getattr` leaves behind is attributes-only (`max_hash_bytes=0`).
-            // The serve could never hit. An isolated arena probe measured the
-            // same file rewritten three times at 51/50/44ms while an append to
-            // it — the identical write without O_TRUNC — cost 24ms, one round
-            // trip, with `stat` at 3ms proving the entry was cached all along.
-            //
-            // O_TRUNC needs NO hash, so ask for none: attributes only.
-            let route = if truncate {
-                self.resolve_inode_file_route_attributes(ino)?
-            } else {
-                self.resolve_inode_file_route_deferred_hash(ino)?
-            };
-            let path = route.path;
-            let metadata = route.metadata;
-            if metadata.kind == "directory" {
+            let path = self.path_for_ino(ino)?;
+            let (file, metadata) = self.local.open_file(&path, flags.0).map_err(errno_for)?;
+            if metadata.is_dir() {
                 return Err(Errno::EISDIR);
             }
-            if truncate && self.read_only {
-                return Err(Errno::EROFS);
-            }
-            let (initial, loaded, dirty) = if truncate {
-                (Vec::new(), true, true)
-            } else {
-                self.cache
-                    .get_file_matching(&path, &metadata)
-                    .map(|bytes| (bytes, true, false))
-                    .unwrap_or_else(|| (Vec::new(), false, false))
-            };
-            // A truncating open publishes under IDENTITY, not content: the
-            // previous bytes are already discarded, so a content fingerprint
-            // guards nothing, and demanding one is what forced the extra stat
-            // above. `expected_file_id` still catches an unlink-and-recreate
-            // underneath, which is the race that actually matters here.
-            let base_content_hash = if truncate {
-                None
-            } else {
-                metadata.content_hash.clone()
-            };
-            let fh = self.next_handle(
-                &path,
-                initial,
-                loaded,
-                base_content_hash,
-                metadata_mode(&metadata),
-                false,
-                metadata.file_id.clone(),
-                metadata.link_count,
-            )?;
-            if dirty {
-                let mut handles = self.lock_handles()?;
-                let state = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
-                if truncate {
-                    state.buffer.clear();
-                    state.loaded = true;
-                }
-                state.dirty = true;
-                state.revision = state.revision.saturating_add(1);
-                Self::mirror_handle_state_locked(&mut handles, fh)?;
-            }
-            Ok(fh)
+            self.next_handle(file, &path, flags.0)
         })();
         match result {
             Ok(fh) => reply.opened(FileHandle(fh), remote_file_open_flags()),
@@ -11384,6 +2610,7 @@ impl RemoteFuseFs {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn read(
         &self,
         ino: INodeNo,
@@ -11395,34 +2622,14 @@ impl RemoteFuseFs {
         reply: ReplyData,
     ) {
         let result: FuseResult<Vec<u8>> = (|| {
-            if self.lock_handles()?.files.contains_key(&fh.0) {
-                let gate = self.publication_gate_for_handle(fh.0)?;
-                let _guard = gate.lock().map_err(|_| Errno::EIO)?;
-                let state = self
-                    .lock_handles()?
-                    .files
-                    .get(&fh.0)
-                    .map(|state| (state.dirty, state.created, state.unlinked))
-                    .ok_or(Errno::ENOENT)?;
-                if !state.0 && !state.1 && !state.2 {
-                    let route = match self.resolve_handle_route_locked(fh.0)? {
-                        StableFileRoute::Linked(route) => route,
-                        StableFileRoute::Unlinked => return Err(Errno::ENOENT),
-                    };
-                    if route.metadata.kind == "file" && route.metadata.size_bytes > LARGE_FILE_BYTES
-                    {
-                        return self.read_large_handle_range_locked(fh.0, &route, offset, size);
-                    }
-                }
-                self.ensure_handle_loaded_locked(fh.0)?;
-                let handles = self.lock_handles()?;
-                let state = handles.files.get(&fh.0).ok_or(Errno::ENOENT)?;
-                let start = (offset as usize).min(state.buffer.len());
-                let end = start.saturating_add(size as usize).min(state.buffer.len());
-                return Ok(state.buffer[start..end].to_vec());
-            }
-            let path = self.path_for_ino(ino)?;
-            self.read_bytes(&path, offset, size)
+            let state = self.handle_state(fh.0)?;
+            let mut buffer = vec![0u8; size as usize];
+            let read = self
+                .local
+                .read(&state.file, &mut buffer, offset)
+                .map_err(errno_for)?;
+            buffer.truncate(read);
+            Ok(buffer)
         })();
         match result {
             Ok(bytes) => reply.data(&bytes),
@@ -11440,6 +2647,7 @@ impl RemoteFuseFs {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn write(
         &self,
         _ino: INodeNo,
@@ -11451,29 +2659,19 @@ impl RemoteFuseFs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyWrite,
     ) {
-        if self.read_only {
-            reply.error(Errno::EROFS);
-            return;
-        }
         let result: FuseResult<u32> = (|| {
-            let gate = self.publication_gate_for_handle(fh.0)?;
-            let _guard = gate.lock().map_err(|_| Errno::EIO)?;
-            self.ensure_handle_loaded_locked(fh.0)?;
-            let mut handles = self.lock_handles()?;
-            let state = handles.files.get_mut(&fh.0).ok_or(Errno::ENOENT)?;
-            let start = offset as usize;
-            if state.buffer.len() < start {
-                state.buffer.resize(start, 0);
+            let state = self.handle_state(fh.0)?;
+            if !state.is_writable() {
+                return Err(Errno::EBADF);
             }
-            if state.buffer.len() < start + data.len() {
-                state.buffer.resize(start + data.len(), 0);
-            }
-            state.buffer[start..start + data.len()].copy_from_slice(data);
-            state.dirty = true;
-            state.loaded = true;
-            state.revision = state.revision.saturating_add(1);
-            Self::mirror_handle_state_locked(&mut handles, fh.0)?;
-            Ok(data.len() as u32)
+            // A through-write to the backing file. There is no read-modify-write
+            // download: the bytes the guest is not overwriting are already there.
+            // Durable-storage exhaustion surfaces as the local `ENOSPC` it is.
+            let written = self
+                .local
+                .write(&state.file, data, offset)
+                .map_err(errno_for)?;
+            Ok(written as u32)
         })();
         match result {
             Ok(written) => reply.written(written),
@@ -11488,8 +2686,10 @@ impl RemoteFuseFs {
         lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
-        // FLUSH is what close(2) sends. It is not fsync: see `FlushBarrier`.
-        let flush_result = self.flush_handle_immediate(fh.0, FlushBarrier::Close);
+        // FLUSH is what close(2) sends. It seals this path's content generation
+        // into one committed WAL record and returns; it is not a durability
+        // point and it never waits for the publisher.
+        let flush_result = self.seal_handle(fh.0);
         let cleanup_result =
             self.release_advisory_lock_owner(ino, lock_owner, LockNamespace::Posix, Some(fh.0));
         match combine_flush_and_lock_cleanup("flush", flush_result, cleanup_result) {
@@ -11498,34 +2698,40 @@ impl RemoteFuseFs {
         }
     }
 
-    pub(super) fn fsync(&self, _ino: INodeNo, fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
-        // The explicit durability point: both ordered journals remotely
-        // acknowledged before this returns.
-        match self.flush_handle_immediate(fh.0, FlushBarrier::Durable) {
+    /// `fsync(2)`: the explicit durability point, and a purely local one. The
+    /// generation is sealed, the backing file is synced, and the WAL is group
+    /// synced through that record. The bytes are then durable on this host,
+    /// which is what POSIX durability means for a mount that owns its scope; a
+    /// network round trip would make `fsync` depend on a service POSIX never
+    /// mentions.
+    pub(super) fn fsync(&self, _ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
+        let result: FuseResult<()> = (|| {
+            let state = self.handle_state(fh.0)?;
+            self.local
+                .fsync_handle(&state.file, datasync)
+                .map_err(errno_for)
+        })();
+        match result {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(err),
         }
     }
 
-    /// The directory-level durability point.
-    ///
-    /// A guest that fsyncs a directory is asking for the entries it created or
-    /// removed in it to be durable — which for this filesystem means published,
-    /// since the entries live in the namespace journal until then. Ordinary
-    /// `close()` deliberately stopped draining that journal (a close is not a
-    /// durability barrier and draining per close serializes every creation
-    /// behind its own publication), so this is the operation a caller uses to
-    /// demand it. Both journals are drained in the same order a file `fsync`
-    /// drains them: content first, then the namespace that names it.
+    /// The directory-level durability point: seal every dirty path under this
+    /// directory, `fsync` the backing directory, group sync the WAL. Like
+    /// `fsync`, it never reaches the network.
     pub(super) fn fsyncdir(
         &self,
-        _ino: INodeNo,
+        ino: INodeNo,
         _fh: FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        let barrier = self.flush_writes().and_then(|()| self.flush_namespace());
-        match barrier {
+        let result: FuseResult<()> = (|| {
+            let path = self.path_for_ino(ino)?;
+            self.local.fsync_dir(&path).map_err(errno_for)
+        })();
+        match result {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(err),
         }
@@ -11540,47 +2746,16 @@ impl RemoteFuseFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let flush_result = match self.publication_gate_for_handle(fh.0) {
-            Ok(gate) => match gate.lock() {
-                Ok(_guard) => {
-                    // A non-exclusive create has no namespace record: its first
-                    // content WAL entry is the creation. Publish an empty file
-                    // only at final RELEASE if no write dirtied the handle.
-                    // Marking it dirty in `create` made an earlier FLUSH publish
-                    // empty bytes before the caller's real write, doubling every
-                    // create/write into two `write-many` requests.
-                    let prepared = (|| -> FuseResult<()> {
-                        let mut handles = self.lock_handles()?;
-                        if let Some(state) = handles.files.get_mut(&fh.0)
-                            && state.created
-                            && !state.dirty
-                            && state.pending_publication.is_none()
-                        {
-                            state.loaded = true;
-                            state.dirty = true;
-                            state.revision = state.revision.saturating_add(1);
-                            Self::mirror_handle_state_locked(&mut handles, fh.0)?;
-                        }
-                        Ok(())
-                    })();
-                    prepared.and_then(|()| {
-                        // RELEASE is the second half of close(2), not an fsync.
-                        let result = self.flush_handle_immediate_locked(fh.0, FlushBarrier::Close);
-                        if result.is_ok() {
-                            // The descriptor can retire once its bytes are in the
-                            // durable WAL. Publication completion and cache
-                            // convergence belong to the journal worker's hooks.
-                            let _ = self
-                                .lock_handles()
-                                .map(|mut handles| handles.files.remove(&fh.0));
-                        }
-                        result
-                    })
-                }
-                Err(_) => Err(Errno::EIO),
-            },
-            Err(error) => Err(error),
-        };
+        // RELEASE is the second half of close(2). The generation is sealed and
+        // the descriptor retires; a file created and closed without a write
+        // needs no promotion, because the create already appended its own
+        // `CreateFile` record and the backing file already exists.
+        let flush_result = self.seal_handle(fh.0);
+        if flush_result.is_ok() {
+            let _ = self
+                .lock_handles()
+                .map(|mut handles| handles.files.remove(&fh.0));
+        }
         let cleanup_result = match lock_owner {
             Some(lock_owner) => {
                 self.release_advisory_lock_owner(ino, lock_owner, LockNamespace::Flock, None)
@@ -11590,6 +2765,98 @@ impl RemoteFuseFs {
         match combine_flush_and_lock_cleanup("release", flush_result, cleanup_result) {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(err),
+        }
+    }
+
+    /// `fallocate(2)`. Nearly free now that a backing file exists, and it is what
+    /// lets an archive extractor reserve a file's final length up front instead
+    /// of growing it a write at a time.
+    pub(super) fn fallocate(
+        &self,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        let result: FuseResult<()> = (|| {
+            if mode != 0 {
+                // Only plain allocation has a meaning the gateway's whole-file
+                // content model can carry. Hole punching and collapse-range would
+                // publish a generation whose bytes the local file never held.
+                return Err(Errno::EOPNOTSUPP);
+            }
+            let state = self.handle_state(fh.0)?;
+            if !state.is_writable() {
+                return Err(Errno::EBADF);
+            }
+            self.local
+                .allocate(&state.file, offset, length)
+                .map_err(errno_for)
+        })();
+        match result {
+            Ok(()) => reply.ok(),
+            Err(err) => reply.error(err),
+        }
+    }
+
+    /// `copy_file_range(2)`. On a reflinking backing filesystem this copies no
+    /// bytes at all, which is exactly the shape a `node_modules` install has.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn copy_file_range(
+        &self,
+        _ino_in: INodeNo,
+        fh_in: FileHandle,
+        offset_in: u64,
+        _ino_out: INodeNo,
+        fh_out: FileHandle,
+        offset_out: u64,
+        length: u64,
+        reply: ReplyWrite,
+    ) {
+        let result: FuseResult<u32> = (|| {
+            let source = self.handle_state(fh_in.0)?;
+            let destination = self.handle_state(fh_out.0)?;
+            if !destination.is_writable() {
+                return Err(Errno::EBADF);
+            }
+            let copied = self
+                .local
+                .copy_range(
+                    &destination.file,
+                    &source.file,
+                    offset_in,
+                    offset_out,
+                    length,
+                )
+                .map_err(errno_for)?;
+            Ok(copied.min(u32::MAX as u64) as u32)
+        })();
+        match result {
+            Ok(copied) => reply.written(copied),
+            Err(err) => reply.error(err),
+        }
+    }
+
+    /// `statfs(2)`, answered by the filesystem holding the backing tree.
+    ///
+    /// This is what makes the guest's free space honest: local exhaustion is a
+    /// real filesystem answer the guest can act on, while a gateway outage never
+    /// surfaces as one.
+    pub(super) fn statfs(&self, _ino: INodeNo, reply: ReplyStatfs) {
+        match self.local.statfs() {
+            Ok(stat) => reply.statfs(
+                stat.blocks,
+                stat.blocks_free,
+                stat.blocks_available,
+                stat.files,
+                stat.files_free,
+                stat.block_size,
+                stat.max_name_length,
+                stat.fragment_size,
+            ),
+            Err(error) => reply.error(errno_for(error)),
         }
     }
 
@@ -11611,13 +2878,13 @@ impl RemoteFuseFs {
             if kind == "unlock" {
                 return Err(Errno::EINVAL);
             }
-            let target = self.advisory_lock_target(fh.0)?;
+            let path = self.advisory_lock_target(fh.0)?;
             let owner = self.advisory_lock_owner_key(lock_owner);
             let (start, end) = Self::advisory_lock_range(namespace, start, end);
             self.tokio
                 .block_on(self.client.advisory_lock(
                     "get",
-                    &target.path,
+                    &path,
                     &self.mount_id,
                     &owner,
                     Self::advisory_lock_namespace(namespace),
@@ -11627,13 +2894,6 @@ impl RemoteFuseFs {
                     pid,
                 ))
                 .map_err(|error| Self::advisory_lock_error(&error))
-                .and_then(|response| {
-                    if response.file_id.as_deref() == Some(target.file_id.as_str()) {
-                        Ok(response)
-                    } else {
-                        Err(Errno::EIO)
-                    }
-                })
         })();
         match result {
             Ok(response) if response.acquired => {
@@ -11679,9 +2939,9 @@ impl RemoteFuseFs {
         reply: ReplyEmpty,
     ) {
         let result = Self::advisory_lock_kind(typ).and_then(|_| {
-            self.advisory_lock_target(fh.0).and_then(|target| {
+            self.advisory_lock_target(fh.0).and_then(|path| {
                 self.set_advisory_lock(
-                    &target,
+                    &path,
                     lock_owner,
                     namespace,
                     start,
@@ -11744,52 +3004,13 @@ impl RemoteFuseFs {
         let result: FuseResult<FileAttr> = (|| {
             let parent_path = self.path_for_ino(parent)?;
             let path = Self::child_path(parent_path.as_str(), name)?;
-            let mode = creation_mode(mode, umask);
-            let metadata = RemoteMetadata {
-                kind: "directory".to_string(),
-                size_bytes: 0,
-                file_id: None,
-                link_count: 2,
-                link_target: None,
-                content_hash: None,
-                executable: mode_is_executable(mode),
-                mode: Some(mode),
-                updated_at: None,
-            };
-            self.enqueue_namespace_creation(
-                VfsNamespaceMutation::CreateDirectory {
-                    path: path.clone(),
-                    mode: Some(mode),
-                },
-                Some(metadata.clone()),
-            )?;
-            // A directory THIS mount just created is provably empty: FUSE
-            // resolved the name as absent before dispatch, and the durable
-            // namespace-journal projection owns the creation before this reply.
-            // Seed its listing as complete-and-empty.
-            //
-            // This is the piece that makes writing a tree cost round trips per
-            // DIRECTORY instead of per FILE. Every `create(2)` begins with the
-            // kernel looking the new name up, and a lookup into a directory this
-            // mount has no listing for goes to the wire — so an installer
-            // unpacking 40k files paid 40k negative lookups, arriving ~20ms
-            // apart, which also kept the write journal's batch window empty and
-            // published every file alone. With a listing present,
-            // `listing_proves_absent` answers those lookups locally, the writes
-            // land in the journal back-to-back, and the journal publishes them
-            // in batches — the standard client-side directory cache every
-            // network filesystem relies on (readdirplus prefill, NFS/SMB
-            // negative-dentry caching).
-            //
-            // It stays correct as the directory fills because a publication
-            // PATCHES this listing from its own snapshot rather than dropping it
-            // (`restore_patched_parent_listings_locked`), and the entry is
-            // revision-fenced like any other cached listing: a publication this
-            // mount did not make advances the fence and retires it.
-            self.cache
-                .put_dir(&path, Vec::new(), self.client.coherence_revision());
-            self.cache
-                .put_metadata(&path, metadata.clone(), self.client.coherence_revision());
+            let metadata = self
+                .local
+                .create_directory(&path, creation_mode(mode, umask))
+                .map_err(errno_for)?;
+            // No cache seeding: an empty backing directory is its own proof of
+            // emptiness, and the negative lookups an installer issues into it are
+            // answered by a local `lstat` miss.
             Ok(self.attr_for_path(&path, &metadata, true))
         })();
         match result {
@@ -11806,30 +3027,13 @@ impl RemoteFuseFs {
         reply: ReplyEntry,
     ) {
         let result: FuseResult<FileAttr> = (|| {
-            if self.read_only {
-                return Err(Errno::EROFS);
-            }
-            let target = target.to_str().ok_or(Errno::EINVAL)?.to_string();
+            let target = target.to_str().ok_or(Errno::EINVAL)?;
             let parent_path = self.path_for_ino(parent)?;
             let path = Self::child_path(parent_path.as_str(), link_name)?;
-            let metadata = RemoteMetadata {
-                kind: "symlink".to_string(),
-                size_bytes: target.len() as u64,
-                file_id: None,
-                link_count: 1,
-                link_target: Some(target.clone()),
-                content_hash: None,
-                executable: false,
-                mode: Some(0o777),
-                updated_at: None,
-            };
-            self.enqueue_namespace_creation(
-                VfsNamespaceMutation::CreateSymlink {
-                    path: path.clone(),
-                    target: target.clone(),
-                },
-                Some(metadata.clone()),
-            )?;
+            let metadata = self
+                .local
+                .create_symlink(&path, target)
+                .map_err(errno_for)?;
             Ok(self.attr_for_path(&path, &metadata, true))
         })();
         match result {
@@ -11842,75 +3046,12 @@ impl RemoteFuseFs {
         let result: FuseResult<()> = (|| {
             let parent_path = self.path_for_ino(parent)?;
             let path = Self::child_path(parent_path.as_str(), name)?;
-            // Publish pre-unlink dirty bytes while the pathname still exists.
-            // Later writes on the open handle can then target an authoritative
-            // surviving alias without resurrecting this name.
-            self.flush_handles_for_path(&path)?;
-            let metadata = self.stat_path_attributes(&path)?.ok_or(Errno::ENOENT)?;
-            let file_id = metadata.file_id.clone();
-            let mutation = VfsNamespaceMutation::DeleteFile {
-                path: path.clone(),
-                precondition: file_id.as_ref().map(|file_id| VfsWritePrecondition {
-                    predicate: None,
-                    fingerprint: None,
-                    secondary_fingerprint: None,
-                    expected_file_id: Some(file_id.clone()),
-                }),
-            };
-            if let Err(error) = self.commit_namespace(mutation) {
-                let completed = match file_id.as_deref() {
-                    Some(file_id) => {
-                        let current = match self.tokio.block_on(self.client.stat_attributes(&path))
-                        {
-                            Ok(current) => current,
-                            Err(_) => return Err(error),
-                        };
-                        current.is_none_or(|current| current.file_id.as_deref() != Some(file_id))
-                    }
-                    None => false,
-                };
-                if !completed {
-                    return Err(error);
-                }
-            }
-            let surviving_route = match file_id.as_deref() {
-                // A surviving alias only exists if some OTHER name held this inode,
-                // so a link count of one answers the question without asking the
-                // gateway. That lookup is a remote round trip per deleted file — on
-                // a bulk `rm` of thousands of single-linked files it was the
-                // dominant cost, and it could never return anything.
-                Some(_) if metadata.link_count <= 1 => None,
-                Some(file_id) => match self.authoritative_file_route(&path, file_id)? {
-                    StableFileRoute::Linked(route) => Some(route),
-                    StableFileRoute::Unlinked => None,
-                },
-                None => None,
-            };
-            if let Ok(mut handles) = self.lock_handles() {
-                for state in handles.files.values_mut().filter(|state| {
-                    state.path == path
-                        && file_id
-                            .as_ref()
-                            .is_none_or(|file_id| state.file_id.as_ref() == Some(file_id))
-                }) {
-                    if let Some(route) = surviving_route.as_ref() {
-                        state.path = route.path.clone();
-                        state.link_count = route.metadata.link_count.max(1);
-                    } else {
-                        state.unlinked = true;
-                        state.link_count = 0;
-                    }
-                }
-            }
-            if let Some(route) = surviving_route.as_ref() {
-                self.retarget_identity_route(&path, route);
-                self.detach_inode_path(&path);
-            } else if let Some(file_id) = file_id.as_deref() {
-                let mut inodes = self.lock_inodes()?;
-                inodes.detach_unlinked_identity(file_id);
-            } else {
-                self.detach_inode_path(&path);
-            }
+            // `remove_file` seals any pending generation before the name goes,
+            // so bytes the guest wrote are described while the name that names
+            // them still exists. Open descriptors keep working afterwards: the
+            // backing inode survives its last link natively.
+            self.local.remove_file(&path).map_err(errno_for)?;
+            self.detach_inode_path(&path);
             Ok(())
         })();
         match result {
@@ -11923,8 +3064,15 @@ impl RemoteFuseFs {
         let result: FuseResult<()> = (|| {
             let parent_path = self.path_for_ino(parent)?;
             let path = Self::child_path(parent_path.as_str(), name)?;
-            self.commit_namespace(VfsNamespaceMutation::RemoveDirectory { path: path.clone() })?;
-            self.detach_inode_path(&path);
+            // `unlinkat(AT_REMOVEDIR)` answers `ENOTEMPTY` locally, so emptiness
+            // is no longer arbitrated remotely.
+            self.local.remove_directory(&path).map_err(errno_for)?;
+            // A successful rmdir proves the directory was empty, but this mount
+            // may still hold inode records for names the guest has since removed
+            // from it. Sweep the subtree rather than the exact path.
+            if let Ok(mut inodes) = self.lock_inodes() {
+                inodes.detach_subtree(&path);
+            }
             Ok(())
         })();
         match result {
@@ -11933,17 +3081,25 @@ impl RemoteFuseFs {
         }
     }
 
+    /// `rename(2)`, applied with one `renameat2`.
+    ///
+    /// A replacing rename needs no ambiguity verification and no alias
+    /// resolution any more: the displaced entry survives as an open-unlinked
+    /// backing inode exactly as it would on any local filesystem.
+    /// `RENAME_NOREPLACE` is honoured by the syscall; `RENAME_EXCHANGE` and
+    /// `RENAME_WHITEOUT` are rejected with `EINVAL`, because neither has an
+    /// atomic form in the gateway contract and decomposing them would publish a
+    /// namespace state this mount never had.
     pub(super) fn rename(
         &self,
         parent: INodeNo,
         name: &OsStr,
         newparent: INodeNo,
         newname: &OsStr,
-        _flags: RenameFlags,
+        flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
         let mut rename_paths = None;
-        let mut rename_stage = "resolve-paths";
         let result: FuseResult<()> = (|| {
             let parent_path = self.path_for_ino(parent)?;
             let newparent_path = self.path_for_ino(newparent)?;
@@ -11953,174 +3109,9 @@ impl RemoteFuseFs {
             if from == to {
                 return Ok(());
             }
-            rename_stage = "collect-publication-gates";
-            let publication_gates = self.publication_gates_for_subtrees(&[&from, &to])?;
-            rename_stage = "lock-publication-gates";
-            let _publication_guards = Self::lock_publication_gates(&publication_gates)?;
-            rename_stage = "flush-open-handles";
-            for (fh, _) in &publication_gates {
-                if let Err(error) = self.flush_handle_locked(*fh, FlushBarrier::Durable) {
-                    let handle = self
-                        .lock_handles()
-                        .ok()
-                        .and_then(|handles| handles.files.get(fh).cloned());
-                    tracing::warn!(
-                        fh,
-                        handle_path = handle.as_ref().map(|state| state.path.as_str()),
-                        dirty = handle.as_ref().is_some_and(|state| state.dirty),
-                        created = handle.as_ref().is_some_and(|state| state.created),
-                        file_id = handle.as_ref().and_then(|state| state.file_id.as_deref()),
-                        base_mode = handle.as_ref().and_then(|state| state.base_mode),
-                        mode = handle.as_ref().map(|state| state.mode),
-                        base_content_hash = handle
-                            .as_ref()
-                            .and_then(|state| state.base_content_hash.as_deref()),
-                        pending_publication = handle
-                            .as_ref()
-                            .and_then(|state| state.pending_publication.as_ref())
-                            .map(|publication| publication.id),
-                        ?error,
-                        "vfs rename could not flush an open descendant handle"
-                    );
-                    return Err(error);
-                }
-            }
-            // Package managers rename completed temporary files and
-            // directories onto absent final names. Both journals already have
-            // mount-local projections, so establish that shape without first
-            // forcing either journal through a remote publication. Replacing a
-            // destination keeps the synchronous path below, which resolves the
-            // displaced inode and any surviving alias before retargeting it.
-            rename_stage = "stat-projected-source";
-            let projected_source_metadata =
-                self.stat_path_attributes(&from)?.ok_or(Errno::ENOENT)?;
-            rename_stage = "stat-projected-destination";
-            let projected_replaced_metadata = self.stat_path_attributes(&to)?;
-            if projected_source_metadata
-                .file_id
-                .as_deref()
-                .is_some_and(|file_id| {
-                    projected_replaced_metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.file_id.as_deref())
-                        == Some(file_id)
-                })
-            {
-                // POSIX rename between two hard-link aliases of the same inode
-                // is a successful no-op. The projected identities are already
-                // authoritative enough to decide this without draining either
-                // journal.
-                return Ok(());
-            }
-            if projected_replaced_metadata.is_none() {
-                rename_stage = "enqueue-ordered-rename";
-                self.enqueue_ordered_rename(
-                    VfsNamespaceMutation::Rename {
-                        from: from.clone(),
-                        to: to.clone(),
-                    },
-                    projected_source_metadata,
-                )?;
-                self.rename_inode_path(&from, &to);
-                return Ok(());
-            }
-
-            // A replacing rename remains synchronous because resolving the
-            // displaced inode may require its post-publication surviving alias.
-            rename_stage = "flush-writes";
-            self.flush_writes()?;
-            rename_stage = "flush-namespace";
-            self.flush_namespace()?;
-            rename_stage = "stat-source";
-            let source_metadata = self
-                .tokio
-                .block_on(self.client.stat(&from))
-                .map_err(|_| Errno::EIO)?
-                .ok_or(Errno::ENOENT)?;
-            rename_stage = "stat-destination";
-            let replaced_metadata = self.stat_path_attributes(&to)?;
-            if source_metadata.file_id.as_deref().is_some_and(|file_id| {
-                replaced_metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.file_id.as_deref())
-                    == Some(file_id)
-            }) {
-                // POSIX rename between two hard-link aliases of the same
-                // inode is a successful no-op; neither open alias is retired.
-                return Ok(());
-            }
-            rename_stage = "publish-rename";
-            let rename_result = self.commit_namespace_with_metadata(
-                VfsNamespaceMutation::Rename {
-                    from: from.clone(),
-                    to: to.clone(),
-                },
-                Some(source_metadata.clone()),
-            );
-            let completed = match rename_result {
-                Ok(()) => true,
-                Err(_) => {
-                    let current_source = self
-                        .tokio
-                        .block_on(self.client.stat_attributes(&from))
-                        .ok()
-                        .flatten();
-                    let current_destination = self
-                        .tokio
-                        .block_on(self.client.stat_attributes(&to))
-                        .ok()
-                        .flatten();
-                    match source_metadata.file_id.as_deref() {
-                        Some(file_id) => {
-                            current_destination
-                                .as_ref()
-                                .and_then(|metadata| metadata.file_id.as_deref())
-                                == Some(file_id)
-                                && current_source
-                                    .as_ref()
-                                    .and_then(|metadata| metadata.file_id.as_deref())
-                                    != Some(file_id)
-                        }
-                        None => {
-                            current_source.is_none()
-                                && current_destination
-                                    .as_ref()
-                                    .is_some_and(|metadata| metadata.kind == source_metadata.kind)
-                        }
-                    }
-                }
-            };
-            if !completed {
-                rename_stage = "verify-ambiguous-publication";
-                return Err(Errno::EIO);
-            }
-            rename_stage = "retarget-replaced-inode";
-            let replaced_route = match replaced_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.file_id.as_deref())
-            {
-                Some(file_id) if source_metadata.file_id.as_deref() != Some(file_id) => {
-                    match self.authoritative_file_route(&to, file_id)? {
-                        StableFileRoute::Linked(route) => Some(route),
-                        StableFileRoute::Unlinked => None,
-                    }
-                }
-                _ => None,
-            };
-            if let Ok(mut handles) = self.lock_handles() {
-                for state in handles.files.values_mut().filter(|state| state.path == to) {
-                    if let Some(route) = replaced_route.as_ref() {
-                        state.path = route.path.clone();
-                        state.link_count = route.metadata.link_count.max(1);
-                    } else {
-                        state.unlinked = true;
-                        state.link_count = 0;
-                    }
-                }
-            }
-            if let Some(route) = replaced_route.as_ref() {
-                self.retarget_identity_route(&to, route);
-            }
+            self.local
+                .rename(&from, &to, flags.bits())
+                .map_err(errno_for)?;
             self.rename_inode_path(&from, &to);
             Ok(())
         })();
@@ -12129,14 +3120,7 @@ impl RemoteFuseFs {
                 .as_ref()
                 .map(|(from, to)| (from.as_str(), to.as_str()))
                 .unwrap_or(("<unresolved>", "<unresolved>"));
-            tracing::warn!(
-                from,
-                to,
-                ?error,
-                stage = rename_stage,
-                flags = ?_flags,
-                "vfs rename failed"
-            );
+            tracing::warn!(from, to, ?error, ?flags, "vfs rename failed");
         }
         match result {
             Ok(()) => reply.ok(),
@@ -12152,83 +3136,21 @@ impl RemoteFuseFs {
         reply: ReplyEntry,
     ) {
         let result: FuseResult<FileAttr> = (|| {
-            if self.read_only {
-                return Err(Errno::EROFS);
-            }
-            let source_hint = self.path_for_ino(ino)?;
+            let source = self.path_for_ino(ino)?;
             let parent = self.path_for_ino(newparent)?;
             let destination = Self::child_path(parent.as_str(), newname)?;
-            self.flush_handles_for_path(&source_hint)?;
-            let source_route = self.resolve_inode_file_route(ino)?;
-            let source = source_route.path;
-            let source_metadata = source_route.metadata;
-            if source_metadata.kind != "file" {
-                return Err(Errno::EPERM);
-            }
-            if self
-                .tokio
-                .block_on(self.client.stat_attributes(&destination))
-                .map_err(|_| Errno::EIO)?
-                .is_some()
-            {
-                return Err(Errno::EEXIST);
-            }
-            let mut projected = source_metadata.clone();
-            projected.link_count = projected.link_count.saturating_add(1).max(2);
-            if let Err(error) = self.commit_namespace_with_metadata(
-                VfsNamespaceMutation::CreateHardLink {
-                    source_path: source.clone(),
-                    destination_path: destination.clone(),
-                },
-                Some(projected),
-            ) {
-                let expected_file_id = source_metadata.file_id.as_deref().ok_or(error)?;
-                let completed = self
-                    .tokio
-                    .block_on(self.client.stat_attributes(&destination))
-                    .ok()
-                    .flatten()
-                    .is_some_and(|metadata| metadata.file_id.as_deref() == Some(expected_file_id));
-                if !completed {
-                    return Err(error);
-                }
-            }
-            let destination_metadata = self
-                .tokio
-                .block_on(self.client.stat(&destination))
-                .map_err(|_| Errno::EIO)?
-                .ok_or(Errno::EIO)?;
-            let source_metadata = self
-                .tokio
-                .block_on(self.client.stat(&source))
-                .map_err(|_| Errno::EIO)?
-                .unwrap_or_else(|| destination_metadata.clone());
-            let response = chevalier_sandbox::vfs::VfsHardLinkMetadataResponse {
-                source: source_metadata,
-                destination: destination_metadata,
-            };
-            if let Some(file_id) = response.source.file_id.as_deref() {
-                // A freshly created file first entered the inode table before
-                // the gateway assigned its stable identity. Bind that existing
-                // inode before allocating the destination attr so both names
-                // are returned to the kernel as one hard-linked inode.
-                self.lock_inodes()?
-                    .ensure_with_identity(&source, Some(file_id));
-            }
-            if let Ok(mut handles) = self.lock_handles() {
-                for state in handles.files.values_mut().filter(|state| {
-                    state.path == source
-                        || response
-                            .destination
-                            .file_id
-                            .as_ref()
-                            .is_some_and(|file_id| state.file_id.as_ref() == Some(file_id))
-                }) {
-                    state.file_id = response.destination.file_id.clone();
-                    state.link_count = response.destination.link_count;
-                }
-            }
-            Ok(self.attr_for_path(&destination, &response.destination, true))
+            // `linkat` supplies `EEXIST`, `EPERM` for a directory source and the
+            // resulting link count, all locally: none of the five gateway round
+            // trips this used to cost describe anything the backing tree cannot.
+            let metadata = self
+                .local
+                .create_hard_link(&source, &destination)
+                .map_err(errno_for)?;
+            // Bind the source name to the shared identity too, so both names are
+            // returned to the kernel as one hard-linked inode.
+            self.lock_inodes()?
+                .ensure_with_identity(&source, Some(metadata.local_identity.as_str()));
+            Ok(self.attr_for_path(&destination, &metadata, true))
         })();
         match result {
             Ok(attr) => reply.entry(&self.reply_ttl(), &attr, Generation(0)),
@@ -12256,52 +3178,17 @@ impl RemoteFuseFs {
                 error
             })?;
             let path = Self::child_path(parent_path.as_str(), name)?;
-            let mode = creation_mode(mode, umask);
-            // FUSE presents a successful CREATE request with O_EXCL set even
-            // for an ordinary `echo x > new-file`; the mounted arena measured
-            // flags 0x280c1 for that exact operation. Treating this transport
-            // flag as a user-requested synchronous O_EXCL made every file pay a
-            // CreateFile publication, metadata read, and point stat before its
-            // content could enter the write journal. The kernel has already
-            // resolved the local negative dentry. Reserve it locally and carry
-            // expect-absent on the folded write for cross-mount arbitration.
-            let _transport_flags = flags;
-            let metadata = self.reserve_file_if_absent(&path, mode, false)?;
-            let reserved = true;
-            if reserved {
-                self.cache
-                    .put_file(&path, Vec::new(), Some(metadata.clone()));
-            }
+            // FUSE presents a successful CREATE with `O_EXCL` set even for an
+            // ordinary `echo x > new-file`, which used to force a synchronous
+            // cross-mount arbitration per created file. The backing tree makes it
+            // a real `openat(O_CREAT | O_EXCL)`: correct, local and free, with
+            // `EEXIST` answered by the filesystem.
+            let (file, metadata) = self
+                .local
+                .create_file(&path, creation_mode(mode, umask), flags)
+                .map_err(errno_for)?;
             let attr = self.attr_for_path(&path, &metadata, true);
-            let truncate = !reserved && flags & libc::O_TRUNC != 0;
-            let (initial, loaded) = if reserved || truncate {
-                (Vec::new(), true)
-            } else {
-                self.cache
-                    .get_file_matching(&path, &metadata)
-                    .map(|bytes| (bytes, true))
-                    .unwrap_or_else(|| (Vec::new(), false))
-            };
-            let fh = self.next_handle(
-                &path,
-                initial,
-                loaded,
-                None,
-                metadata_mode(&metadata),
-                reserved,
-                metadata.file_id.clone(),
-                metadata.link_count,
-            )?;
-            if truncate
-                && let Ok(mut handles) = self.lock_handles()
-                && let Some(state) = handles.files.get_mut(&fh)
-            {
-                state.buffer.clear();
-                state.loaded = true;
-                state.dirty = true;
-                state.revision = state.revision.saturating_add(1);
-                let _ = Self::mirror_handle_state_locked(&mut handles, fh);
-            }
+            let fh = self.next_handle(file, &path, flags)?;
             Ok((attr, fh))
         })();
         match result {
@@ -12313,6 +3200,46 @@ impl RemoteFuseFs {
                 remote_file_open_flags(),
             ),
             Err(err) => reply.error(err),
+        }
+    }
+
+    // -- shared callback helpers ---------------------------------------------
+
+    /// Seal one handle's content generation. A handle the table no longer knows
+    /// about is a duplicate FLUSH whose RELEASE already retired it, which is
+    /// success, not `EBADF`.
+    fn seal_handle(&self, fh: u64) -> FuseResult<()> {
+        let Some(state) = self.lock_handles()?.files.get(&fh).cloned() else {
+            return Ok(());
+        };
+        self.local.flush_handle(&state.file).map_err(errno_for)
+    }
+
+    fn join_child(parent: &str, name: &str) -> String {
+        if parent.is_empty() {
+            name.to_string()
+        } else {
+            format!("{parent}/{name}")
+        }
+    }
+
+    /// Attributes for the mount root, from the backing tree root itself.
+    fn root_attributes(&self) -> FileAttr {
+        match self.local.tree().lstat("") {
+            Ok(Some(metadata)) => self.attr_for_metadata(ROOT_INO, &metadata),
+            Ok(None) | Err(_) => self.root_attr(),
+        }
+    }
+
+    /// Attributes for a `.`/`..` entry in a `readdirplus` reply.
+    fn directory_attributes(&self, ino: INodeNo, path: &str) -> FileAttr {
+        match self.local.tree().lstat(path) {
+            Ok(Some(metadata)) => self.attr_for_metadata(ino, &metadata),
+            Ok(None) | Err(_) => {
+                let mut attr = self.root_attr();
+                attr.ino = ino;
+                attr
+            }
         }
     }
 }

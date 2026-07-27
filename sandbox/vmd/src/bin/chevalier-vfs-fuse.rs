@@ -1,8 +1,11 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
-use vmd_rs::fuse::{mount_remote_vfs_fuse, unmount_fuse};
+use vmd_rs::fuse::{
+    DEFAULT_VFS_DRAIN_TIMEOUT, default_vfs_state_dir, mount_remote_vfs_fuse, unmount_fuse,
+};
 
 #[derive(Debug, Parser)]
 #[command(about = "Mount a Chevalier remote VFS endpoint as a foreground FUSE filesystem")]
@@ -21,6 +24,17 @@ struct Args {
     read_only: bool,
     #[arg(long)]
     mountpoint: Option<PathBuf>,
+    /// Durable local state for this mount: the backing tree, the write-ahead log
+    /// and the payload store. Must be on the same filesystem as itself (payload
+    /// capture reflinks from the backing tree) and must never be inside the
+    /// mountpoint. Defaults to a `.<name>-vfs-state` sibling of the mountpoint.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// How long the shutdown signal waits for the publisher to bring the gateway
+    /// replica level with this mount before detaching it. Whatever is still
+    /// unpublished stays in the durable WAL and is replayed by the next mount.
+    #[arg(long)]
+    drain_timeout_secs: Option<u64>,
     #[arg(value_name = "MOUNTPOINT")]
     positional_mountpoint: Option<PathBuf>,
 }
@@ -38,6 +52,10 @@ async fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("missing VFS token; pass --token or set {}", args.token_env))?;
     let read_only =
         args.read_only || env_truthy("OC_MOUNT_READONLY") || env_truthy("CHEVALIER_VFS_READ_ONLY");
+    let state_dir = match args.state_dir {
+        Some(state_dir) => state_dir,
+        None => default_vfs_state_dir(&mountpoint)?,
+    };
 
     let handle = mount_remote_vfs_fuse(
         args.endpoint.as_str(),
@@ -45,12 +63,23 @@ async fn main() -> Result<()> {
         args.scope.as_str(),
         args.tag.as_str(),
         &mountpoint,
+        &state_dir,
         read_only,
     )
     .await
     .with_context(|| format!("mount remote VFS at {}", mountpoint.display()))?;
 
     wait_for_shutdown_signal().await?;
+    // The signal means this process stops being the mount's owner. Drain the
+    // publication cursor, stop the publisher and seal the log *before* detaching
+    // the kernel mount, so the state directory left behind is one a restart
+    // recovers from cheaply. A residue is logged, never silently dropped: the
+    // WAL is durable and the next mount replays it from the acknowledged cursor.
+    let drain_timeout = args
+        .drain_timeout_secs
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_VFS_DRAIN_TIMEOUT);
+    handle.shutdown_publication(drain_timeout).await;
     unmount_fuse(&handle).await
 }
 

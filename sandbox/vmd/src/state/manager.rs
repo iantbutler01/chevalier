@@ -245,6 +245,13 @@ pub struct Manager {
     pci_leases: Mutex<HashMap<String, String>>,
 }
 
+/// One live mount's publication status, attributed to the VM that owns it.
+#[derive(Clone, Debug)]
+pub struct VmVfsPublicationStatus {
+    pub vm_id: String,
+    pub status: fuse::VfsPublicationStatus,
+}
+
 #[derive(Clone, Debug)]
 pub struct PciActionResult {
     pub metadata: VmMetadata,
@@ -511,6 +518,43 @@ impl Manager {
 
     async fn vm_refs(&self) -> Vec<Arc<Vm>> {
         self.vms.read().await.values().cloned().collect()
+    }
+
+    /// Publication status for every live VFS mount this node owns.
+    ///
+    /// A mount's local view is authoritative, so a replication failure is
+    /// invisible to the guest by construction — which is exactly why it has to
+    /// be visible here. A blocked suffix is preserved and retried forever and
+    /// will never resolve itself; nothing but this surface and the mount's own
+    /// tracing will ever say so.
+    ///
+    /// A VM whose guard is currently held is skipped rather than waited on: the
+    /// qemu exit reaper holds it across a drain, and a health surface that can
+    /// park behind a replication outage is not a health surface.
+    pub async fn vfs_publication_status(&self) -> Vec<VmVfsPublicationStatus> {
+        let mut statuses = Vec::new();
+        for vm in self.vm_refs().await {
+            let Ok(inner) = vm.try_lock() else {
+                continue;
+            };
+            let vm_id = inner.metadata.id.clone();
+            for handle in &inner.runtime.fuse_handles {
+                statuses.push(VmVfsPublicationStatus {
+                    vm_id: vm_id.clone(),
+                    status: handle.publication_status(),
+                });
+            }
+        }
+        statuses
+    }
+
+    /// Whether any mount on this node cannot publish. Cheap enough for a health
+    /// probe: it reads in-memory cursors and takes no gateway round trip.
+    pub async fn vfs_publication_is_degraded(&self) -> bool {
+        self.vfs_publication_status()
+            .await
+            .iter()
+            .any(|entry| !entry.status.is_healthy())
     }
 
     async fn attached_vm_ids_for_volume(&self, owner_key: &str) -> Vec<String> {
@@ -1912,6 +1956,11 @@ impl Manager {
             let inner = vm.lock().await;
             inner.runtime.state
         };
+        // Deleting a VM destroys its mount state directories, so this is the
+        // last moment publication can still make progress at full speed: the
+        // mounts are live, their publishers are running, and the qemu exit
+        // reaper that follows only gets the short guarded bound.
+        drain_vm_publication(&vm, "delete-vm", fuse::DEFAULT_VFS_DRAIN_TIMEOUT).await;
         if matches!(state, VmState::Running | VmState::Paused) {
             self.force_stop_vm(id).await?;
         }
@@ -1944,6 +1993,19 @@ impl Manager {
                 .map_err(ManagerError::Other)?;
         }
 
+        // Everything below destroys the VM directory, and with it every mount's
+        // write-ahead log. Anything still unacknowledged at this point is being
+        // discarded, not deferred — the mount was the authority for those events
+        // and nothing else in the system knows they existed, so the decision is
+        // recorded before it is executed.
+        let residue = fuse::report_unpublished_vfs_state_under(&vm.dir).await;
+        if fuse::warn_unpublished_vfs_state("delete-vm", &residue) {
+            warn!(
+                vm_id = %id,
+                state_directories = residue.len(),
+                "deleting a VM whose vfs mount state could not be proven fully published"
+            );
+        }
         remove_vm_dir_if_detached(id, &vm.dir).map_err(ManagerError::Other)?;
         let _ = fs::remove_dir_all(runtime_dir);
         self.vms.write().await.remove(id);
@@ -1981,6 +2043,13 @@ impl Manager {
         if matches!(parent_state, VmState::Creating | VmState::Error) {
             return Err(ManagerError::InvalidState);
         }
+
+        // The child hydrates its scope from the gateway replica, so anything the
+        // parent accepted but has not published yet would be invisible to it.
+        // Drained here, before the pause and the fork snapshot, because this is
+        // the last point where the parent's mounts are live and its publisher can
+        // still make progress at full speed.
+        drain_vm_publication(&parent_vm, "fork-vm", fuse::DEFAULT_VFS_DRAIN_TIMEOUT).await;
 
         if matches!(parent_state, VmState::Running) {
             self.pause_vm(parent_id).await?;
@@ -2663,6 +2732,14 @@ impl Manager {
                     .map_err(ManagerError::Other)?;
             }
         }
+
+        // A snapshot captures guest memory that assumes this mount's local view,
+        // so the replica has to carry everything that view already accepted
+        // before the RAM image is taken. Publication is asynchronous by design;
+        // a snapshot is one of the boundaries where the architecture pays that
+        // debt back. Done before the qemu phase, while the guest is still live
+        // and the publisher can still make progress at full speed.
+        drain_vm_publication(&vm, "create-snapshot", fuse::DEFAULT_VFS_DRAIN_TIMEOUT).await;
 
         // @dive: QEMU background-snapshot can transiently stall guest exec while
         //        userfaultfd-WP drains pages. That does not mean the VM is wedged;
@@ -5260,6 +5337,20 @@ async fn cleanup_unpublished_fuse_handles(vm_id: &str, handles: &[fuse::FuseHand
     }
 }
 
+/// Bring the gateway replica level with every VFS mount this VM owns.
+///
+/// Clones the handles out from under the per-VM lock and drains with the lock
+/// released: a drain awaits the network, and holding the VM guard across it
+/// would put every other operation on that VM behind a replication outage.
+/// The handles stay in runtime state — this drains the mounts, it does not end
+/// them.
+async fn drain_vm_publication(vm: &Arc<Vm>, reason: &str, deadline: Duration) {
+    let handles = { vm.lock().await.runtime.fuse_handles.clone() };
+    for handle in handles {
+        handle.drain_publication(reason, deadline).await;
+    }
+}
+
 async fn cleanup_runtime_mounts(vm: &Arc<Vm>) -> Result<()> {
     let (virtiofsd_handles, fuse_handles, tap_network) = {
         let mut inner = vm.lock().await;
@@ -5275,10 +5366,23 @@ async fn cleanup_runtime_mounts(vm: &Arc<Vm>) -> Result<()> {
     for handle in &virtiofsd_handles {
         virt::terminate_virtiofsd(handle);
     }
+    // virtiofsd is gone, so the guest can no longer reach these mounts and the
+    // WAL is final. Drain every one of them before detaching any: a torn-down
+    // mount can no longer seal a dirty generation, and this pass covers every
+    // mount of the VM even if a later unmount fails and pushes its handle back.
+    for handle in &fuse_handles {
+        handle
+            .drain_publication("cleanup-runtime-mounts", fuse::DEFAULT_VFS_DRAIN_TIMEOUT)
+            .await;
+    }
     let mut failed_handles = Vec::new();
     let mut failures = Vec::new();
     for handle in fuse_handles {
-        if let Err(error) = fuse::unmount_fuse(&handle).await {
+        // Zero drain bound: the pass above already waited for the cursor, and
+        // repeating a full wait per mount would multiply a gateway outage by the
+        // mount count. The unmount still seals dirty content and finalizes the
+        // state directory.
+        if let Err(error) = fuse::unmount_fuse_with_drain(&handle, Duration::ZERO).await {
             failures.push(format!("{}: {error:#}", handle.mountpoint().display()));
             failed_handles.push(handle);
         }
@@ -5466,7 +5570,14 @@ fn spawn_exit_task(
         let mut failed_fuse_handles = Vec::new();
         let mut unmount_failures = Vec::new();
         for handle in fuse_handles {
-            if let Err(error) = fuse::unmount_fuse(&handle).await {
+            // The per-VM guard is held across this await, so the publication
+            // drain gets the guarded bound rather than the lifecycle one: an
+            // unreachable gateway must not park every other operation on this VM
+            // for the full drain timeout. Whatever is left stays in the durable
+            // WAL and is replayed by the next mount of the state directory.
+            if let Err(error) =
+                fuse::unmount_fuse_with_drain(&handle, fuse::GUARDED_VFS_DRAIN_TIMEOUT).await
+            {
                 unmount_failures.push(format!("{}: {error:#}", handle.mountpoint().display()));
                 failed_fuse_handles.push(handle);
             }
@@ -5558,7 +5669,13 @@ fn configure_qemu_process_identity(
         vm_dir,
         cfg.qemu_process.run_as_uid,
         cfg.qemu_process.run_as_gid,
-        &[vm_dir.join("fuse-mounts")],
+        // `fuse-mounts` holds live FUSE mountpoints; `vfs-state` holds each
+        // fuse-backed mount's authoritative local state — its backing tree, its
+        // write-ahead log and its payload store. Chowning either is wrong twice
+        // over: it is an O(files) recursive walk of a tree that can hold a whole
+        // `node_modules`, and it hands the unprivileged qemu process ownership of
+        // state only vmd may write.
+        &[vm_dir.join("fuse-mounts"), vm_dir.join("vfs-state")],
     )
     .with_context(|| format!("chown vm dir {} for qemu user", vm_dir.display()))?;
     recursively_chown_path_skipping(
