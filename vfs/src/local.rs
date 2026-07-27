@@ -29,13 +29,14 @@ use tokio::sync::{
 use uuid::Uuid;
 
 use crate::{
-    OptimizedVfsStorage, SeededFileHash, VfsStorageCasPredicate, VfsStorageDeleteResult, VfsStorageDirListFilter,
-    VfsStorageDirListOrder, VfsStorageEntryKind, VfsStorageError, VfsStorageHardLinkResult,
-    VfsStorageMetadata, VfsStorageMetadataFields, VfsStorageNamespaceMutation,
-    VfsStorageObjectState, VfsStoragePrefetchOptions, VfsStoragePrefetchResult,
-    VfsStorageReadIfChanged, VfsStorageReadIfChangedResult, VfsStorageReadRange,
-    VfsStorageRenameResult, VfsStorageResult, VfsStorageSubtreeOptions, VfsStorageWrite,
-    VfsStorageWriteOptions, VfsStorageWritePrecondition, VfsStorageWriteResult, normalize_vfs_mode,
+    OptimizedVfsStorage, SeededFileHash, VfsStorageCasPredicate, VfsStorageDeleteResult,
+    VfsStorageDirListFilter, VfsStorageDirListOrder, VfsStorageEntryKind, VfsStorageError,
+    VfsStorageHardLinkResult, VfsStorageMetadata, VfsStorageMetadataFields,
+    VfsStorageNamespaceMutation, VfsStorageObjectState, VfsStoragePrefetchOptions,
+    VfsStoragePrefetchResult, VfsStorageReadIfChanged, VfsStorageReadIfChangedResult,
+    VfsStorageReadRange, VfsStorageRenameResult, VfsStorageResult, VfsStorageSubtreeOptions,
+    VfsStorageWrite, VfsStorageWriteOptions, VfsStorageWritePrecondition, VfsStorageWriteResult,
+    normalize_vfs_mode,
     pack::{SlotCompression, hex_hash},
 };
 
@@ -2332,7 +2333,11 @@ fn install_writes_with_options(
             }),
             (None, _) => None,
         };
-        let previous_mode = if options.is_some() { existing_mode } else { None };
+        let previous_mode = if options.is_some() {
+            existing_mode
+        } else {
+            None
+        };
         let content_hash = hex_hash(&write.bytes);
         let durability_directories = abs_path
             .parent()
@@ -6093,7 +6098,10 @@ mod tests {
             .await
             .expect("stat")
             .expect("present");
-        let original_mtime = fs::metadata(&path).expect("metadata").modified().expect("mtime");
+        let original_mtime = fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
 
         // Out-of-band replacement: identical length, mtime put back afterwards.
         fs::write(&path, b"bbbb").expect("out-of-band write");
@@ -6655,7 +6663,11 @@ mod tests {
             "a declared hash that does not match the bytes must not commit: {result:?}",
         );
         // And the destination must be untouched by the rejected write.
-        let after = storage.stat("claimed.bin").await.expect("stat").expect("present");
+        let after = storage
+            .stat("claimed.bin")
+            .await
+            .expect("stat")
+            .expect("present");
         assert_eq!(after.content_hash, Some(original.content_hash));
     }
 
@@ -6851,8 +6863,10 @@ mod tests {
             .map(|index| VfsStorageWrite {
                 path: format!(".git/objects/ab/{index:04x}"),
                 mode: None,
-                bytes: Bytes::from(format!("object-{index:04}
-")),
+                bytes: Bytes::from(format!(
+                    "object-{index:04}
+"
+                )),
                 token_count: None,
                 precondition: None,
             })
@@ -6892,8 +6906,10 @@ mod tests {
             .map(|index| VfsStorageWrite {
                 path: format!(".git/refs/heads/perf-{index:05}.lock"),
                 mode: None,
-                bytes: Bytes::from(format!("ref-{generation}-{index:05}
-")),
+                bytes: Bytes::from(format!(
+                    "ref-{generation}-{index:05}
+"
+                )),
                 token_count: None,
                 precondition: None,
             })
@@ -6907,8 +6923,10 @@ mod tests {
             .chain((0..object_count).map(|index| VfsStorageWrite {
                 path: format!(".git/objects/{:02x}/{:038x}", index % 256, index),
                 mode: None,
-                bytes: Bytes::from(format!("blob {generation} {index:08}
-")),
+                bytes: Bytes::from(format!(
+                    "blob {generation} {index:08}
+"
+                )),
                 token_count: None,
                 precondition: None,
             }))
@@ -7373,8 +7391,11 @@ mod tests {
 
         // Overwriting must NOT re-apply mode: the file already has one, and a
         // rewrite is not a chmod. Someone who ran `chmod 700` keeps it.
-        fs::set_permissions(dir.path().join("tool.sh"), fs::Permissions::from_mode(0o700))
-            .expect("chmod");
+        fs::set_permissions(
+            dir.path().join("tool.sh"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .expect("chmod");
         storage
             .write_many_atomic(vec![VfsStorageWrite {
                 path: "tool.sh".to_string(),

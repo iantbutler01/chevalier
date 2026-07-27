@@ -434,7 +434,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!(completes, 1, "one tool call must emit exactly one ToolCallComplete");
+        assert_eq!(
+            completes, 1,
+            "one tool call must emit exactly one ToolCallComplete"
+        );
     }
 
     #[test]
@@ -455,7 +458,11 @@ mod tests {
         assert_eq!(completes, 1);
         // And a REPLAYED duplicate done for the same call stays suppressed.
         let again = parse_openai_responses_event(&item_done, &mut acc, true);
-        assert!(again.iter().all(|c| !matches!(c, StreamChunk::ToolCallComplete(_))));
+        assert!(
+            again
+                .iter()
+                .all(|c| !matches!(c, StreamChunk::ToolCallComplete(_)))
+        );
     }
 
     #[test]
