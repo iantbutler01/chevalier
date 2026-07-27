@@ -3,6 +3,7 @@ pub mod client;
 mod dispatch;
 pub mod fs;
 pub mod handle;
+mod local_view;
 mod namespace;
 mod write;
 

@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use chevalier_vfs::SeededFileHash;
 use chevalier_vfs::gateway::{GatewayVfsStorage, GatewayVfsStorageConfig};
 use chevalier_vfs::local::LocalVfsStorage;
-use chevalier_vfs::SeededFileHash;
 use chevalier_vfs::{
     OptimizedVfsStorage, VFS_POSIX_MODE_MASK, VfsStorageCasPredicate, VfsStorageDirListFilter,
     VfsStorageEntryKind, VfsStorageError, VfsStorageMetadata, VfsStorageMetadataFields,
@@ -372,7 +372,32 @@ struct VfsWriteManyInput {
     path: String,
     body: Vec<u8>,
     #[serde(default)]
+    mode: Option<u32>,
+    #[serde(default)]
     precondition: Option<VfsStorageWritePrecondition>,
+}
+
+fn storage_writes_from_value(writes: Value) -> napi::Result<Vec<VfsStorageWrite>> {
+    let writes = serde_json::from_value::<Vec<VfsWriteManyInput>>(writes)
+        .map_err(|error| invalid_options_err(format!("invalid write batch: {error}")))?;
+    if writes
+        .iter()
+        .any(|write| write.mode.is_some_and(|mode| mode & !0o7777 != 0))
+    {
+        return Err(invalid_options_err(
+            "invalid write batch: mode must contain only POSIX permission and special bits",
+        ));
+    }
+    Ok(writes
+        .into_iter()
+        .map(|write| VfsStorageWrite {
+            path: write.path,
+            mode: write.mode,
+            bytes: Bytes::from(write.body),
+            token_count: None,
+            precondition: write.precondition,
+        })
+        .collect())
 }
 
 /// One durably-stored content hash plus the stat witness proving it was current
@@ -722,17 +747,7 @@ impl VfsStorage {
     /// Write an ordered set of files through one backend operation.
     #[napi]
     pub async fn write_many(&self, writes: Value) -> napi::Result<Value> {
-        let writes = serde_json::from_value::<Vec<VfsWriteManyInput>>(writes)
-            .map_err(|error| invalid_options_err(format!("invalid write batch: {error}")))?
-            .into_iter()
-            .map(|write| VfsStorageWrite {
-                path: write.path,
-                mode: None,
-                bytes: Bytes::from(write.body),
-                token_count: None,
-                precondition: write.precondition,
-            })
-            .collect();
+        let writes = storage_writes_from_value(writes)?;
         let result = self
             .inner
             .write_many_atomic(writes)
@@ -793,4 +808,43 @@ pub fn vfs_content_hash(bytes: Buffer) -> String {
 #[napi]
 pub fn vfs_content_hash_algorithm() -> String {
     chevalier_vfs_hash::algorithm().as_str().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::storage_writes_from_value;
+    use serde_json::json;
+
+    #[test]
+    fn write_many_preserves_create_mode() {
+        let writes = storage_writes_from_value(json!([
+            {
+                "path": "bin/tool",
+                "body": [35, 33],
+                "mode": 0o755
+            },
+            {
+                "path": "README.md",
+                "body": [111, 107]
+            }
+        ]))
+        .expect("decode write batch");
+
+        assert_eq!(writes[0].mode, Some(0o755));
+        assert_eq!(writes[1].mode, None);
+    }
+
+    #[test]
+    fn write_many_rejects_file_type_bits() {
+        let error = storage_writes_from_value(json!([
+            {
+                "path": "bin/tool",
+                "body": [],
+                "mode": 0o100755
+            }
+        ]))
+        .expect_err("file type bits must be rejected");
+
+        assert!(error.reason.contains("POSIX permission and special bits"));
+    }
 }

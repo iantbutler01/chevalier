@@ -739,6 +739,28 @@ test("a watcher woken by a publication is answered with that publication's paths
   assert.deepStrictEqual([...body.paths].sort(), ["late", "late/added.txt"]);
 });
 
+test("the first publication after an observed owner baseline is answered completely", async () => {
+  const handler = createVfsGatewayServer({ resolveStore: () => watchPathStore() });
+  const owner = "owner-first-publication";
+
+  // Establish the owner's pre-publication revision. The since=0 query itself
+  // cannot be answered from history, but the revision it returns is the exact
+  // floor from which the first retained publication is complete.
+  const initial = await watchRequest(handler, owner, "since=0&timeout_ms=1000");
+  const initialBody = await initial.json();
+  const baseline = Number(initialBody.revision);
+
+  const published = await namespaceMany(handler, owner, [
+    { kind: "create_file", path: "first/file.txt" },
+  ]);
+  assert.strictEqual(published.status, 200);
+
+  const response = await watchRequest(handler, owner, `since=${baseline}&timeout_ms=1000`);
+  const body = await response.json();
+  assert.strictEqual(body.truncated, undefined);
+  assert.deepStrictEqual([...body.paths].sort(), ["first", "first/file.txt"]);
+});
+
 test("watch serializes an empty-but-complete path set distinguishably from a truncated one", async () => {
   const handler = createVfsGatewayServer({ resolveStore: () => watchPathStore() });
   const owner = "owner-empty-complete";
@@ -928,13 +950,23 @@ test("a watcher behind the retained publication history is answered truncated", 
     assert.strictEqual((await putDir(handler, owner, `bulk-${index}`)).status, 204);
   }
 
-  const response = await watchRequest(handler, owner, `since=${evicted}&timeout_ms=1000`);
+  const boundary = await watchRequest(handler, owner, `since=${evicted}&timeout_ms=1000`);
+  assert.strictEqual(boundary.status, 200);
+  const boundaryBody = await boundary.json();
+  assert.strictEqual(
+    boundaryBody.truncated,
+    undefined,
+    "the exact eviction boundary is complete because the watcher already observed that revision",
+  );
+  assert.deepStrictEqual([...boundaryBody.paths].sort(), ["kept", "kept/second.txt"]);
+
+  const response = await watchRequest(handler, owner, `since=${evicted - 1}&timeout_ms=1000`);
   assert.strictEqual(response.status, 200);
   const body = await response.json();
   assert.strictEqual(
     body.truncated,
     true,
-    "publications before the retained history may have been evicted unseen",
+    "a watcher before the eviction boundary may have missed a removed publication",
   );
   assert.deepStrictEqual(body.paths, []);
 
@@ -955,19 +987,26 @@ test("a union past the watch path cap is answered truncated", async () => {
   ]);
   const baseline = Number(seeded.headers.get(NAMESPACE_REVISION_HEADER));
 
-  // 900 files in one directory -> 901 paths (each file plus their shared
-  // parent), comfortably under the 1024 cap: still answered precisely.
-  const under = await namespaceMany(handler, owner, createFiles(900, "bulk"));
+  // 4,000 files in one directory -> 4,001 paths (each file plus their shared
+  // parent), comfortably under the 8,192 cap: still answered precisely.
+  const under = await namespaceMany(handler, owner, createFiles(4_000, "bulk"));
   assert.strictEqual(under.status, 200);
-  const underRevision = Number(under.headers.get(NAMESPACE_REVISION_HEADER));
   const precise = await watchRequest(handler, owner, `since=${baseline}&timeout_ms=1000`);
   const preciseBody = await precise.json();
   assert.strictEqual(preciseBody.truncated, undefined);
-  assert.strictEqual(preciseBody.paths.length, 901);
+  assert.strictEqual(preciseBody.paths.length, 4_001);
 
-  // A second batch takes the union to 1102, past the cap, where the targeted
-  // answer stops being cheaper than the watcher's own fallback.
-  const over = await namespaceMany(handler, owner, createFiles(200, "more"));
+  // A full second batch still fits: 4,001 + 4,097 = 8,098 paths.
+  const within = await namespaceMany(handler, owner, createFiles(4_096, "more"));
+  assert.strictEqual(within.status, 200);
+  const withinRevision = Number(within.headers.get(NAMESPACE_REVISION_HEADER));
+  const withinResponse = await watchRequest(handler, owner, `since=${baseline}&timeout_ms=1000`);
+  const withinBody = await withinResponse.json();
+  assert.strictEqual(withinBody.truncated, undefined);
+  assert.strictEqual(withinBody.paths.length, 8_098);
+
+  // A third batch takes the union to 8,199, past the cap.
+  const over = await namespaceMany(handler, owner, createFiles(100, "over"));
   assert.strictEqual(over.status, 200);
   const response = await watchRequest(handler, owner, `since=${baseline}&timeout_ms=1000`);
   assert.strictEqual(response.status, 200);
@@ -975,12 +1014,12 @@ test("a union past the watch path cap is answered truncated", async () => {
   assert.strictEqual(body.truncated, true);
   assert.deepStrictEqual(body.paths, [], "a truncated answer carries no partial set");
 
-  // A watcher that missed only the second batch stays under the cap and is
+  // A watcher that missed only the third batch stays under the cap and is
   // still told exactly what to revoke.
-  const later = await watchRequest(handler, owner, `since=${underRevision}&timeout_ms=1000`);
+  const later = await watchRequest(handler, owner, `since=${withinRevision}&timeout_ms=1000`);
   const laterBody = await later.json();
   assert.strictEqual(laterBody.truncated, undefined);
-  assert.strictEqual(laterBody.paths.length, 201);
+  assert.strictEqual(laterBody.paths.length, 101);
 });
 
 // ---- revocation-acked publications ----------------------------------------

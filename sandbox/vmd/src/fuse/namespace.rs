@@ -19,7 +19,9 @@ use tokio::runtime::Handle;
 use uuid::Uuid;
 
 use super::client::{RemoteVfsClient, rejected_request_status, request_status};
-use super::write::{WriteDrainHandle, is_write_staging_temp_name};
+use super::write::{
+    WriteBarrierDrain, WriteBarrierGuard, WriteDrainHandle, is_write_staging_temp_name,
+};
 
 /// Bounded self-healing budget for a RemoveDirectory/DeleteFile the gateway
 /// rejected with a 409 conflict before it is dead-lettered: drain the write
@@ -33,13 +35,25 @@ const DELETION_RECOVERY_BACKOFF: Duration = Duration::from_millis(50);
 /// Large enough to span a deep `rm -rf` in flight, small enough to stay cheap.
 const RECENTLY_DELETED_CAPACITY: usize = 8192;
 
-const BATCH_DELAY: Duration = Duration::from_millis(8);
+// Idle debounce for creation bursts. A fixed 8ms deadline from the first
+// mutation sliced a continuously arriving package layout into hundreds of
+// tiny publications; each publication advanced the coherence fence while the
+// same directory tree was still being built. Resetting a 100ms window on new
+// work lets the journal form one structural batch, while explicit namespace
+// barriers still set `force_flush` and bypass the wait immediately.
+const BATCH_DELAY: Duration = Duration::from_millis(100);
 const RETRY_DELAY: Duration = Duration::from_millis(100);
 const FLUSH_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Emit one WARN if the namespace flush barrier parks past this before the hard
 /// timeout, surfacing an intermittent upstream stall without per-poll spam.
 const SLOW_FLUSH_WARN_AFTER: Duration = Duration::from_secs(10);
 const MAX_BATCH_MUTATIONS: usize = 4096;
+/// Brief enqueue window for concurrent namespace creations. Ordinary POSIX
+/// mutation calls return after their WAL records enter the host page cache; the
+/// publication worker syncs the complete queued journal before any record is
+/// sent to the gateway.
+const DURABLE_ENQUEUE_GROUP_DELAY: Duration = Duration::from_millis(1);
+const MAX_DURABLE_ENQUEUE_GROUP: usize = 256;
 const JOURNAL_READ_BUFFER_BYTES: usize = 64 * 1024;
 /// Journal records contain metadata and bounded paths, never file payloads.
 /// One MiB is far above the supported path envelope while keeping a corrupt
@@ -65,6 +79,11 @@ struct JournalState {
     /// A creation in this set has already cost its round trip and its response
     /// still has to find its record, so it may not be withdrawn.
     in_flight: std::collections::HashSet<String>,
+    /// Write barriers transferred by asynchronous delete/rename callers. Each
+    /// barrier remains active until its exact namespace mutation has committed
+    /// (or been durably dead-lettered), so a later write cannot overtake the
+    /// queued namespace operation through the independent content journal.
+    write_barriers: HashMap<String, WriteBarrierGuard>,
     stop: bool,
     /// A rewrite crossed or may have crossed the atomic rename boundary but
     /// did not complete both parent-directory sync and append-handle reopen.
@@ -79,9 +98,28 @@ struct JournalState {
 type CommitHook =
     Box<dyn Fn(u64, &[VfsNamespaceMutation], &[VfsPublicationSnapshotEntry]) + Send + Sync>;
 
+struct DurableNamespacePayload {
+    mutation: VfsNamespaceMutation,
+    projected_metadata: Option<VfsMetadata>,
+    write_barrier: Option<WriteBarrierGuard>,
+}
+
+struct DurableNamespaceEnqueue {
+    payload: Mutex<Option<DurableNamespacePayload>>,
+    result: Mutex<Option<std::result::Result<(), String>>>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct DurableNamespaceEnqueueState {
+    pending: VecDeque<Arc<DurableNamespaceEnqueue>>,
+    processing: bool,
+}
+
 struct Shared {
     state: Mutex<JournalState>,
     changed: Condvar,
+    durable_enqueues: Mutex<DurableNamespaceEnqueueState>,
     journal_path: PathBuf,
 }
 
@@ -128,6 +166,21 @@ impl NamespaceJournal {
         }
         let pending = read_journal(journal_path)?;
         let journal = open_append(journal_path)?;
+        let mut write_barriers = HashMap::new();
+        if let Some(write_drain) = write_drain.as_ref() {
+            for record in pending
+                .iter()
+                .filter(|record| record.committed_revision.is_none())
+            {
+                let prefixes = namespace_write_barrier_prefixes(&record.mutation);
+                if !prefixes.is_empty() {
+                    write_barriers.insert(
+                        record.operation_id.clone(),
+                        write_drain.install_descendant_barrier(prefixes),
+                    );
+                }
+            }
+        }
         let shared = Arc::new(Shared {
             state: Mutex::new(JournalState {
                 pending,
@@ -135,12 +188,14 @@ impl NamespaceJournal {
                 force_flush: false,
                 flushing: false,
                 in_flight: std::collections::HashSet::new(),
+                write_barriers,
                 stop: false,
                 journal_needs_repair: false,
                 last_error: None,
                 dead_letter_error: None,
             }),
             changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableNamespaceEnqueueState::default()),
             journal_path: journal_path.to_path_buf(),
         });
         let worker_shared = Arc::clone(&shared);
@@ -174,36 +229,55 @@ impl NamespaceJournal {
         mutation: VfsNamespaceMutation,
         projected_metadata: Option<VfsMetadata>,
     ) -> Result<()> {
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .map_err(|_| anyhow!("vfs namespace journal lock poisoned"))?;
-        repair_before_append(&self.shared.journal_path, &mut state)?;
-        let record = NamespaceJournalRecord {
-            operation_id: Uuid::new_v4().to_string(),
-            mutation,
-            projected_metadata,
-            committed_revision: None,
+        self.enqueue_with_metadata_and_barrier(mutation, projected_metadata, None)
+    }
+
+    pub(crate) fn enqueue_with_metadata_and_barrier(
+        &self,
+        mutation: VfsNamespaceMutation,
+        projected_metadata: Option<VfsMetadata>,
+        write_barrier: Option<WriteBarrierGuard>,
+    ) -> Result<()> {
+        let request = Arc::new(DurableNamespaceEnqueue {
+            payload: Mutex::new(Some(DurableNamespacePayload {
+                mutation,
+                projected_metadata,
+                write_barrier,
+            })),
+            result: Mutex::new(None),
+            ready: Condvar::new(),
+        });
+        let leader = {
+            let mut enqueues = self
+                .shared
+                .durable_enqueues
+                .lock()
+                .map_err(|_| anyhow!("vfs durable namespace enqueue lock poisoned"))?;
+            enqueues.pending.push_back(Arc::clone(&request));
+            if enqueues.processing {
+                false
+            } else {
+                enqueues.processing = true;
+                true
+            }
         };
-        append_json_line(
-            &mut state.journal,
-            &record,
-            "append vfs namespace journal entry",
-        )?;
-        state.pending.push_back(record);
-        state.last_error = None;
-        if state
-            .pending
-            .iter()
-            .filter(|record| record.committed_revision.is_none())
-            .count()
-            >= MAX_BATCH_MUTATIONS
-        {
-            state.force_flush = true;
+        if leader {
+            drive_durable_namespace_enqueues(&self.shared);
         }
-        self.shared.changed.notify_all();
-        Ok(())
+        let mut result = request
+            .result
+            .lock()
+            .map_err(|_| anyhow!("vfs durable namespace enqueue result lock poisoned"))?;
+        while result.is_none() {
+            result = request
+                .ready
+                .wait(result)
+                .map_err(|_| anyhow!("vfs durable namespace enqueue result lock poisoned"))?;
+        }
+        result
+            .take()
+            .ok_or_else(|| anyhow!("vfs durable namespace enqueue result missing"))?
+            .map_err(|error| anyhow!(error))
     }
 
     /// Withdraw an undrained creation for `path`, handing ownership of the
@@ -258,7 +332,10 @@ impl NamespaceJournal {
         // against. This is per-record, not "is the worker busy" — a mount
         // materializing a tree keeps the worker permanently mid-batch, and a
         // blanket check would fold nothing.
-        if state.in_flight.contains(state.pending[index].operation_id.as_str()) {
+        if state
+            .in_flight
+            .contains(state.pending[index].operation_id.as_str())
+        {
             return Ok(false);
         }
         let removed = state.pending.remove(index);
@@ -373,6 +450,28 @@ impl NamespaceJournal {
         }))
     }
 
+    /// Whether a content write to `path` must wait for an earlier namespace
+    /// mutation to publish.
+    ///
+    /// Directory creation is deliberately not an ancestor fence. Every VFS
+    /// storage backend creates or infers missing parent directories while
+    /// installing a write, and the later CreateDirectory replay is idempotent
+    /// and applies its requested mode. Draining the complete directory journal
+    /// at every file close serialized tree imports behind one remote batch per
+    /// directory wave. Deletes and renames remain fences because they retarget
+    /// or retire the content pathname; exact entry creations also remain fences.
+    pub fn has_pending_write_ordering_for_path(&self, path: &str) -> Result<bool> {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| anyhow!("vfs namespace journal lock poisoned"))?;
+        Ok(state.pending.iter().any(|record| {
+            record.committed_revision.is_none()
+                && namespace_mutation_requires_write_order(&record.mutation, path)
+        }))
+    }
+
     pub fn has_projection_for_path(
         &self,
         path: &str,
@@ -389,6 +488,161 @@ impl NamespaceJournal {
                     && namespace_mutation_affects_path(mutation_path, path, include_direct_children)
             })
         }))
+    }
+
+    pub fn diagnostic_projection_state(&self, path: &str) -> Result<String> {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| anyhow!("vfs namespace journal lock poisoned"))?;
+        let path = path.trim_matches('/');
+        let matching = state
+            .pending
+            .iter()
+            .filter(|record| {
+                record.mutation.paths().into_iter().any(|mutation_path| {
+                    !mutation_path.is_empty()
+                        && namespace_mutation_affects_path(mutation_path, path, false)
+                })
+            })
+            .map(|record| {
+                format!(
+                    "{}:{:?}@{:?}",
+                    record.operation_id, record.mutation, record.committed_revision
+                )
+            })
+            .take(8)
+            .collect::<Vec<_>>();
+        Ok(format!(
+            "pending={} matching={matching:?}",
+            state.pending.len()
+        ))
+    }
+
+    /// Resolve namespace state that is complete without an authoritative base.
+    ///
+    /// The outer option means "the journal can answer"; the inner option is the
+    /// projected entry, including an authoritative local absence. A rename
+    /// destination descendant still needs metadata from its routed source and
+    /// therefore returns `None`, while the renamed-away source subtree is known
+    /// absent immediately and returns `Some(None)`.
+    pub fn project_metadata_without_base(&self, path: &str) -> Result<Option<Option<VfsMetadata>>> {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| anyhow!("vfs namespace journal lock poisoned"))?;
+        let path = path.trim_matches('/');
+        let mut resolved = None;
+        for record in &state.pending {
+            match &record.mutation {
+                VfsNamespaceMutation::CreateFile {
+                    path: created,
+                    mode,
+                } if created == path => {
+                    resolved = Some(Some(
+                        record
+                            .projected_metadata
+                            .clone()
+                            .unwrap_or_else(|| projected_file(*mode)),
+                    ));
+                }
+                VfsNamespaceMutation::CreateDirectory {
+                    path: created,
+                    mode,
+                } if created == path => {
+                    resolved = Some(Some(
+                        record
+                            .projected_metadata
+                            .clone()
+                            .unwrap_or_else(|| projected_directory(*mode)),
+                    ));
+                }
+                VfsNamespaceMutation::CreateSymlink {
+                    path: created,
+                    target,
+                } if created == path => {
+                    resolved = Some(Some(
+                        record
+                            .projected_metadata
+                            .clone()
+                            .unwrap_or_else(|| projected_symlink(target)),
+                    ));
+                }
+                VfsNamespaceMutation::CreateHardLink {
+                    destination_path, ..
+                } if destination_path == path => {
+                    if let Some(metadata) = record.projected_metadata.clone() {
+                        resolved = Some(Some(metadata));
+                    }
+                }
+                VfsNamespaceMutation::DeleteFile { path: deleted, .. } if deleted == path => {
+                    resolved = Some(None);
+                }
+                VfsNamespaceMutation::RemoveDirectory { path: deleted }
+                    if path_suffix(path, deleted).is_some() =>
+                {
+                    resolved = Some(None);
+                }
+                VfsNamespaceMutation::Rename { from, to } => {
+                    if path_suffix(path, from).is_some() {
+                        resolved = Some(None);
+                    } else if path_suffix(path, to) == Some("")
+                        && let Some(metadata) = record.projected_metadata.clone()
+                    {
+                        resolved = Some(Some(metadata));
+                    } else if path_suffix(path, to).is_some() {
+                        // A destination descendant is read through the still
+                        // authoritative source subtree; no base-free answer.
+                        resolved = None;
+                    }
+                }
+                VfsNamespaceMutation::SetMode {
+                    path: changed,
+                    mode,
+                } if changed == path => {
+                    if let Some(Some(metadata)) = resolved.as_mut() {
+                        metadata.mode = Some(*mode & 0o7777);
+                        metadata.executable = *mode & 0o111 != 0;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Map a locally visible pathname back to the authoritative path the
+    /// gateway still has while an asynchronous rename is pending.
+    ///
+    /// Pending renames are replayed in reverse because the journal projects
+    /// them forward in FIFO order. A lookup under `to/child` therefore reads
+    /// `from/child` until the rename batch commits, then applies the ordinary
+    /// namespace projection to that response. Only uncommitted records route
+    /// backwards; a committed record kept solely for a partial-response fence
+    /// already exists at its destination on the gateway.
+    pub fn authoritative_path_for_projection(&self, path: &str) -> Result<String> {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| anyhow!("vfs namespace journal lock poisoned"))?;
+        let mut routed = path.trim_matches('/').to_string();
+        for record in state
+            .pending
+            .iter()
+            .rev()
+            .filter(|record| record.committed_revision.is_none())
+        {
+            let VfsNamespaceMutation::Rename { from, to } = &record.mutation else {
+                continue;
+            };
+            if let Some(suffix) = path_suffix(routed.as_str(), to) {
+                routed = format!("{}{suffix}", from.trim_matches('/'));
+            }
+        }
+        Ok(routed)
     }
 
     pub fn project_metadata(
@@ -463,7 +717,13 @@ impl NamespaceJournal {
                 VfsNamespaceMutation::Rename { from, to } => {
                     if path_suffix(path, from).is_some() {
                         projected = None;
-                    } else if path_suffix(path, to).is_some() {
+                    } else if let Some(suffix) = path_suffix(path, to)
+                        && suffix.is_empty()
+                    {
+                        // The record carries metadata for the renamed ROOT.
+                        // Descendants are read from their routed pre-rename
+                        // source path and must keep that exact file/directory
+                        // metadata rather than all masquerading as the root.
                         projected = record.projected_metadata.clone().or(projected);
                     }
                 }
@@ -613,6 +873,18 @@ impl NamespaceJournal {
 
 fn observe_revision(shared: &Shared, state: &mut JournalState, revision: u64) -> Result<()> {
     if revision == 0 {
+        return Ok(());
+    }
+    // The common read path has only uncommitted projections. Avoid cloning the
+    // complete journal unless this revision can actually retire something.
+    // During a tree import this turns every projected LOOKUP from an O(N)
+    // allocation into one read-only scan; the indexed projection below removes
+    // that remaining scan.
+    if !state.pending.iter().any(|record| {
+        record
+            .committed_revision
+            .is_some_and(|committed| committed <= revision)
+    }) {
         return Ok(());
     }
     let before = state.pending.clone();
@@ -768,6 +1040,158 @@ fn namespace_mutation_affects_path(
             == observed_path
 }
 
+fn namespace_mutation_requires_write_order(
+    mutation: &VfsNamespaceMutation,
+    write_path: &str,
+) -> bool {
+    let write_path = write_path.trim_matches('/');
+    match mutation {
+        VfsNamespaceMutation::CreateFile { path, .. }
+        | VfsNamespaceMutation::CreateDirectory { path, .. }
+        | VfsNamespaceMutation::CreateSymlink { path, .. }
+        | VfsNamespaceMutation::DeleteFile { path, .. } => path.trim_matches('/') == write_path,
+        VfsNamespaceMutation::CreateHardLink {
+            destination_path, ..
+        } => destination_path.trim_matches('/') == write_path,
+        VfsNamespaceMutation::RemoveDirectory { path } => path_suffix(write_path, path).is_some(),
+        VfsNamespaceMutation::Rename { from, to } => {
+            path_suffix(write_path, from).is_some() || path_suffix(write_path, to).is_some()
+        }
+        // SetMode commutes with a content write: existing-file writes preserve
+        // the inode mode, and a projected new entry has its creation mutation
+        // above as the ordering fence.
+        VfsNamespaceMutation::SetMode { .. } => false,
+    }
+}
+
+fn namespace_write_barrier_prefixes(mutation: &VfsNamespaceMutation) -> Vec<String> {
+    match mutation {
+        VfsNamespaceMutation::RemoveDirectory { path }
+        | VfsNamespaceMutation::DeleteFile { path, .. } => {
+            vec![path.trim_matches('/').to_string()]
+        }
+        VfsNamespaceMutation::Rename { from, to } => vec![
+            from.trim_matches('/').to_string(),
+            to.trim_matches('/').to_string(),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn drive_durable_namespace_enqueues(shared: &Arc<Shared>) {
+    loop {
+        std::thread::sleep(DURABLE_ENQUEUE_GROUP_DELAY);
+        let requests = {
+            let mut enqueues = shared
+                .durable_enqueues
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if enqueues.pending.is_empty() {
+                enqueues.processing = false;
+                return;
+            }
+            let take = enqueues.pending.len().min(MAX_DURABLE_ENQUEUE_GROUP);
+            enqueues.pending.drain(..take).collect::<Vec<_>>()
+        };
+        let outcome = process_durable_namespace_enqueue_group(shared, &requests);
+        match outcome {
+            Ok(()) => {
+                for request in &requests {
+                    *request
+                        .result
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Ok(()));
+                    request.ready.notify_all();
+                }
+            }
+            Err(error) => {
+                let error = error.to_string();
+                for request in &requests {
+                    *request
+                        .result
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        Some(Err(error.clone()));
+                    request.ready.notify_all();
+                }
+            }
+        }
+    }
+}
+
+fn process_durable_namespace_enqueue_group(
+    shared: &Arc<Shared>,
+    requests: &[Arc<DurableNamespaceEnqueue>],
+) -> Result<()> {
+    let mut state = shared
+        .state
+        .lock()
+        .map_err(|_| anyhow!("vfs namespace journal lock poisoned"))?;
+    repair_before_append(&shared.journal_path, &mut state)?;
+
+    let mut prepared = Vec::with_capacity(requests.len());
+    for request in requests {
+        let payload = request
+            .payload
+            .lock()
+            .map_err(|_| anyhow!("vfs durable namespace payload lock poisoned"))?
+            .take()
+            .ok_or_else(|| anyhow!("vfs durable namespace payload missing"))?;
+        prepared.push((
+            NamespaceJournalRecord {
+                operation_id: Uuid::new_v4().to_string(),
+                mutation: payload.mutation,
+                projected_metadata: payload.projected_metadata,
+                committed_revision: None,
+            },
+            payload.write_barrier,
+        ));
+    }
+
+    let mut journal_touched = false;
+    let append_result = (|| -> Result<()> {
+        for (record, _) in &prepared {
+            // Any failed serialization/write may have changed the append file,
+            // so a later enqueue must first rewrite from authoritative pending
+            // state even when the failure happened before a full line landed.
+            journal_touched = true;
+            append_json_line_unsynced(
+                &mut state.journal,
+                record,
+                "append vfs namespace journal entry",
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = append_result {
+        if journal_touched {
+            state.journal_needs_repair = true;
+        }
+        return Err(error);
+    }
+
+    for (record, write_barrier) in prepared {
+        if let Some(write_barrier) = write_barrier {
+            state
+                .write_barriers
+                .insert(record.operation_id.clone(), write_barrier);
+        }
+        state.pending.push_back(record);
+    }
+    state.last_error = None;
+    if state
+        .pending
+        .iter()
+        .filter(|record| record.committed_revision.is_none())
+        .count()
+        >= MAX_BATCH_MUTATIONS
+    {
+        state.force_flush = true;
+    }
+    shared.changed.notify_all();
+    Ok(())
+}
+
 impl Drop for NamespaceJournal {
     fn drop(&mut self) {
         let _ = self.flush();
@@ -844,7 +1268,8 @@ fn run_worker(
                 .filter(|record| record.committed_revision.is_none())
                 .count();
             if !state.force_flush && uncommitted_count < MAX_BATCH_MUTATIONS {
-                let deadline = Instant::now() + BATCH_DELAY;
+                let mut observed_count = uncommitted_count;
+                let mut deadline = Instant::now() + BATCH_DELAY;
                 while !state.force_flush
                     && state
                         .pending
@@ -860,6 +1285,16 @@ fn run_worker(
                         Err(_) => return,
                     };
                     state = waited.0;
+                    let current_count = state
+                        .pending
+                        .iter()
+                        .filter(|record| record.committed_revision.is_none())
+                        .count();
+                    if current_count > observed_count {
+                        observed_count = current_count;
+                        deadline = Instant::now() + BATCH_DELAY;
+                        continue;
+                    }
                     if waited.1.timed_out() {
                         break;
                     }
@@ -879,13 +1314,29 @@ fn run_worker(
                 .take_while(|record| mutation_surface(&scope_path, &record.mutation) == surface)
                 .cloned()
                 .collect::<Vec<_>>();
+            // No later enqueue can append while `state` is held. Syncing here
+            // therefore makes every WAL record currently visible durable before
+            // any selected mutation is allowed onto the wire.
+            let durability = state
+                .journal
+                .sync_data()
+                .context("sync vfs namespace journal before publication");
+            let write_barrier_drains = batch
+                .iter()
+                .filter_map(|record| {
+                    state
+                        .write_barriers
+                        .get(record.operation_id.as_str())
+                        .map(WriteBarrierGuard::drain_handle)
+                })
+                .collect::<Vec<WriteBarrierDrain>>();
             state.force_flush = false;
             state.flushing = true;
             state.in_flight = batch
                 .iter()
                 .map(|record| record.operation_id.clone())
                 .collect();
-            (batch, surface)
+            (batch, surface, durability, write_barrier_drains)
         };
 
         let operation_ids = batch
@@ -898,11 +1349,24 @@ fn run_worker(
             .iter()
             .map(|record| record.mutation.clone())
             .collect::<Vec<_>>();
-        let result = tokio.block_on(client.apply_namespace_batch(
-            operation_ids.as_slice(),
-            mutations.as_slice(),
-            batch.1,
-        ));
+        // A queued delete/rename owns a descendant write barrier from enqueue
+        // through this publication. Drain only matching writes admitted before
+        // each barrier, then apply the namespace batch. Later matching writes
+        // are parked; unrelated later writes may continue and must not prevent
+        // this journal from reaching an empty global queue. Crash recovery uses
+        // the same path because startup reconstructs these guards from the WAL.
+        let write_ordering = || batch.3.iter().try_for_each(WriteBarrierDrain::flush);
+        let result = if let Err(error) = batch.2 {
+            Err(error)
+        } else {
+            write_ordering().and_then(|()| {
+                tokio.block_on(client.apply_namespace_batch(
+                    operation_ids.as_slice(),
+                    mutations.as_slice(),
+                    batch.1,
+                ))
+            })
+        };
         // A 4xx rejection can never succeed by retrying the same batch. Replay
         // the batch one mutation at a time, in order, so a single rejected
         // mutation is recorded and dropped instead of wedging the journal.
@@ -967,29 +1431,41 @@ fn run_worker(
                     .iter()
                     .map(|record| record.operation_id.as_str())
                     .collect::<std::collections::HashSet<_>>();
-                if publication_snapshot_observes_mutations(
+                let observed_paths = publication_snapshot_observed_paths(
                     mutations.as_slice(),
                     publication.entries.as_slice(),
-                ) {
-                    // This is not retirement on a mutation acknowledgement:
-                    // the response carries the authoritative post-mutation
-                    // metadata snapshot under the same server revision. The
-                    // commit hook installed that snapshot before we reached
-                    // this point, so both the projection and cache have now
-                    // observed the committed revision.
-                    state
-                        .pending
-                        .retain(|record| !committed_ids.contains(record.operation_id.as_str()));
-                } else {
-                    // Rolling-upgrade and partial responses remain fail
-                    // closed. Keep projecting until an ordinary read observes
-                    // the committed revision.
-                    for record in &mut state.pending {
-                        if committed_ids.contains(record.operation_id.as_str()) {
-                            record.committed_revision = Some(publication.revision);
-                        }
+                );
+                let observed_ids = batch
+                    .0
+                    .iter()
+                    .filter(|record| {
+                        record
+                            .mutation
+                            .paths()
+                            .into_iter()
+                            .filter(|path| !path.is_empty())
+                            .all(|path| observed_paths.contains(path.trim_matches('/')))
+                    })
+                    .map(|record| record.operation_id.as_str())
+                    .collect::<std::collections::HashSet<_>>();
+                // This is not retirement on a mutation acknowledgement: each
+                // retired record has every path it can project proven in the
+                // authoritative post-batch snapshot at this exact revision.
+                //
+                // A rolling/partial response can omit one unrelated path without
+                // forcing the complete batch to remain in the hot projection
+                // queue. Records touching an omitted path stay fail-closed and
+                // are retired only after an ordinary read observes this revision.
+                for record in &mut state.pending {
+                    if committed_ids.contains(record.operation_id.as_str())
+                        && !observed_ids.contains(record.operation_id.as_str())
+                    {
+                        record.committed_revision = Some(publication.revision);
                     }
                 }
+                state
+                    .pending
+                    .retain(|record| !observed_ids.contains(record.operation_id.as_str()));
                 if let Err(error) = rewrite_journal(&shared.journal_path, &mut state) {
                     // The durable journal still contains this batch. Preserve
                     // the in-memory copy too so an ambiguous remote completion
@@ -997,6 +1473,9 @@ fn run_worker(
                     state.pending = pending_before;
                     state.last_error = Some(error.to_string());
                 } else {
+                    for operation_id in &committed_ids {
+                        state.write_barriers.remove(*operation_id);
+                    }
                     state.last_error = None;
                     if let Some(error) = recovered {
                         tracing::info!(
@@ -1035,49 +1514,68 @@ fn run_worker(
     }
 }
 
-fn publication_snapshot_observes_mutations(
+fn publication_snapshot_observed_paths(
     mutations: &[VfsNamespaceMutation],
     entries: &[VfsPublicationSnapshotEntry],
-) -> bool {
-    if mutations.is_empty() {
-        return true;
-    }
-    let mut expected_presence = HashMap::<&str, bool>::new();
+) -> std::collections::HashSet<String> {
+    let mut expected_presence = HashMap::<String, bool>::new();
     for mutation in mutations {
         match mutation {
             VfsNamespaceMutation::CreateFile { path, .. }
             | VfsNamespaceMutation::CreateDirectory { path, .. }
             | VfsNamespaceMutation::CreateSymlink { path, .. }
             | VfsNamespaceMutation::SetMode { path, .. } => {
-                expected_presence.insert(path.as_str(), true);
+                expected_presence.insert(path.trim_matches('/').to_string(), true);
             }
             VfsNamespaceMutation::CreateHardLink {
                 source_path,
                 destination_path,
             } => {
-                expected_presence.insert(source_path.as_str(), true);
-                expected_presence.insert(destination_path.as_str(), true);
+                expected_presence.insert(source_path.trim_matches('/').to_string(), true);
+                expected_presence.insert(destination_path.trim_matches('/').to_string(), true);
             }
             VfsNamespaceMutation::DeleteFile { path, .. }
             | VfsNamespaceMutation::RemoveDirectory { path } => {
-                expected_presence.insert(path.as_str(), false);
+                expected_presence.insert(path.trim_matches('/').to_string(), false);
             }
             VfsNamespaceMutation::Rename { from, to } => {
                 if from == to {
-                    expected_presence.insert(from.as_str(), true);
+                    expected_presence.insert(from.trim_matches('/').to_string(), true);
                 } else {
-                    expected_presence.insert(from.as_str(), false);
-                    expected_presence.insert(to.as_str(), true);
+                    expected_presence.insert(from.trim_matches('/').to_string(), false);
+                    expected_presence.insert(to.trim_matches('/').to_string(), true);
                 }
             }
         }
     }
-    expected_presence.into_iter().all(|(path, expected)| {
-        entries
-            .iter()
-            .find(|entry| entry.path.trim_matches('/') == path.trim_matches('/'))
-            .is_some_and(|entry| entry.metadata.is_some() == expected)
-    })
+    let observed_presence = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.path.trim_matches('/'),
+                entry.metadata.as_ref().is_some(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    expected_presence
+        .into_iter()
+        .filter_map(|(path, expected)| {
+            (observed_presence.get(path.as_str()) == Some(&expected)).then_some(path)
+        })
+        .collect()
+}
+
+fn publication_snapshot_observes_mutations(
+    mutations: &[VfsNamespaceMutation],
+    entries: &[VfsPublicationSnapshotEntry],
+) -> bool {
+    let expected_paths = mutations
+        .iter()
+        .flat_map(VfsNamespaceMutation::paths)
+        .filter(|path| !path.is_empty())
+        .map(|path| path.trim_matches('/'))
+        .collect::<std::collections::HashSet<_>>();
+    publication_snapshot_observed_paths(mutations, entries).len() == expected_paths.len()
 }
 
 struct NamespaceResolution {
@@ -1567,6 +2065,20 @@ fn apply_namespace_resolution(
         state.last_error = Some(error.to_string());
         return;
     }
+    let resolved_barriers = committed
+        .keys()
+        .copied()
+        .chain(
+            dead_lettered
+                .iter()
+                .copied()
+                .filter(|operation_id| !failed_ids.contains(operation_id)),
+        )
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for operation_id in resolved_barriers {
+        state.write_barriers.remove(operation_id.as_str());
+    }
     if !preserved_dead_letters.is_empty() {
         state.dead_letter_error = Some(format!(
             "vfs namespace mutation(s) rejected by the gateway and dead-lettered: {}",
@@ -1881,10 +2393,19 @@ fn append_json_line(
     value: &impl serde::Serialize,
     context: &'static str,
 ) -> Result<()> {
-    serde_json::to_writer(&mut *file, value).with_context(|| context)?;
-    file.write_all(b"\n").with_context(|| context)?;
+    append_json_line_unsynced(file, value, context)?;
     file.sync_data()
         .with_context(|| format!("sync {context}"))?;
+    Ok(())
+}
+
+fn append_json_line_unsynced(
+    file: &mut File,
+    value: &impl serde::Serialize,
+    context: &'static str,
+) -> Result<()> {
+    serde_json::to_writer(&mut *file, value).with_context(|| context)?;
+    file.write_all(b"\n").with_context(|| context)?;
     Ok(())
 }
 
@@ -1902,6 +2423,7 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::Barrier;
 
     use axum::body::{Body, to_bytes};
     use axum::extract::State;
@@ -1948,6 +2470,71 @@ mod tests {
 
     fn test_entry(name: &str, kind: &str, mode: u32, file_id: Option<&str>) -> VfsDirEntry {
         dir_entry_from_metadata(name.to_string(), test_metadata(kind, mode, file_id))
+    }
+
+    #[test]
+    fn concurrent_namespace_enqueues_are_all_durable_and_projected() {
+        const REQUESTS: usize = 32;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("namespace.jsonl");
+        let journal = Arc::new(NamespaceJournal {
+            shared: Arc::new(Shared {
+                state: Mutex::new(JournalState {
+                    pending: VecDeque::new(),
+                    journal: open_append(&journal_path).expect("journal"),
+                    force_flush: false,
+                    flushing: false,
+                    in_flight: std::collections::HashSet::new(),
+                    write_barriers: HashMap::new(),
+                    stop: false,
+                    journal_needs_repair: false,
+                    last_error: None,
+                    dead_letter_error: None,
+                }),
+                changed: Condvar::new(),
+                durable_enqueues: Mutex::new(DurableNamespaceEnqueueState::default()),
+                journal_path: journal_path.clone(),
+            }),
+            worker: Mutex::new(None),
+        });
+        let start = Arc::new(Barrier::new(REQUESTS + 1));
+        let mut callers = Vec::with_capacity(REQUESTS);
+        for index in 0..REQUESTS {
+            let journal = Arc::clone(&journal);
+            let start = Arc::clone(&start);
+            callers.push(std::thread::spawn(move || {
+                start.wait();
+                journal.enqueue_with_metadata(
+                    VfsNamespaceMutation::CreateDirectory {
+                        path: format!("node_modules/pkg-{index}"),
+                        mode: Some(0o755),
+                    },
+                    Some(test_metadata("directory", 0o755, None)),
+                )
+            }));
+        }
+        start.wait();
+        for caller in callers {
+            caller
+                .join()
+                .expect("namespace enqueue caller")
+                .expect("durable namespace enqueue");
+        }
+
+        let durable = read_journal(&journal_path).expect("durable journal");
+        assert_eq!(durable.len(), REQUESTS);
+        let mut state = journal.shared.state.lock().expect("journal state");
+        assert_eq!(state.pending.len(), REQUESTS);
+        let projected = state
+            .pending
+            .iter()
+            .filter(|record| record.projected_metadata.is_some())
+            .count();
+        assert_eq!(projected, REQUESTS);
+        // This journal has no worker in the unit test; clear it so Drop's flush
+        // does not wait for a publisher that intentionally does not exist.
+        state.pending.clear();
     }
 
     #[test]
@@ -2030,6 +2617,22 @@ mod tests {
                 &entries[..entries.len() - 1],
             ),
             "a partial response must retain the projection for a later read fence",
+        );
+        let partially_observed = publication_snapshot_observed_paths(
+            mutations.as_slice(),
+            &entries[..entries.len() - 1],
+        );
+        assert!(
+            partially_observed.contains("created-then-deleted"),
+            "the final absence proves both same-path mutations"
+        );
+        assert!(
+            partially_observed.contains("new-name"),
+            "an unrelated missing response entry must not retain proven paths"
+        );
+        assert!(
+            !partially_observed.contains("removed-dir"),
+            "the omitted path remains fail-closed"
         );
     }
 
@@ -2128,12 +2731,14 @@ mod tests {
                 force_flush: false,
                 flushing: false,
                 in_flight: std::collections::HashSet::new(),
+                write_barriers: HashMap::new(),
                 stop: false,
                 journal_needs_repair: false,
                 last_error: None,
                 dead_letter_error: None,
             }),
             changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableNamespaceEnqueueState::default()),
             journal_path,
         });
         let journal = NamespaceJournal {
@@ -2181,6 +2786,59 @@ mod tests {
             .expect("project awaited empty create/unlink");
         assert!(projected.applied);
         assert!(projected.value.is_none());
+        assert_eq!(
+            journal
+                .authoritative_path_for_projection("new-name/deep/file.js")
+                .expect("route pending rename"),
+            "old-name/deep/file.js"
+        );
+        assert_eq!(
+            journal
+                .authoritative_path_for_projection("unrelated/file.js")
+                .expect("leave unrelated route alone"),
+            "unrelated/file.js"
+        );
+        assert_eq!(
+            journal
+                .project_metadata_without_base("deleted")
+                .expect("project deleted file without a base"),
+            Some(None)
+        );
+        assert_eq!(
+            journal
+                .project_metadata_without_base("deleted-dir/deep/file.js")
+                .expect("project removed subtree without a base"),
+            Some(None)
+        );
+        assert_eq!(
+            journal
+                .project_metadata_without_base("old-name/deep/file.js")
+                .expect("project renamed-away subtree without a base"),
+            Some(None)
+        );
+        assert_eq!(
+            journal
+                .project_metadata_without_base("new-name")
+                .expect("project rename root without a base")
+                .flatten()
+                .map(|metadata| metadata.mode),
+            Some(Some(0o700))
+        );
+        assert_eq!(
+            journal
+                .project_metadata_without_base("new-name/deep/file.js")
+                .expect("rename destination descendant needs its routed base"),
+            None
+        );
+        let descendant = test_metadata("file", 0o600, Some("nested-inode"));
+        assert_eq!(
+            journal
+                .project_metadata("new-name/deep/file.js", Some(descendant.clone()), 0)
+                .expect("project routed rename descendant")
+                .value,
+            Some(descendant),
+            "rename-root metadata must not replace descendant metadata"
+        );
 
         {
             let mut state = shared.state.lock().expect("state");
@@ -2188,6 +2846,12 @@ mod tests {
                 record.committed_revision = Some(77);
             }
         }
+        assert_eq!(
+            journal
+                .authoritative_path_for_projection("new-name/deep/file.js")
+                .expect("committed rename already lives at destination"),
+            "new-name/deep/file.js"
+        );
         let projected = journal
             .project_metadata("deleted", Some(test_metadata("file", 0o644, None)), 76)
             .expect("projection before publication observation");
@@ -2225,12 +2889,14 @@ mod tests {
                 force_flush: false,
                 flushing: false,
                 in_flight: std::collections::HashSet::new(),
+                write_barriers: HashMap::new(),
                 stop: false,
                 journal_needs_repair: false,
                 last_error: None,
                 dead_letter_error: None,
             }),
             changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableNamespaceEnqueueState::default()),
             journal_path,
         });
         let worker_state = Arc::clone(&shared);
@@ -2287,12 +2953,14 @@ mod tests {
                 force_flush: false,
                 flushing: false,
                 in_flight: std::collections::HashSet::new(),
+                write_barriers: HashMap::new(),
                 stop: false,
                 journal_needs_repair: false,
                 last_error: Some("vfs request failed: 409".to_string()),
                 dead_letter_error: None,
             }),
             changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableNamespaceEnqueueState::default()),
             journal_path: journal_path.clone(),
         };
         let resolution = NamespaceResolution {
@@ -2516,7 +3184,9 @@ mod tests {
         assert_eq!(resolution.dead_lettered.len(), 1);
         assert_eq!(resolution.dead_lettered[0].0.operation_id, "rmdir-op");
         assert!(
-            resolution.dead_lettered[0].1.contains("not this mount's residue"),
+            resolution.dead_lettered[0]
+                .1
+                .contains("not this mount's residue"),
             "a live sibling-mount child must fail the rmdir, never be deleted"
         );
         assert!(resolution.transient_error.is_none());
@@ -2601,12 +3271,14 @@ mod tests {
                 force_flush: false,
                 flushing: false,
                 in_flight: std::collections::HashSet::new(),
+                write_barriers: HashMap::new(),
                 stop: false,
                 journal_needs_repair: false,
                 last_error: None,
                 dead_letter_error: None,
             }),
             changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableNamespaceEnqueueState::default()),
             journal_path: journal_path.clone(),
         };
 
@@ -2660,12 +3332,14 @@ mod tests {
                 force_flush: false,
                 flushing: false,
                 in_flight: std::collections::HashSet::new(),
+                write_barriers: HashMap::new(),
                 stop: false,
                 journal_needs_repair: false,
                 last_error: None,
                 dead_letter_error: None,
             }),
             changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableNamespaceEnqueueState::default()),
             journal_path: journal_path.clone(),
         };
 
@@ -2711,12 +3385,14 @@ mod tests {
                 force_flush: false,
                 flushing: false,
                 in_flight: std::collections::HashSet::new(),
+                write_barriers: HashMap::new(),
                 stop: false,
                 journal_needs_repair: false,
                 last_error: Some("rewrite failed".to_string()),
                 dead_letter_error: None,
             }),
             changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableNamespaceEnqueueState::default()),
             journal_path,
         });
         let journal = NamespaceJournal {
@@ -2842,6 +3518,65 @@ mod tests {
     }
 
     #[test]
+    fn content_write_ordering_skips_only_commuting_namespace_mutations() {
+        let parent_creation = VfsNamespaceMutation::CreateDirectory {
+            path: "repo/src".to_string(),
+            mode: Some(0o755),
+        };
+        assert!(!namespace_mutation_requires_write_order(
+            &parent_creation,
+            "repo/src/lib.rs"
+        ));
+        assert!(namespace_mutation_requires_write_order(
+            &parent_creation,
+            "repo/src"
+        ));
+
+        let exact_creation = VfsNamespaceMutation::CreateFile {
+            path: "repo/src/lib.rs".to_string(),
+            mode: Some(0o644),
+        };
+        assert!(namespace_mutation_requires_write_order(
+            &exact_creation,
+            "repo/src/lib.rs"
+        ));
+
+        let rename = VfsNamespaceMutation::Rename {
+            from: "repo/src".to_string(),
+            to: "repo/generated".to_string(),
+        };
+        assert!(namespace_mutation_requires_write_order(
+            &rename,
+            "repo/src/lib.rs"
+        ));
+        assert!(namespace_mutation_requires_write_order(
+            &rename,
+            "repo/generated/lib.rs"
+        ));
+        assert!(!namespace_mutation_requires_write_order(
+            &rename,
+            "repo/tests/lib.rs"
+        ));
+
+        let removal = VfsNamespaceMutation::RemoveDirectory {
+            path: "repo/src".to_string(),
+        };
+        assert!(namespace_mutation_requires_write_order(
+            &removal,
+            "repo/src/lib.rs"
+        ));
+
+        let mode = VfsNamespaceMutation::SetMode {
+            path: "repo/src/lib.rs".to_string(),
+            mode: 0o755,
+        };
+        assert!(!namespace_mutation_requires_write_order(
+            &mode,
+            "repo/src/lib.rs"
+        ));
+    }
+
+    #[test]
     fn reopen_truncates_only_a_torn_final_namespace_record() {
         let dir = tempfile::tempdir().expect("tempdir");
         let journal_path = dir.path().join("namespace.jsonl");
@@ -2905,12 +3640,14 @@ mod tests {
                 force_flush: false,
                 flushing: false,
                 in_flight: std::collections::HashSet::new(),
+                write_barriers: HashMap::new(),
                 stop: false,
                 journal_needs_repair: false,
                 last_error: None,
                 dead_letter_error: None,
             }),
             changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableNamespaceEnqueueState::default()),
             journal_path: journal_path.clone(),
         };
         let mut state = shared.state.lock().expect("state");
@@ -2963,12 +3700,14 @@ mod tests {
                     force_flush: false,
                     flushing: false,
                     in_flight: std::collections::HashSet::new(),
+                    write_barriers: HashMap::new(),
                     stop: false,
                     journal_needs_repair: false,
                     last_error: None,
                     dead_letter_error: None,
                 }),
                 changed: Condvar::new(),
+                durable_enqueues: Mutex::new(DurableNamespaceEnqueueState::default()),
                 journal_path: journal_path.clone(),
             });
             {
@@ -3042,12 +3781,14 @@ mod tests {
                 force_flush: false,
                 flushing: false,
                 in_flight: std::collections::HashSet::new(),
+                write_barriers: HashMap::new(),
                 stop: false,
                 journal_needs_repair: false,
                 last_error: None,
                 dead_letter_error: None,
             }),
             changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableNamespaceEnqueueState::default()),
             journal_path,
         });
         let journal = NamespaceJournal {

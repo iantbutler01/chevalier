@@ -725,8 +725,7 @@ mod server {
         VfsPublicationSnapshotEntry, VfsReadManyRequest, VfsReadManyResponse, VfsReadRange,
         VfsRenameMetadataResponse, VfsRenameRequest, VfsResult, VfsSubtreeMetadataEntry,
         VfsSubtreeMetadataRequest, VfsSubtreeMetadataResponse, VfsSymlinkRequest, VfsWriteHeaders,
-        VfsWriteManyBody, VfsWriteManyPublicationResponse, VfsWriteManyRequest,
-        VfsWriteManyResult,
+        VfsWriteManyBody, VfsWriteManyPublicationResponse, VfsWriteManyRequest, VfsWriteManyResult,
         VfsWritePrecondition, VfsWriteRequest, VfsWriteScope, parse_vfs_range_header,
     };
 
@@ -836,6 +835,10 @@ mod server {
         /// behind than this history is told the answer is truncated and falls
         /// back to its own conservative handling.
         publication_history: Mutex<VecDeque<PublishedPaths>>,
+        /// Highest revision evicted from `publication_history`, or the owner's
+        /// initial revision before any eviction. A watcher at this exact floor
+        /// has already observed everything older than the retained entries.
+        publication_history_floor: AtomicU64,
     }
 
     /// One publication's affected paths, retained so a lagging watcher can be
@@ -869,10 +872,11 @@ mod server {
     /// this covers a watcher that missed a burst without letting the history
     /// grow with the mount's lifetime.
     const PUBLICATION_HISTORY_LIMIT: usize = 256;
-    /// Ceiling on paths returned for one watch answer. Past this the targeted
-    /// answer stops being cheaper than the watcher's own fallback, so the watch
-    /// reports truncation instead.
-    const WATCH_PATHS_LIMIT: usize = 1024;
+    /// Ceiling on paths returned for one watch answer. Package-manager
+    /// namespace batches routinely affect two or three thousand paths;
+    /// truncating those forces a mount-wide kernel sweep, which is both less
+    /// precise and far more expensive than carrying the known set.
+    const WATCH_PATHS_LIMIT: usize = 8192;
 
     impl OwnerState {
         fn new(ack_timeout: Duration) -> Self {
@@ -887,6 +891,7 @@ mod server {
                 last_ack_warn_us: AtomicU64::new(0),
                 ack_timeout,
                 publication_history: Mutex::new(VecDeque::new()),
+                publication_history_floor: AtomicU64::new(initial),
             }
         }
 
@@ -905,7 +910,10 @@ mod server {
                 subtrees: Arc::new(subtrees),
             });
             while history.len() > PUBLICATION_HISTORY_LIMIT {
-                history.pop_front();
+                if let Some(evicted) = history.pop_front() {
+                    self.publication_history_floor
+                        .store(evicted.revision, Ordering::Release);
+                }
             }
         }
 
@@ -922,11 +930,12 @@ mod server {
                 .publication_history
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let oldest = history.front()?.revision;
+            history.front()?;
             // `since` must be covered: the watcher needs every publication after
-            // it, and anything at or before the oldest retained entry may have
-            // evicted publications the watcher never saw.
-            if since < oldest {
+            // it, and anything before the eviction floor may have evicted
+            // publications the watcher never saw. The floor itself is covered:
+            // `since` means the watcher has observed that exact revision.
+            if since < self.publication_history_floor.load(Ordering::Acquire) {
                 return None;
             }
             let mut seen = HashSet::new();
@@ -1585,7 +1594,9 @@ mod server {
     /// Trimmed, non-empty `watcher_id`, or "" for an anonymous (unregistered)
     /// watcher.
     fn watch_watcher_id(raw: Option<&str>) -> &str {
-        raw.map(str::trim).filter(|text| !text.is_empty()).unwrap_or("")
+        raw.map(str::trim)
+            .filter(|text| !text.is_empty())
+            .unwrap_or("")
     }
 
     #[derive(Serialize)]
@@ -1931,11 +1942,11 @@ mod server {
         // keeps a write from evicting every cached sibling in its directory,
         // and it is unaffected here: an overwrite's parent is unchanged.
         {
-            let mut seen = snapshot_paths
+            let mut seen = snapshot_paths.iter().cloned().collect::<HashSet<_>>();
+            for result in results
                 .iter()
-                .cloned()
-                .collect::<HashSet<_>>();
-            for result in results.iter().filter(|result| result.previous_hash.is_none()) {
+                .filter(|result| result.previous_hash.is_none())
+            {
                 let parent = immediate_parent(result.path.as_str());
                 if !parent.is_empty() && seen.insert(parent.clone()) {
                     snapshot_paths.push(parent);
@@ -3007,16 +3018,14 @@ mod server_tests {
         CHEVALIER_VFS_NAMESPACE_REVISION_HEADER, CHEVALIER_VFS_OPERATION_HEADER,
         CHEVALIER_VFS_PRECONDITION_FILE_ID_HEADER, CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER,
         CHEVALIER_VFS_PRECONDITION_SECONDARY_FINGERPRINT_HEADER, CHEVALIER_VFS_RESOURCE_KEY_HEADER,
-        CHEVALIER_VFS_ROUTE_PREFIX,
-        VFS_ENTRY_KIND_DIRECTORY, VFS_ENTRY_KIND_FILE, VFS_OPERATION_SETATTR_SIZE,
-        VFS_SURFACE_KIND_VM_WORKSPACE, VfsDirEntry, VfsGatewayBackend, VfsGatewayError,
-        VfsLeaseAcquire, VfsLeaseGrant, VfsLeaseReleaseRequest, VfsMetadata,
+        CHEVALIER_VFS_ROUTE_PREFIX, VFS_ENTRY_KIND_DIRECTORY, VFS_ENTRY_KIND_FILE,
+        VFS_OPERATION_SETATTR_SIZE, VFS_SURFACE_KIND_VM_WORKSPACE, VfsDirEntry, VfsGatewayBackend,
+        VfsGatewayError, VfsLeaseAcquire, VfsLeaseGrant, VfsLeaseReleaseRequest, VfsMetadata,
         VfsMetadataManyResponse, VfsNamespaceMutation, VfsNamespaceMutationBatchRequest,
         VfsNamespaceMutationBatchResponse, VfsNamespaceMutationRequest, VfsReadManyResponse,
-        VfsReadRange, VfsRenameRequest,
-        VfsResult, VfsSymlinkRequest, VfsWriteManyRequest, VfsWriteManyResponse,
-        VfsWriteManyResult, VfsWritePrecondition, VfsWriteRequest, VfsWriteScope,
-        chevalier_vfs_routes,
+        VfsReadRange, VfsRenameRequest, VfsResult, VfsSymlinkRequest, VfsWriteManyRequest,
+        VfsWriteManyResponse, VfsWriteManyResult, VfsWritePrecondition, VfsWriteRequest,
+        VfsWriteScope, chevalier_vfs_routes,
     };
 
     #[derive(Clone, Default)]
@@ -3156,7 +3165,10 @@ mod server_tests {
                     .method("PUT")
                     .uri("/internal/chevalier/vfs/owner-1/dir?path=folder")
                     .header(CHEVALIER_VFS_RESOURCE_KEY_HEADER, "owner:owner-1:workspace")
-                    .header(CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, owner_token.to_string())
+                    .header(
+                        CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                        owner_token.to_string(),
+                    )
                     .header(CHEVALIER_VFS_MODE_HEADER, 0o750.to_string())
                     .body(Body::empty())
                     .unwrap(),
@@ -3254,7 +3266,10 @@ mod server_tests {
                     .method("PUT")
                     .uri("/internal/chevalier/vfs/owner-1/dir?path=folder")
                     .header(CHEVALIER_VFS_RESOURCE_KEY_HEADER, "owner:owner-1:workspace")
-                    .header(CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, owner_token.to_string())
+                    .header(
+                        CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                        owner_token.to_string(),
+                    )
                     .header(CHEVALIER_VFS_MODE_HEADER, 0o750.to_string())
                     .body(Body::empty())
                     .unwrap(),
@@ -3516,9 +3531,9 @@ mod server_tests {
             let app = app.clone();
             let owner = owner.to_string();
             let query = format!("since={baseline}&timeout_ms=30000&watcher_id={id}");
-            parked.push(tokio::spawn(
-                async move { watch_poll(&app, &owner, &query).await },
-            ));
+            parked.push(tokio::spawn(async move {
+                watch_poll(&app, &owner, &query).await
+            }));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -3656,9 +3671,7 @@ mod server_tests {
             .collect::<Vec<_>>();
         Request::builder()
             .method("POST")
-            .uri(format!(
-                "/internal/chevalier/vfs/{owner}/namespace-many"
-            ))
+            .uri(format!("/internal/chevalier/vfs/{owner}/namespace-many"))
             .header(header::CONTENT_TYPE, "application/json")
             .header(
                 CHEVALIER_VFS_RESOURCE_KEY_HEADER,
@@ -3683,6 +3696,40 @@ mod server_tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn first_publication_after_observed_owner_baseline_is_complete() {
+        let app = ack_app(Duration::from_secs(1));
+        let owner = "first-publication";
+        let baseline = seed_revision(&app, owner).await;
+
+        let published = app
+            .clone()
+            .oneshot(namespace_many_request(
+                owner,
+                serde_json::json!([
+                    {"kind": "create_directory", "path": "first"},
+                    {"kind": "create_file", "path": "first/file.txt"},
+                ]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(published.status(), StatusCode::OK);
+
+        let answer = watch_body(&app, owner, baseline).await;
+        assert!(
+            answer.get("truncated").is_none(),
+            "the initial owner revision is the complete history floor: {answer}"
+        );
+        let paths = answer["paths"]
+            .as_array()
+            .expect("complete watch answer has paths")
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<HashSet<_>>();
+        assert!(paths.contains("first"));
+        assert!(paths.contains("first/file.txt"));
     }
 
     /// A watch answer separates the paths a publication touched from the
@@ -3830,9 +3877,10 @@ mod server_tests {
 
         let answer = watch_body(&app, owner, seeded).await;
         assert_eq!(
-            answer["paths"]
-                .as_array()
-                .map(|paths| paths.iter().map(|p| p.as_str().unwrap()).collect::<Vec<_>>()),
+            answer["paths"].as_array().map(|paths| paths
+                .iter()
+                .map(|p| p.as_str().unwrap())
+                .collect::<Vec<_>>()),
             Some(vec!["tree/file.txt"])
         );
         assert_eq!(answer["subtrees"].as_array().map(Vec::len), Some(0));

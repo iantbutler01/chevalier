@@ -77,10 +77,12 @@ const MAX_ALIAS_VALIDATION_ATTEMPTS = 3;
  *  watcher that missed a burst without letting the history grow with the mount's
  *  lifetime. Mirrors `PUBLICATION_HISTORY_LIMIT` in the Rust gateway. */
 const PUBLICATION_HISTORY_LIMIT = 256;
-/** Ceiling on paths returned for one watch answer. Past this the targeted answer
- *  stops being cheaper than the watcher's own fallback, so the watch reports
- *  truncation instead. Mirrors `WATCH_PATHS_LIMIT` in the Rust gateway. */
-const WATCH_PATHS_LIMIT = 1024;
+/** Ceiling on paths returned for one watch answer. Package-manager namespace
+ *  batches routinely affect two or three thousand paths; truncating those
+ *  forces a mount-wide kernel sweep, which is both less precise and far more
+ *  expensive than carrying the known set. Mirrors `WATCH_PATHS_LIMIT` in the
+ *  Rust gateway. */
+const WATCH_PATHS_LIMIT = 8192;
 
 /** One publication's affected paths, retained so a lagging watcher can be told
  *  exactly what to revoke. `subtrees` is the subset of `paths` whose ENTIRE
@@ -154,6 +156,12 @@ type VfsPublicationState = {
   // Bounded: a watcher that has fallen further behind than this history is told
   // the answer is truncated and falls back to its own conservative handling.
   publicationHistory: VfsPublishedPaths[];
+  // Highest revision evicted from `publicationHistory`, or the owner's initial
+  // revision before any eviction. A watcher at or beyond this floor has already
+  // observed everything no longer retained; comparing only with the oldest
+  // retained publication incorrectly marked the very first publication (and
+  // the exact eviction boundary) as truncated.
+  publicationHistoryFloor: number;
 };
 
 type VfsPendingWatcher = {
@@ -183,8 +191,9 @@ class VfsPublicationCoordinator {
   #state(ownerId: string): VfsPublicationState {
     let state = this.#states.get(ownerId);
     if (state === undefined) {
+      const initialRevision = Date.now() * 1_000;
       state = {
-        revision: Date.now() * 1_000,
+        revision: initialRevision,
         activityEpoch: 0,
         activeReaders: 0,
         activeWriter: false,
@@ -194,6 +203,7 @@ class VfsPublicationCoordinator {
         pendingAckWaiters: [],
         lastAckWarnAt: 0,
         publicationHistory: [],
+        publicationHistoryFloor: initialRevision,
       };
       this.#states.set(ownerId, state);
     }
@@ -435,7 +445,8 @@ class VfsPublicationCoordinator {
       subtrees: [...new Set(subtrees.map(normalizePath))],
     });
     while (state.publicationHistory.length > PUBLICATION_HISTORY_LIMIT) {
-      state.publicationHistory.shift();
+      const evicted = state.publicationHistory.shift();
+      if (evicted !== undefined) state.publicationHistoryFloor = evicted.revision;
     }
   }
 
@@ -449,12 +460,12 @@ class VfsPublicationCoordinator {
    * watcher falls back to its own handling rather than acting on a partial set.
    */
   #pathsPublishedSince(state: VfsPublicationState, since: number): VfsAffected | null {
-    const oldest = state.publicationHistory[0];
-    if (oldest === undefined) return null;
+    if (state.publicationHistory.length === 0) return null;
     // `since` must be covered: the watcher needs every publication after it, and
-    // anything before the oldest retained entry may have evicted publications
-    // the watcher never saw.
-    if (since < oldest.revision) return null;
+    // anything before the eviction floor may have evicted publications the
+    // watcher never saw. The floor itself is covered: `since` means the watcher
+    // has already observed that exact revision.
+    if (since < state.publicationHistoryFloor) return null;
     const seen = new Set<string>();
     const union: string[] = [];
     const seenSubtrees = new Set<string>();
@@ -1342,7 +1353,7 @@ export function createVfsGatewayServer(
         if (req.headers.get(STREAM_UPLOAD_HEADER) === "1") {
           const expectedHash = req.headers.get(EXPECTED_CONTENT_HASH_HEADER)?.trim().toLowerCase() ?? "";
           if (!/^[a-f0-9]{64}$/.test(expectedHash)) {
-            return errorResponse(400, `${EXPECTED_CONTENT_HASH_HEADER} must be a SHA-256 hex digest`);
+            return errorResponse(400, `${EXPECTED_CONTENT_HASH_HEADER} must be a 64-character content digest`);
           }
           const declaredLength = parseOptionalNonNegativeInteger(req.headers.get("content-length"), "content-length");
           if (declaredLength instanceof Response) return declaredLength;
@@ -1363,7 +1374,19 @@ export function createVfsGatewayServer(
                   if (done) break;
                   if (value.byteLength === 0) continue;
                   hasher.update(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
-                  await staged.write(value);
+                  let offset = 0;
+                  while (offset < value.byteLength) {
+                    const { bytesWritten } = await staged.write(
+                      value,
+                      offset,
+                      value.byteLength - offset,
+                      null,
+                    );
+                    if (bytesWritten === 0) {
+                      throw new Error(`streamed upload made no write progress for ${relPath}`);
+                    }
+                    offset += bytesWritten;
+                  }
                   received += value.byteLength;
                 }
               }
@@ -1382,22 +1405,49 @@ export function createVfsGatewayServer(
               ...preconditionOptions(precondition, expectedFileId),
               ...writeOptions,
             };
-            const publication = await publications.mutate(ownerId, async () =>
-              typeof streamingStore.writeFromFile === "function"
-                ? streamingStore.writeFromFile(relPath, stagedPath, expectedHash, options)
-                : store.write(relPath, await readFile(stagedPath), options),
-            );
-            const value = publication.value as {
+            const publication = await publications.transact(ownerId, async () => {
+              const result =
+                typeof streamingStore.writeFromFile === "function"
+                  ? await streamingStore.writeFromFile(relPath, stagedPath, expectedHash, options)
+                  : await store.write(relPath, await readFile(stagedPath), options);
+              const value = result as {
+                content_hash?: string;
+                contentHash?: string;
+                previous_hash?: string | null;
+                previousHash?: string | null;
+                changed?: boolean;
+              };
+              const affected = writeManyAffectedPaths(
+                [relPath],
+                [{
+                  path: relPath,
+                  content_hash: value.content_hash ?? value.contentHash,
+                  previous_hash: value.previous_hash ?? value.previousHash ?? null,
+                  changed: value.changed ?? true,
+                }],
+              );
+              return {
+                value: {
+                  result: value,
+                  entries: await snapshotPaths(store, affected),
+                },
+                mutated: true,
+                paths: affected,
+              };
+            });
+            const value = publication.value.result as {
               content_hash?: string;
               contentHash?: string;
               previous_hash?: string | null;
+              previousHash?: string | null;
               changed?: boolean;
             };
             return withNamespaceRevision(json(200, {
               path: relPath,
               content_hash: value.content_hash ?? value.contentHash ?? expectedHash,
-              previous_hash: value.previous_hash ?? null,
+              previous_hash: value.previous_hash ?? value.previousHash ?? null,
               changed: value.changed ?? true,
+              entries: publication.value.entries,
             }), publication.revision);
           } catch (error) {
             const conflict = conflictResponseFromStoreError(error, relPath);

@@ -498,6 +498,11 @@ test("vfs gateway streams verified uploads and serves bounded ranges", async () 
     }),
   );
   assert.strictEqual(response.status, 200);
+  const publication = await response.json();
+  assert.deepStrictEqual(
+    publication.entries.map((entry) => [entry.path, entry.metadata?.size_bytes]),
+    [["large.bin", payload.length]],
+  );
   assert.strictEqual((await backing.stat("large.bin")).contentHash, expected);
 
   const range = await handler(

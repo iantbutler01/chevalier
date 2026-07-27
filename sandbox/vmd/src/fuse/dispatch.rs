@@ -1,22 +1,21 @@
-//! Concurrent FUSE dispatch.
+//! FUSE dispatch.
 //!
-//! `fuser::spawn_mount2` runs a single-threaded session loop: with the
-//! filesystem handling operations inline, every op from the whole VM
-//! serializes behind one network round trip at a time (~1/RTT ops/s for the
-//! entire mount, with any slow op stalling all others). `SpawnedFuseFs` owns
-//! the `fuser::Filesystem` impl and fans each operation out to the tokio
-//! blocking pool, replying from the worker — the session loop only decodes
-//! and dispatches. In-flight ops are bounded by a semaphore so a stat storm
-//! cannot stampede the gateway.
+//! The patched `fuser` session runs 32 native request threads (configured by
+//! `RemoteFuseFs::mount_options`). Ordinary operations execute on those
+//! threads directly. Re-queueing every callback through Tokio and then
+//! `spawn_blocking` added two scheduler hops to every local LOOKUP/CREATE/WRITE
+//! in package extraction workloads without adding concurrency.
 //!
-//! Kernel-side parallelism is raised to match in `init` (`max_background`
-//! defaults to 12, which would throttle the whole exercise from above).
+//! Only distributed blocking-lock waits use a separate bounded Tokio pool.
+//! This prevents a lock waiter from occupying every native FUSE request thread.
+//! Kernel-side parallelism is raised in `init` (`max_background` defaults to
+//! 12, which would otherwise throttle the whole exercise from above).
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -35,6 +34,100 @@ use super::fs::{LockWaitCancellation, RemoteFuseFs};
 /// dep-tree scan saturating the wire without monopolizing the pool.
 const MAX_IN_FLIGHT_OPS: usize = 64;
 const MAX_IN_FLIGHT_BLOCKING_LOCKS: usize = 32;
+const OPERATION_COUNTER_LOG_INTERVAL: u64 = 20_000;
+
+#[derive(Default)]
+struct OperationCounters {
+    total: AtomicU64,
+    total_ns: AtomicU64,
+    lookup: AtomicU64,
+    lookup_ns: AtomicU64,
+    getattr: AtomicU64,
+    getattr_ns: AtomicU64,
+    setattr: AtomicU64,
+    setattr_ns: AtomicU64,
+    read: AtomicU64,
+    read_ns: AtomicU64,
+    write: AtomicU64,
+    write_ns: AtomicU64,
+    create: AtomicU64,
+    create_ns: AtomicU64,
+    flush: AtomicU64,
+    flush_ns: AtomicU64,
+    release: AtomicU64,
+    release_ns: AtomicU64,
+    mkdir: AtomicU64,
+    mkdir_ns: AtomicU64,
+    rename: AtomicU64,
+    rename_ns: AtomicU64,
+    unlink: AtomicU64,
+    unlink_ns: AtomicU64,
+    readdir: AtomicU64,
+    readdir_ns: AtomicU64,
+    other: AtomicU64,
+    other_ns: AtomicU64,
+}
+
+impl OperationCounters {
+    fn record(&self, operation: &'static str, elapsed: Duration) {
+        let (counter, duration) = match operation {
+            "lookup" => (&self.lookup, &self.lookup_ns),
+            "getattr" => (&self.getattr, &self.getattr_ns),
+            "setattr" => (&self.setattr, &self.setattr_ns),
+            "read" => (&self.read, &self.read_ns),
+            "write" => (&self.write, &self.write_ns),
+            "create" => (&self.create, &self.create_ns),
+            "flush" => (&self.flush, &self.flush_ns),
+            "release" => (&self.release, &self.release_ns),
+            "mkdir" => (&self.mkdir, &self.mkdir_ns),
+            "rename" => (&self.rename, &self.rename_ns),
+            "unlink" | "rmdir" => (&self.unlink, &self.unlink_ns),
+            "readdir" | "readdirplus" => (&self.readdir, &self.readdir_ns),
+            _ => (&self.other, &self.other_ns),
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        duration.fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.total_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+        let total = self.total.fetch_add(1, Ordering::Relaxed) + 1;
+        if total % OPERATION_COUNTER_LOG_INTERVAL == 0 {
+            let average_us = |count: &AtomicU64, nanos: &AtomicU64| {
+                nanos.load(Ordering::Relaxed) / count.load(Ordering::Relaxed).max(1) / 1_000
+            };
+            tracing::info!(
+                total,
+                cumulative_ms = self.total_ns.load(Ordering::Relaxed) / 1_000_000,
+                lookup = self.lookup.load(Ordering::Relaxed),
+                lookup_us = average_us(&self.lookup, &self.lookup_ns),
+                getattr = self.getattr.load(Ordering::Relaxed),
+                getattr_us = average_us(&self.getattr, &self.getattr_ns),
+                setattr = self.setattr.load(Ordering::Relaxed),
+                setattr_us = average_us(&self.setattr, &self.setattr_ns),
+                read = self.read.load(Ordering::Relaxed),
+                read_us = average_us(&self.read, &self.read_ns),
+                write = self.write.load(Ordering::Relaxed),
+                write_us = average_us(&self.write, &self.write_ns),
+                create = self.create.load(Ordering::Relaxed),
+                create_us = average_us(&self.create, &self.create_ns),
+                flush = self.flush.load(Ordering::Relaxed),
+                flush_us = average_us(&self.flush, &self.flush_ns),
+                release = self.release.load(Ordering::Relaxed),
+                release_us = average_us(&self.release, &self.release_ns),
+                mkdir = self.mkdir.load(Ordering::Relaxed),
+                mkdir_us = average_us(&self.mkdir, &self.mkdir_ns),
+                rename = self.rename.load(Ordering::Relaxed),
+                rename_us = average_us(&self.rename, &self.rename_ns),
+                unlink = self.unlink.load(Ordering::Relaxed),
+                unlink_us = average_us(&self.unlink, &self.unlink_ns),
+                readdir = self.readdir.load(Ordering::Relaxed),
+                readdir_us = average_us(&self.readdir, &self.readdir_ns),
+                other = self.other.load(Ordering::Relaxed),
+                other_us = average_us(&self.other, &self.other_ns),
+                "vfs fuse operation counters"
+            );
+        }
+    }
+}
 
 #[derive(Default)]
 struct LockWaitRegistry {
@@ -137,18 +230,18 @@ impl Drop for LockWaitRegistration {
 
 pub struct SpawnedFuseFs {
     inner: Arc<RemoteFuseFs>,
-    ops: Arc<Semaphore>,
     blocking_lock_ops: Arc<Semaphore>,
     lock_waits: Arc<LockWaitRegistry>,
+    operation_counters: OperationCounters,
 }
 
 impl SpawnedFuseFs {
     pub fn new(inner: RemoteFuseFs) -> Self {
         Self {
             inner: Arc::new(inner),
-            ops: Arc::new(Semaphore::new(MAX_IN_FLIGHT_OPS)),
             blocking_lock_ops: Arc::new(Semaphore::new(MAX_IN_FLIGHT_BLOCKING_LOCKS)),
             lock_waits: Arc::new(LockWaitRegistry::default()),
+            operation_counters: OperationCounters::default(),
         }
     }
 
@@ -159,10 +252,13 @@ impl SpawnedFuseFs {
     fn spawn(
         &self,
         operation: &'static str,
-        request_id: RequestId,
+        _request_id: RequestId,
         op: impl FnOnce(&RemoteFuseFs) + Send + 'static,
     ) {
-        self.spawn_with_semaphore(Arc::clone(&self.ops), operation, request_id, op);
+        let started_at = Instant::now();
+        op(&self.inner);
+        self.operation_counters
+            .record(operation, started_at.elapsed());
     }
 
     fn spawn_blocking_lock(

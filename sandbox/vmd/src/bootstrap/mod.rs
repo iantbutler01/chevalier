@@ -1477,9 +1477,9 @@ mod tests {
         assert!(script.contains(": > /var/log/portproxy.log"));
         // Default the transport stack down to WARN at the source; still
         // overridable via RUST_LOG in the EnvironmentFile.
-        assert!(script.contains(
-            "Environment=RUST_LOG=info,h2=warn,hyper=warn,tonic=warn,tower=warn"
-        ));
+        assert!(
+            script.contains("Environment=RUST_LOG=info,h2=warn,hyper=warn,tonic=warn,tower=warn")
+        );
         assert!(
             !script.contains("Environment=RUST_LOG=trace"),
             "portproxy must not default to trace-level logging"
@@ -1529,16 +1529,24 @@ mod tests {
 
         // An existing filesystem is checked before it is ever mounted.
         assert!(script.contains("repair_durable_volume"));
-        let repair_at = script.find("repair_durable_volume()").expect("repair function");
+        let repair_at = script
+            .find("repair_durable_volume()")
+            .expect("repair function");
         let mount_at = script
             .find(r#"mount -t ext4 -o noatime "$DEVICE" "$MOUNT""#)
             .expect("durable mount");
-        assert!(repair_at < mount_at, "repair must be defined before the mount");
+        assert!(
+            repair_at < mount_at,
+            "repair must be defined before the mount"
+        );
 
         // Unattended by design: nothing inside a sandbox VM can answer a prompt.
         assert!(script.contains("e2fsck -p \"$DEVICE\""));
         assert!(script.contains("e2fsck -f -y \"$DEVICE\""));
-        assert!(!script.contains("e2fsck -n"), "a dry run would repair nothing");
+        assert!(
+            !script.contains("e2fsck -n"),
+            "a dry run would repair nothing"
+        );
 
         // Recorded errors must force the full pass, not the preen that skips them.
         assert!(script.contains("FS Error count"));
@@ -1572,7 +1580,12 @@ mod tests {
             .split("chevalier-durable-volume.service")
             .nth(1)
             .expect("durable volume unit");
-        for shadowed in ["/usr/local/", "/root/", "/var/lib/docker/", "/var/cache/openbracket/"] {
+        for shadowed in [
+            "/usr/local/",
+            "/root/",
+            "/var/lib/docker/",
+            "/var/cache/openbracket/",
+        ] {
             assert!(
                 !durable_unit.contains(&format!("ExecStart={shadowed}")),
                 "durable-volume unit must not execute from bind-shadowed {shadowed}"

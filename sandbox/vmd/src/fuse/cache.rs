@@ -15,6 +15,7 @@ const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_FILES: usize = 16_384;
 const SUBTREE_LOAD_MISS_THRESHOLD: u32 = 8;
+const MAX_STAGED_LOCAL_SUBTREES: usize = 16;
 pub(super) const SUBTREE_LOAD_REVISION_QUIET_PERIOD: Duration = Duration::from_millis(250);
 /// Kernel revocations the invalidation worker may have outstanding before the
 /// queue refuses new work.
@@ -41,9 +42,15 @@ const KERNEL_REVOCATION_QUEUE_DEPTH: usize = 256;
 /// guest kernel on the parent inode's lock, which the in-flight op holds.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct PublicationInvalidation {
-    /// Exact paths whose attrs/dentry the publication changed (each changed
-    /// path plus its parent directory).
+    /// Exact paths whose attrs and dentry the publication changed.
     pub(super) paths: Vec<String>,
+    /// Directories whose listing changed without changing the directory's
+    /// identity in its own parent. These need an inode invalidation so a later
+    /// directory read is refreshed, but MUST NOT receive `inval_entry` against
+    /// their parent: repeatedly dropping the hot directory dentry while many
+    /// children are being created can retire its FUSE lookup reference during
+    /// concurrent creates, which surfaces as a false parent `ENOENT`.
+    pub(super) relisted: Vec<String>,
     /// Directory prefixes whose entire subtree the publication changed
     /// (`RemoveDirectory` / `Rename`). Every descendant the kernel cached under
     /// the prefix must be invalidated, not just the prefix itself.
@@ -58,7 +65,10 @@ impl PublicationInvalidation {
     /// True when the publication superseded nothing this mount could have handed
     /// a kernel, so no invalidation is needed.
     pub(super) fn is_empty(&self) -> bool {
-        self.paths.is_empty() && self.subtrees.is_empty() && self.identities.is_empty()
+        self.paths.is_empty()
+            && self.relisted.is_empty()
+            && self.subtrees.is_empty()
+            && self.identities.is_empty()
     }
 
     /// The set a remote publication reported over the revision watch.
@@ -79,6 +89,11 @@ impl PublicationInvalidation {
     pub(super) fn for_affected(paths: &[String], subtrees: &[String]) -> Self {
         Self {
             paths: paths.to_vec(),
+            // Older/current watch responses do not distinguish exact changes
+            // from listing-only parents. Keep their established conservative
+            // full-dentry behavior; locally originated publications carry the
+            // precise split through `publication_invalidation` below.
+            relisted: Vec::new(),
             subtrees: subtrees.to_vec(),
             identities: Vec::new(),
         }
@@ -575,6 +590,13 @@ struct CachedDirectory {
 }
 
 #[derive(Default)]
+struct RenamedCacheEntries {
+    metadata: HashMap<String, CachedMetadata>,
+    directories: HashMap<String, CachedDirectory>,
+    files: HashMap<String, CachedFile>,
+}
+
+#[derive(Default)]
 struct CacheState {
     /// Latest authoritative gateway revision reflected by `metadata`.
     ///
@@ -596,6 +618,12 @@ struct CacheState {
     subtree_misses: HashMap<String, (u64, u32, Instant)>,
     subtree_disabled: bool,
     directory_generation: u64,
+    /// Source-subtree cache snapshots captured when the revision watch acks a
+    /// rename this process is currently publishing. The watch must invalidate
+    /// the live cache before the gateway releases the response; the later local
+    /// commit hook consumes the snapshot at the exact same revision and
+    /// retargets it to the rename destination.
+    staged_local_subtrees: VecDeque<(u64, RenamedCacheEntries)>,
 }
 
 #[derive(Default)]
@@ -665,6 +693,35 @@ impl RemoteFuseCache {
             return None;
         }
         Some(entry.entries.clone())
+    }
+
+    pub(super) fn diagnostic_lookup_state(&self, path: &str, revision: u64) -> String {
+        let inner = self.lock_inner();
+        let path = path.trim_matches('/');
+        let direct = inner
+            .metadata
+            .get(path)
+            .map(|entry| entry.revision.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let missing = inner
+            .missing_metadata
+            .get(path)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "-".to_string());
+        let parent = parent_path(path).unwrap_or_default();
+        let listing = inner.directories.get(parent.as_str());
+        let listing_revision = listing
+            .map(|listing| listing.revision.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let listing_entries = listing.map(|listing| listing.entries.len()).unwrap_or(0);
+        let listed = listing.is_some_and(|listing| {
+            let name = path.rsplit('/').next().unwrap_or(path);
+            listing.entries.iter().any(|entry| entry.name == name)
+        });
+        format!(
+            "wanted={revision} cache={} direct={direct} missing={missing} parent={parent:?} listing={listing_revision}/{listing_entries} listed={listed}",
+            inner.metadata_revision
+        )
     }
 
     pub fn put_dir(&self, path: &str, entries: Vec<RemoteDirEntry>, revision: u64) {
@@ -743,6 +800,7 @@ impl RemoteFuseCache {
         let mut inner = self.lock_inner();
         observe_authoritative_revision_locked(&mut inner, revision);
         inner.missing_metadata.get(path).copied() == Some(revision)
+            || listing_proves_absent(&inner, path, revision)
     }
 
     pub fn put_missing_metadata(&self, path: &str, revision: u64) {
@@ -793,28 +851,61 @@ impl RemoteFuseCache {
         entries: &[VfsPublicationSnapshotEntry],
     ) -> PublicationInvalidation {
         let mut inner = self.lock_inner();
+        let renamed_cache = capture_locally_renamed_cache_locked(&mut inner, revision, mutations);
         let mut affected = AffectedSet::default();
+        // The publishing mount already installed creation attrs/dentries from
+        // its durable projection, and the response snapshot below makes those
+        // entries authoritative at the committed revision. Revoking those same
+        // dentries after an async create is redundant and actively races
+        // concurrent child CREATE requests. Other mounts are not skipped: the
+        // revision-watch ack path revokes them before this response is released.
+        //
+        // Non-creation mutations still need the source-side catch-up revocation.
+        let mut source_kernel_affected = AffectedSet::default();
         for mutation in mutations {
             let affects_descendants = matches!(
                 mutation,
                 VfsNamespaceMutation::RemoveDirectory { .. } | VfsNamespaceMutation::Rename { .. }
             );
+            let is_creation = matches!(
+                mutation,
+                VfsNamespaceMutation::CreateFile { .. }
+                    | VfsNamespaceMutation::CreateDirectory { .. }
+                    | VfsNamespaceMutation::CreateSymlink { .. }
+                    | VfsNamespaceMutation::CreateHardLink { .. }
+            );
+            let parent_effect = if matches!(mutation, VfsNamespaceMutation::SetMode { .. }) {
+                // chmod changes the child's mode carried in a directory
+                // listing, but it neither adds nor removes the child. Refresh
+                // the parent inode/listing without dropping the parent's own
+                // dentry under its grandparent.
+                ParentEffect::Relisted
+            } else {
+                ParentEffect::Superseded
+            };
             for path in mutation.paths().into_iter().filter(|path| !path.is_empty()) {
-                // A namespace mutation changes the parent's OWN metadata too
-                // (an added or removed link), so the parent is superseded, not
-                // merely relisted. The gateway's publication snapshot carries
-                // the parent for exactly this reason (`namespace_snapshot_paths`
-                // in crates/sandbox/src/vfs.rs), so the install below puts the
-                // authoritative replacement back at this revision.
+                // Namespace changes that add/remove a name supersede the
+                // parent's own metadata. SetMode is the one exception: it only
+                // changes data carried by the parent's listing.
                 collect_affected_path(
                     &inner,
                     path,
                     affects_descendants,
-                    ParentEffect::Superseded,
+                    parent_effect,
                     &mut affected,
                 );
+                if !is_creation {
+                    collect_affected_path(
+                        &inner,
+                        path,
+                        affects_descendants,
+                        parent_effect,
+                        &mut source_kernel_affected,
+                    );
+                }
             }
         }
+        let captured = capture_parent_listings_locked(&inner, entries, revision);
         advance_known_revision_locked(&mut inner, revision, &affected);
         // Replace, do not merely drop: this mount produced the publication, so
         // the gateway answered it with the resulting state of everything it
@@ -822,7 +913,9 @@ impl RemoteFuseCache {
         // observes the transient hole between the eviction and the replacement
         // and turns it into a wire round trip.
         install_publication_snapshot_locked(&mut inner, revision, entries);
-        publication_invalidation(affected)
+        restore_patched_parent_listings_locked(&mut inner, revision, entries, captured);
+        restore_locally_renamed_cache_locked(&mut inner, revision, renamed_cache);
+        publication_invalidation(source_kernel_affected)
     }
 
     /// Content publication changes the named inode and every cached hard-link
@@ -844,6 +937,7 @@ impl RemoteFuseCache {
     ) -> PublicationInvalidation {
         let mut inner = self.lock_inner();
         let mut affected = AffectedSet::default();
+        let mut source_kernel_affected = AffectedSet::default();
         for (path, expected_file_id) in writes {
             // A content write changes the file, not the directory holding it:
             // the parent's kind, identity, link count and mode are untouched.
@@ -860,13 +954,30 @@ impl RemoteFuseCache {
             // `PublicationInvalidation`), so the guest re-asks — and this mount
             // answers from the metadata it never had reason to drop.
             collect_affected_path(&inner, path, false, ParentEffect::Relisted, &mut affected);
+            // The publishing mount already owns a positive dentry for this
+            // exact path. A content publication changes only that inode's
+            // attrs/page state, so revoking the dentry as well is redundant.
+            // More importantly, CREATE-heavy workloads can observe the
+            // resulting post-create LOOKUP in the narrow handoff between the
+            // local write projection and its committed snapshot and report a
+            // false ENOENT even though the write itself succeeded. Preserve the
+            // dentry and invalidate the inode instead. Sibling mounts still get
+            // the conservative full path revocation from the revision watch.
+            let normalized = path.trim_matches('/').to_string();
+            source_kernel_affected.relisted.insert(normalized.clone());
+            if let Some(parent) = parent_path(normalized.as_str()) {
+                source_kernel_affected.relisted.insert(parent);
+            }
             if let Some(file_id) = expected_file_id {
                 affected.identities.insert(file_id.clone());
+                source_kernel_affected.identities.insert(file_id.clone());
             }
         }
+        let captured = capture_parent_listings_locked(&inner, entries, revision);
         advance_known_revision_locked(&mut inner, revision, &affected);
         install_publication_snapshot_locked(&mut inner, revision, entries);
-        publication_invalidation(affected)
+        restore_patched_parent_listings_locked(&mut inner, revision, entries, captured);
+        publication_invalidation(source_kernel_affected)
     }
 
     /// Advance the cache across one publication observed on the revision watch,
@@ -912,6 +1023,34 @@ impl RemoteFuseCache {
         paths: &[String],
         subtrees: &[String],
     ) {
+        self.observe_remote_publication_with_local_paths(
+            since,
+            revision,
+            paths,
+            subtrees,
+            &HashSet::new(),
+        );
+    }
+
+    /// Apply a watch publication while preserving parent listings invalidated
+    /// only by this mount's own writes that are still awaiting the watch ack.
+    ///
+    /// The gateway cannot return the write response (and its authoritative
+    /// snapshot) until this callback acks. Invalidating the listing here and
+    /// trying to patch it from that later response therefore loses by
+    /// construction. Exact reads of a locally in-flight path already drain the
+    /// write journal before consulting a negative listing; retaining the old
+    /// listing for the brief ack window is consequently safe for every other
+    /// name, and the commit hook patches in the written children immediately
+    /// after the response is released.
+    pub(super) fn observe_remote_publication_with_local_paths(
+        &self,
+        since: u64,
+        revision: u64,
+        paths: &[String],
+        subtrees: &[String],
+        local_paths: &HashSet<String>,
+    ) {
         if revision == 0 {
             self.observe_authoritative_revision(revision);
             return;
@@ -926,25 +1065,107 @@ impl RemoteFuseCache {
             .map(|prefix| prefix.trim_matches('/'))
             .filter(|prefix| !prefix.is_empty())
             .collect::<HashSet<_>>();
+        let normalized_paths = paths
+            .iter()
+            .map(|path| path.trim_matches('/').to_string())
+            .chain(prefixes.iter().map(|prefix| (*prefix).to_string()))
+            .filter(|path| !path.is_empty())
+            .collect::<HashSet<_>>();
+        let local_paths = local_paths
+            .iter()
+            .map(|path| path.trim_matches('/'))
+            .filter(|path| !path.is_empty())
+            .collect::<HashSet<_>>();
+        let local_subtree_prefixes = prefixes
+            .iter()
+            .copied()
+            .filter(|prefix| local_paths.contains(prefix))
+            .collect::<Vec<_>>();
+        if !local_subtree_prefixes.is_empty() {
+            let staged = capture_cache_prefixes_locked(&inner, &local_subtree_prefixes);
+            if !renamed_cache_is_empty(&staged) {
+                inner.staged_local_subtrees.push_back((revision, staged));
+                while inner.staged_local_subtrees.len() > MAX_STAGED_LOCAL_SUBTREES {
+                    inner.staged_local_subtrees.pop_front();
+                }
+            }
+        }
+        let mut preserved_listings = HashMap::<String, CachedDirectory>::new();
+        for local_path in normalized_paths
+            .iter()
+            .filter(|path| local_paths.contains(path.as_str()))
+        {
+            let Some(parent) = parent_path(local_path) else {
+                continue;
+            };
+            let parent_has_remote_change = normalized_paths.iter().any(|path| {
+                !local_paths.contains(path.as_str())
+                    && parent_path(path).as_deref() == Some(parent.as_str())
+            });
+            let parent_in_remote_subtree = prefixes.iter().any(|prefix| {
+                parent == *prefix
+                    || parent
+                        .strip_prefix(*prefix)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            });
+            if parent_has_remote_change || parent_in_remote_subtree {
+                continue;
+            }
+            if let Some(listing) = inner
+                .directories
+                .get(parent.as_str())
+                .filter(|listing| listing.revision == inner.metadata_revision)
+            {
+                preserved_listings.insert(parent, listing.clone());
+            }
+        }
+        for local_path in normalized_paths
+            .iter()
+            .filter(|path| local_paths.contains(path.as_str()))
+            .filter(|path| !prefixes.contains(path.as_str()))
+        {
+            // A directory created by this mount is cached as a complete empty
+            // listing before MKDIR replies. Its own create publication leaves
+            // that directory at the same pathname; throwing the listing away
+            // here makes every subsequent child CREATE perform a remote
+            // negative lookup. Preserve it across the watch ack just like the
+            // parent listing above. A rename/remove prefix is deliberately
+            // excluded: those listings are staged and retargeted only after the
+            // matching response, never left live under the old pathname.
+            let has_remote_child_change = normalized_paths.iter().any(|path| {
+                !local_paths.contains(path.as_str())
+                    && parent_path(path).as_deref() == Some(local_path.as_str())
+            });
+            if has_remote_child_change {
+                continue;
+            }
+            if let Some(listing) = inner
+                .directories
+                .get(local_path.as_str())
+                .filter(|listing| listing.revision == inner.metadata_revision)
+            {
+                preserved_listings.insert(local_path.clone(), listing.clone());
+            }
+        }
         let mut affected = AffectedSet::default();
         // Every reported prefix is itself an affected path, whether or not the
         // gateway also listed it in `paths` (it always does today).
-        for path in paths
-            .iter()
-            .map(|path| path.trim_matches('/'))
-            .chain(prefixes.iter().copied())
-            .filter(|path| !path.is_empty())
-            .collect::<HashSet<_>>()
-        {
+        for path in &normalized_paths {
             collect_affected_path(
                 &inner,
                 path,
-                prefixes.contains(path),
+                prefixes.contains(path.as_str()),
                 ParentEffect::Relisted,
                 &mut affected,
             );
         }
         advance_known_revision_locked(&mut inner, revision, &affected);
+        if inner.metadata_revision == revision {
+            for (parent, mut listing) in preserved_listings {
+                listing.revision = revision;
+                inner.directories.insert(parent, listing);
+            }
+        }
     }
 
     /// Coalesce one server-side subtree snapshot per prefix and stable
@@ -1177,10 +1398,9 @@ fn collect_affected_path(
 /// process can still answer a stat of it from metadata the publication did not
 /// touch. Narrowing the CACHE eviction never narrows the kernel revocation.
 fn publication_invalidation(affected: AffectedSet) -> PublicationInvalidation {
-    let mut paths = affected.paths;
-    paths.extend(affected.relisted);
     PublicationInvalidation {
-        paths: paths.into_iter().collect(),
+        paths: affected.paths.into_iter().collect(),
+        relisted: affected.relisted.into_iter().collect(),
         subtrees: affected.subtrees.into_iter().collect(),
         identities: affected.identities.into_iter().collect(),
     }
@@ -1289,6 +1509,283 @@ fn advance_known_revision_locked(inner: &mut CacheState, revision: u64, affected
     inner.subtree_revisions.clear();
 }
 
+fn renamed_cache_is_empty(cache: &RenamedCacheEntries) -> bool {
+    cache.metadata.is_empty() && cache.directories.is_empty() && cache.files.is_empty()
+}
+
+fn path_suffix_for_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    let path = path.trim_matches('/');
+    let prefix = prefix.trim_matches('/');
+    if path == prefix {
+        Some("")
+    } else {
+        path.strip_prefix(prefix)
+            .filter(|suffix| suffix.starts_with('/'))
+    }
+}
+
+fn capture_cache_prefixes_locked(inner: &CacheState, prefixes: &[&str]) -> RenamedCacheEntries {
+    let matches = |path: &str| {
+        prefixes
+            .iter()
+            .any(|prefix| path_suffix_for_prefix(path, prefix).is_some())
+    };
+    RenamedCacheEntries {
+        metadata: inner
+            .metadata
+            .iter()
+            .filter(|(path, entry)| {
+                entry.revision == inner.metadata_revision && matches(path.as_str())
+            })
+            .map(|(path, entry)| (path.clone(), entry.clone()))
+            .collect(),
+        directories: inner
+            .directories
+            .iter()
+            .filter(|(path, entry)| {
+                entry.revision == inner.metadata_revision && matches(path.as_str())
+            })
+            .map(|(path, entry)| (path.clone(), entry.clone()))
+            .collect(),
+        files: inner
+            .files
+            .iter()
+            .filter(|(path, _)| matches(path.as_str()))
+            .map(|(path, entry)| (path.clone(), entry.clone()))
+            .collect(),
+    }
+}
+
+fn retarget_locally_renamed_path(path: &str, renames: &[(String, String)]) -> Option<String> {
+    let mut current = path.trim_matches('/').to_string();
+    let mut moved = false;
+    for (from, to) in renames {
+        if from == to {
+            continue;
+        }
+        if let Some(suffix) = path_suffix_for_prefix(current.as_str(), from) {
+            current = format!("{to}{suffix}");
+            moved = true;
+        } else if path_suffix_for_prefix(current.as_str(), to).is_some() {
+            // This entry belonged to the replaced destination subtree, not the
+            // source being moved onto it.
+            return None;
+        }
+    }
+    moved.then_some(current)
+}
+
+fn retarget_locally_renamed_cache(
+    captured: RenamedCacheEntries,
+    renames: &[(String, String)],
+) -> RenamedCacheEntries {
+    let retarget = |path: String| {
+        retarget_locally_renamed_path(path.as_str(), renames).map(|target| (target, path))
+    };
+    let mut retargeted = RenamedCacheEntries::default();
+    for (path, entry) in captured.metadata {
+        if let Some((target, _)) = retarget(path) {
+            retargeted.metadata.insert(target, entry);
+        }
+    }
+    for (path, entry) in captured.directories {
+        if let Some((target, _)) = retarget(path) {
+            retargeted.directories.insert(target, entry);
+        }
+    }
+    for (path, entry) in captured.files {
+        if let Some((target, _)) = retarget(path) {
+            retargeted.files.insert(target, entry);
+        }
+    }
+    retargeted
+}
+
+fn capture_locally_renamed_cache_locked(
+    inner: &mut CacheState,
+    revision: u64,
+    mutations: &[VfsNamespaceMutation],
+) -> RenamedCacheEntries {
+    let renames = mutations
+        .iter()
+        .filter_map(|mutation| match mutation {
+            VfsNamespaceMutation::Rename { from, to } if from != to => Some((
+                from.trim_matches('/').to_string(),
+                to.trim_matches('/').to_string(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if renames.is_empty() {
+        return RenamedCacheEntries::default();
+    }
+    let source_prefixes = renames
+        .iter()
+        .map(|(from, _)| from.as_str())
+        .collect::<Vec<_>>();
+    let mut captured = capture_cache_prefixes_locked(inner, &source_prefixes);
+    let mut retained = VecDeque::new();
+    while let Some((staged_revision, staged)) = inner.staged_local_subtrees.pop_front() {
+        if staged_revision == revision {
+            captured.metadata.extend(staged.metadata);
+            captured.directories.extend(staged.directories);
+            captured.files.extend(staged.files);
+        } else if staged_revision > revision {
+            retained.push_back((staged_revision, staged));
+        }
+    }
+    inner.staged_local_subtrees = retained;
+    retarget_locally_renamed_cache(captured, &renames)
+}
+
+fn restore_locally_renamed_cache_locked(
+    inner: &mut CacheState,
+    revision: u64,
+    mut renamed: RenamedCacheEntries,
+) {
+    if revision == 0 || inner.metadata_revision != revision {
+        return;
+    }
+    for (path, mut entry) in renamed.metadata.drain() {
+        entry.revision = revision;
+        if let Some(current) = inner
+            .metadata
+            .get(path.as_str())
+            .filter(|current| current.revision == revision)
+        {
+            entry.metadata = preserve_stronger_metadata(&entry.metadata, current.metadata.clone());
+        }
+        inner.metadata.insert(path.clone(), entry);
+        inner.missing_metadata.remove(path.as_str());
+    }
+    for (path, mut entry) in renamed.directories.drain() {
+        entry.revision = revision;
+        inner.directories.insert(path, entry);
+    }
+    for (path, entry) in renamed.files.drain() {
+        remove_file_locked(inner, path.as_str());
+        inner.file_bytes = inner.file_bytes.saturating_add(entry.bytes.len());
+        if let Some(file_id) = entry
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.file_id.as_ref())
+        {
+            inner
+                .identity_paths
+                .entry(file_id.clone())
+                .or_default()
+                .insert(path.clone());
+        }
+        inner.files.insert(path, entry);
+    }
+    enforce_file_limits_locked(inner, Instant::now(), MAX_FILES, MAX_TOTAL_BYTES);
+}
+
+/// The parent listings a publication is about to disturb, captured BEFORE its
+/// invalidation runs.
+///
+/// `invalidate_path_locked` drops the parent directory's cached listing for every
+/// superseded child. That is safe but expensive: a mount writing N files into one
+/// directory loses that directory's listing N times, so every negative lookup in
+/// it goes back to the wire, and the per-file read round trip is what stops the
+/// write journal from ever batching (a time window only batches writers that
+/// overlap, and a wire read between files guarantees they do not).
+///
+/// The publication's own snapshot says exactly what changed, so the listing does
+/// not need to be thrown away — it can be patched. Captured here, re-applied in
+/// `restore_patched_parent_listings_locked`.
+/// A published child's snapshot metadata as the directory entry its parent's
+/// listing holds. Mirrors `namespace::dir_entry_from_metadata`, which is private
+/// to that module.
+fn published_dir_entry(name: String, metadata: RemoteMetadata) -> RemoteDirEntry {
+    RemoteDirEntry {
+        name,
+        kind: metadata.kind,
+        size_bytes: metadata.size_bytes,
+        file_id: metadata.file_id,
+        link_count: metadata.link_count,
+        link_target: metadata.link_target,
+        content_hash: metadata.content_hash,
+        executable: metadata.executable,
+        mode: metadata.mode,
+        updated_at: metadata.updated_at,
+    }
+}
+
+fn capture_parent_listings_locked(
+    inner: &CacheState,
+    entries: &[VfsPublicationSnapshotEntry],
+    revision: u64,
+) -> HashMap<String, CachedDirectory> {
+    let mut captured = HashMap::new();
+    for entry in entries {
+        let path = entry.path.trim_matches('/');
+        let Some(parent) = parent_path(path) else {
+            continue;
+        };
+        if captured.contains_key(parent.as_str()) {
+            continue;
+        }
+        // Only a listing this cache already trusted at the fence the publication
+        // supersedes. Anything else is not a listing we may speak for.
+        if let Some(listing) = inner.directories.get(parent.as_str())
+            && (listing.revision == revision || listing.revision == inner.metadata_revision)
+        {
+            captured.insert(parent.clone(), listing.clone());
+        }
+    }
+    captured
+}
+
+/// Re-apply the captured parent listings with each published child patched in.
+///
+/// A created or rewritten child is inserted/replaced from the snapshot's own
+/// metadata; a deleted child (`metadata: None`) is removed. The result is stamped
+/// at the publication's revision, so it is exactly as trustworthy as the snapshot
+/// that produced it — and a name absent from it is genuinely absent, which is
+/// what lets `listing_proves_absent` answer the next create's lookup locally.
+fn restore_patched_parent_listings_locked(
+    inner: &mut CacheState,
+    revision: u64,
+    entries: &[VfsPublicationSnapshotEntry],
+    mut captured: HashMap<String, CachedDirectory>,
+) {
+    if revision == 0 || inner.metadata_revision != revision || captured.is_empty() {
+        return;
+    }
+    for entry in entries {
+        let path = entry.path.trim_matches('/');
+        let Some(parent) = parent_path(path) else {
+            continue;
+        };
+        let Some(listing) = captured.get_mut(parent.as_str()) else {
+            continue;
+        };
+        let Some(name) = path.rsplit_once('/').map(|(_, name)| name).or(Some(path)) else {
+            continue;
+        };
+        listing.entries.retain(|child| child.name != name);
+        if let Some(metadata) = entry.metadata.clone() {
+            listing
+                .entries
+                .push(published_dir_entry(name.to_string(), metadata));
+        }
+    }
+    for (parent, mut listing) in captured {
+        // The parent itself may have been superseded by this same publication
+        // (a directory create/remove changes its OWN metadata); in that case the
+        // listing was dropped for a reason and must not come back.
+        if inner
+            .metadata
+            .get(parent.as_str())
+            .is_none_or(|cached| cached.revision == revision)
+        {
+            listing.revision = revision;
+            inner.directories.insert(parent, listing);
+        }
+    }
+}
+
 fn install_publication_snapshot_locked(
     inner: &mut CacheState,
     revision: u64,
@@ -1340,16 +1837,50 @@ fn observe_authoritative_revision_locked(inner: &mut CacheState, revision: u64) 
     inner.metadata_revision = revision;
 }
 
+/// Whether a cached directory listing already proves this pathname does not
+/// exist, so its absence needs no wire call.
+///
+/// A listing enters the cache only through `publish_authoritative_projection`
+/// (see `dir_entries` in fs.rs), which means it is the gateway's own answer with
+/// no unapplied local projection over it, and it is stored under the exact
+/// revision it was read at. So a listing whose revision still matches the
+/// caller's fence is a COMPLETE statement about that directory's children: a
+/// name absent from it is absent, full stop.
+///
+/// This is the difference between a create costing a round trip and costing
+/// nothing. `create` measured 22.8ms on the mounted arena — a single round trip
+/// — and it is not the creation, which is journaled and batched; it is the
+/// kernel's LOOKUP of the new name, which missed the metadata cache (nothing had
+/// ever stat'd a file that does not exist) and went to the wire to be told so.
+/// Every tool that writes into a directory it has just listed — installers,
+/// `git checkout`, any build — pays that per file.
+///
+/// The revision equality is the whole safety argument and is deliberately exact,
+/// not `>=`: a newer revision may have created this very name, and the listing
+/// cached at the older one cannot speak to it. `apply_publication_locked` drops
+/// or retags listings as publications land, so a stale listing is never
+/// consulted here.
+fn listing_proves_absent(inner: &CacheState, path: &str, revision: u64) -> bool {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return false;
+    }
+    let (parent, name) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
+    let Some(listing) = inner.directories.get(parent) else {
+        return false;
+    };
+    if listing.revision != revision {
+        return false;
+    }
+    !listing.entries.iter().any(|entry| entry.name == name)
+}
+
 /// Whether one cached entry is among what a publication superseded.
 ///
 /// `relisted` parents are deliberately not consulted: their listing is dropped
 /// through the changed child's own `invalidate_path_locked`, and their metadata
 /// was not superseded at all.
-fn path_or_identity_is_affected(
-    path: &str,
-    file_id: Option<&str>,
-    affected: &AffectedSet,
-) -> bool {
+fn path_or_identity_is_affected(path: &str, file_id: Option<&str>, affected: &AffectedSet) -> bool {
     affected.paths.contains(path)
         || affected.subtrees.iter().any(|affected_path| {
             !affected_path.is_empty()
@@ -1606,6 +2137,68 @@ mod tests {
     }
 
     #[test]
+    fn local_creation_snapshot_does_not_revoke_its_projected_dentry() {
+        let cache = RemoteFuseCache::default();
+        cache.put_metadata("tree", directory_metadata(), 17);
+        let created = directory_metadata();
+
+        let invalidation = cache.observe_namespace_publication_snapshot(
+            18,
+            &[VfsNamespaceMutation::CreateDirectory {
+                path: "tree/package_tmp".to_string(),
+                mode: Some(0o755),
+            }],
+            &[VfsPublicationSnapshotEntry {
+                path: "tree/package_tmp".to_string(),
+                metadata: Some(created.clone()),
+            }],
+        );
+
+        assert!(
+            invalidation.is_empty(),
+            "the source mount's creation projection is already current"
+        );
+        assert_eq!(cache.get_metadata("tree/package_tmp", 18), Some(created));
+    }
+
+    #[test]
+    fn own_directory_creation_watch_ack_preserves_its_complete_empty_listing() {
+        let cache = RemoteFuseCache::default();
+        let created = directory_metadata();
+        cache.put_metadata("tree", directory_metadata(), 17);
+        cache.put_metadata("tree/package_tmp", created.clone(), 17);
+        cache.put_dir("tree/package_tmp", Vec::new(), 17);
+        let local_paths =
+            std::collections::HashSet::from(["tree".to_string(), "tree/package_tmp".to_string()]);
+
+        cache.observe_remote_publication_with_local_paths(
+            17,
+            18,
+            &["tree".to_string(), "tree/package_tmp".to_string()],
+            &[],
+            &local_paths,
+        );
+        assert_eq!(
+            cache.get_dir("tree/package_tmp", 18),
+            Some(Vec::new()),
+            "the watch ack must not turn every child create into a wire lookup"
+        );
+
+        cache.observe_namespace_publication_snapshot(
+            18,
+            &[VfsNamespaceMutation::CreateDirectory {
+                path: "tree/package_tmp".to_string(),
+                mode: Some(0o755),
+            }],
+            &[VfsPublicationSnapshotEntry {
+                path: "tree/package_tmp".to_string(),
+                metadata: Some(created),
+            }],
+        );
+        assert_eq!(cache.get_dir("tree/package_tmp", 18), Some(Vec::new()));
+    }
+
+    #[test]
     fn publication_snapshot_seeds_exact_changed_and_missing_metadata() {
         let cache = RemoteFuseCache::default();
         cache.put_metadata("tree/new", metadata("stale", 9), 17);
@@ -1643,6 +2236,26 @@ mod tests {
             cache.get_metadata("tree/stable", 18),
             Some(metadata("stable", 6))
         );
+    }
+
+    #[test]
+    fn set_mode_relists_parent_without_dropping_its_dentry() {
+        let cache = RemoteFuseCache::default();
+        cache.put_metadata("tree", directory_metadata(), 17);
+        cache.put_metadata("tree/tool", metadata("same", 4), 17);
+
+        let invalidation = cache.observe_namespace_publication_snapshot(
+            18,
+            &[VfsNamespaceMutation::SetMode {
+                path: "tree/tool".to_string(),
+                mode: 0o755,
+            }],
+            &[],
+        );
+
+        assert_eq!(invalidation.paths, vec!["tree/tool".to_string()]);
+        assert_eq!(invalidation.relisted, vec!["tree".to_string()]);
+        assert_eq!(cache.get_metadata("tree", 18), Some(directory_metadata()));
     }
 
     #[test]
@@ -1706,12 +2319,130 @@ mod tests {
             Some(directory_metadata()),
             "a content write does not change its parent directory's own metadata"
         );
-        // Narrowing the CACHE eviction must not narrow the KERNEL revocation:
-        // the guest still has to drop the directory's dentry and page cache,
-        // because its listing carries the child's size and content hash.
+        // Narrowing the CACHE eviction must not skip the KERNEL refresh. A
+        // content publication changes inode attrs/page state, not namespace
+        // identity, so both child and parent keep their dentries and receive
+        // inode-only refreshes. Sibling mounts still receive conservative full
+        // path invalidation from the revision watch.
         let mut paths = invalidation.paths.clone();
         paths.sort();
-        assert_eq!(paths, vec!["tree".to_string(), "tree/file".to_string()]);
+        assert!(paths.is_empty());
+        let mut relisted = invalidation.relisted.clone();
+        relisted.sort();
+        assert_eq!(relisted, vec!["tree".to_string(), "tree/file".to_string()]);
+    }
+
+    #[test]
+    fn own_write_watch_ack_preserves_listing_until_commit_snapshot_patches_it() {
+        let cache = RemoteFuseCache::default();
+        cache.put_metadata("tree", directory_metadata(), 17);
+        cache.put_dir("tree", Vec::new(), 17);
+        let local_paths = std::collections::HashSet::from(["tree/file".to_string()]);
+
+        // The revision watch runs before the gateway may release this mount's
+        // write response. Preserve the complete listing across that ack instead
+        // of discarding the state the later response needs to patch.
+        cache.observe_remote_publication_with_local_paths(
+            17,
+            18,
+            &["tree/file".to_string(), "tree".to_string()],
+            &[],
+            &local_paths,
+        );
+        assert_eq!(cache.get_dir("tree", 18), Some(Vec::new()));
+        assert!(cache.is_known_missing("tree/next", 18));
+
+        let written = metadata("new", 4);
+        cache.observe_write_publication_snapshot(
+            18,
+            &[("tree/file".to_string(), None)],
+            &[VfsPublicationSnapshotEntry {
+                path: "tree/file".to_string(),
+                metadata: Some(written),
+            }],
+        );
+        assert_eq!(
+            cache
+                .get_dir("tree", 18)
+                .expect("listing survives the local publication")
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>(),
+            vec!["file".to_string()]
+        );
+        assert!(cache.is_known_missing("tree/next", 18));
+    }
+
+    /// A local directory rename is reported on the revision watch before the
+    /// gateway can release its response to the publishing mount. The watch must
+    /// still invalidate siblings conservatively, but this mount needs the
+    /// authoritative source subtree it just populated so the response hook can
+    /// retarget that state to the final pathname. Losing the subtree here makes
+    /// package installers stat every file again after each temp-directory
+    /// rename.
+    #[test]
+    fn own_rename_watch_ack_retargets_the_cached_source_subtree_on_commit() {
+        let cache = RemoteFuseCache::default();
+        let package = directory_metadata();
+        let license = metadata("license-hash", 7);
+        cache.put_metadata("tree/package_tmp", package.clone(), 17);
+        cache.put_metadata("tree/package_tmp/LICENSE", license.clone(), 17);
+        cache.put_dir("tree/package_tmp", vec![entry("LICENSE")], 17);
+        cache.put_file(
+            "tree/package_tmp/LICENSE",
+            b"license".to_vec(),
+            Some(license.clone()),
+        );
+
+        let local_paths = std::collections::HashSet::from([
+            "tree/package_tmp".to_string(),
+            "tree/package".to_string(),
+        ]);
+        cache.observe_remote_publication_with_local_paths(
+            17,
+            18,
+            &[
+                "tree/package_tmp".to_string(),
+                "tree/package".to_string(),
+                "tree".to_string(),
+            ],
+            &["tree/package_tmp".to_string(), "tree/package".to_string()],
+            &local_paths,
+        );
+
+        assert!(
+            cache.get_metadata("tree/package_tmp/LICENSE", 18).is_none(),
+            "the watch still invalidates the live cache before the response arrives"
+        );
+        cache.observe_namespace_publication_snapshot(
+            18,
+            &[VfsNamespaceMutation::Rename {
+                from: "tree/package_tmp".to_string(),
+                to: "tree/package".to_string(),
+            }],
+            &[VfsPublicationSnapshotEntry {
+                path: "tree/package".to_string(),
+                metadata: Some(package),
+            }],
+        );
+
+        assert_eq!(
+            cache.get_metadata("tree/package/LICENSE", 18),
+            Some(license.clone()),
+            "the response retargets descendant metadata staged before watch invalidation"
+        );
+        assert_eq!(
+            cache.get_dir("tree/package", 18),
+            Some(vec![entry("LICENSE")]),
+            "the complete source listing follows the rename"
+        );
+        assert_eq!(
+            cache.get_file_matching("tree/package/LICENSE", &license),
+            Some(b"license".to_vec()),
+            "cached content follows the same rename"
+        );
+        assert!(cache.get_metadata("tree/package_tmp/LICENSE", 18).is_none());
+        assert!(cache.get_dir("tree/package_tmp", 18).is_none());
     }
 
     /// The other half of the same rule: a NAMESPACE publication does change the
@@ -1998,6 +2729,42 @@ mod tests {
         assert_eq!(cache.get_metadata("tree/file", 17), Some(strong));
     }
 
+    /// A fence-matched complete listing answers absence without a wire call.
+    ///
+    /// This is the round trip every create pays: the kernel LOOKUPs the new name
+    /// first, and a name that has never existed has nothing in the metadata cache
+    /// to miss against. The parent's listing already knows.
+    #[test]
+    fn a_fence_matched_listing_answers_absence_without_a_wire_call() {
+        let cache = RemoteFuseCache::default();
+        cache.put_dir("tree", vec![entry("present.txt")], 21);
+
+        assert!(
+            cache.is_known_missing("tree/absent.txt", 21),
+            "a name absent from a complete listing at this fence is absent"
+        );
+        assert!(
+            !cache.is_known_missing("tree/present.txt", 21),
+            "a name the listing contains must never be reported missing"
+        );
+
+        // A directory this mount has never listed proves nothing either way.
+        assert!(!cache.is_known_missing("unlisted/absent.txt", 21));
+
+        // Root-level names resolve against the root listing, which is keyed "".
+        cache.put_dir("", vec![entry("top.txt")], 21);
+        assert!(cache.is_known_missing("missing-top.txt", 21));
+        assert!(!cache.is_known_missing("top.txt", 21));
+
+        // Exact revision, not `>=`: a newer revision may have created this very
+        // name, and a listing read before it cannot speak to that. Asking at 22
+        // also advances this cache's fence, which is why it is asked last.
+        assert!(
+            !cache.is_known_missing("tree/absent.txt", 22),
+            "a listing must not answer for a fence it was not read at"
+        );
+    }
+
     #[test]
     fn known_missing_metadata_is_revision_fenced_and_retagged_by_unrelated_publications() {
         let cache = RemoteFuseCache::default();
@@ -2227,6 +2994,7 @@ mod tests {
     fn one_path(path: &str) -> PublicationInvalidation {
         PublicationInvalidation {
             paths: vec![path.to_string()],
+            relisted: Vec::new(),
             subtrees: Vec::new(),
             identities: Vec::new(),
         }

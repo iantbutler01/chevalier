@@ -10,23 +10,53 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use chevalier_sandbox::vfs::{
-    VFS_SURFACE_KIND_VM_SHARED, VFS_SURFACE_KIND_VM_WORKSPACE, VfsPublicationSnapshotEntry,
+    VFS_SURFACE_KIND_VM_SHARED, VFS_SURFACE_KIND_VM_WORKSPACE, VfsDirEntry,
+    VfsPublicationSnapshotEntry,
 };
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
-use super::client::{RemotePublication, RemoteVfsClient, RemoteWrite, rejected_request_status};
+use super::client::{RemoteVfsClient, RemoteWrite, rejected_request_status};
 
-const BATCH_DELAY: Duration = Duration::from_millis(8);
+// This is an IDLE debounce, so it adds no wait to close(2) and explicit
+// barriers bypass it.
+// Eight milliseconds was shorter than the mounted create/write/close cadence:
+// the worker published the first partial queue while the burst was still
+// arriving, every publication advanced the global coherence fence, and the
+// remaining creates fell back to metadata/stat traffic. A 100ms idle window
+// keeps a package-install burst together while fsync still force-flushes.
+const BATCH_DELAY: Duration = Duration::from_millis(100);
 const RETRY_DELAY_MIN: Duration = Duration::from_millis(100);
 const RETRY_DELAY_MAX: Duration = Duration::from_secs(5);
 const FLUSH_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Emit one WARN if a flush barrier parks past this before the hard timeout, so
 /// an intermittent upstream stall is visible in production without per-poll spam.
 const SLOW_FLUSH_WARN_AFTER: Duration = Duration::from_secs(10);
-const MAX_BATCH_WRITES: usize = 256;
+/// Cap on per-id terminal errors retained for a waiter that may never come.
+/// Close does not wait (see `flush_handle_locked`), so these would otherwise grow
+/// without bound on a mount that keeps dead-lettering.
+const MAX_RETAINED_TERMINAL_ERRORS: usize = 1024;
+/// Brief enqueue window for concurrent close(2) callbacks. Ordinary close
+/// returns after the staging file and WAL record are installed in the host page
+/// cache; the publication worker establishes stable-storage ordering for the
+/// complete queued batch before sending any of it to the gateway.
+const DURABLE_ENQUEUE_GROUP_DELAY: Duration = Duration::from_millis(1);
+const MAX_DURABLE_ENQUEUE_GROUP: usize = 128;
+/// Parallel fdatasync lanes used by the publication worker. Concurrent file
+/// syncs let the filesystem coalesce device barriers across the queued set
+/// before its WAL is synced and its gateway request is issued.
+const MAX_PUBLICATION_SYNC_WORKERS: usize = 16;
+
+// One package install commonly creates hundreds of small files in one
+// directory. Keep the complete burst in one atomic write-many publication; the
+// byte cap remains the guard for large payloads.
+const MAX_BATCH_WRITES: usize = 1_024;
 const MAX_BATCH_BYTES: u64 = 16 * 1024 * 1024;
+/// A single staged write at or above this size uses the gateway's raw streamed
+/// upload route. Below it, `/write-many` remains more efficient because it can
+/// atomically publish a whole small-file burst in one request.
+const STREAMED_WRITE_MIN_BYTES: u64 = 8 * 1024 * 1024;
 const JOURNAL_READ_BUFFER_BYTES: usize = 64 * 1024;
 /// Journal records contain metadata and bounded paths, never file payloads.
 /// One MiB is far above the supported path envelope while keeping a corrupt
@@ -58,6 +88,12 @@ struct JournalWrite {
 }
 
 type WriteTarget = (String, Option<String>);
+
+pub(super) struct PendingCreatedFile {
+    pub(super) size_bytes: u64,
+    pub(super) file_id: Option<String>,
+    pub(super) mode: u32,
+}
 
 impl JournalWrite {
     fn target(&self) -> WriteTarget {
@@ -97,9 +133,31 @@ struct JournalState {
 type DeadLetterHook = Box<dyn Fn(&str) + Send + Sync>;
 type CommitHook = Box<dyn Fn(u64, &[WriteTarget], &[VfsPublicationSnapshotEntry]) + Send + Sync>;
 
+struct DurableEnqueue {
+    path: String,
+    bytes: Vec<u8>,
+    base_content_hash: Option<String>,
+    expected_file_id: Option<String>,
+    create_mode: Option<u32>,
+    result: Mutex<Option<std::result::Result<u64, String>>>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct DurableEnqueueState {
+    pending: VecDeque<Arc<DurableEnqueue>>,
+    /// Paths currently being staged and appended by the group-commit leader.
+    /// Namespace barriers inspect both this and `pending` so a request that
+    /// entered the durability queue first is drained ahead of the mutation.
+    active_paths: Vec<String>,
+    processing: bool,
+}
+
 struct Shared {
     state: Mutex<JournalState>,
     changed: Condvar,
+    durable_enqueues: Mutex<DurableEnqueueState>,
+    durable_enqueues_changed: Condvar,
     journal_path: PathBuf,
     staging_dir: PathBuf,
     /// Invalidates reader-visible caches for a path whose write was dropped.
@@ -170,6 +228,8 @@ impl WriteJournal {
                 descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableEnqueueState::default()),
+            durable_enqueues_changed: Condvar::new(),
             journal_path: journal_path.to_path_buf(),
             staging_dir,
             on_dead_letter,
@@ -208,68 +268,69 @@ impl WriteJournal {
         expected_file_id: Option<String>,
         create_mode: Option<u32>,
     ) -> Result<u64> {
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
-        // Descendant write-barrier (see `descendant_barriers`): a namespace
-        // delete/rename of an ancestor of `path` is publishing. Block until it
-        // completes so this write cannot be applied server-side after the
-        // RemoveDirectory and resurrect the subtree.
+        // Park a barred path before it enters the shared durability queue. This
+        // preserves path-scoped namespace ordering without making an unrelated
+        // enqueue wait behind the barred request at the head of the group.
         //
-        // Deadlock-freedom, in full. The caller may be parked here while holding
-        // a per-handle publication gate — flush_handle_locked enqueues with its
-        // handle gate held — so it is not enough that the wait releases the
-        // journal `state` lock (it does, so a parked writer never holds the
-        // write-journal lock and never wedges the flush_writes drain the
-        // installing mutation performs). It also holds because the mutation that
-        // installed the barrier never needs the parked writer's handle gate: a
-        // DeleteFile/RemoveDirectory takes no handle gate at all, and a Rename
-        // acquires every subtree publication gate BEFORE it installs its barrier
-        // and holds them across the mutation (see publication_gates_for_subtrees
-        // / lock_publication_gates in fs.rs), so a Rename can never itself be the
-        // writer parked here. The barrier therefore always clears once its
-        // bounded, synchronous mutation resolves, and this wait is bounded.
-        while path_within_any_barrier(&state.descendant_barriers, path) {
-            state = self
-                .shared
-                .changed
-                .wait(state)
-                .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
-        }
-        repair_before_append(&self.shared.journal_path, &mut state)?;
-        let id = state.next_id;
-        state.next_id = state.next_id.saturating_add(1);
-        let staged_file = format!("{id}.bin");
-        let staged_path = self.shared.staging_dir.join(staged_file.as_str());
-        let temporary = staged_path.with_extension("tmp");
+        // Barrier installation holds `durable_enqueues` until it has installed
+        // the journal-state barrier. Therefore the gap between this check and
+        // queue admission is ordered: either this request queues first and the
+        // barrier waits for it, or the barrier becomes visible first and the
+        // group re-check below parks behind it.
         {
-            let mut file = File::create(&temporary)
-                .with_context(|| format!("create staged vfs write {}", temporary.display()))?;
-            file.write_all(bytes).context("stage vfs write bytes")?;
-            file.sync_data().context("sync staged vfs write bytes")?;
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
+            while path_within_any_barrier(&state.descendant_barriers, path) {
+                state = self
+                    .shared
+                    .changed
+                    .wait(state)
+                    .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
+            }
         }
-        fs::rename(&temporary, &staged_path)
-            .with_context(|| format!("install staged vfs write {}", staged_path.display()))?;
-        sync_parent_directory(&staged_path)?;
-        let write = JournalWrite {
-            id,
+        let request = Arc::new(DurableEnqueue {
             path: path.to_string(),
-            staged_file,
-            size_bytes: bytes.len() as u64,
+            bytes: bytes.to_vec(),
             base_content_hash,
             expected_file_id,
             create_mode,
+            result: Mutex::new(None),
+            ready: Condvar::new(),
+        });
+        let leader = {
+            let mut enqueues = self
+                .shared
+                .durable_enqueues
+                .lock()
+                .map_err(|_| anyhow!("vfs durable enqueue lock poisoned"))?;
+            enqueues.pending.push_back(Arc::clone(&request));
+            if enqueues.processing {
+                false
+            } else {
+                enqueues.processing = true;
+                true
+            }
         };
-        append_json_line(&mut state.journal, &write, "append vfs write journal")?;
-        state.pending.push_back(write);
-        state.last_error = None;
-        if state.pending.len() >= MAX_BATCH_WRITES {
-            state.force_flush = true;
+        if leader {
+            drive_durable_enqueues(&self.shared);
         }
-        self.shared.changed.notify_all();
-        Ok(id)
+        let mut result = request
+            .result
+            .lock()
+            .map_err(|_| anyhow!("vfs durable enqueue result lock poisoned"))?;
+        while result.is_none() {
+            result = request
+                .ready
+                .wait(result)
+                .map_err(|_| anyhow!("vfs durable enqueue result lock poisoned"))?;
+        }
+        result
+            .take()
+            .ok_or_else(|| anyhow!("vfs durable enqueue result missing"))?
+            .map_err(|error| anyhow!(error))
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -291,20 +352,22 @@ impl WriteJournal {
     /// either drained ahead of the mutation or blocked behind it. Idempotent for
     /// disjoint prefixes; each guard removes exactly the prefixes it added.
     pub(crate) fn install_descendant_barrier(&self, prefixes: Vec<String>) -> WriteBarrierGuard {
-        if !prefixes.is_empty()
-            && let Ok(mut state) = self.shared.state.lock()
-        {
-            state.descendant_barriers.extend(prefixes.iter().cloned());
-        }
-        WriteBarrierGuard {
-            shared: Arc::clone(&self.shared),
-            prefixes,
-        }
+        install_descendant_barrier(&self.shared, prefixes)
     }
 
     /// Wait for one exact enqueue to resolve and report only that operation's
     /// terminal error. The global journal barrier remains available for
     /// namespace ordering, but file fsync/close should use this method.
+    /// Wait for one specific queued write to publish.
+    ///
+    /// Called by `fsync` and by the paths that report authoritative
+    /// post-publication state. NOT by `close(2)` — see `flush_handle_locked`.
+    ///
+    /// `force_flush` here is deliberate and is why this must stay off the close
+    /// path: it shuts the batch window immediately so THIS id goes out now. That
+    /// is exactly right for an fsync, which is a caller asking to pay for
+    /// durability now, and exactly wrong for a close, where it meant every file
+    /// in a sequential loop published alone.
     pub fn flush_through(&self, id: u64) -> Result<()> {
         let mut state = self
             .shared
@@ -347,10 +410,63 @@ impl WriteJournal {
         if let Some(error) = state.terminal_errors.remove(&id) {
             return Err(anyhow!(error));
         }
+        // Bound the map. It is keyed per write id and drained only by a waiter,
+        // and close no longer waits — so without this, every dead-lettered write
+        // nobody fsynced would leak an entry for the life of the mount. The
+        // failure itself is not lost: `dead_letter_error` is latched for the next
+        // `flush()` (which every `flush_writes()` reaches) and the dead-letter
+        // hook has already invalidated the path so no reader serves the dropped
+        // bytes.
+        if state.terminal_errors.len() > MAX_RETAINED_TERMINAL_ERRORS {
+            let excess = state.terminal_errors.len() - MAX_RETAINED_TERMINAL_ERRORS;
+            let stale = state
+                .terminal_errors
+                .keys()
+                .copied()
+                .take(excess)
+                .collect::<Vec<_>>();
+            for key in stale {
+                state.terminal_errors.remove(&key);
+            }
+        }
         // `last_error` summarizes the journal worker globally and may belong
         // to another pathname. Once this exact id has left `pending`, only its
         // own terminal result is relevant to this handle's fsync/close.
         Ok(())
+    }
+
+    /// Whether a queued write lives UNDER `path` — i.e. whether this mount's own
+    /// unpublished work implies `path` is an existing directory.
+    ///
+    /// Read-your-writes for ancestors. A queued write to `many/file-0` means
+    /// `many` exists as far as this mount is concerned, but the gateway has not
+    /// been told yet, so a wire stat of `many` answers 404. Draining to settle
+    /// it would defeat the batching that made the write async in the first
+    /// place, and the namespace projection cannot answer either — a folded
+    /// creation withdrew its record precisely because the write now carries it.
+    pub fn has_pending_under(&self, path: &str) -> bool {
+        let prefix = path.trim_matches('/');
+        if prefix.is_empty() {
+            return self
+                .shared
+                .state
+                .lock()
+                .map(|state| !state.pending.is_empty())
+                .unwrap_or(false);
+        }
+        self.shared
+            .state
+            .lock()
+            .map(|state| {
+                state.pending.iter().any(|write| {
+                    write
+                        .path
+                        .trim_matches('/')
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| rest.starts_with('/'))
+                })
+            })
+            .unwrap_or(false)
     }
 
     pub fn has_pending_path(&self, path: &str) -> bool {
@@ -360,6 +476,250 @@ impl WriteJournal {
             .map(|state| state.pending.iter().any(|write| write.path == path))
             .unwrap_or(true)
     }
+
+    /// Return the newest queued contents for a pathname whose creation is still
+    /// owned by this journal, together with the durable creation mode.
+    ///
+    /// Node's `copyFile` path performs `create/write/close/chmod` even when the
+    /// chmod merely repeats the mode used by create. The mode is already in the
+    /// write WAL in that case; forcing the whole write journal to publish and
+    /// then issuing `stat + SetMode` turned one package import into thousands
+    /// of synchronous namespace round trips. This view lets the filesystem
+    /// recognize that exact no-op without weakening a real mode change.
+    pub fn pending_created_file(&self, path: &str) -> Option<PendingCreatedFile> {
+        let state = self.shared.state.lock().ok()?;
+        pending_created_file(state.pending.iter(), path)
+    }
+
+    /// Merge this mount's unpublished direct-child writes into a directory
+    /// listing without exposing them through the cache shared by sibling
+    /// mounts.
+    ///
+    /// Folded creations have no namespace-journal record: their write WAL entry
+    /// is the only mount-local proof that the name exists until `write-many`
+    /// commits. Without this overlay an immediate `readdir` can observe the
+    /// authoritative pre-publication listing (often the seeded empty listing),
+    /// so `rm -rf` skips every child and sends only the final rmdir. The rmdir
+    /// drains the write journal, creates those skipped children server-side,
+    /// and then correctly fails as not-empty.
+    pub fn project_directory(
+        &self,
+        path: &str,
+        mut entries: Vec<VfsDirEntry>,
+    ) -> Result<(Vec<VfsDirEntry>, bool)> {
+        let directory = path.trim_matches('/');
+        let state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
+        let mut applied = false;
+        for write in &state.pending {
+            let write_path = write.path.trim_matches('/');
+            let direct_name = if directory.is_empty() {
+                (!write_path.contains('/')).then_some(write_path)
+            } else {
+                write_path
+                    .strip_prefix(directory)
+                    .and_then(|suffix| suffix.strip_prefix('/'))
+                    .filter(|suffix| !suffix.is_empty() && !suffix.contains('/'))
+            };
+            let Some(name) = direct_name else {
+                continue;
+            };
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.name == name) {
+                entry.size_bytes = write.size_bytes;
+                entry.content_hash = None;
+                if let Some(file_id) = write.expected_file_id.as_ref() {
+                    entry.file_id = Some(file_id.clone());
+                }
+                if let Some(mode) = write.create_mode {
+                    entry.mode = Some(mode);
+                    entry.executable = mode & 0o111 != 0;
+                }
+                applied = true;
+            } else if let Some(mode) = write.create_mode {
+                entries.push(VfsDirEntry {
+                    name: name.to_string(),
+                    kind: "file".to_string(),
+                    size_bytes: write.size_bytes,
+                    file_id: write.expected_file_id.clone(),
+                    link_count: 1,
+                    link_target: None,
+                    content_hash: None,
+                    executable: mode & 0o111 != 0,
+                    mode: Some(mode),
+                    updated_at: None,
+                });
+                applied = true;
+            }
+        }
+        Ok((entries, applied))
+    }
+}
+
+fn drive_durable_enqueues(shared: &Arc<Shared>) {
+    loop {
+        std::thread::sleep(DURABLE_ENQUEUE_GROUP_DELAY);
+        let requests = {
+            let mut enqueues = shared
+                .durable_enqueues
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if enqueues.pending.is_empty() {
+                enqueues.processing = false;
+                enqueues.active_paths.clear();
+                shared.durable_enqueues_changed.notify_all();
+                return;
+            }
+            let take = enqueues.pending.len().min(MAX_DURABLE_ENQUEUE_GROUP);
+            let requests = enqueues.pending.drain(..take).collect::<Vec<_>>();
+            enqueues.active_paths = requests
+                .iter()
+                .map(|request| request.path.clone())
+                .collect();
+            requests
+        };
+        let outcome = process_durable_enqueue_group(shared, &requests);
+        match outcome {
+            Ok(ids) => {
+                for (request, id) in requests.iter().zip(ids) {
+                    *request
+                        .result
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Ok(id));
+                    request.ready.notify_all();
+                }
+            }
+            Err(error) => {
+                let error = error.to_string();
+                for request in &requests {
+                    *request
+                        .result
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        Some(Err(error.clone()));
+                    request.ready.notify_all();
+                }
+            }
+        }
+        let mut enqueues = shared
+            .durable_enqueues
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        enqueues.active_paths.clear();
+        shared.durable_enqueues_changed.notify_all();
+    }
+}
+
+fn process_durable_enqueue_group(
+    shared: &Arc<Shared>,
+    requests: &[Arc<DurableEnqueue>],
+) -> Result<Vec<u64>> {
+    let mut state = shared
+        .state
+        .lock()
+        .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
+    // The state lock makes the whole group atomic against installation of a
+    // delete/rename descendant barrier. If the barrier won the race, wait for
+    // it exactly as the former per-file enqueue did; if this group won, the
+    // namespace operation installs behind these durable WAL entries and its
+    // normal write drain orders them before the mutation.
+    while requests
+        .iter()
+        .any(|request| path_within_any_barrier(&state.descendant_barriers, request.path.as_str()))
+    {
+        state = shared
+            .changed
+            .wait(state)
+            .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
+    }
+    repair_before_append(&shared.journal_path, &mut state)?;
+
+    let mut prepared = Vec::with_capacity(requests.len());
+    let mut journal_touched = false;
+    let result = (|| -> Result<Vec<u64>> {
+        for request in requests {
+            let id = state.next_id;
+            state.next_id = state.next_id.saturating_add(1);
+            let staged_file = format!("{id}.bin");
+            let staged_path = shared.staging_dir.join(staged_file.as_str());
+            let temporary = staged_path.with_extension("tmp");
+            let mut file = File::create(&temporary)
+                .with_context(|| format!("create staged vfs write {}", temporary.display()))?;
+            file.write_all(request.bytes.as_slice())
+                .context("stage vfs write bytes")?;
+            prepared.push((
+                temporary,
+                staged_path,
+                JournalWrite {
+                    id,
+                    path: request.path.clone(),
+                    staged_file,
+                    size_bytes: request.bytes.len() as u64,
+                    base_content_hash: request.base_content_hash.clone(),
+                    expected_file_id: request.expected_file_id.clone(),
+                    create_mode: request.create_mode,
+                },
+                file,
+            ));
+        }
+        // close(2) is not fsync(2). Install complete staging files and WAL
+        // records in the host page cache; the publication worker syncs the
+        // complete queued set in one ordered group before it goes remote.
+        for (temporary, staged_path, _, _) in &prepared {
+            fs::rename(temporary, staged_path)
+                .with_context(|| format!("install staged vfs write {}", staged_path.display()))?;
+        }
+        for (_, _, write, _) in &prepared {
+            append_json_line_unsynced(&mut state.journal, write, "append vfs write journal")?;
+            journal_touched = true;
+        }
+        let ids = prepared
+            .iter()
+            .map(|(_, _, write, _)| write.id)
+            .collect::<Vec<_>>();
+        state
+            .pending
+            .extend(prepared.iter().map(|(_, _, write, _)| write.clone()));
+        state.last_error = None;
+        if state.pending.len() >= MAX_BATCH_WRITES {
+            state.force_flush = true;
+        }
+        shared.changed.notify_all();
+        Ok(ids)
+    })();
+
+    if let Err(error) = result {
+        if journal_touched {
+            // A partial/unsynced append is repaired from the authoritative
+            // in-memory pending queue before any later append is admitted.
+            state.journal_needs_repair = true;
+        }
+        for (temporary, staged_path, _, _) in &prepared {
+            let _ = fs::remove_file(temporary);
+            if !journal_touched {
+                let _ = fs::remove_file(staged_path);
+            }
+        }
+        return Err(error);
+    }
+    result
+}
+
+fn pending_created_file<'a>(
+    pending: impl DoubleEndedIterator<Item = &'a JournalWrite> + Clone,
+    path: &str,
+) -> Option<PendingCreatedFile> {
+    let latest = pending.clone().rev().find(|write| write.path == path)?;
+    let mode = pending
+        .rev()
+        .find_map(|write| (write.path == path).then_some(write.create_mode).flatten())?;
+    Some(PendingCreatedFile {
+        size_bytes: latest.size_bytes,
+        file_id: latest.expected_file_id.clone(),
+        mode,
+    })
 }
 
 impl Drop for WriteJournal {
@@ -381,6 +741,7 @@ impl Drop for WriteJournal {
 /// A detached drain handle over a live journal's shared state. Cloning the
 /// `Arc` keeps the journal's worker and staging directory alive for as long as
 /// any handle exists, exactly like the owning `WriteJournal`.
+#[derive(Clone)]
 pub(crate) struct WriteDrainHandle {
     shared: Arc<Shared>,
 }
@@ -391,6 +752,60 @@ impl WriteDrainHandle {
     pub(crate) fn flush(&self) -> Result<()> {
         flush_shared(&self.shared)
     }
+
+    pub(crate) fn install_descendant_barrier(&self, prefixes: Vec<String>) -> WriteBarrierGuard {
+        install_descendant_barrier(&self.shared, prefixes)
+    }
+}
+
+/// Install a descendant barrier atomically against both durable queued writes
+/// and writes already present in the publication journal.
+///
+/// The durable queue lock is held until the journal-state barrier is visible:
+/// a write that queued first is allowed to finish its durable append, while a
+/// later write cannot enter the queue until it will observe the new barrier.
+fn install_descendant_barrier(shared: &Arc<Shared>, prefixes: Vec<String>) -> WriteBarrierGuard {
+    let mut prior_write_ids = Vec::new();
+    if !prefixes.is_empty() {
+        let mut enqueues = shared
+            .durable_enqueues
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while durable_enqueues_intersect(&enqueues, &prefixes) {
+            enqueues = shared
+                .durable_enqueues_changed
+                .wait(enqueues)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        let mut state = shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prior_write_ids.extend(
+            state
+                .pending
+                .iter()
+                .filter(|write| path_within_any_barrier(&prefixes, write.path.as_str()))
+                .map(|write| write.id),
+        );
+        state.descendant_barriers.extend(prefixes.iter().cloned());
+    }
+    WriteBarrierGuard {
+        shared: Arc::clone(shared),
+        prefixes,
+        prior_write_ids,
+    }
+}
+
+fn durable_enqueues_intersect(enqueues: &DurableEnqueueState, prefixes: &[String]) -> bool {
+    enqueues
+        .pending
+        .iter()
+        .any(|request| path_within_any_barrier(prefixes, request.path.as_str()))
+        || enqueues
+            .active_paths
+            .iter()
+            .any(|path| path_within_any_barrier(prefixes, path))
 }
 
 /// RAII guard for an installed descendant write-barrier. Dropping it removes the
@@ -398,6 +813,19 @@ impl WriteDrainHandle {
 pub(crate) struct WriteBarrierGuard {
     shared: Arc<Shared>,
     prefixes: Vec<String>,
+    /// Writes under this barrier that were admitted before it became visible.
+    /// Later matching writes are parked by `prefixes`; unrelated later writes
+    /// must not keep the namespace mutation waiting for a globally empty queue.
+    prior_write_ids: Vec<u64>,
+}
+
+impl WriteBarrierGuard {
+    pub(crate) fn drain_handle(&self) -> WriteBarrierDrain {
+        WriteBarrierDrain {
+            shared: Arc::clone(&self.shared),
+            prior_write_ids: self.prior_write_ids.clone(),
+        }
+    }
 }
 
 impl Drop for WriteBarrierGuard {
@@ -418,6 +846,72 @@ impl Drop for WriteBarrierGuard {
         }
         // Wake enqueues parked on the barrier; they re-check under `state`.
         self.shared.changed.notify_all();
+    }
+}
+
+pub(crate) struct WriteBarrierDrain {
+    shared: Arc<Shared>,
+    prior_write_ids: Vec<u64>,
+}
+
+impl WriteBarrierDrain {
+    pub(crate) fn flush(&self) -> Result<()> {
+        flush_selected_shared(&self.shared, &self.prior_write_ids)
+    }
+}
+
+fn flush_selected_shared(shared: &Arc<Shared>, ids: &[u64]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let ids = ids.iter().copied().collect::<HashSet<_>>();
+    let mut state = shared
+        .state
+        .lock()
+        .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
+    state.force_flush = true;
+    shared.changed.notify_all();
+    let start = Instant::now();
+    let deadline = start + FLUSH_RETRY_TIMEOUT;
+    let mut slow_warned = false;
+    while state.pending.iter().any(|write| ids.contains(&write.id)) {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(anyhow!(state.last_error.clone().unwrap_or_else(|| {
+                "timed out flushing writes ordered before a namespace mutation".to_string()
+            })));
+        }
+        let elapsed = now.duration_since(start);
+        if !slow_warned && elapsed >= SLOW_FLUSH_WARN_AFTER {
+            slow_warned = true;
+            tracing::warn!(
+                waited_secs = elapsed.as_secs(),
+                selected = ids.len(),
+                pending = state.pending.len(),
+                "vfs namespace write watermark still draining prior writes"
+            );
+        }
+        let mut wait_for = deadline.saturating_duration_since(now);
+        if !slow_warned {
+            wait_for = wait_for.min(SLOW_FLUSH_WARN_AFTER.saturating_sub(elapsed));
+        }
+        let waited = shared
+            .changed
+            .wait_timeout(state, wait_for)
+            .map_err(|_| anyhow!("vfs write journal lock poisoned"))?;
+        state = waited.0;
+    }
+    let mut first_error = None;
+    for id in ids {
+        if let Some(error) = state.terminal_errors.remove(&id)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(anyhow!(error)),
+        None => Ok(()),
     }
 }
 
@@ -526,6 +1020,51 @@ fn is_uuid_like(value: &str) -> bool {
     })
 }
 
+/// Establish the write-ahead ordering for every record currently visible in
+/// the journal before any selected batch is published remotely.
+///
+/// The caller holds `state`, so no later WAL append can be included in the
+/// journal sync without its staged file also being included here.
+fn sync_pending_before_publication(shared: &Arc<Shared>, state: &mut JournalState) -> Result<()> {
+    let pending = state.pending.iter().cloned().collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let worker_count = pending.len().min(MAX_PUBLICATION_SYNC_WORKERS).max(1);
+    let chunk_size = pending.len().div_ceil(worker_count);
+    std::thread::scope(|scope| -> Result<()> {
+        let mut workers = Vec::with_capacity(worker_count);
+        for chunk in pending.chunks(chunk_size) {
+            workers.push(scope.spawn(move || -> Result<()> {
+                for write in chunk {
+                    let staged_path = shared.staging_dir.join(write.staged_file.as_str());
+                    File::open(&staged_path)
+                        .with_context(|| {
+                            format!("open staged vfs write for sync {}", staged_path.display())
+                        })?
+                        .sync_data()
+                        .with_context(|| {
+                            format!("sync staged vfs write bytes {}", staged_path.display())
+                        })?;
+                }
+                Ok(())
+            }));
+        }
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow!("vfs staged write sync worker panicked"))??;
+        }
+        Ok(())
+    })?;
+    let first_staged = shared.staging_dir.join(pending[0].staged_file.as_str());
+    sync_parent_directory(&first_staged)?;
+    state
+        .journal
+        .sync_data()
+        .context("sync vfs write journal before publication")
+}
+
 fn run_worker(
     shared: Arc<Shared>,
     client: RemoteVfsClient,
@@ -535,12 +1074,21 @@ fn run_worker(
 ) {
     let mut retry_delay = RETRY_DELAY_MIN;
     loop {
-        let (batch, surface) = {
+        let (batch, surface, durability) = {
             let mut state = match shared.state.lock() {
                 Ok(state) => state,
                 Err(_) => return,
             };
             while state.pending.is_empty() && !state.stop {
+                // Nothing queued, so a pending force-flush is satisfied by
+                // definition — retire it rather than carrying it into work that
+                // has not been asked for yet. `flush()` raises the flag
+                // unconditionally, including when the journal is already empty,
+                // and only a batch take (below) lowers it: a flush with nothing
+                // to drain therefore latched it until the NEXT enqueue, which
+                // the worker then published ALONE instead of batching. The
+                // namespace journal had the identical bug.
+                state.force_flush = false;
                 state = match shared.changed.wait(state) {
                     Ok(state) => state,
                     Err(_) => return,
@@ -550,7 +1098,13 @@ fn run_worker(
                 return;
             }
             if !state.force_flush && state.pending.len() < MAX_BATCH_WRITES {
-                let deadline = Instant::now() + BATCH_DELAY;
+                // Debounce on ENQUEUE activity, not on the first entry. A fixed
+                // deadline from the first write split one steady sequential
+                // create loop every 8ms even though entries kept arriving. The
+                // worker now publishes after the queue has been idle for one
+                // batch window (or reaches a hard size/byte boundary).
+                let mut observed_len = state.pending.len();
+                let mut deadline = Instant::now() + BATCH_DELAY;
                 while !state.force_flush
                     && state.pending.len() < MAX_BATCH_WRITES
                     && Instant::now() < deadline
@@ -563,6 +1117,11 @@ fn run_worker(
                         Err(_) => return,
                     };
                     state = waited.0;
+                    if state.pending.len() > observed_len {
+                        observed_len = state.pending.len();
+                        deadline = Instant::now() + BATCH_DELAY;
+                        continue;
+                    }
                     if waited.1.timed_out() {
                         break;
                     }
@@ -585,55 +1144,87 @@ fn run_worker(
                 bytes = bytes.saturating_add(write.size_bytes);
                 batch.push(write.clone());
             }
+            let durability = sync_pending_before_publication(&shared, &mut state);
             state.force_flush = false;
             state.flushing = true;
-            (batch, surface)
+            (batch, surface, durability)
         };
 
         let coalesced = coalesce_batch(&batch);
-        let writes = coalesced
-            .iter()
-            .map(|write| {
-                fs::read(shared.staging_dir.join(write.staged_file.as_str()))
-                    .map(|bytes| RemoteWrite {
-                        path: write.path.clone(),
-                        bytes,
-                        base_content_hash: write.base_content_hash.clone(),
-                        expected_file_id: write.expected_file_id.clone(),
-                        mode: write.create_mode,
-                    })
-                    .with_context(|| format!("read staged vfs write {}", write.staged_file))
-            })
-            .collect::<Result<Vec<_>>>();
-        let committed_hashes = writes
-            .as_ref()
-            .map(|writes| {
-                writes
-                    .iter()
-                    .map(|write| {
-                        (
-                            (write.path.clone(), write.expected_file_id.clone()),
-                            content_hash_for_bytes(write.bytes.as_slice()),
-                        )
-                    })
-                    .collect::<HashMap<_, _>>()
-            })
-            .unwrap_or_default();
-        let result = writes.and_then(|writes| {
-            flush_batch_concurrently(&client, &tokio, writes, surface)
-        });
+        let (committed_hashes, result) = if let Err(error) = durability {
+            (HashMap::new(), Err(error))
+        } else if coalesced.len() == 1 && coalesced[0].size_bytes >= STREAMED_WRITE_MIN_BYTES {
+            let write = &coalesced[0];
+            let staged_path = shared.staging_dir.join(write.staged_file.as_str());
+            match stream_exact_file(&staged_path, None, write.size_bytes) {
+                Ok(content_hash) => {
+                    let committed_hashes = HashMap::from([(write.target(), content_hash.clone())]);
+                    let result = tokio.block_on(client.write_staged_file(
+                        write.path.as_str(),
+                        &staged_path,
+                        write.size_bytes,
+                        content_hash.as_str(),
+                        write.base_content_hash.as_deref(),
+                        write.expected_file_id.as_deref(),
+                        write.create_mode,
+                        surface,
+                    ));
+                    (committed_hashes, result)
+                }
+                Err(error) => (HashMap::new(), Err(error)),
+            }
+        } else {
+            let writes = coalesced
+                .iter()
+                .map(|write| {
+                    fs::read(shared.staging_dir.join(write.staged_file.as_str()))
+                        .map(|bytes| RemoteWrite {
+                            path: write.path.clone(),
+                            bytes,
+                            base_content_hash: write.base_content_hash.clone(),
+                            expected_file_id: write.expected_file_id.clone(),
+                            mode: write.create_mode,
+                        })
+                        .with_context(|| format!("read staged vfs write {}", write.staged_file))
+                })
+                .collect::<Result<Vec<_>>>();
+            let committed_hashes = writes
+                .as_ref()
+                .map(|writes| {
+                    writes
+                        .iter()
+                        .map(|write| {
+                            (
+                                (write.path.clone(), write.expected_file_id.clone()),
+                                content_hash_for_bytes(write.bytes.as_slice()),
+                            )
+                        })
+                        .collect::<HashMap<_, _>>()
+                })
+                .unwrap_or_default();
+            let result =
+                writes.and_then(|writes| tokio.block_on(client.write_many(writes, surface)));
+            (committed_hashes, result)
+        };
         // A 4xx means the gateway rejected the batch outright; retrying the
         // same batch can never succeed. Resolve each write individually so one
         // poisoned entry cannot wedge the journal forever.
         let resolution = match &result {
-            Err(error) if rejected_request_status(error).is_some() => Some(resolve_rejected_batch(
-                &shared,
-                &client,
-                &tokio,
-                &coalesced,
-                surface,
-                on_commit.as_deref(),
-            )),
+            Err(error) if rejected_request_status(error).is_some() => {
+                tracing::warn!(
+                    writes = coalesced.len(),
+                    error = %error,
+                    "vfs write batch rejected; reconciling individual writes"
+                );
+                Some(resolve_rejected_batch(
+                    &shared,
+                    &client,
+                    &tokio,
+                    &coalesced,
+                    surface,
+                    on_commit.as_deref(),
+                ))
+            }
             _ => None,
         };
         let mut state = match shared.state.lock() {
@@ -1163,90 +1754,6 @@ fn remove_dead_letter_temporary(path: &Path) -> Result<()> {
     }
 }
 
-/// How many write batches may be in flight at once.
-///
-/// The journal batched writes but issued exactly one request at a time, so
-/// throughput was `batch_bytes / round_trip` no matter how large the batch got —
-/// a hard ceiling of ~5.6MiB/s on a link whose RTT is 0.87ms. Overlapping
-/// requests multiplies that; it does not require the gateway to get any faster.
-///
-/// Bounded rather than unbounded: the gateway serialises publications per owner,
-/// so past a small number of concurrent batches the extra requests only queue
-/// server-side while consuming host sockets and guest memory.
-const MAX_INFLIGHT_WRITE_BATCHES: usize = 4;
-
-/// Split a coalesced batch into shards that may be issued concurrently.
-///
-/// ORDERING CONTRACT: every write for a given path lands in the SAME shard, in
-/// its original relative order. Two writes to one path are order-dependent —
-/// each carries `base_content_hash` as a CAS precondition chaining onto the
-/// previous content — so splitting them across shards would let the second race
-/// the first and be rejected, or worse, applied out of order.
-///
-/// Partitioning by path specifically, NOT by `JournalWrite::target()`: that key
-/// is `(path, expected_file_id)`, so a file deleted and recreated inside one
-/// batch appears twice under the same path with different identities. Keying on
-/// the target would place those in different shards and let the recreate
-/// overtake the delete.
-fn shard_writes_by_path(writes: Vec<RemoteWrite>, shards: usize) -> Vec<Vec<RemoteWrite>> {
-    let shards = shards.max(1);
-    let mut order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, Vec<RemoteWrite>> = HashMap::new();
-    for write in writes {
-        if !groups.contains_key(&write.path) {
-            order.push(write.path.clone());
-        }
-        groups.entry(write.path.clone()).or_default().push(write);
-    }
-    // Built by hand rather than `vec![Vec::new(); shards]`: RemoteWrite carries
-    // the payload bytes and is deliberately not Clone.
-    let mut buckets: Vec<Vec<RemoteWrite>> = (0..shards).map(|_| Vec::new()).collect();
-    for (index, path) in order.into_iter().enumerate() {
-        if let Some(group) = groups.remove(&path) {
-            buckets[index % shards].extend(group);
-        }
-    }
-    buckets.retain(|bucket| !bucket.is_empty());
-    buckets
-}
-
-/// Issue a batch as concurrent per-path shards.
-///
-/// On partial failure this returns the first error and the caller retries the
-/// WHOLE batch, which re-sends shards that already committed. Those retries hit
-/// a `base_content_hash` that no longer matches and are rejected, which routes
-/// into `resolve_rejected_batch` — the existing per-entry resolution path. That
-/// is slower than a clean retry but it is correct, and it is the same path a
-/// single-request flush already took on rejection.
-fn flush_batch_concurrently(
-    client: &RemoteVfsClient,
-    tokio: &Handle,
-    writes: Vec<RemoteWrite>,
-    surface: &str,
-) -> Result<RemotePublication> {
-    let shards = shard_writes_by_path(writes, MAX_INFLIGHT_WRITE_BATCHES);
-    if shards.len() <= 1 {
-        let only = shards.into_iter().next().unwrap_or_default();
-        return tokio.block_on(client.write_many(only, surface));
-    }
-    tokio.block_on(async {
-        let issued = shards
-            .into_iter()
-            .map(|shard| client.write_many(shard, surface));
-        let settled = futures::future::join_all(issued).await;
-        let mut revision = 0_u64;
-        let mut entries = Vec::new();
-        for outcome in settled {
-            // Report the first failure rather than a synthesised success: a
-            // partial publication must not look complete to the commit hook.
-            let publication = outcome?;
-            revision = revision.max(publication.revision);
-            entries.extend(publication.entries);
-        }
-        Ok(RemotePublication { revision, entries })
-    })
-}
-
 fn coalesce_batch(batch: &[JournalWrite]) -> Vec<JournalWrite> {
     let mut writes = Vec::<JournalWrite>::new();
     let mut positions = HashMap::<WriteTarget, usize>::new();
@@ -1556,10 +2063,19 @@ fn open_append(path: &Path) -> Result<File> {
 }
 
 fn append_json_line(file: &mut File, value: &impl Serialize, context: &'static str) -> Result<()> {
-    serde_json::to_writer(&mut *file, value).with_context(|| context)?;
-    file.write_all(b"\n").with_context(|| context)?;
+    append_json_line_unsynced(file, value, context)?;
     file.sync_data()
         .with_context(|| format!("sync {context}"))?;
+    Ok(())
+}
+
+fn append_json_line_unsynced(
+    file: &mut File,
+    value: &impl Serialize,
+    context: &'static str,
+) -> Result<()> {
+    serde_json::to_writer(&mut *file, value).with_context(|| context)?;
+    file.write_all(b"\n").with_context(|| context)?;
     Ok(())
 }
 
@@ -1662,6 +2178,7 @@ fn remove_staged_after_wal(shared: &Shared, writes: &[JournalWrite]) {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::mpsc;
 
     #[test]
     fn coalescing_keeps_first_precondition_and_latest_bytes() {
@@ -1702,6 +2219,211 @@ mod tests {
         assert_eq!(coalesced[0].base_content_hash.as_deref(), Some("base"));
         assert_eq!(coalesced[1].path, "README.md");
         assert_eq!(coalesced[1].base_content_hash, None);
+    }
+
+    #[test]
+    fn pending_creation_reports_latest_size_and_durable_mode() {
+        let pending = VecDeque::from([
+            JournalWrite {
+                id: 1,
+                path: "node_modules/pkg/index.js".to_string(),
+                staged_file: "1.bin".to_string(),
+                size_bytes: 10,
+                base_content_hash: Some("absent".to_string()),
+                expected_file_id: None,
+                create_mode: Some(0o644),
+            },
+            JournalWrite {
+                id: 2,
+                path: "node_modules/pkg/index.js".to_string(),
+                staged_file: "2.bin".to_string(),
+                size_bytes: 42,
+                base_content_hash: Some("first".to_string()),
+                expected_file_id: None,
+                create_mode: None,
+            },
+        ]);
+
+        let created = pending_created_file(pending.iter(), "node_modules/pkg/index.js").unwrap();
+        assert_eq!(created.size_bytes, 42);
+        assert_eq!(created.mode, 0o644);
+        assert_eq!(created.file_id, None);
+        assert!(pending_created_file(pending.iter(), "node_modules/pkg/missing.js").is_none());
+    }
+
+    #[test]
+    fn descendant_barrier_waits_for_an_earlier_durable_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("writes.jsonl");
+        let staging_dir = dir.path().join("writes");
+        fs::create_dir_all(&staging_dir).expect("staging directory");
+        let shared = Arc::new(Shared {
+            state: Mutex::new(JournalState {
+                pending: VecDeque::new(),
+                journal: open_append(&journal_path).expect("journal"),
+                next_id: 2,
+                force_flush: false,
+                flushing: false,
+                stop: false,
+                journal_needs_repair: false,
+                last_error: None,
+                dead_letter_error: None,
+                terminal_errors: HashMap::new(),
+                descendant_barriers: Vec::new(),
+            }),
+            changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableEnqueueState {
+                pending: VecDeque::new(),
+                active_paths: vec!["node_modules/pkg/index.js".to_string()],
+                processing: true,
+            }),
+            durable_enqueues_changed: Condvar::new(),
+            journal_path,
+            staging_dir,
+            on_dead_letter: None,
+        });
+
+        // The active path models a group that entered the durability queue
+        // before this namespace operation. The barrier may not become visible
+        // until that group has published its durable WAL records into `state`.
+        let barrier_shared = Arc::clone(&shared);
+        let (barrier_tx, barrier_rx) = mpsc::channel();
+        let barrier_installer = std::thread::spawn(move || {
+            let guard =
+                install_descendant_barrier(&barrier_shared, vec!["node_modules/pkg".to_string()]);
+            barrier_tx.send(guard).expect("barrier result receiver");
+        });
+        assert!(
+            matches!(
+                barrier_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "a later namespace barrier must wait for the already-queued write"
+        );
+
+        {
+            let mut state = shared.state.lock().expect("journal state");
+            state.pending.push_back(JournalWrite {
+                id: 1,
+                path: "node_modules/pkg/index.js".to_string(),
+                staged_file: "1.bin".to_string(),
+                size_bytes: 6,
+                base_content_hash: None,
+                expected_file_id: None,
+                create_mode: Some(0o644),
+            });
+        }
+        {
+            let mut enqueues = shared
+                .durable_enqueues
+                .lock()
+                .expect("durable enqueue state");
+            enqueues.active_paths.clear();
+            enqueues.processing = false;
+            shared.durable_enqueues_changed.notify_all();
+        }
+        let second_barrier = barrier_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("later barrier installs after the durable write");
+        {
+            let state = shared.state.lock().expect("journal state");
+            assert_eq!(
+                state
+                    .pending
+                    .iter()
+                    .map(|write| write.path.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["node_modules/pkg/index.js"],
+                "the durable write is journaled before the later barrier becomes visible"
+            );
+        }
+        drop(second_barrier);
+        barrier_installer.join().expect("barrier installer");
+    }
+
+    #[test]
+    fn descendant_barrier_drain_ignores_later_unrelated_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("writes.jsonl");
+        let staging_dir = dir.path().join("writes");
+        fs::create_dir_all(&staging_dir).expect("staging directory");
+        let write = |id, path: &str| JournalWrite {
+            id,
+            path: path.to_string(),
+            staged_file: format!("{id}.bin"),
+            size_bytes: 1,
+            base_content_hash: None,
+            expected_file_id: None,
+            create_mode: Some(0o644),
+        };
+        let shared = Arc::new(Shared {
+            state: Mutex::new(JournalState {
+                pending: VecDeque::from([
+                    write(1, "node_modules/pkg/index.js"),
+                    write(2, "node_modules/other/index.js"),
+                ]),
+                journal: open_append(&journal_path).expect("journal"),
+                next_id: 3,
+                force_flush: false,
+                flushing: false,
+                stop: false,
+                journal_needs_repair: false,
+                last_error: None,
+                dead_letter_error: None,
+                terminal_errors: HashMap::new(),
+                descendant_barriers: Vec::new(),
+            }),
+            changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableEnqueueState::default()),
+            durable_enqueues_changed: Condvar::new(),
+            journal_path,
+            staging_dir,
+            on_dead_letter: None,
+        });
+
+        let guard = install_descendant_barrier(&shared, vec!["node_modules/pkg".to_string()]);
+        assert_eq!(guard.prior_write_ids, vec![1]);
+        {
+            let mut state = shared.state.lock().expect("state");
+            state
+                .pending
+                .push_back(write(3, "node_modules/later/index.js"));
+        }
+
+        let drain = guard.drain_handle();
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            drain.flush().expect("drain prior matching write");
+            done_tx.send(()).expect("report drain");
+        });
+        assert!(
+            matches!(
+                done_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the barrier must still wait for the matching prior write"
+        );
+        {
+            let mut state = shared.state.lock().expect("state");
+            state.pending.retain(|write| write.id != 1);
+            shared.changed.notify_all();
+        }
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("unrelated pending writes do not hold the barrier");
+        assert_eq!(
+            shared
+                .state
+                .lock()
+                .expect("state")
+                .pending
+                .iter()
+                .map(|write| write.id)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        waiter.join().expect("barrier drain waiter");
+        drop(guard);
     }
 
     #[test]
@@ -1860,6 +2582,8 @@ mod tests {
                 descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableEnqueueState::default()),
+            durable_enqueues_changed: Condvar::new(),
             journal_path,
             staging_dir,
             on_dead_letter: None,
@@ -1910,6 +2634,8 @@ mod tests {
                 descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableEnqueueState::default()),
+            durable_enqueues_changed: Condvar::new(),
             journal_path,
             staging_dir,
             on_dead_letter: None,
@@ -2230,6 +2956,8 @@ mod tests {
                 descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableEnqueueState::default()),
+            durable_enqueues_changed: Condvar::new(),
             journal_path: journal_path.clone(),
             staging_dir: staging_dir.clone(),
             on_dead_letter: None,
@@ -2343,6 +3071,8 @@ mod tests {
                 descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableEnqueueState::default()),
+            durable_enqueues_changed: Condvar::new(),
             journal_path: journal_path.clone(),
             staging_dir: staging_dir.clone(),
             on_dead_letter: None,
@@ -2400,6 +3130,8 @@ mod tests {
                 descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableEnqueueState::default()),
+            durable_enqueues_changed: Condvar::new(),
             journal_path: journal_path.clone(),
             staging_dir: staging_dir.clone(),
             on_dead_letter: Some(Box::new(move |path| {
@@ -2453,6 +3185,8 @@ mod tests {
                 descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableEnqueueState::default()),
+            durable_enqueues_changed: Condvar::new(),
             journal_path,
             staging_dir,
             on_dead_letter: None,
@@ -2464,6 +3198,118 @@ mod tests {
 
         assert!(journal.has_pending_path("logs/api.log"));
         assert!(!journal.has_pending_path("src/main.rs"));
+
+        journal
+            .shared
+            .state
+            .lock()
+            .expect("journal state")
+            .pending
+            .clear();
+    }
+
+    #[test]
+    fn pending_folded_creates_are_mount_local_directory_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("writes.jsonl");
+        let staging_dir = dir.path().join("writes");
+        fs::create_dir_all(&staging_dir).expect("staging dir");
+        let pending = VecDeque::from([
+            JournalWrite {
+                id: 1,
+                path: "tree/new".to_string(),
+                create_mode: Some(0o755),
+                staged_file: "1.bin".to_string(),
+                size_bytes: 7,
+                base_content_hash: Some("absent".to_string()),
+                expected_file_id: None,
+            },
+            JournalWrite {
+                id: 2,
+                path: "tree/existing".to_string(),
+                create_mode: None,
+                staged_file: "2.bin".to_string(),
+                size_bytes: 11,
+                base_content_hash: Some("old".to_string()),
+                expected_file_id: Some("existing-id".to_string()),
+            },
+            JournalWrite {
+                id: 3,
+                path: "tree/nested/child".to_string(),
+                create_mode: Some(0o644),
+                staged_file: "3.bin".to_string(),
+                size_bytes: 13,
+                base_content_hash: Some("absent".to_string()),
+                expected_file_id: None,
+            },
+        ]);
+        let shared = Arc::new(Shared {
+            state: Mutex::new(JournalState {
+                pending,
+                journal: open_append(&journal_path).expect("journal"),
+                next_id: 4,
+                force_flush: false,
+                flushing: false,
+                stop: false,
+                journal_needs_repair: false,
+                last_error: None,
+                dead_letter_error: None,
+                terminal_errors: HashMap::new(),
+                descendant_barriers: Vec::new(),
+            }),
+            changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableEnqueueState::default()),
+            durable_enqueues_changed: Condvar::new(),
+            journal_path,
+            staging_dir,
+            on_dead_letter: None,
+        });
+        let journal = WriteJournal {
+            shared,
+            worker: Mutex::new(None),
+        };
+        let existing = VfsDirEntry {
+            name: "existing".to_string(),
+            kind: "file".to_string(),
+            size_bytes: 3,
+            file_id: Some("existing-id".to_string()),
+            link_count: 1,
+            link_target: None,
+            content_hash: Some("old".to_string()),
+            executable: false,
+            mode: Some(0o644),
+            updated_at: None,
+        };
+
+        let (entries, applied) = journal
+            .project_directory("tree", vec![existing])
+            .expect("project pending writes");
+        assert!(applied);
+        assert_eq!(
+            entries.len(),
+            2,
+            "nested descendants are not direct entries"
+        );
+        let new = entries
+            .iter()
+            .find(|entry| entry.name == "new")
+            .expect("folded creation is visible");
+        assert_eq!(new.size_bytes, 7);
+        assert_eq!(new.mode, Some(0o755));
+        assert!(new.executable);
+        let existing = entries
+            .iter()
+            .find(|entry| entry.name == "existing")
+            .expect("existing write remains visible");
+        assert_eq!(existing.size_bytes, 11);
+        assert_eq!(existing.file_id.as_deref(), Some("existing-id"));
+        assert_eq!(existing.content_hash, None);
+
+        let (unrelated, applied) = journal
+            .project_directory("other", Vec::new())
+            .expect("project unrelated directory");
+        assert!(!applied);
+        assert!(unrelated.is_empty());
 
         journal
             .shared
@@ -2498,6 +3344,8 @@ mod tests {
                 descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableEnqueueState::default()),
+            durable_enqueues_changed: Condvar::new(),
             journal_path,
             staging_dir,
             on_dead_letter: None,
@@ -2669,6 +3517,8 @@ mod tests {
                 descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableEnqueueState::default()),
+            durable_enqueues_changed: Condvar::new(),
             journal_path: journal_path.clone(),
             staging_dir: staging_dir.clone(),
             on_dead_letter: None,
@@ -2756,6 +3606,8 @@ mod tests {
                     descendant_barriers: Vec::new(),
                 }),
                 changed: Condvar::new(),
+                durable_enqueues: Mutex::new(DurableEnqueueState::default()),
+                durable_enqueues_changed: Condvar::new(),
                 journal_path: journal_path.clone(),
                 staging_dir: staging_dir.clone(),
                 on_dead_letter: None,
@@ -2800,6 +3652,8 @@ mod tests {
                 descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableEnqueueState::default()),
+            durable_enqueues_changed: Condvar::new(),
             journal_path: journal_path.clone(),
             staging_dir,
             on_dead_letter: None,
@@ -2933,6 +3787,8 @@ mod tests {
                 descendant_barriers: Vec::new(),
             }),
             changed: Condvar::new(),
+            durable_enqueues: Mutex::new(DurableEnqueueState::default()),
+            durable_enqueues_changed: Condvar::new(),
             journal_path: journal_path.clone(),
             staging_dir: staging_dir.clone(),
             on_dead_letter: None,
@@ -3012,6 +3868,8 @@ mod tests {
                     descendant_barriers: Vec::new(),
                 }),
                 changed: Condvar::new(),
+                durable_enqueues: Mutex::new(DurableEnqueueState::default()),
+                durable_enqueues_changed: Condvar::new(),
                 journal_path: journal_path.clone(),
                 staging_dir,
                 on_dead_letter: None,
@@ -3102,115 +3960,5 @@ mod tests {
         assert!(!dir.path().join("2.bin").exists());
         assert!(!dir.path().join("3.tmp").exists());
         assert!(dir.path().join("notes.txt").exists());
-    }
-
-    fn remote_write(path: &str, file_id: Option<&str>, base: Option<&str>, byte: u8) -> RemoteWrite {
-        RemoteWrite {
-            path: path.to_string(),
-            mode: None,
-            bytes: vec![byte],
-            base_content_hash: base.map(str::to_string),
-            expected_file_id: file_id.map(str::to_string),
-        }
-    }
-
-    /// THE ORDERING CONTRACT for concurrent flushes.
-    ///
-    /// Two writes to one path chain through `base_content_hash`, so the second
-    /// is only valid against the first's result. Sharding them apart would let
-    /// the second be issued concurrently with — or ahead of — the first.
-    #[test]
-    fn sharding_keeps_every_write_for_a_path_together_and_in_order() {
-        let writes = vec![
-            remote_write("a.txt", None, None, 1),
-            remote_write("b.txt", None, None, 2),
-            remote_write("a.txt", None, Some("hash-of-1"), 3),
-            remote_write("c.txt", None, None, 4),
-            remote_write("a.txt", None, Some("hash-of-3"), 5),
-        ];
-
-        let shards = shard_writes_by_path(writes, 4);
-
-        let a_shard = shards
-            .iter()
-            .find(|shard| shard.iter().any(|write| write.path == "a.txt"))
-            .expect("a.txt must land somewhere");
-        let a_bytes: Vec<u8> = a_shard
-            .iter()
-            .filter(|write| write.path == "a.txt")
-            .map(|write| write.bytes[0])
-            .collect();
-        assert_eq!(
-            a_bytes,
-            vec![1, 3, 5],
-            "all writes for one path must stay in a single shard, in submission order"
-        );
-        // And nowhere else.
-        let stray = shards
-            .iter()
-            .filter(|shard| shard.iter().any(|write| write.path == "a.txt"))
-            .count();
-        assert_eq!(stray, 1, "a path must not be split across shards");
-    }
-
-    /// `coalesce_batch` keys on (path, expected_file_id), so a file deleted and
-    /// recreated inside one batch appears TWICE under the same path with
-    /// different identities. Sharding by that key would separate them and let
-    /// the recreate overtake its predecessor.
-    #[test]
-    fn sharding_keeps_a_recreated_path_ordered_despite_differing_file_ids() {
-        let writes = vec![
-            remote_write("recreated.txt", Some("inode-1"), None, 1),
-            remote_write("other.txt", None, None, 9),
-            remote_write("recreated.txt", Some("inode-2"), None, 2),
-        ];
-
-        let shards = shard_writes_by_path(writes, 4);
-
-        let owning: Vec<&Vec<RemoteWrite>> = shards
-            .iter()
-            .filter(|shard| shard.iter().any(|write| write.path == "recreated.txt"))
-            .collect();
-        assert_eq!(owning.len(), 1, "differing file ids must not split a path");
-        let ids: Vec<Option<&str>> = owning[0]
-            .iter()
-            .filter(|write| write.path == "recreated.txt")
-            .map(|write| write.expected_file_id.as_deref())
-            .collect();
-        assert_eq!(ids, vec![Some("inode-1"), Some("inode-2")], "recreate must follow the original");
-    }
-
-    /// The point of the change: independent paths must actually fan out, or the
-    /// write path keeps its one-request-at-a-time ceiling.
-    #[test]
-    fn sharding_distributes_independent_paths_across_shards() {
-        let writes = (0..8)
-            .map(|index| remote_write(&format!("f{index}.txt"), None, None, index as u8))
-            .collect::<Vec<_>>();
-
-        let shards = shard_writes_by_path(writes, MAX_INFLIGHT_WRITE_BATCHES);
-
-        assert_eq!(shards.len(), MAX_INFLIGHT_WRITE_BATCHES, "independent paths must parallelise");
-        assert_eq!(
-            shards.iter().map(|shard| shard.len()).sum::<usize>(),
-            8,
-            "sharding must not drop or duplicate writes"
-        );
-    }
-
-    /// A batch touching one path must not pay fan-out overhead, and must remain
-    /// a single request so its CAS chain is issued in order.
-    #[test]
-    fn sharding_a_single_path_yields_one_shard() {
-        let writes = vec![
-            remote_write("only.txt", None, None, 1),
-            remote_write("only.txt", None, Some("hash-of-1"), 2),
-        ];
-        assert_eq!(shard_writes_by_path(writes, 4).len(), 1);
-    }
-
-    #[test]
-    fn sharding_an_empty_batch_yields_no_shards() {
-        assert!(shard_writes_by_path(Vec::new(), 4).is_empty());
     }
 }

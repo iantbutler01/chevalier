@@ -151,9 +151,7 @@ impl ContentHasher {
     /// `finalize` consumes, so its state is cloned.
     pub fn digest(&self) -> String {
         match self {
-            Self::Sha256(hasher) => {
-                hex_encode(hasher.as_ref().clone().finalize().as_slice())
-            }
+            Self::Sha256(hasher) => hex_encode(hasher.as_ref().clone().finalize().as_slice()),
             Self::Blake3(hasher) => hex_encode(hasher.finalize().as_bytes()),
         }
     }
@@ -206,7 +204,10 @@ mod tests {
         assert_eq!(VfsHashAlgorithm::Sha256.empty_vector(), SHA256_EMPTY);
         assert_eq!(VfsHashAlgorithm::Blake3.empty_vector(), BLAKE3_EMPTY);
         assert_ne!(SHA256_EMPTY, BLAKE3_EMPTY);
-        assert_eq!(hex_encode(sha2::Sha256::digest(b"").as_slice()), SHA256_EMPTY);
+        assert_eq!(
+            hex_encode(sha2::Sha256::digest(b"").as_slice()),
+            SHA256_EMPTY
+        );
         assert_eq!(hex_encode(blake3::hash(b"").as_bytes()), BLAKE3_EMPTY);
     }
 
@@ -241,9 +242,7 @@ mod tests {
                 VfsHashAlgorithm::Sha256 => {
                     hex_encode(sha2::Sha256::digest(b"chevalier vfs").as_slice())
                 }
-                VfsHashAlgorithm::Blake3 => {
-                    hex_encode(blake3::hash(b"chevalier vfs").as_bytes())
-                }
+                VfsHashAlgorithm::Blake3 => hex_encode(blake3::hash(b"chevalier vfs").as_bytes()),
             };
             assert_eq!(split, whole, "{} split update", algorithm.as_str());
         }

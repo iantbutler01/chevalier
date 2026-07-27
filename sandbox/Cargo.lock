@@ -3729,6 +3729,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tonic 0.14.4",
  "tonic-health",
  "tonic-prost",

@@ -103,8 +103,9 @@ pub async fn mount_remote_vfs_fuse(
     // reachable — the fuser notifier only exists after the session is spawned,
     // by which point the fs has been moved into it.
     let registrar = filesystem.kernel_invalidation_registrar();
-    // Concurrent dispatch: the single-threaded fuser session loop only decodes
-    // requests; ops fan out to workers (see fuse/dispatch.rs).
+    // The patched fuser session runs the configured native request-thread pool.
+    // The wrapper keeps distributed blocking-lock waits on a separate bounded
+    // Tokio pool while ordinary callbacks stay on those native threads.
     let filesystem = super::dispatch::SpawnedFuseFs::new(filesystem);
     let session = fuser::spawn_mount2(filesystem, mountpoint, &options)
         .with_context(|| format!("mount fuse filesystem at {}", mountpoint.display()))?;

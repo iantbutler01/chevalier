@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::{
     Arc, Mutex, OnceLock, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -26,6 +27,7 @@ use chevalier_sandbox::vfs::{
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
+use tokio_util::io::ReaderStream;
 
 use super::cache::{MountInvalidators, PublicationInvalidation, RemoteFuseCache};
 use super::fs::ATTR_ENTRY_LEASE_TTL;
@@ -50,6 +52,13 @@ const FILE_READ_RETRY_TIMEOUT: Duration = Duration::from_secs(45);
 const ALIAS_READ_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 const METADATA_READ_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const FILE_READ_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Hard wall for one streamed write publication. Large writes bypass the
+/// client's normal 30s mutation timeout, but remain bounded so a wedged
+/// gateway cannot turn a close/fsync into the old multi-minute stall.
+const STREAM_WRITE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(300);
+const STREAM_UPLOAD_HEADER: &str = "x-chevalier-vfs-stream-upload";
+const EXPECTED_CONTENT_HASH_HEADER: &str = "x-chevalier-vfs-expected-content-sha256";
+const STREAM_READ_BUFFER_BYTES: usize = 1024 * 1024;
 const ADVISORY_LOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const ADVISORY_LOCK_RENEWAL_BATCH_SIZE: usize = 4_096;
 const READ_RETRY_DELAY_MIN: Duration = Duration::from_millis(50);
@@ -200,6 +209,17 @@ impl InFlightPublications {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_empty()
     }
+
+    /// Snapshot the paths whose publication response is still waiting on this
+    /// mount's revision-watch acknowledgement.
+    pub(super) fn paths(&self) -> HashSet<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
 }
 
 /// Drops one publication's registration, including on the error path — a
@@ -231,12 +251,38 @@ impl Drop for InFlightPublicationGuard {
 /// endpoints of a rename and both ends of a hard link are in flight together:
 /// the op holds each one's parent inode lock for the whole publication.
 fn in_flight_namespace_paths(mutations: &[VfsNamespaceMutation]) -> Vec<String> {
-    mutations
+    let mut paths = HashSet::new();
+    for path in mutations
         .iter()
         .flat_map(|mutation| mutation.paths())
-        .map(|path| path.trim_matches('/').to_string())
+        .map(|path| path.trim_matches('/'))
         .filter(|path| !path.is_empty())
-        .collect()
+    {
+        paths.insert(path.to_string());
+        paths.insert(parent_path(path));
+    }
+    paths.into_iter().collect()
+}
+
+/// Mirror the affected-set shape produced by gateway `write-many`: every
+/// written path, plus the parent directory when the write owns an unpublished
+/// creation. The publication changes that parent's listing too, and a busy
+/// installer commonly has another create holding the parent's kernel lock.
+/// Marking only the leaf made the mount's own watcher try to revoke its parent
+/// before acking, so each publication rode the gateway ack cap.
+fn in_flight_write_paths(writes: &[RemoteWrite]) -> Vec<String> {
+    let mut paths = HashSet::new();
+    for write in writes {
+        let path = write.path.trim_matches('/');
+        if path.is_empty() {
+            continue;
+        }
+        paths.insert(path.to_string());
+        if write.mode.is_some() {
+            paths.insert(parent_path(path));
+        }
+    }
+    paths.into_iter().collect()
 }
 
 #[derive(Debug, Default)]
@@ -310,6 +356,12 @@ pub struct Versioned<T> {
 pub struct RemotePublication {
     pub revision: u64,
     pub entries: Vec<VfsPublicationSnapshotEntry>,
+}
+
+#[derive(Deserialize)]
+struct StreamWritePublicationResponse {
+    #[serde(default)]
+    entries: Vec<VfsPublicationSnapshotEntry>,
 }
 
 /// Outcome of a fingerprint-pinned ranged read.
@@ -459,8 +511,16 @@ impl RemoteVfsClient {
         let revisions = Arc::downgrade(&self.revisions);
         let cache = Arc::downgrade(cache);
         let notifiers = Arc::downgrade(invalidators);
+        let publications = Arc::downgrade(&self.publications);
         tokio.spawn(run_revision_watch(
-            http, endpoint, auth_token, scope_path, revisions, cache, notifiers,
+            http,
+            endpoint,
+            auth_token,
+            scope_path,
+            revisions,
+            cache,
+            notifiers,
+            publications,
         ));
     }
 
@@ -1255,14 +1315,8 @@ impl RemoteVfsClient {
             )
             .await?;
         // Same in-flight window as the namespace batch above: a content
-        // publication's own paths must never gate its own ack.
-        let _in_flight = self.publications.begin(
-            writes
-                .iter()
-                .map(|write| write.path.trim_matches('/').to_string())
-                .filter(|path| !path.is_empty())
-                .collect(),
-        );
+        // publication's own affected set must never gate its own ack.
+        let _in_flight = self.publications.begin(in_flight_write_paths(&writes));
         let body = VfsWriteManyBody {
             writes: writes
                 .into_iter()
@@ -1296,6 +1350,100 @@ impl RemoteVfsClient {
                 .context("read write batch response")?;
             let decoded = serde_json::from_slice::<VfsWriteManyPublicationResponse>(body.as_ref())
                 .context("decode write batch response")?;
+            Ok(RemotePublication {
+                revision,
+                entries: self.unscoped_publication_entries(decoded.entries),
+            })
+        }
+        .await;
+        let release = self.release_lease(&lease).await;
+        match (result, release) {
+            (Ok(publication), Ok(())) => Ok(publication),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    /// Publish one already-staged large file without materializing it in the
+    /// vmd heap or JSON/base64 expanding it through `/write-many`.
+    ///
+    /// The gateway verifies `content_hash` while streaming the request to its
+    /// own temporary file, then hands that file to the storage backend. Small
+    /// writes continue to use `write_many`; this is the bounded-memory path for
+    /// a single oversized journal entry.
+    pub async fn write_staged_file(
+        &self,
+        path: &str,
+        staged_path: &Path,
+        size_bytes: u64,
+        content_hash: &str,
+        base_content_hash: Option<&str>,
+        expected_file_id: Option<&str>,
+        mode: Option<u32>,
+        surface_kind: &str,
+    ) -> Result<RemotePublication> {
+        let staged = tokio::fs::File::open(staged_path)
+            .await
+            .with_context(|| format!("open staged vfs stream {}", staged_path.display()))?;
+        let metadata = staged
+            .metadata()
+            .await
+            .with_context(|| format!("stat staged vfs stream {}", staged_path.display()))?;
+        if !metadata.is_file() || metadata.len() != size_bytes {
+            return Err(anyhow!(
+                "staged vfs stream {} has {} bytes but journal requires {}",
+                staged_path.display(),
+                metadata.len(),
+                size_bytes,
+            ));
+        }
+
+        let lease = self
+            .acquire_lease(path, 1, "flush streamed vfs fuse write")
+            .await?;
+        let in_flight = [RemoteWrite {
+            path: path.to_string(),
+            bytes: Vec::new(),
+            base_content_hash: base_content_hash.map(ToOwned::to_owned),
+            expected_file_id: expected_file_id.map(ToOwned::to_owned),
+            mode,
+        }];
+        let _in_flight = self.publications.begin(in_flight_write_paths(&in_flight));
+        let result = async {
+            let mut request = self
+                .client
+                .put(self.url("/file"))
+                .query(&[("path", self.path_arg(path))])
+                .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
+                .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
+                .header(CHEVALIER_VFS_OPERATION_HEADER, "vfs_stream_write")
+                .header(
+                    CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+                    lease.resource_key.as_str(),
+                )
+                .header(
+                    CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                    lease.owner_token.to_string(),
+                )
+                .header(STREAM_UPLOAD_HEADER, "1")
+                .header(EXPECTED_CONTENT_HASH_HEADER, content_hash)
+                .header(header::CONTENT_LENGTH, size_bytes)
+                .timeout(STREAM_WRITE_ATTEMPT_TIMEOUT);
+            request = with_mode_header(request, mode);
+            request = with_precondition_headers(request, base_content_hash, expected_file_id);
+            let body = reqwest::Body::wrap_stream(ReaderStream::with_capacity(
+                staged,
+                STREAM_READ_BUFFER_BYTES,
+            ));
+            let response = self.request_mutation(request.body(body)).await?;
+            let revision = parse_namespace_revision(response.headers())
+                .expect("mutation response revision was validated");
+            let body = response
+                .bytes()
+                .await
+                .context("read streamed write response")?;
+            let decoded = serde_json::from_slice::<StreamWritePublicationResponse>(body.as_ref())
+                .context("decode streamed write response")?;
             Ok(RemotePublication {
                 revision,
                 entries: self.unscoped_publication_entries(decoded.entries),
@@ -1800,6 +1948,7 @@ async fn run_revision_watch(
     revisions: Weak<SharedRevisionState>,
     cache: Weak<RemoteFuseCache>,
     notifiers: Weak<MountInvalidators>,
+    publications: Weak<InFlightPublications>,
 ) {
     let mut health = WatchHealth::default();
     let mut backoff = REVISION_WATCH_BACKOFF_MIN;
@@ -1855,14 +2004,21 @@ async fn run_revision_watch(
                     // ACK-ORDERING INVARIANT (revocation-acked publications): the
                     // gateway treats the NEXT poll's `since` as this watcher's ack
                     // of that revision, and a sibling's publication is blocked
-                    // until this ack lands. We MUST advance the fence and clear the
-                    // cache BEFORE that next poll is issued, so the ack can never
-                    // precede this mount becoming coherent — otherwise the writer
-                    // would unblock while this mount could still serve stale reads.
-                    // The next poll reads `since` from `coherence` at the top of
-                    // the loop, strictly after both stores below, so the order
-                    // holds. Fence first:
-                    state.coherence.fetch_max(revision, Ordering::AcqRel);
+                    // until this ack lands. We MUST update the cache and expose the
+                    // new fence BEFORE that next poll is issued, so the ack can
+                    // never precede this mount becoming coherent.
+                    //
+                    // Cache first, fence second. Publishing `coherence` first
+                    // created a real reader race: concurrent FUSE callbacks saw
+                    // the new fence while the cache still carried the prior one,
+                    // treated every entry as stale, and started wire metadata/tree
+                    // fetches. An 8-vCPU package install amplified that tiny window
+                    // into thousands of requests. Retagging/evicting the cache
+                    // first is fail-closed while the old fence remains visible
+                    // (newly retagged entries simply cannot serve at the old
+                    // revision), then the release-store makes the coherent cache
+                    // and its revision visible together to later readers.
+                    //
                     // Apply the publication to the shared cache with the SAME
                     // set the kernel revocation below uses. The gateway reports
                     // the exact union of paths published in `(since, revision]`
@@ -1889,15 +2045,23 @@ async fn run_revision_watch(
                             // `.git/index.lock` publication drop the cached
                             // metadata of every `.git` internal and cost the
                             // next `git status` phase 30 point stats.
-                            Some(affected) => cache.observe_remote_publication(
-                                since,
-                                revision,
-                                &affected.paths,
-                                &affected.subtrees,
-                            ),
+                            Some(affected) => {
+                                let local_paths = publications
+                                    .upgrade()
+                                    .map(|publications| publications.paths())
+                                    .unwrap_or_default();
+                                cache.observe_remote_publication_with_local_paths(
+                                    since,
+                                    revision,
+                                    &affected.paths,
+                                    &affected.subtrees,
+                                    &local_paths,
+                                )
+                            }
                             None => cache.observe_authoritative_revision(revision),
                         }
                     }
+                    state.coherence.fetch_max(revision, Ordering::Release);
                     // Extend the ack-ordering invariant to the KERNEL: this
                     // remote publication carries only a revision (no path set),
                     // so sweep every attr/dentry each mount of this registry
@@ -2529,10 +2693,7 @@ mod tests {
     fn revision_watch_attempt_timeout_exceeds_the_long_poll_window() {
         // The read-class budget must outlast a full long-poll so a held-open
         // watch is never cut short by the client's default mutation timeout.
-        assert!(
-            REVISION_WATCH_ATTEMPT_TIMEOUT
-                > Duration::from_millis(REVISION_WATCH_TIMEOUT_MS)
-        );
+        assert!(REVISION_WATCH_ATTEMPT_TIMEOUT > Duration::from_millis(REVISION_WATCH_TIMEOUT_MS));
         assert!(REVISION_WATCH_BACKOFF_MAX > REVISION_WATCH_BACKOFF_MIN);
     }
 
@@ -2832,6 +2993,58 @@ mod tests {
     }
 
     #[test]
+    fn in_flight_publications_cover_the_gateway_affected_parents() {
+        let namespace = in_flight_namespace_paths(&[
+            VfsNamespaceMutation::CreateDirectory {
+                path: "node_modules/pkg".to_string(),
+                mode: Some(0o755),
+            },
+            VfsNamespaceMutation::SetMode {
+                path: "top-level".to_string(),
+                mode: 0o644,
+            },
+        ])
+        .into_iter()
+        .collect::<HashSet<_>>();
+        assert_eq!(
+            namespace,
+            HashSet::from([
+                "".to_string(),
+                "node_modules".to_string(),
+                "node_modules/pkg".to_string(),
+                "top-level".to_string(),
+            ])
+        );
+
+        let writes = in_flight_write_paths(&[
+            RemoteWrite {
+                path: "node_modules/pkg/index.js".to_string(),
+                mode: Some(0o644),
+                bytes: Vec::new(),
+                base_content_hash: Some("absent".to_string()),
+                expected_file_id: None,
+            },
+            RemoteWrite {
+                path: "existing/file.txt".to_string(),
+                mode: None,
+                bytes: Vec::new(),
+                base_content_hash: Some("hash".to_string()),
+                expected_file_id: Some("file-1".to_string()),
+            },
+        ])
+        .into_iter()
+        .collect::<HashSet<_>>();
+        assert_eq!(
+            writes,
+            HashSet::from([
+                "existing/file.txt".to_string(),
+                "node_modules/pkg".to_string(),
+                "node_modules/pkg/index.js".to_string(),
+            ])
+        );
+    }
+
+    #[test]
     fn write_many_preserves_identity_only_and_absent_preconditions() {
         let client = RemoteVfsClient::new("http://localhost", "token", "scope").unwrap();
         let identity_only = client.scope_remote_write(RemoteWrite {
@@ -2986,8 +3199,9 @@ mod tests {
                                 .unwrap_or(0);
                             let watcher_id = params.get("watcher_id").cloned().unwrap_or_default();
                             let count = {
-                                let mut guard =
-                                    probe.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                let mut guard = probe
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                                 guard.poll_count += 1;
                                 guard.poll_count
                             };
@@ -3003,8 +3217,9 @@ mod tests {
                                 // swept — both strictly before this ack is sent.
                                 let cleared = cache.get_dir("probe", BASELINE).is_none();
                                 let swept = kernel_invalidated.load(Ordering::Acquire);
-                                let mut guard =
-                                    probe.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                let mut guard = probe
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                                 guard.ack_since = Some(since);
                                 guard.ack_watcher_id = Some(watcher_id);
                                 guard.cache_cleared_before_ack = cleared;
@@ -3029,7 +3244,9 @@ mod tests {
                 .expect("client must issue the ack poll after applying the publication");
         });
 
-        let guard = probe.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert_eq!(
             guard.ack_since,
             Some(PUBLISHED),
@@ -3142,8 +3359,9 @@ mod tests {
                                 .and_then(|value| value.parse::<u64>().ok())
                                 .unwrap_or(0);
                             let count = {
-                                let mut guard =
-                                    probe.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                let mut guard = probe
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                                 guard.polls += 1;
                                 guard.polls
                             };
@@ -3303,8 +3521,9 @@ mod tests {
                         // The immediate retry. Snapshot watch_live as seen right
                         // now — the retry must have kept it live.
                         let live = server_client.revision_watch_live();
-                        *server_live.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                            Some(live);
+                        *server_live
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(live);
                         let _ = socket.write_all(RESP_204).await;
                         let _ = socket.flush().await;
                         server_ready.notify_one();
@@ -3684,12 +3903,18 @@ mod tests {
     /// `hold_parent_lock` reproduces the guest kernel's behaviour on a mutating
     /// op: the parent directory's inode lock is held for the whole op, and the
     /// op is parked on the publication.
+    ///
+    /// `publishing_mount` selects whether the invalidator belongs to the client
+    /// issuing the publication or to a sibling observer. Real mounts share the
+    /// watch/invalidator registry but keep distinct in-flight path sets, so an
+    /// observer must never inherit the publisher's ack exclusion.
     fn run_ack_probe(
         publications: usize,
         cached: &[&str],
         drain: Duration,
         hold_parent_lock: bool,
         exclude_own_publications: bool,
+        publishing_mount: bool,
     ) -> AckProbeArm {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
@@ -3703,9 +3928,14 @@ mod tests {
         let invalidators = Arc::new(MountInvalidators::default());
         let client = RemoteVfsClient::new(&endpoint, "token", "").unwrap();
         let parent_lock = Arc::new(Mutex::new(()));
+        let mount_publications = if publishing_mount {
+            client.in_flight_publications()
+        } else {
+            Arc::new(InFlightPublications::default())
+        };
         let double = Arc::new(MountDouble {
             cached: cached.iter().map(|path| path.to_string()).collect(),
-            publications: client.in_flight_publications(),
+            publications: mount_publications,
             parent_lock: Arc::clone(&parent_lock),
             locked_dir: "many".to_string(),
             exclude_own_publications,
@@ -3771,7 +4001,7 @@ mod tests {
         // every publication lands. The publishing op holds `many`'s inode lock
         // throughout, so any revocation that DID reach this mount for a child of
         // `many` would block on it and ride the ack cap out.
-        let arm = run_ack_probe(20, &["unrelated"], Duration::ZERO, true, true);
+        let arm = run_ack_probe(20, &["unrelated"], Duration::ZERO, true, true, false);
         assert_eq!(
             arm.cap_hits,
             0,
@@ -3803,7 +4033,7 @@ mod tests {
         // ack-critical. Its dentry hangs off the root, whose lock nothing holds,
         // so the revocation CAN land: the point here is that the publisher waits
         // for it, not that it deadlocks against it.
-        let arm = run_ack_probe(10, &["many"], DRAIN, false, true);
+        let arm = run_ack_probe(10, &["many"], DRAIN, false, true, false);
         assert_eq!(
             arm.applied, 10,
             "every publication must revoke the observer mount's state"
@@ -3840,7 +4070,7 @@ mod tests {
         // Control: the same mount, the same lock, with a mount's own in-flight
         // paths still on the ack path — ce855e3 as deployed. Every publication
         // must wait the cap out, or this test is proving nothing.
-        let regressed = run_ack_probe(N, &cached, Duration::ZERO, true, false);
+        let regressed = run_ack_probe(N, &cached, Duration::ZERO, true, false, true);
         assert_eq!(
             regressed.cap_hits,
             N,
@@ -3849,7 +4079,7 @@ mod tests {
             regressed.mean()
         );
 
-        let fixed = run_ack_probe(N, &cached, Duration::ZERO, true, true);
+        let fixed = run_ack_probe(N, &cached, Duration::ZERO, true, true, true);
         assert_eq!(
             fixed.cap_hits,
             0,
@@ -3863,12 +4093,13 @@ mod tests {
             "every publication must return well inside the ack cap; max was {:?}",
             fixed.max()
         );
-        // `many` itself is never in flight, so its revocation stays ack-critical
-        // and still runs — only the entry whose parent lock the publishing op
-        // holds came off the ack path.
-        assert!(
-            fixed.applied > 0,
-            "the parent directory's revocation must still gate the ack"
+        // The gateway's affected set includes both the created path and its
+        // parent directory. Both are local publication paths: revoking either
+        // on this ack would contend with the publishing operation. The commit
+        // hook applies the local catch-up revocation after the response.
+        assert_eq!(
+            fixed.applied, 0,
+            "the publishing mount must not revoke its own leaf or parent on the ack path"
         );
     }
 
@@ -3886,24 +4117,24 @@ mod tests {
             // a no-op.
             (
                 "pre-ce855e3 (no targets)",
-                run_ack_probe(N, &[], Duration::ZERO, true, true),
+                run_ack_probe(N, &[], Duration::ZERO, true, true, false),
             ),
             // Targets resolve, nothing contends: the pure cost of the watch
             // cycle plus the queue/worker hop.
             (
                 "targets, uncontended",
-                run_ack_probe(N, &["many"], Duration::ZERO, false, true),
+                run_ack_probe(N, &["many"], Duration::ZERO, false, true, false),
             ),
             // ce855e3 as deployed: the publishing mount's own paths resolve AND
             // their revocation contends with the parked op's parent inode lock.
             (
                 "ce855e3 (own paths on ack)",
-                run_ack_probe(N, &cached, Duration::ZERO, true, false),
+                run_ack_probe(N, &cached, Duration::ZERO, true, false, true),
             ),
             // Fixed: the publishing mount's in-flight paths are off the ack path.
             (
                 "fixed (own paths excluded)",
-                run_ack_probe(N, &cached, Duration::ZERO, true, true),
+                run_ack_probe(N, &cached, Duration::ZERO, true, true, true),
             ),
         ];
         for (name, arm) in arms.iter() {
