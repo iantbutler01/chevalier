@@ -464,13 +464,8 @@ fn build_durable_volume_setup_script(enabled: bool) -> String {
         return r#"log "durable machine-state volume disabled""#.to_string();
     }
     r#"log "configuring durable machine-state volume"
-# NOT /usr/local/sbin: /usr/local is itself one of the bind_state paths below,
-# so anything written there is shadowed by the durable volume the moment this
-# script mounts it. The script that mounts the volume cannot live on the volume
-# — after first boot every later boot re-ran the STALE copy from the volume,
-# which is how a repair that was correctly built into the image never once ran.
-# /usr/lib is rootfs-only and never bind-mounted, so it always reflects the
-# image that actually booted.
+# This mount helper is part of the guest image contract. Keep it on the root
+# disk so every cattle reprovision runs the version from the image that booted.
 mkdir -p /usr/lib/chevalier /etc/systemd/system
 
 # Bound the guest's own teardown so it finishes INSIDE the host's stop budget.
@@ -589,12 +584,51 @@ bind_state() {
   fi
 }
 
+# `/usr/local` is durable because sandboxes may accumulate global tools there.
+# Capture the small control-plane surface owned by the current image/bootstrap
+# before the durable tree shadows it, then refresh only those paths after the
+# bind. User-installed tools, package-manager state, and every other path remain
+# untouched.
+IMAGE_USR_LOCAL=/run/chevalier-image-usr-local
+rm -rf "$IMAGE_USR_LOCAL"
+mkdir -p "$IMAGE_USR_LOCAL"
+
+capture_image_usr_local_path() {
+  RELATIVE="$1"
+  SOURCE="/usr/local/$RELATIVE"
+  STAGED="$IMAGE_USR_LOCAL/$RELATIVE"
+  if [ -e "$SOURCE" ] || [ -L "$SOURCE" ]; then
+    mkdir -p "$(dirname "$STAGED")"
+    cp -a "$SOURCE" "$STAGED"
+  fi
+}
+
+refresh_image_usr_local_path() {
+  RELATIVE="$1"
+  STAGED="$IMAGE_USR_LOCAL/$RELATIVE"
+  TARGET="/usr/local/$RELATIVE"
+  mkdir -p "$(dirname "$TARGET")"
+  rm -rf -- "$TARGET"
+  if [ -e "$STAGED" ] || [ -L "$STAGED" ]; then
+    cp -a "$STAGED" "$TARGET"
+  fi
+}
+
+capture_image_usr_local_path bin/computer-host
+capture_image_usr_local_path bin/openbracket-docker-ready
+capture_image_usr_local_path sbin/chevalier-apply-tap-network.sh
+
 # Preserve the sandbox image contract's machine-state paths while keeping the
 # base root disk available as the immutable boot/recovery surface.
 bind_state /var/lib/docker var-lib-docker
 bind_state /var/cache/openbracket var-cache-openbracket
 bind_state /root root
 bind_state /usr/local usr-local
+
+refresh_image_usr_local_path bin/computer-host
+refresh_image_usr_local_path bin/openbracket-docker-ready
+refresh_image_usr_local_path sbin/chevalier-apply-tap-network.sh
+rm -rf "$IMAGE_USR_LOCAL"
 
 # The backing qcow2 is thin-provisioned and, without discard, only ever grows:
 # every block a deleted file ever touched stays allocated on the host. Paired
@@ -1513,6 +1547,23 @@ mod tests {
         assert!(script.contains("bind_state /var/cache/openbracket var-cache-openbracket"));
         assert!(script.contains("bind_state /root root"));
         assert!(script.contains("bind_state /usr/local usr-local"));
+        for managed in [
+            "bin/computer-host",
+            "bin/openbracket-docker-ready",
+            "sbin/chevalier-apply-tap-network.sh",
+        ] {
+            let capture = format!("capture_image_usr_local_path {managed}");
+            let refresh = format!("refresh_image_usr_local_path {managed}");
+            let capture_at = script.find(&capture).expect("managed path capture");
+            let bind_at = script
+                .find("bind_state /usr/local usr-local")
+                .expect("durable /usr/local bind");
+            let refresh_at = script.rfind(&refresh).expect("managed path refresh");
+            assert!(
+                capture_at < bind_at && bind_at < refresh_at,
+                "{managed} must be captured from the image before the durable bind and refreshed after it"
+            );
+        }
         assert!(script.contains(
             "Before=containerd.service docker.service chevalier-shared-mounts.service portproxy.service"
         ));
@@ -1561,21 +1612,15 @@ mod tests {
         assert!(script.contains("DefaultTimeoutStopSec=45s"));
         assert!(script.contains("TimeoutStopSec=30s"));
 
-        // The mount script must NOT live under any path this script later
-        // bind-mounts from the durable volume, or every boot after the first
-        // re-runs the stale copy stored on that volume and the repair above
-        // silently never executes. /usr/lib is rootfs-only.
+        // The mount script must live on the image-owned root disk so it refreshes
+        // before the durable /usr/local tree is mounted on every reprovision.
         assert!(script.contains("ExecStart=/usr/lib/chevalier/durable-volume.sh"));
         assert!(
             !script.contains("/usr/local/sbin/chevalier-mount-durable.sh"),
-            "the durable mount script cannot live on a bind_state path"
+            "the durable mount script cannot execute from the tree it mounts"
         );
-        // Scoped to the durable-volume unit. NOTE: portproxy.service still runs
-        // ExecStartPre=/usr/local/sbin/chevalier-apply-tap-network.sh, and the
-        // shares/diagnostics helpers also live under /usr/local/sbin — all of
-        // them are shadowed the same way and run stale copies after first boot.
-        // Moving those is a separate change; chevalier-mount-shares.sh is what
-        // mounts /workspace, so it does not ride along with a repair fix.
+        // Scoped to the durable-volume unit. None of its dependencies may execute
+        // from a path that is still bind-mounted from durable machine state.
         let durable_unit = script
             .split("chevalier-durable-volume.service")
             .nth(1)
