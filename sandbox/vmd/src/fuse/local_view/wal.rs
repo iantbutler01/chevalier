@@ -1018,26 +1018,23 @@ impl MountWal {
         }
 
         if !candidates.is_empty() {
-            let live = self.inner.payloads.live_files()?;
-            let mut unreachable = BTreeSet::new();
+            let mut reclaimable = BTreeSet::new();
             let mut deferred = BTreeSet::new();
             for name in candidates {
                 if referenced.contains(&name) || protected.contains(&name) {
                     deferred.insert(name);
-                } else if live.contains(&name) {
-                    unreachable.insert(name);
+                } else {
+                    reclaimable.insert(name);
                 }
             }
             if !deferred.is_empty() {
                 let mut state = self.append_lock()?;
                 state.reclaim_candidates.extend(deferred);
             }
-            if !unreachable.is_empty() {
-                let retain: BTreeSet<String> = live.difference(&unreachable).cloned().collect();
-                outcome.removed_payload_files = unreachable.len() as u64;
-                outcome.reclaimed_bytes = outcome
-                    .reclaimed_bytes
-                    .saturating_add(self.inner.payloads.reclaim(&retain)?);
+            if !reclaimable.is_empty() {
+                let (removed, reclaimed) = self.inner.payloads.reclaim(&reclaimable)?;
+                outcome.removed_payload_files = removed;
+                outcome.reclaimed_bytes = outcome.reclaimed_bytes.saturating_add(reclaimed);
             }
         }
         Ok(outcome)
@@ -1994,6 +1991,55 @@ mod tests {
             Err(error) => error,
         };
         assert!(format!("{error:#}").contains("decode mount WAL"));
+    }
+
+    #[test]
+    fn missing_or_corrupt_committed_payload_fails_recovery_closed() {
+        for damage in ["missing", "corrupt"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let layout = MountStateLayout::new(temp.path());
+            let wal = open(temp.path());
+            let event = wal
+                .prepare(
+                    MountMutation::ReplaceFile {
+                        path: "repo/file.txt".to_string(),
+                        mode: 0o644,
+                        expected_file_id: None,
+                        base_content_hash: None,
+                    },
+                    PayloadSource::Bytes(b"authoritative"),
+                    MountPreImage::empty(),
+                )
+                .expect("prepare payload");
+            let payload = event.event.payload.clone().expect("payload");
+            wal.commit(event, None).expect("commit payload");
+            wal.sync_local().expect("sync payload and WAL");
+            drop(wal);
+
+            let path = layout.payload_dir().join(payload.storage.file());
+            match damage {
+                "missing" => std::fs::remove_file(&path).expect("remove payload"),
+                "corrupt" => {
+                    let mut file = OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .expect("open payload");
+                    file.write_all(b"CORRUPT").expect("corrupt payload");
+                    file.sync_all().expect("sync corrupt payload");
+                }
+                _ => unreachable!(),
+            }
+
+            let error = match MountWal::open(&layout, None) {
+                Ok(_) => panic!("{damage} committed payload must fail recovery"),
+                Err(error) => error,
+            };
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("payload of committed mount sequence 1"),
+                "{damage}: {message}"
+            );
+        }
     }
 
     #[test]

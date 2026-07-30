@@ -402,24 +402,17 @@ impl PayloadStore {
         Ok(())
     }
 
-    /// Every payload filename currently on disk.
-    pub(crate) fn live_files(&self) -> Result<BTreeSet<String>> {
-        let mut files = BTreeSet::new();
-        for (name, _, _) in self.scan_directory()? {
-            files.insert(name);
-        }
-        Ok(files)
-    }
-
-    /// Delete every payload file not in `retain`, then fsync the directory.
-    /// Only ever called with a retain set derived from a durable checkpoint and
-    /// the remote acknowledgement cursor, off the callback hot path.
-    pub(crate) fn reclaim(&self, retain: &BTreeSet<String>) -> Result<u64> {
-        // Three things are unreclaimable no matter what the caller's retain set
-        // says: the active segment, which is still handing out reservations;
-        // anything in the pending sync set; and any in-flight dedicated capture.
-        // All three are newer than the durable checkpoint the retain set was
-        // derived from, so a capture racing this scan is always covered.
+    /// Delete exactly the checkpoint-proven `candidates`, then fsync the
+    /// directory. This must never be implemented as an inverse retain-set
+    /// sweep: a payload created after the caller's snapshot would be absent
+    /// from that snapshot and could be unlinked while still active.
+    ///
+    /// Only called off the callback hot path. The store mutex is held only
+    /// while taking the protection snapshot, never across filesystem I/O.
+    pub(crate) fn reclaim(&self, candidates: &BTreeSet<String>) -> Result<(u64, u64)> {
+        // These protections are defensive revalidation. Candidate names come
+        // only from durable checkpoints and names are never reused, but an
+        // active, dirty, or reserved payload is unreclaimable regardless.
         let (active, pending) = {
             let state = self.lock()?;
             let mut pending = state.dirty.files.clone();
@@ -432,18 +425,27 @@ impl PayloadStore {
                 pending,
             )
         };
+        let mut removed = 0_u64;
         let mut reclaimed = 0_u64;
         let mut removed_any = false;
-        for (name, _, length) in self.scan_directory()? {
-            if retain.contains(&name)
-                || pending.contains(&name)
-                || active.as_deref() == Some(name.as_str())
-            {
+        for name in candidates {
+            validate_payload_name(name)?;
+            if pending.contains(name) || active.as_deref() == Some(name.as_str()) {
                 continue;
             }
-            let path = self.directory.join(&name);
+            let path = self.directory.join(name);
+            let length = match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.is_file() => metadata.len(),
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("stat mount payload {}", path.display()));
+                }
+            };
             match std::fs::remove_file(&path) {
                 Ok(()) => {
+                    removed = removed.saturating_add(1);
                     reclaimed = reclaimed.saturating_add(length);
                     removed_any = true;
                 }
@@ -457,7 +459,7 @@ impl PayloadStore {
         if removed_any {
             sync_directory(&self.directory)?;
         }
-        Ok(reclaimed)
+        Ok((removed, reclaimed))
     }
 
     /// Current on-disk usage, for storage-pressure accounting.
@@ -842,4 +844,36 @@ fn hash_captured_file(destination: &Path) -> Result<CapturedFile> {
         length,
         content_hash: hasher.finalize(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::PayloadStore;
+
+    #[test]
+    fn reclaim_deletes_only_explicit_checkpoint_candidates() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = PayloadStore::open(temp.path()).expect("open payload store");
+
+        let stale = store.capture_bytes(b"stale").expect("capture stale");
+        let dirty = store.take_dirty().expect("take stale dirty set");
+        store.sync_dirty(&dirty).expect("sync stale payload");
+        store.seal_active_segment().expect("seal stale segment");
+
+        let current = store.capture_bytes(b"current").expect("capture current");
+        let stale_name = stale.storage.file().to_string();
+        let current_name = current.storage.file().to_string();
+        assert_ne!(stale_name, current_name);
+
+        let candidates = BTreeSet::from([stale_name.clone()]);
+        let (removed, bytes) = store.reclaim(&candidates).expect("reclaim candidate");
+
+        assert_eq!(removed, 1);
+        assert_eq!(bytes, b"stale".len() as u64);
+        assert!(!temp.path().join(stale_name).exists());
+        assert!(temp.path().join(current_name).exists());
+        store.verify(&current).expect("current payload survives");
+    }
 }
