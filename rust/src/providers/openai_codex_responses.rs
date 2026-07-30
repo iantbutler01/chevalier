@@ -33,6 +33,12 @@ use super::openai_responses_streaming::{ResponsesToolAccumulator, parse_openai_r
 
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
+const OPENBRACKET_ORIGINATOR: &str = "openbracket";
+const OPENBRACKET_USER_AGENT: &str = concat!(
+    "openbracket/",
+    env!("CARGO_PKG_VERSION"),
+    " (chevalier; rust)"
+);
 const OPENAI_BETA_RESPONSES: &str = "responses=experimental";
 const OPENAI_BETA_RESPONSES_WEBSOCKETS: &str = "responses_websockets=2026-02-06";
 const DEFAULT_SSE_HEADER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -234,8 +240,8 @@ impl OpenAICodexResponsesClient {
             .timeout(timeout.unwrap_or(Duration::from_secs(180)))
             .header(header::AUTHORIZATION, format!("Bearer {}", self.token))
             .header("chatgpt-account-id", &self.account_id)
-            .header("originator", "pi")
-            .header(header::USER_AGENT, "openbracket-chevalier (rust)")
+            .header("originator", OPENBRACKET_ORIGINATOR)
+            .header(header::USER_AGENT, OPENBRACKET_USER_AGENT)
             .header("OpenAI-Beta", OPENAI_BETA_RESPONSES)
             .header(header::ACCEPT, "text/event-stream")
             .header(header::CONTENT_TYPE, "application/json")
@@ -274,8 +280,8 @@ impl OpenAICodexResponsesClient {
         for (name, value) in [
             ("Authorization", format!("Bearer {}", self.token)),
             ("chatgpt-account-id", self.account_id.clone()),
-            ("originator", "pi".to_string()),
-            ("User-Agent", "openbracket-chevalier (rust)".to_string()),
+            ("originator", OPENBRACKET_ORIGINATOR.to_string()),
+            ("User-Agent", OPENBRACKET_USER_AGENT.to_string()),
             ("OpenAI-Beta", OPENAI_BETA_RESPONSES_WEBSOCKETS.to_string()),
         ] {
             builder = builder.add_header(
@@ -1056,6 +1062,37 @@ mod tests {
             "gpt-5.1-codex",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn codex_subscription_requests_identify_openbracket() {
+        let request = test_client()
+            .sse_request_builder(&serde_json::json!({}), None)
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get("originator")
+                .and_then(|value| value.to_str().ok()),
+            Some("openbracket")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(header::USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some(OPENBRACKET_USER_AGENT)
+        );
+        assert_eq!(
+            OPENBRACKET_USER_AGENT,
+            concat!(
+                "openbracket/",
+                env!("CARGO_PKG_VERSION"),
+                " (chevalier; rust)"
+            )
+        );
     }
 
     fn codex_rate_limit_headers() -> HeaderMap {
