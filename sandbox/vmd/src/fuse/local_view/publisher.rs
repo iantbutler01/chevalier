@@ -981,11 +981,22 @@ impl PublisherShared {
                         || mode_agrees(&metadata, *mode)))
             }
             MountMutation::CreateSymlink { path, target } => {
-                let Some(metadata) = snapshots.get(path).await? else {
-                    return Ok(false);
-                };
-                Ok(is_kind(&metadata, LocalKind::Symlink)
-                    && metadata.link_target.as_deref() == Some(target.as_str()))
+                let remote = snapshots.get(path).await?;
+                if remote.as_ref().is_some_and(|metadata| {
+                    is_kind(metadata, LocalKind::Symlink)
+                        && metadata.link_target.as_deref() == Some(target.as_str())
+                }) {
+                    return Ok(true);
+                }
+                // A short-lived guest workaround may create a symlink that the
+                // gateway correctly rejects (for example an absolute target),
+                // then replace it before the publisher reaches that sequence.
+                // Requiring the obsolete intermediate link to land would freeze
+                // the entire ordered suffix even though later WAL events carry
+                // the authoritative final state. Only treat the rejection as
+                // superseded when the live mount proves the path is no longer a
+                // symlink; a still-live or retargeted symlink remains blocked.
+                self.path_kind_intent_is_superseded(path, LocalKind::Symlink)
             }
             MountMutation::CreateHardLink {
                 existing_path,
@@ -1042,6 +1053,13 @@ impl PublisherShared {
             return Ok(false);
         };
         Ok(source.kind(old_path)?.is_none() && source.kind(new_path)?.is_some())
+    }
+
+    fn path_kind_intent_is_superseded(&self, path: &str, intended: LocalKind) -> Result<bool> {
+        let Some(source) = self.options.authoritative_paths.as_ref() else {
+            return Ok(false);
+        };
+        Ok(kind_intent_is_superseded(source.kind(path)?, intended))
     }
 
     /// Remove one stale remote subtree through the ordinary gateway namespace
@@ -1309,6 +1327,10 @@ fn is_kind(metadata: &RemoteMetadata, kind: LocalKind) -> bool {
     LocalKind::from_wire_kind(metadata.kind.as_str()) == Some(kind)
 }
 
+fn kind_intent_is_superseded(current: Option<LocalKind>, intended: LocalKind) -> bool {
+    current.is_none_or(|kind| kind != intended)
+}
+
 /// Permissive mode comparison for a creation: a backend that does not report a
 /// mode cannot contradict the intent.
 fn mode_agrees(metadata: &RemoteMetadata, mode: u32) -> bool {
@@ -1384,10 +1406,10 @@ impl<'a> RemoteSnapshots<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ABSENT_PRECONDITION, plan_runs};
+    use super::{ABSENT_PRECONDITION, kind_intent_is_superseded, plan_runs};
     use crate::fuse::local_view::types::{
-        MountEvent, MountMutation, MountPreImage, PayloadRef, PayloadStorage, PublishBatch,
-        PublishRun,
+        LocalKind, MountEvent, MountMutation, MountPreImage, PayloadRef, PayloadStorage,
+        PublishBatch, PublishRun,
     };
 
     fn event(sequence: u64, mutation: MountMutation, payload: Option<PayloadRef>) -> MountEvent {
@@ -1413,6 +1435,19 @@ mod tests {
             hash_algorithm: "blake3".to_string(),
             content_hash: format!("hash-{sequence}"),
         }
+    }
+
+    #[test]
+    fn rejected_symlink_is_superseded_only_after_authoritative_kind_changes() {
+        assert!(!kind_intent_is_superseded(
+            Some(LocalKind::Symlink),
+            LocalKind::Symlink,
+        ));
+        assert!(kind_intent_is_superseded(
+            Some(LocalKind::File),
+            LocalKind::Symlink,
+        ));
+        assert!(kind_intent_is_superseded(None, LocalKind::Symlink));
     }
 
     #[test]
