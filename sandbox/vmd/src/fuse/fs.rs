@@ -63,10 +63,9 @@ const ADVISORY_LOCK_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
 /// spam.
 const SLOW_ADVISORY_LOCK_WARN_AFTER: Duration = Duration::from_secs(10);
 const ADVISORY_LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-/// How long an advisory-lock callback waits for the publisher to make its path
-/// exist remotely. Bounded, because a lock request is a guest syscall and a
-/// gateway outage must never park one indefinitely: the request is issued
-/// anyway, and the gateway's own answer is authoritative.
+/// Bound retained for the userspace lock callbacks. Ordinary mounts no longer
+/// negotiate those callbacks, but an unexpected direct invocation must still
+/// fail boundedly rather than parking behind publication indefinitely.
 const ADVISORY_LOCK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const POSIX_MODE_MASK: u32 = 0o7777;
 
@@ -1822,15 +1821,19 @@ fn errno_for(error: anyhow::Error) -> Errno {
 
 impl RemoteFuseFs {
     fn requested_init_capabilities_for(read_only: bool) -> InitFlags {
-        let locks = InitFlags::FUSE_POSIX_LOCKS | InitFlags::FUSE_FLOCK_LOCKS;
         let directory_prefetch = InitFlags::FUSE_DO_READDIRPLUS | InitFlags::FUSE_READDIRPLUS_AUTO;
+        // One writable mount belongs to one VM. Leaving FUSE_POSIX_LOCKS and
+        // FUSE_FLOCK_LOCKS unset makes the guest kernel arbitrate advisory locks
+        // locally across every process on that mount. Advertising them forwards
+        // getlk/setlk to userspace and turns a gateway or publisher stall into a
+        // Cargo-visible lock failure, violating the local-first mount contract.
         // FUSE_WRITEBACK_CACHE is deliberately still not requested. It changes
         // write semantics (the kernel becomes authoritative for i_size and
         // batches writeback behind the daemon's back) and needs measurement
         // before it can be trusted; direct I/O is no longer forced, so the
         // ordinary page cache already covers the read path it would help.
         let _ = read_only;
-        InitFlags::FUSE_AUTO_INVAL_DATA | locks | directory_prefetch
+        InitFlags::FUSE_AUTO_INVAL_DATA | directory_prefetch
     }
 }
 
@@ -1871,16 +1874,12 @@ mod tests {
         assert_eq!(
             RemoteFuseFs::requested_init_capabilities_for(false),
             InitFlags::FUSE_AUTO_INVAL_DATA
-                | InitFlags::FUSE_POSIX_LOCKS
-                | InitFlags::FUSE_FLOCK_LOCKS
                 | InitFlags::FUSE_DO_READDIRPLUS
                 | InitFlags::FUSE_READDIRPLUS_AUTO
         );
         assert_eq!(
             RemoteFuseFs::requested_init_capabilities_for(true),
             InitFlags::FUSE_AUTO_INVAL_DATA
-                | InitFlags::FUSE_POSIX_LOCKS
-                | InitFlags::FUSE_FLOCK_LOCKS
                 | InitFlags::FUSE_DO_READDIRPLUS
                 | InitFlags::FUSE_READDIRPLUS_AUTO
         );

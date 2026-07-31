@@ -583,9 +583,11 @@ impl PublisherShared {
 
     async fn publish_once(&self) -> Result<PublishProgress> {
         let cursor_before = self.wal.acknowledged_sequence();
-        let Some(batch) = self
-            .wal
-            .next_publish_batch(self.options.max_events, self.options.max_payload_bytes)?
+        let Some(batch) = self.wal.next_publish_batch(
+            self.options.max_events,
+            self.options.max_payload_bytes,
+            self.options.stream_threshold_bytes,
+        )?
         else {
             return Ok(PublishProgress::Idle);
         };

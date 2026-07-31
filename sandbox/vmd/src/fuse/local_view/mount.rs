@@ -1554,7 +1554,11 @@ mod tests {
         let batch = view
             .wal()
             .expect("writable WAL")
-            .next_publish_batch(32, 1024 * 1024)
+            .next_publish_batch(
+                32,
+                1024 * 1024,
+                super::super::STREAM_PAYLOAD_THRESHOLD_BYTES,
+            )
             .expect("read publish batch")
             .expect("pending events");
         let payload = batch

@@ -35,7 +35,7 @@ use super::payload::{PayloadReader, PayloadStore};
 use super::types::{
     CompactionOutcome, MountCheckpoint, MountEvent, MountMutation, MountPreImage, PayloadRef,
     PayloadSource, PreparedEvent, PublishBatch, RecoveryResolution, RecoveryState, StoragePressure,
-    WalRecord, validate_mount_path,
+    WalRecord, dependency_sets_conflict, validate_mount_path,
 };
 use super::{
     BACKING_FREE_FRACTION_FLOOR, LOG_TARGET_BYTES, MAX_RECORD_BYTES, MountStateLayout,
@@ -56,6 +56,34 @@ struct PreparedRecord {
     event: MountEvent,
     generation: u64,
     offset: u64,
+}
+
+/// Return the older content generation that `candidate` makes unnecessary on
+/// the wire. Walking backward stops at the first remote mutation that conflicts
+/// with the candidate. Only another `ReplaceFile` of the exact same path may be
+/// removed; a create, rename, link, delete or mode change remains an ordering
+/// boundary. Local-only owner/time records do not constrain gateway order.
+fn superseded_content_generation(events: &[MountEvent], candidate: &MountEvent) -> Option<usize> {
+    let MountMutation::ReplaceFile {
+        path: candidate_path,
+        ..
+    } = &candidate.mutation
+    else {
+        return None;
+    };
+    let candidate_keys = candidate.dependency_keys();
+    for (index, event) in events.iter().enumerate().rev() {
+        if event.mutation.is_local_only()
+            || !dependency_sets_conflict(&candidate_keys, &event.dependency_keys())
+        {
+            continue;
+        }
+        return match &event.mutation {
+            MountMutation::ReplaceFile { path, .. } if path == candidate_path => Some(index),
+            _ => None,
+        };
+    }
+    None
 }
 
 /// Everything the append critical section touches. One short mutex: assign a
@@ -667,26 +695,43 @@ impl MountWal {
 
     // -- publication ---------------------------------------------------------
 
-    /// The next contiguous committed prefix, bounded by event count and payload
-    /// bytes. Stops at the first sequence that is missing or still unresolved,
-    /// which is how one permanently failed event preserves and blocks its own
-    /// WAL suffix. Aborted sequences inside the prefix advance
-    /// `through_sequence` without producing an event.
+    /// The next contiguous committed prefix, bounded by event count and the
+    /// bytes that a batched request materializes in memory. Stops at the first
+    /// sequence that is missing or still unresolved, which is how one
+    /// permanently failed event preserves and blocks its own WAL suffix.
+    /// Aborted sequences inside the prefix advance `through_sequence` without
+    /// producing an event.
     ///
-    /// A single event larger than `max_payload_bytes` is still returned alone,
-    /// so the cursor can always make progress.
+    /// Repeated whole-file generations of one path are collapsed while they are
+    /// still unacknowledged, provided no intervening remote mutation conflicts
+    /// with that path. The WAL retains every generation; only the wire plan
+    /// omits the obsolete snapshots. This matters for append-heavy files: a
+    /// 65 MiB log reopened for each line must not upload every intermediate
+    /// 65 MiB generation merely because the gateway models whole files.
+    ///
+    /// Payloads at or above `stream_threshold_bytes` do not consume the batched
+    /// byte budget because the publisher streams them from disk. At most one
+    /// distinct streamed generation survives in a batch, preserving the old
+    /// bound on concurrent oversized uploads while still allowing many queued
+    /// generations of that same path to collapse to the newest one.
     pub(crate) fn next_publish_batch(
         &self,
         max_events: usize,
         max_payload_bytes: u64,
+        stream_threshold_bytes: u64,
     ) -> Result<Option<PublishBatch>> {
         if max_events == 0 {
             bail!("mount publication batch must allow at least one event");
+        }
+        if stream_threshold_bytes == 0 {
+            bail!("mount publication stream threshold must be non-zero");
         }
         let state = self.append_lock()?;
         let mut sequence = state.acknowledged_sequence.saturating_add(1);
         let mut through_sequence = state.acknowledged_sequence;
         let mut payload_bytes = 0_u64;
+        let mut streamed_events = 0_usize;
+        let mut scanned_events = 0_usize;
         let mut events: Vec<MountEvent> = Vec::new();
         loop {
             if state.aborted.contains(&sequence) {
@@ -700,15 +745,35 @@ impl MountWal {
             if !state.committed.contains(&sequence) {
                 break;
             }
-            let event_bytes = record.event.payload_length();
+            if scanned_events >= max_events {
+                break;
+            }
+
+            let superseded = superseded_content_generation(&events, &record.event);
+            let old_payload = superseded
+                .map(|index| events[index].payload_length())
+                .unwrap_or(0);
+            let event_payload = record.event.payload_length();
+            let old_streamed = old_payload >= stream_threshold_bytes;
+            let event_streamed = event_payload >= stream_threshold_bytes;
+            let next_payload_bytes = payload_bytes
+                .saturating_sub(if old_streamed { 0 } else { old_payload })
+                .saturating_add(if event_streamed { 0 } else { event_payload });
+            let next_streamed_events = streamed_events
+                .saturating_sub(usize::from(old_streamed))
+                .saturating_add(usize::from(event_streamed));
             if !events.is_empty()
-                && (events.len() >= max_events
-                    || payload_bytes.saturating_add(event_bytes) > max_payload_bytes)
+                && (next_payload_bytes > max_payload_bytes || next_streamed_events > 1)
             {
                 break;
             }
-            payload_bytes = payload_bytes.saturating_add(event_bytes);
+            if let Some(index) = superseded {
+                events.remove(index);
+            }
+            payload_bytes = next_payload_bytes;
+            streamed_events = next_streamed_events;
             events.push(record.event.clone());
+            scanned_events += 1;
             through_sequence = sequence;
             sequence = sequence.saturating_add(1);
         }
@@ -1898,7 +1963,7 @@ mod tests {
         assert_eq!(state.committed_unacknowledged.len(), 2);
         assert_eq!(state.unresolved_prepares, vec![dangling.event]);
         let batch = recovered
-            .next_publish_batch(64, 1024)
+            .next_publish_batch(64, 1024, super::super::STREAM_PAYLOAD_THRESHOLD_BYTES)
             .expect("batch")
             .expect("pending batch");
         assert_eq!(batch.events.len(), 2);
@@ -1939,7 +2004,7 @@ mod tests {
             .expect("prepare second");
         wal.commit(second, None).expect("commit second");
         let batch = wal
-            .next_publish_batch(64, 1024)
+            .next_publish_batch(64, 1024, super::super::STREAM_PAYLOAD_THRESHOLD_BYTES)
             .expect("batch")
             .expect("pending batch");
         assert_eq!(batch.events.len(), 1);
@@ -1947,9 +2012,100 @@ mod tests {
         assert_eq!(batch.through_sequence, 2);
         wal.acknowledge(2, 9, 2).expect("acknowledge");
         assert!(
-            wal.next_publish_batch(64, 1024)
+            wal.next_publish_batch(64, 1024, super::super::STREAM_PAYLOAD_THRESHOLD_BYTES)
                 .expect("empty batch")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn queued_generations_of_one_path_publish_only_the_newest_snapshot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let wal = open(temp.path());
+        for bytes in [
+            b"first".as_slice(),
+            b"second".as_slice(),
+            b"third".as_slice(),
+        ] {
+            let generation = wal
+                .prepare(
+                    MountMutation::ReplaceFile {
+                        path: ".run/api.watch.log".to_string(),
+                        mode: 0o644,
+                        expected_file_id: None,
+                        base_content_hash: None,
+                    },
+                    PayloadSource::Bytes(bytes),
+                    MountPreImage::empty(),
+                )
+                .expect("prepare log generation");
+            wal.commit(generation, None).expect("commit log generation");
+        }
+
+        let batch = wal
+            .next_publish_batch(64, 1, 4)
+            .expect("batch")
+            .expect("pending batch");
+        assert_eq!(batch.through_sequence, 3);
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].sequence, 3);
+        assert_eq!(batch.events[0].payload_length(), 5);
+    }
+
+    #[test]
+    fn conflicting_path_mutation_prevents_generation_supersession() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let wal = open(temp.path());
+        let first = wal
+            .prepare(
+                MountMutation::ReplaceFile {
+                    path: "tracked.txt".to_string(),
+                    mode: 0o644,
+                    expected_file_id: None,
+                    base_content_hash: None,
+                },
+                PayloadSource::Bytes(b"first"),
+                MountPreImage::empty(),
+            )
+            .expect("prepare first generation");
+        wal.commit(first, None).expect("commit first generation");
+        let mode = wal
+            .prepare(
+                MountMutation::SetMode {
+                    path: "tracked.txt".to_string(),
+                    mode: 0o755,
+                },
+                PayloadSource::None,
+                MountPreImage::empty(),
+            )
+            .expect("prepare mode");
+        wal.commit(mode, None).expect("commit mode");
+        let second = wal
+            .prepare(
+                MountMutation::ReplaceFile {
+                    path: "tracked.txt".to_string(),
+                    mode: 0o755,
+                    expected_file_id: None,
+                    base_content_hash: None,
+                },
+                PayloadSource::Bytes(b"second"),
+                MountPreImage::empty(),
+            )
+            .expect("prepare second generation");
+        wal.commit(second, None).expect("commit second generation");
+
+        let batch = wal
+            .next_publish_batch(64, 64, 1024)
+            .expect("batch")
+            .expect("pending batch");
+        assert_eq!(batch.through_sequence, 3);
+        assert_eq!(
+            batch
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
         );
     }
 

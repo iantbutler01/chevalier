@@ -693,6 +693,12 @@ impl PreparedEvent {
 }
 
 /// A contiguous committed prefix the publisher may reconcile.
+///
+/// `events` may omit an older whole-file generation when a later generation of
+/// the same path supersedes it without an intervening conflicting mutation.
+/// `through_sequence` still covers the omitted event: once the newer generation
+/// lands, acknowledging both is safe because the gateway holds the same final
+/// path state the ordered pair would have produced.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PublishBatch {
     pub(crate) events: Vec<MountEvent>,
