@@ -55,6 +55,11 @@ done
 require_cmd docker
 
 BIN_DIR="$REPO_ROOT/portproxy/bin"
+HASH_ROOT="$(cd "$REPO_ROOT/../hash" && pwd)"
+[[ -f "$HASH_ROOT/Cargo.toml" ]] || {
+  err "shared chevalier-vfs-hash crate missing at $HASH_ROOT"
+  exit 1
+}
 mkdir -p "$BIN_DIR"
 
 build_target() {
@@ -66,6 +71,7 @@ build_target() {
   docker run --rm \
     --platform "$platform" \
     -v "$REPO_ROOT:/work" \
+    -v "$HASH_ROOT:/hash:ro" \
     -w /work/portproxy \
     "$RUST_IMAGE" \
     bash -lc "export PATH=/usr/local/cargo/bin:\$PATH; cargo build --release --target $target"

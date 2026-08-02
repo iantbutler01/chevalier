@@ -645,6 +645,20 @@ impl Session {
             .map_err(sb_err)
     }
 
+    /// Stream a host-local file into the guest and atomically replace `path`.
+    #[napi]
+    pub async fn write_file_from_file(
+        &self,
+        path: String,
+        source_path: String,
+        mode: Option<u32>,
+    ) -> napi::Result<()> {
+        self.inner
+            .write_file_from_file(&path, &source_path, mode)
+            .await
+            .map_err(sb_err)
+    }
+
     /// Fork this session (CoW); returns the child session.
     #[napi]
     pub async fn fork(&self, options: Option<ForkOpts>) -> napi::Result<Session> {

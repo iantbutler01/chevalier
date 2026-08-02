@@ -50,6 +50,8 @@ export declare class Session {
   listDir(path: string): Promise<Array<SessionDirectoryEntryJs>>
   /** Write a file to the guest. */
   writeFile(path: string, data: Buffer): Promise<void>
+  /** Stream a host-local file into the guest and atomically replace `path`. */
+  writeFileFromFile(path: string, sourcePath: string, mode?: number | undefined | null): Promise<void>
   /** Fork this session (CoW); returns the child session. */
   fork(options?: ForkOpts | undefined | null): Promise<Session>
   /** Create a checkpoint/snapshot for this session. */

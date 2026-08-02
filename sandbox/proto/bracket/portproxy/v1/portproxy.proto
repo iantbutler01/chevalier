@@ -12,6 +12,7 @@ service PortProxy {
   rpc PrepareShutdown(google.protobuf.Empty) returns (google.protobuf.Empty);
   rpc ReadFile(ReadFileRequest) returns (ReadFileResponse);
   rpc WriteFile(WriteFileRequest) returns (google.protobuf.Empty);
+  rpc WriteFileStream(stream WriteFileStreamRequest) returns (google.protobuf.Empty);
   rpc ListDirectory(ListDirectoryRequest) returns (ListDirectoryResponse);
   rpc DeletePath(DeletePathRequest) returns (google.protobuf.Empty);
 }
@@ -116,6 +117,20 @@ message WriteFileRequest {
   string path = 1;
   bytes data = 2;
   bool create_parents = 3;
+}
+
+message WriteFileStreamRequest {
+  oneof request {
+    WriteFileStreamStart start = 1;
+    bytes data = 2;
+  }
+}
+
+message WriteFileStreamStart {
+  string path = 1;
+  bool create_parents = 2;
+  uint64 expected_bytes = 3;
+  optional uint32 mode = 4;
 }
 
 message ListDirectoryRequest {

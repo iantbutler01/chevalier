@@ -15,8 +15,8 @@ use chevalier_sandbox::proto::bracket::portproxy::v1::shell_exec_server::{
 use chevalier_sandbox::proto::bracket::portproxy::v1::{
     DeletePathRequest, DirectoryEntry, ExecRequest, ExecResponse, InteractiveShellRequest,
     InteractiveShellResponse, ListDirectoryRequest, ListDirectoryResponse, ReadFileRequest,
-    ReadFileResponse, WriteFileRequest, exec_request, exec_response, interactive_shell_request,
-    interactive_shell_response,
+    ReadFileResponse, WriteFileRequest, WriteFileStreamRequest, exec_request, exec_response,
+    interactive_shell_request, interactive_shell_response, write_file_stream_request,
 };
 use chevalier_sandbox::proto::google::protobuf::Empty;
 use chevalier_sandbox::proto::vmd::v1::vmd_service_server::{VmdService, VmdServiceServer};
@@ -490,6 +490,27 @@ impl PortProxy for MockPortProxy {
     ) -> Result<Response<Empty>, Status> {
         let req = request.into_inner();
         self.state.lock().await.files.insert(req.path, req.data);
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn write_file_stream(
+        &self,
+        request: Request<tonic::Streaming<WriteFileStreamRequest>>,
+    ) -> Result<Response<Empty>, Status> {
+        let mut stream = request.into_inner();
+        let mut path = None;
+        let mut data = Vec::new();
+        while let Some(message) = stream.message().await? {
+            match message.request {
+                Some(write_file_stream_request::Request::Start(start)) => {
+                    path = Some(start.path);
+                }
+                Some(write_file_stream_request::Request::Data(chunk)) => data.extend(chunk),
+                None => return Err(Status::invalid_argument("missing stream request")),
+            }
+        }
+        let path = path.ok_or_else(|| Status::invalid_argument("missing stream start"))?;
+        self.state.lock().await.files.insert(path, data);
         Ok(Response::new(Empty {}))
     }
 

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use futures::{Stream, StreamExt};
 #[cfg(feature = "distributed-control")]
 use serde_json::json;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 #[cfg(feature = "host")]
 use tokio::process::{Child, Command};
@@ -60,8 +60,9 @@ use proto::bracket::portproxy::v1::shell_exec_client::ShellExecClient;
 use proto::bracket::portproxy::v1::{
     DeletePathRequest, ExecRequest, ExecResponse, ExecStart, InteractiveShellRequest,
     InteractiveShellResize, InteractiveShellResponse, InteractiveShellStart, ListDirectoryRequest,
-    ReadFileRequest, WriteFileRequest, exec_request, exec_response, interactive_shell_request,
-    interactive_shell_response,
+    ReadFileRequest, WriteFileRequest, WriteFileStreamRequest, WriteFileStreamStart, exec_request,
+    exec_response, interactive_shell_request, interactive_shell_response,
+    write_file_stream_request,
 };
 use proto::vmd::v1::vmd_service_client::VmdServiceClient;
 use proto::vmd::v1::{
@@ -2204,6 +2205,221 @@ impl Session {
                 )?,
             ))
             .await?;
+        Ok(())
+    }
+
+    /// Stream a host-local file into the guest and atomically replace `path`.
+    ///
+    /// This uses the portproxy file RPC directly rather than the distributed
+    /// exec/stdin control stream, so large payloads stay binary end to end.
+    pub async fn write_file_from_file(
+        &self,
+        path: &str,
+        source_path: &str,
+        mode: Option<u32>,
+    ) -> Result<()> {
+        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+            let data = tokio::fs::read(source_path).await?;
+            return control.write_file(&self.vm_id, path, data).await;
+        }
+
+        match self
+            .write_file_from_file_once(path, source_path, mode)
+            .await
+        {
+            Err(SandboxError::Grpc(status)) if portproxy_method_is_unimplemented(&status) => {
+                // A retained VM can still be running the portproxy bundled by
+                // the prior VMD release. Keep the public operation binary and
+                // atomic: bounded unary file RPCs stage parts outside the VFS,
+                // then one guest command assembles and renames the destination.
+                // No payload bytes cross exec stdin or the control-command bus.
+                self.write_file_from_file_legacy(path, source_path, mode)
+                    .await
+            }
+            result => result,
+        }
+    }
+
+    async fn write_file_from_file_legacy(
+        &self,
+        path: &str,
+        source_path: &str,
+        mode: Option<u32>,
+    ) -> Result<()> {
+        // Retained guests expose only the unary binary file RPC, whose payload
+        // ceiling is 16 MiB. Stay comfortably below that ceiling without
+        // paying one connection round trip per MiB; current guests use the
+        // client-streaming RPC above and never take this compatibility path.
+        const LEGACY_CHUNK_BYTES: usize = 12 * 1024 * 1024;
+
+        let target = std::path::Path::new(path);
+        if !target.is_absolute() {
+            return Err(SandboxError::InvalidConfig(
+                "legacy streamed guest writes require an absolute destination".to_string(),
+            ));
+        }
+        let parent = target.parent().unwrap_or_else(|| std::path::Path::new("/"));
+        let file_name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file");
+        let transfer_id = Uuid::new_v4();
+        let staging_path = parent.join(format!(
+            ".{file_name}.openbracket-write-legacy-{transfer_id}"
+        ));
+        let staging_path = staging_path.to_string_lossy().into_owned();
+        let mut source = tokio::fs::File::open(source_path).await?;
+        let expected_bytes = source.metadata().await?.len();
+        let mut parts: Vec<String> = Vec::new();
+        let mut buffer = vec![0_u8; LEGACY_CHUNK_BYTES];
+        loop {
+            let read = source.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            let part = format!("/tmp/chevalier-file-{transfer_id}-{}", parts.len());
+            if let Err(error) = self
+                .write_file(part.as_str(), buffer[..read].to_vec())
+                .await
+            {
+                for staged in &parts {
+                    let _ = self.delete_path(staged).await;
+                }
+                return Err(error);
+            }
+            parts.push(part);
+        }
+
+        let quoted_parts = parts
+            .iter()
+            .map(|part| shell_single_quote(part))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let quoted_parent = shell_single_quote(parent.to_string_lossy().as_ref());
+        let quoted_target = shell_single_quote(path);
+        let quoted_staging = shell_single_quote(staging_path.as_str());
+        let content_command = if parts.is_empty() {
+            format!(": > {quoted_staging}")
+        } else {
+            format!("cat {quoted_parts} > {quoted_staging}")
+        };
+        let permission_command = match mode {
+            Some(mode) => format!("chmod {:o} {quoted_staging}", mode & 0o7777),
+            None => format!(
+                "if [ -e {quoted_target} ]; then chmod --reference={quoted_target} {quoted_staging}; fi"
+            ),
+        };
+        let remove_parts_command = if parts.is_empty() {
+            ":".to_string()
+        } else {
+            format!("rm -f {quoted_parts}")
+        };
+        let command = format!(
+            "set -eu; mkdir -p {quoted_parent}; {content_command}; test \"$(wc -c < {quoted_staging})\" = {expected_bytes}; {permission_command}; mv -f {quoted_staging} {quoted_target}; {remove_parts_command}"
+        );
+
+        let result = async {
+            let mut handle = self
+                .exec(
+                    command.as_str(),
+                    ExecOptions {
+                        timeout_secs: Some(30),
+                        close_stdin_on_start: true,
+                        ..ExecOptions::default()
+                    },
+                )
+                .await?;
+            while let Some(event) = handle.events.next().await {
+                match event? {
+                    ExecEvent::Exit(0) => return Ok(()),
+                    ExecEvent::Exit(code) => {
+                        return Err(SandboxError::InvalidResponse(format!(
+                            "legacy streamed guest write exited with status {code}"
+                        )));
+                    }
+                    ExecEvent::Timeout => {
+                        return Err(SandboxError::DaemonUnavailable(
+                            "legacy streamed guest write timed out".to_string(),
+                        ));
+                    }
+                    ExecEvent::Stdout(_) | ExecEvent::Stderr(_) => {}
+                }
+            }
+            Err(SandboxError::InvalidResponse(
+                "legacy streamed guest write ended without an exit status".to_string(),
+            ))
+        }
+        .await;
+        for staged in parts
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(staging_path.as_str()))
+        {
+            let _ = self.delete_path(staged).await;
+        }
+        result
+    }
+
+    async fn write_file_from_file_once(
+        &self,
+        path: &str,
+        source_path: &str,
+        mode: Option<u32>,
+    ) -> Result<()> {
+        let expected_bytes = tokio::fs::metadata(source_path).await?.len();
+        let source_path = source_path.to_string();
+        let path = path.to_string();
+        let (tx, rx) = mpsc::channel(4);
+        let producer = tokio::spawn(async move {
+            tx.send(WriteFileStreamRequest {
+                request: Some(write_file_stream_request::Request::Start(
+                    WriteFileStreamStart {
+                        path,
+                        create_parents: true,
+                        expected_bytes,
+                        mode,
+                    },
+                )),
+            })
+            .await
+            .map_err(|_| SandboxError::InvalidResponse("file stream closed before start".into()))?;
+
+            let mut file = tokio::fs::File::open(source_path).await?;
+            let mut buffer = vec![0_u8; 512 * 1024];
+            loop {
+                let read = file.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                tx.send(WriteFileStreamRequest {
+                    request: Some(write_file_stream_request::Request::Data(
+                        buffer[..read].to_vec(),
+                    )),
+                })
+                .await
+                .map_err(|_| {
+                    SandboxError::InvalidResponse("file stream closed before completion".into())
+                })?;
+            }
+            Ok::<(), SandboxError>(())
+        });
+
+        let mut access = self.portproxy_client_access().await?;
+        let rpc = access
+            .client
+            .write_file_stream(request_with_optional_auth_timeout(
+                ReceiverStream::new(rx),
+                access.auth_header.as_ref(),
+                configured_portproxy_timeout(
+                    "CHEVALIER_PORTPROXY_WRITE_FILE_TIMEOUT_MS",
+                    DEFAULT_PORTPROXY_WRITE_FILE_RPC_TIMEOUT,
+                )?,
+            ));
+        let (rpc_result, producer_result) = tokio::join!(rpc, producer);
+        rpc_result?;
+        producer_result.map_err(|err| {
+            SandboxError::InvalidResponse(format!("file stream task failed: {err}"))
+        })??;
         Ok(())
     }
 
@@ -5520,6 +5736,17 @@ fn execution_restore_snapshot_id(vm: &Vm) -> Option<String> {
     None
 }
 
+fn portproxy_method_is_unimplemented(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::Unimplemented
+        || status
+            .message()
+            .eq_ignore_ascii_case("operation is not implemented or not supported")
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 fn log_slo_observation(metric: &str, elapsed: Duration, outcome: &str) {
     let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
     tracing::info!(
@@ -5619,6 +5846,25 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer guest-token")
         );
+    }
+
+    #[test]
+    fn portproxy_unimplemented_detection_accepts_native_and_legacy_statuses() {
+        assert!(portproxy_method_is_unimplemented(
+            &tonic::Status::unimplemented("method is not available")
+        ));
+        assert!(portproxy_method_is_unimplemented(&tonic::Status::unknown(
+            "Operation is not implemented or not supported"
+        )));
+        assert!(!portproxy_method_is_unimplemented(
+            &tonic::Status::unavailable("portproxy is restarting")
+        ));
+    }
+
+    #[test]
+    fn shell_single_quote_preserves_posix_paths() {
+        assert_eq!(shell_single_quote("/tmp/a b"), "'/tmp/a b'");
+        assert_eq!(shell_single_quote("/tmp/ian's"), "'/tmp/ian'\"'\"'s'");
     }
 
     #[tokio::test]

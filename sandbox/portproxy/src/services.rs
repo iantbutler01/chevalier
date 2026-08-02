@@ -1,6 +1,7 @@
 // @dive-file: Implements gRPC PortProxy, ShellExec, and DaemonManager services used inside guest VMs.
 // @dive-rel: Uses portproxy/src/daemon.rs to provide named daemon exec streams that can be reattached.
 // @dive-rel: Conforms to proto/bracket/portproxy/v1/portproxy.proto service contracts.
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -30,7 +31,7 @@ use crate::pb::bracket::portproxy::v1::{
     AttachDaemonRequest, AttachDaemonResponse, DeletePathRequest, DirectoryEntry, ExecRequest,
     ExecResponse, ExecStart, InteractiveShellRequest, InteractiveShellResponse,
     ListDirectoryRequest, ListDirectoryResponse, ReadFileRequest, ReadFileResponse,
-    WriteFileRequest,
+    WriteFileRequest, WriteFileStreamRequest, WriteFileStreamStart, write_file_stream_request,
 };
 use crate::pb::bracket::portproxy::v1::{ExecDaemonRequest, ExecDaemonResponse};
 use crate::pb::google::protobuf::Empty;
@@ -83,6 +84,7 @@ where
 
 const READ_BUFFER: usize = 4096;
 const MAX_FILE_RPC_BYTES: usize = 16 * 1024 * 1024;
+const MAX_STREAM_FILE_CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 10_000;
 static ATOMIC_WRITE_NONCE: AtomicU64 = AtomicU64::new(1);
 
@@ -681,6 +683,107 @@ impl PortProxy for PortProxyService {
         Ok(Response::new(Empty {}))
     }
 
+    async fn write_file_stream(
+        &self,
+        request: Request<tonic::Streaming<WriteFileStreamRequest>>,
+    ) -> Result<Response<Empty>, Status> {
+        let mut stream = request.into_inner();
+        let first = stream.message().await?.ok_or_else(|| {
+            Status::invalid_argument("write_file_stream requires a start message")
+        })?;
+        let WriteFileStreamStart {
+            path,
+            create_parents,
+            expected_bytes,
+            mode,
+        } = match first.request {
+            Some(write_file_stream_request::Request::Start(start)) => start,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "write_file_stream first message must be start",
+                ));
+            }
+        };
+        let path = validate_path(&path)?;
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        if create_parents {
+            fs::create_dir_all(parent).await.map_err(|err| {
+                Status::internal(format!("failed to create parents for {:?}: {err}", path))
+            })?;
+        }
+
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file");
+        let nonce = ATOMIC_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(
+            ".{file_name}.openbracket-write-{}-{nonce}",
+            std::process::id()
+        ));
+        let mut temp = AtomicWriteTemp {
+            path: temp_path.clone(),
+            committed: false,
+        };
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .await
+            .map_err(|err| Status::internal(format!("failed to stage {:?}: {err}", path)))?;
+        let mut written = 0_u64;
+        while let Some(message) = stream.message().await? {
+            let data = match message.request {
+                Some(write_file_stream_request::Request::Data(data)) => data,
+                Some(write_file_stream_request::Request::Start(_)) => {
+                    return Err(Status::invalid_argument(
+                        "write_file_stream accepts exactly one start message",
+                    ));
+                }
+                None => continue,
+            };
+            if data.len() > MAX_STREAM_FILE_CHUNK_BYTES {
+                return Err(Status::resource_exhausted(format!(
+                    "write_file_stream chunk exceeds {MAX_STREAM_FILE_CHUNK_BYTES} bytes"
+                )));
+            }
+            written = written
+                .checked_add(data.len() as u64)
+                .ok_or_else(|| Status::out_of_range("write_file_stream byte count overflow"))?;
+            if written > expected_bytes {
+                return Err(Status::invalid_argument(format!(
+                    "write_file_stream received {written} bytes, expected {expected_bytes}"
+                )));
+            }
+            file.write_all(&data)
+                .await
+                .map_err(|err| Status::internal(format!("failed to stage {:?}: {err}", path)))?;
+        }
+        if written != expected_bytes {
+            return Err(Status::invalid_argument(format!(
+                "write_file_stream received {written} bytes, expected {expected_bytes}"
+            )));
+        }
+        file.flush()
+            .await
+            .map_err(|err| Status::internal(format!("failed to flush {:?}: {err}", path)))?;
+        drop(file);
+        if let Some(mode) = mode {
+            fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(mode))
+                .await
+                .map_err(|err| Status::internal(format!("failed to chmod {:?}: {err}", path)))?;
+        } else if let Ok(metadata) = fs::metadata(&path).await {
+            fs::set_permissions(&temp_path, metadata.permissions())
+                .await
+                .map_err(|err| Status::internal(format!("failed to chmod {:?}: {err}", path)))?;
+        }
+        fs::rename(&temp_path, &path)
+            .await
+            .map_err(|err| Status::internal(format!("failed to commit {:?}: {err}", path)))?;
+        temp.committed = true;
+        Ok(Response::new(Empty {}))
+    }
+
     async fn list_directory(
         &self,
         request: Request<ListDirectoryRequest>,
@@ -1222,6 +1325,8 @@ mod tests {
     use crate::daemon::DaemonRegistry;
     use crate::pb::bracket::portproxy::v1::daemon_manager_client::DaemonManagerClient;
     use crate::pb::bracket::portproxy::v1::daemon_manager_server::DaemonManagerServer;
+    use crate::pb::bracket::portproxy::v1::port_proxy_client::PortProxyClient;
+    use crate::pb::bracket::portproxy::v1::port_proxy_server::PortProxyServer;
     use crate::pb::bracket::portproxy::v1::shell_exec_client::ShellExecClient;
     use crate::pb::bracket::portproxy::v1::shell_exec_server::ShellExecServer;
     use crate::pb::bracket::portproxy::v1::{
@@ -1263,6 +1368,144 @@ mod tests {
         fs::remove_dir_all(dir)
             .await
             .expect("test directory should clean up");
+    }
+
+    #[tokio::test]
+    async fn streamed_file_write_exceeds_unary_limit_and_commits_atomically() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("unix time should be monotonic")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("chevalier-stream-write-{nonce}"));
+        let path = dir.join("large.bundle");
+        fs::create_dir_all(&dir)
+            .await
+            .expect("test directory should be created");
+        fs::write(&path, b"old content")
+            .await
+            .expect("old destination should be created");
+
+        let (mut client, server) = portproxy_test_client().await;
+        let expected_bytes = MAX_FILE_RPC_BYTES + 1;
+        let mut messages = vec![WriteFileStreamRequest {
+            request: Some(write_file_stream_request::Request::Start(
+                WriteFileStreamStart {
+                    path: path.to_string_lossy().into_owned(),
+                    create_parents: true,
+                    expected_bytes: expected_bytes as u64,
+                    mode: Some(0o640),
+                },
+            )),
+        }];
+        let chunk = vec![0x5a; 512 * 1024];
+        let mut remaining = expected_bytes;
+        while remaining > 0 {
+            let take = remaining.min(chunk.len());
+            messages.push(WriteFileStreamRequest {
+                request: Some(write_file_stream_request::Request::Data(
+                    chunk[..take].to_vec(),
+                )),
+            });
+            remaining -= take;
+        }
+        client
+            .write_file_stream(stream::iter(messages))
+            .await
+            .expect("streamed file write should succeed");
+
+        let metadata = fs::metadata(&path)
+            .await
+            .expect("streamed destination should exist");
+        assert_eq!(metadata.len(), expected_bytes as u64);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
+        let bytes = fs::read(&path)
+            .await
+            .expect("streamed destination should read");
+        assert!(bytes.iter().all(|byte| *byte == 0x5a));
+        assert_eq!(directory_names(&dir).await, vec!["large.bundle"]);
+
+        server.abort();
+        fs::remove_dir_all(dir)
+            .await
+            .expect("test directory should clean up");
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_preserves_destination_and_removes_staging_file() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("unix time should be monotonic")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("chevalier-incomplete-stream-{nonce}"));
+        let path = dir.join("plan.html");
+        fs::create_dir_all(&dir)
+            .await
+            .expect("test directory should be created");
+        fs::write(&path, b"preserve me")
+            .await
+            .expect("old destination should be created");
+
+        let (mut client, server) = portproxy_test_client().await;
+        let messages = vec![
+            WriteFileStreamRequest {
+                request: Some(write_file_stream_request::Request::Start(
+                    WriteFileStreamStart {
+                        path: path.to_string_lossy().into_owned(),
+                        create_parents: true,
+                        expected_bytes: 20,
+                        mode: None,
+                    },
+                )),
+            },
+            WriteFileStreamRequest {
+                request: Some(write_file_stream_request::Request::Data(b"short".to_vec())),
+            },
+        ];
+        let status = client
+            .write_file_stream(stream::iter(messages))
+            .await
+            .expect_err("incomplete stream should fail");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        expect_file_contents(&path, b"preserve me").await;
+        assert_eq!(directory_names(&dir).await, vec!["plan.html"]);
+
+        server.abort();
+        fs::remove_dir_all(dir)
+            .await
+            .expect("test directory should clean up");
+    }
+
+    async fn portproxy_test_client() -> (PortProxyClient<tonic::transport::Channel>, JoinHandle<()>)
+    {
+        let service = PortProxyService::new(ChildTracker::new());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().expect("listener has local addr");
+        let incoming = stream::unfold(listener, |listener| async {
+            Some((listener.accept().await.map(|(stream, _)| stream), listener))
+        });
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(PortProxyServer::new(service))
+                .serve_with_incoming(incoming)
+                .await
+                .expect("test portproxy server should run");
+        });
+        let client = PortProxyClient::connect(format!("http://{addr}"))
+            .await
+            .expect("client should connect");
+        (client, server)
+    }
+
+    async fn directory_names(dir: &std::path::Path) -> Vec<String> {
+        let mut entries = fs::read_dir(dir).await.expect("directory should list");
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await.expect("entry should read") {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        names
     }
 
     async fn expect_file_contents(path: &std::path::Path, expected: &[u8]) {
