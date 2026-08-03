@@ -28,7 +28,9 @@ use crate::config::{Config, TlsServerConfig};
 use crate::image::{self, PrebuiltImageStatus};
 use crate::network;
 use crate::partition::{self, PartitionGate, PartitionPolicyConfig};
-use crate::pci::{PCI_CAPABILITY_HEADER, PciInventoryDevice, PciInventoryState};
+use crate::pci::{
+    PCI_CAPABILITY_HEADER, PciInventoryDevice, PciInventoryState, ensure_vfio_memlock_limit,
+};
 use crate::proto::v1::{
     AttachPciDeviceRequest, CreateSnapshotRequest, CreateVmPhase, CreateVmProgress,
     CreateVmRequest, CreateVmStreamResponse, DeleteDurableVolumeRequest, DeleteSnapshotRequest,
@@ -56,6 +58,7 @@ use crate::{
 
 pub async fn run_server(mut config: Config) -> Result<()> {
     config.normalize().context("normalize vmd server config")?;
+    ensure_vfio_memlock_limit(&config.pci).context("prepare PCI passthrough")?;
     let addr: SocketAddr = config
         .listen_address
         .parse()

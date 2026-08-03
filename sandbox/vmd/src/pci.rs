@@ -184,6 +184,38 @@ impl PciConfig {
     }
 }
 
+/// Ensure QEMU children can pin guest memory for VFIO DMA mappings.
+///
+/// Docker's default memlock limit is only 8 MiB. A PCI-enabled vmd can otherwise
+/// start normally and boot a guest, only for QEMU to exit when the first VFIO
+/// device is attached with `vfio_container_dma_map(...)=ENOMEM`. Raising the
+/// daemon limit here makes the requirement follow the PCI capability instead of
+/// depending on one particular container launcher. Child QEMU processes inherit
+/// this limit.
+pub fn ensure_vfio_memlock_limit(config: &PciConfig) -> Result<()> {
+    if !config.enabled() {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let limit = libc::rlimit {
+            rlim_cur: libc::RLIM_INFINITY,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        // SAFETY: `limit` is a valid `rlimit` value and the call does not retain
+        // the pointer. PCI-enabled deployments already require host privileges
+        // for VFIO; failure is reported before vmd accepts work.
+        if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit) } != 0 {
+            return Err(std::io::Error::last_os_error()).context(
+                "raise RLIMIT_MEMLOCK for PCI passthrough; grant CAP_SYS_RESOURCE or start vmd with an unlimited memlock ulimit",
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_policy_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -804,6 +836,7 @@ mod tests {
         assert!(!config.enabled());
         assert!(config.capability_token().is_none());
         assert!(inventory(&config, &HashMap::new()).is_empty());
+        ensure_vfio_memlock_limit(&config).expect("disabled PCI must not require host privileges");
     }
 
     #[test]
