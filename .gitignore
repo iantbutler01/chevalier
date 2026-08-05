@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+.openbracket/sync-trash/
 
 # Rust build output
 target/
