@@ -3553,11 +3553,16 @@ fn sort_entries(entries: &mut [VfsStorageMetadata], order: Option<VfsStorageDirL
 }
 
 fn kind_order(a: VfsStorageEntryKind, b: VfsStorageEntryKind) -> Ordering {
-    match (a, b) {
-        (VfsStorageEntryKind::Directory, VfsStorageEntryKind::File) => Ordering::Less,
-        (VfsStorageEntryKind::File, VfsStorageEntryKind::Directory) => Ordering::Greater,
-        _ => Ordering::Equal,
+    fn rank(kind: VfsStorageEntryKind) -> u8 {
+        match kind {
+            VfsStorageEntryKind::Directory => 0,
+            VfsStorageEntryKind::File => 1,
+            VfsStorageEntryKind::Symlink => 2,
+            VfsStorageEntryKind::Special => 3,
+        }
     }
+
+    rank(a).cmp(&rank(b))
 }
 
 fn sql_like_match(pattern: &str, name: &str) -> bool {
@@ -3614,6 +3619,26 @@ mod tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicBoolOrdering};
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn local_listing_kind_order_is_total() {
+        let ordered = [
+            VfsStorageEntryKind::Directory,
+            VfsStorageEntryKind::File,
+            VfsStorageEntryKind::Symlink,
+            VfsStorageEntryKind::Special,
+        ];
+
+        for (left_index, left) in ordered.iter().copied().enumerate() {
+            for (right_index, right) in ordered.iter().copied().enumerate() {
+                assert_eq!(
+                    kind_order(left, right),
+                    left_index.cmp(&right_index),
+                    "unexpected ordering for {left:?} versus {right:?}",
+                );
+            }
+        }
+    }
 
     fn set_old_mtime(path: &Path) {
         let file = fs::OpenOptions::new()
