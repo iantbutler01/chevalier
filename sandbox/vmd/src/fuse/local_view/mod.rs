@@ -89,15 +89,16 @@ pub(crate) const HYDRATE_CONCURRENCY: usize = 16;
 pub(crate) const CHECKPOINT_INTERVAL_MS: u64 = 5_000;
 pub(crate) const CHECKPOINT_EVENT_INTERVAL: u64 = 4_096;
 
-/// Unreclaimed WAL + payload bytes at which the mount starts pushing back.
-/// `SOFT` widens publication batches and logs; `HARD` fails new content-bearing
-/// mutations with `ENOSPC` while still admitting namespace events, which are
-/// tiny and are what lets a stalled backlog drain.
+/// Unreclaimed WAL + payload bytes at which the mount starts pushing harder on
+/// publication and surfaces a warning. A backlog alone must never manufacture
+/// `ENOSPC`: the local view is authoritative and must remain writable while its
+/// replica repairs. Hard pressure is derived from the backing filesystem's real
+/// free space below.
 pub(crate) const WAL_SOFT_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-pub(crate) const WAL_HARD_LIMIT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Fraction of the backing filesystem that must remain free before the hard
-/// limit applies regardless of the absolute byte limits above.
+/// limit applies. This is the only synthetic `ENOSPC` guard; actual filesystem
+/// allocation errors continue to propagate directly from the backing tree.
 pub(crate) const BACKING_FREE_FRACTION_FLOOR: f64 = 0.05;
 
 /// Default bound for an explicit lifecycle drain (unmount, snapshot, delete).

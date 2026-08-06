@@ -564,22 +564,37 @@ impl LocalVfsStorage {
         } else {
             lexical_normalize(&link_parent.join(target))
         };
+        // A VFS replica must preserve ordinary workspace links such as a
+        // virtualenv's `python -> /usr/bin/python3` even though their target is
+        // outside the replica root. The link itself is opaque: point reads
+        // reject symlink leaves and every descendant operation calls
+        // `assert_no_symlink_ancestor`, so no VFS operation follows it outside
+        // the root. Normalize only targets whose referent is safely in-scope;
+        // preserve every other target exactly as authored.
         if !resolved.starts_with(&lexical_root) {
-            return Err(unsupported_symlink_error());
+            return Ok(SymlinkTargetInfo { target_text });
         }
         match fs::metadata(&resolved) {
             Ok(metadata) => {
                 let canonical_target =
                     fs::canonicalize(&resolved).map_err(|_| unsupported_symlink_error())?;
                 if !canonical_target.starts_with(&canonical_root) {
-                    return Err(unsupported_symlink_error());
+                    return Ok(SymlinkTargetInfo { target_text });
                 }
                 if !metadata.is_file() && !metadata.is_dir() {
-                    return Err(unsupported_symlink_error());
+                    return Ok(SymlinkTargetInfo { target_text });
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(unsupported_symlink_error()),
+            Err(_) => {
+                // The referent may itself be an opaque link to a guest-only or
+                // permission-inaccessible path (virtualenv commonly creates
+                // `python3 -> python -> /root/.local/...`). VFS never follows a
+                // symlink leaf for reads and rejects every symlink ancestor, so
+                // failure to inspect the referent cannot make preserving the
+                // authored target unsafe.
+                return Ok(SymlinkTargetInfo { target_text });
+            }
         }
         let resolved_rel = resolved
             .strip_prefix(&lexical_root)
@@ -5370,7 +5385,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn escaping_symlink_is_absent_from_listings_and_read_stat_error() {
+    async fn external_symlink_is_listed_as_opaque_metadata_and_not_read() {
         let dir = tempfile::tempdir().expect("tempdir");
         let outside = tempfile::tempdir().expect("outside tempdir");
         let outside_file = outside.path().join("secret.txt");
@@ -5382,22 +5397,31 @@ mod tests {
             .list_dir_with_metadata("", VfsStorageDirListFilter::default())
             .await
             .expect("list dir");
-        assert!(listed.iter().all(|entry| entry.path != "secret.txt"));
+        let listed_link = listed
+            .iter()
+            .find(|entry| entry.path == "secret.txt")
+            .expect("external symlink is listed");
+        assert_eq!(listed_link.kind, VfsStorageEntryKind::Symlink);
+        assert_eq!(listed_link.link_target.as_deref(), outside_file.to_str());
 
         let subtree = storage
             .list_subtree_file_metadata("", VfsStorageSubtreeOptions::default())
             .await
             .expect("subtree");
-        assert!(subtree.iter().all(|entry| entry.path != "secret.txt"));
+        let subtree_link = subtree
+            .iter()
+            .find(|entry| entry.path == "secret.txt")
+            .expect("external symlink is present in subtree metadata");
+        assert_eq!(subtree_link.kind, VfsStorageEntryKind::Symlink);
+        assert_eq!(subtree_link.link_target.as_deref(), outside_file.to_str());
 
-        let err = storage
+        let metadata = storage
             .stat("secret.txt")
             .await
-            .expect_err("escaping symlink stat rejected");
-        assert_eq!(
-            err,
-            VfsStorageError::BadRequest("unsupported file type: symlink".to_string())
-        );
+            .expect("external symlink stat")
+            .expect("external symlink metadata");
+        assert_eq!(metadata.kind, VfsStorageEntryKind::Symlink);
+        assert_eq!(metadata.link_target.as_deref(), outside_file.to_str());
 
         let err = storage
             .read("secret.txt")
@@ -5449,7 +5473,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn create_symlink_accepts_in_scope_target_and_rejects_escape() {
+    async fn create_symlink_preserves_external_target_without_following_it() {
         let base = tempfile::tempdir().expect("base tempdir");
         let root = base.path().join("root");
         let outside = base.path().join("outside");
@@ -5471,15 +5495,27 @@ mod tests {
         assert_eq!(metadata.kind, VfsStorageEntryKind::Symlink);
         assert_eq!(metadata.link_target.as_deref(), Some("target.txt"));
 
-        let err = storage
+        storage
             .create_symlink("bad-link.txt", "../outside/secret.txt")
             .await
-            .expect_err("escaping symlink rejected");
+            .expect("external symlink is preserved");
+        let metadata = storage
+            .stat("bad-link.txt")
+            .await
+            .expect("stat external symlink")
+            .expect("external symlink metadata");
         assert_eq!(
-            err,
-            VfsStorageError::BadRequest("unsupported file type: symlink".to_string())
+            metadata.link_target.as_deref(),
+            Some("../outside/secret.txt")
         );
-        assert!(!root.join("bad-link.txt").exists());
+        assert!(matches!(
+            storage.read("bad-link.txt").await,
+            Err(VfsStorageError::BadRequest(message)) if message == "unsupported file type: symlink"
+        ));
+        assert!(matches!(
+            storage.read("bad-link.txt/nested").await,
+            Err(VfsStorageError::BadRequest(message)) if message == "unsupported file type: symlink"
+        ));
     }
 
     #[cfg(unix)]
@@ -5552,26 +5588,30 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn create_symlink_rejects_lexical_parent_escape() {
+    async fn create_symlink_preserves_lexical_parent_target() {
         let base = tempfile::tempdir().expect("base tempdir");
         let root = base.path().join("root");
         fs::create_dir_all(root.join("proj")).expect("root");
         let storage = LocalVfsStorage::new(&root);
 
-        let err = storage
+        storage
             .create_symlink("proj/bad-link.txt", "../../outside/secret.txt")
             .await
-            .expect_err("lexical escape rejected");
+            .expect("lexical parent target is preserved");
+        let metadata = storage
+            .stat("proj/bad-link.txt")
+            .await
+            .expect("stat link")
+            .expect("link metadata");
         assert_eq!(
-            err,
-            VfsStorageError::BadRequest("unsupported file type: symlink".to_string())
+            metadata.link_target.as_deref(),
+            Some("../../outside/secret.txt")
         );
-        assert!(!root.join("proj/bad-link.txt").exists());
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn create_symlink_rejects_existing_escaping_symlink_chain() {
+    async fn create_symlink_preserves_target_through_external_symlink_chain() {
         let base = tempfile::tempdir().expect("base tempdir");
         let root = base.path().join("root");
         let outside = base.path().join("outside");
@@ -5581,15 +5621,57 @@ mod tests {
         symlink(&outside, root.join("escape")).expect("escape symlink");
         let storage = LocalVfsStorage::new(&root);
 
-        let err = storage
+        storage
             .create_symlink("bad-link.txt", "escape/secret.txt")
             .await
-            .expect_err("canonical symlink chain escape rejected");
-        assert_eq!(
-            err,
-            VfsStorageError::BadRequest("unsupported file type: symlink".to_string())
-        );
-        assert!(!root.join("bad-link.txt").exists());
+            .expect("external symlink chain target is preserved");
+        let metadata = storage
+            .stat("bad-link.txt")
+            .await
+            .expect("stat link")
+            .expect("link metadata");
+        assert_eq!(metadata.link_target.as_deref(), Some("escape/secret.txt"));
+        assert!(matches!(
+            storage.read("bad-link.txt").await,
+            Err(VfsStorageError::BadRequest(message)) if message == "unsupported file type: symlink"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_symlink_preserves_target_through_inaccessible_symlink_chain() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = tempfile::tempdir().expect("base tempdir");
+        let root = base.path().join("root");
+        let private = base.path().join("private");
+        fs::create_dir_all(&root).expect("root");
+        fs::create_dir_all(&private).expect("private");
+        fs::write(private.join("python"), b"python").expect("private target");
+        let storage = LocalVfsStorage::new(&root);
+        storage
+            .create_symlink(
+                "python",
+                private.join("python").to_str().expect("private target"),
+            )
+            .await
+            .expect("external symlink");
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o000))
+            .expect("make target inaccessible");
+
+        storage
+            .create_symlink("python3", "python")
+            .await
+            .expect("opaque inaccessible symlink chain is preserved");
+        let metadata = storage
+            .stat("python3")
+            .await
+            .expect("stat link")
+            .expect("link metadata");
+        assert_eq!(metadata.link_target.as_deref(), Some("python"));
+
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700))
+            .expect("restore private permissions");
     }
 
     #[cfg(unix)]

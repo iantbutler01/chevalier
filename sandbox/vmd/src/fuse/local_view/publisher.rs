@@ -44,17 +44,18 @@
 //! client-side. Every event's `{epoch}:{sequence}` key is stable across restart,
 //! and a rejection is reconciled rather than trusted:
 //!
-//! * `rejected_request_status` classifies permanence -- only `400`, `409` and
-//!   `412` can never succeed. `401/403` (auth), `404` (route skew during a
-//!   deploy), `408` and `429` are transient and must be retried, never
+//! * `rejected_request_status` identifies requests that cannot succeed unchanged
+//!   -- only `400`, `409` and `412`. `401/403` (auth), `404` (route skew during
+//!   a deploy), `408` and `429` are transient and must be retried, never
 //!   dead-lettered.
-//! * On a permanent rejection the publisher re-reads the affected paths and
+//! * On an unchanged-request rejection the publisher re-reads the affected paths and
 //!   compares them with the event's intent (content hash, identity, kind, mode,
-//!   absence). A match means the event already landed on an earlier attempt:
-//!   acknowledge it. A genuine mismatch **blocks the WAL suffix**: the event is
-//!   preserved, publication stops at that sequence, and the failure is surfaced
-//!   through `PublicationHealth`. It is never silently dropped, because the local
-//!   accepted view is authoritative.
+//!   absence). A match means the event already landed on an earlier attempt. A
+//!   mismatch is repaired from the accepted WAL through the ordinary gateway:
+//!   stale namespace state is cleared, immutable content is replayed without
+//!   stale replica CAS predicates, and the exact event order is retained.
+//!   Capability/version skew remains retryable and observable, but it does not
+//!   turn a healthy local backing filesystem into `ENOSPC`.
 //!
 //! ## GCS parity
 //!
@@ -90,9 +91,9 @@ use crate::fuse::client::{
 /// with a second wire field, which is why the fold needs no client change.
 const ABSENT_PRECONDITION: &str = "absent";
 
-/// Backoff applied between publication attempts after a stall. A permanently
-/// rejected event never leaves this loop -- it blocks its suffix and is retried
-/// forever, because only the gateway coming back into agreement can resolve it.
+/// Backoff applied between publication attempts after a stall. An event that a
+/// temporarily older gateway cannot represent remains durable and retryable;
+/// publication repair or a compatible gateway lets the same loop resume.
 const RETRY_BACKOFF_MIN: Duration = Duration::from_millis(100);
 const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
@@ -379,27 +380,12 @@ enum RunOutcome {
 #[derive(Clone, Debug)]
 struct PublishFailure {
     sequence: u64,
-    /// `true` only when the gateway rejected the payload permanently *and* a
-    /// re-read proved the event did not land. Everything else is retried.
-    permanent: bool,
     reason: String,
 }
 
 impl PublishFailure {
     fn transient(sequence: u64, reason: String) -> Self {
-        Self {
-            sequence,
-            permanent: false,
-            reason,
-        }
-    }
-
-    fn permanent(sequence: u64, reason: String) -> Self {
-        Self {
-            sequence,
-            permanent: true,
-            reason,
-        }
+        Self { sequence, reason }
     }
 }
 
@@ -460,28 +446,18 @@ impl PublisherShared {
         {
             let mut state = self.state();
             state.last_error = Some(failure.reason.clone());
-            if failure.permanent {
-                state.blocked_sequence = Some(failure.sequence);
-                state.blocked_reason = Some(failure.reason.clone());
-            } else {
-                state.blocked_sequence = None;
-                state.blocked_reason = None;
-            }
+            // A replica rejection can stall the ordered suffix, but it cannot
+            // become an operator-cleared terminal state. The accepted local WAL
+            // remains authoritative and the coordinator keeps repairing or
+            // retrying it in place.
+            state.blocked_sequence = None;
+            state.blocked_reason = None;
         }
-        if failure.permanent {
-            tracing::error!(
-                sequence = failure.sequence,
-                reason = %failure.reason,
-                "vfs mount publication blocked: the local view is authoritative and the event is \
-                 preserved, but its WAL suffix cannot be published"
-            );
-        } else {
-            tracing::warn!(
-                sequence = failure.sequence,
-                reason = %failure.reason,
-                "vfs mount publication retrying"
-            );
-        }
+        tracing::warn!(
+            sequence = failure.sequence,
+            reason = %failure.reason,
+            "vfs mount publication retrying"
+        );
         self.progress.notify_waiters();
     }
 
@@ -696,11 +672,32 @@ impl PublisherShared {
                         Ok(true) => {
                             revision = revision.max(snapshots.revision());
                         }
-                        Ok(false) => {
-                            return Ok(RunOutcome::Failed {
-                                failure: PublishFailure::permanent(event.sequence, reason),
-                            });
-                        }
+                        Ok(false) => match self.repair_rejected_namespace(event).await {
+                            Ok(Some(repair_revision)) => {
+                                revision = revision.max(repair_revision);
+                            }
+                            Ok(None) => {
+                                return Ok(RunOutcome::Failed {
+                                    failure: PublishFailure::transient(
+                                        event.sequence,
+                                        format!(
+                                            "{reason}; no namespace repair adapter matched; \
+                                             retaining the accepted WAL event for retry"
+                                        ),
+                                    ),
+                                });
+                            }
+                            Err(repair_error) => {
+                                return Ok(RunOutcome::Failed {
+                                    failure: PublishFailure::transient(
+                                        event.sequence,
+                                        format!(
+                                            "{reason}; namespace repair failed: {repair_error:#}"
+                                        ),
+                                    ),
+                                });
+                            }
+                        },
                         Err(error) => {
                             return Ok(RunOutcome::Failed {
                                 failure: PublishFailure::transient(
@@ -734,6 +731,60 @@ impl PublisherShared {
             }
         }
         Ok(RunOutcome::Complete { revision })
+    }
+
+    /// Force an accepted namespace event onto a stale replica.
+    ///
+    /// The mount-local WAL is the sole ordered writer for this scope. If an
+    /// an event is rejected because the replica retained the wrong kind, a
+    /// conflicting destination, or stale descendants from an earlier partial
+    /// replay, the WAL remains authoritative. Destructive events are completed
+    /// by recursively removing their target. Creating/moving events first clear
+    /// the stale destination and then replay the exact accepted event. The
+    /// cleanup still uses the normal gateway namespace contract and the cursor
+    /// advances only after the entire publication prefix succeeds.
+    async fn repair_rejected_namespace(&self, event: &MountEvent) -> Result<Option<u64>> {
+        let (path, retry_event) = match &event.mutation {
+            MountMutation::RemoveFile { path, .. } | MountMutation::RemoveDirectory { path } => {
+                (path, false)
+            }
+            MountMutation::CreateDirectory { path, .. }
+            | MountMutation::CreateFile { path, .. }
+            | MountMutation::CreateSymlink { path, .. } => (path, true),
+            MountMutation::CreateHardLink { new_path, .. }
+            | MountMutation::Rename { new_path, .. } => (new_path, true),
+            MountMutation::SetMode { path, .. } => {
+                let Some(source) = self.options.authoritative_paths.as_ref() else {
+                    bail!("cannot reconcile rejected set-mode without authoritative path state");
+                };
+                if source.kind(path)?.is_none() {
+                    tracing::warn!(
+                        sequence = event.sequence,
+                        path,
+                        "skipped an obsolete set-mode after its authoritative path disappeared"
+                    );
+                    return Ok(Some(self.client.observed_namespace_revision()));
+                }
+                bail!("set-mode target remains live locally but the replica rejected it")
+            }
+            _ => return Ok(None),
+        };
+        let mut revision = self
+            .remove_remote_subtree(path, event.idempotency_key.as_str())
+            .await?;
+        if retry_event {
+            let publication = self
+                .issue_namespace_events(std::slice::from_ref(event))
+                .await?;
+            revision = revision.max(publication.revision);
+        }
+        tracing::warn!(
+            sequence = event.sequence,
+            path,
+            retry_event,
+            "repaired stale remote namespace state from the authoritative WAL"
+        );
+        Ok(Some(revision))
     }
 
     // -- content ------------------------------------------------------------
@@ -923,9 +974,49 @@ impl PublisherShared {
             match unlanded.len() {
                 0 => {}
                 1 if attempted_len == 1 => {
-                    return Ok(RunOutcome::Failed {
-                        failure: PublishFailure::permanent(unlanded[0].sequence, reason),
-                    });
+                    let event = &unlanded[0];
+                    match self.repair_stale_folded_creation(event).await {
+                        Ok(Some(cleanup_revision)) => {
+                            revision = revision.max(cleanup_revision);
+                            pending.push((unlanded, None));
+                        }
+                        Ok(None) => match self.repair_rejected_content(event).await {
+                            Ok(Some(repair_revision)) => {
+                                revision = revision.max(repair_revision);
+                            }
+                            Ok(None) => {
+                                return Ok(RunOutcome::Failed {
+                                    failure: PublishFailure::transient(
+                                        event.sequence,
+                                        format!(
+                                            "{reason}; no content repair adapter matched; \
+                                             retaining the accepted WAL event for retry"
+                                        ),
+                                    ),
+                                });
+                            }
+                            Err(repair_error) => {
+                                return Ok(RunOutcome::Failed {
+                                    failure: PublishFailure::transient(
+                                        event.sequence,
+                                        format!(
+                                            "{reason}; content repair failed: {repair_error:#}"
+                                        ),
+                                    ),
+                                });
+                            }
+                        },
+                        Err(repair_error) => {
+                            return Ok(RunOutcome::Failed {
+                                failure: PublishFailure::transient(
+                                    event.sequence,
+                                    format!(
+                                        "{reason}; stale folded-creation repair failed: {repair_error:#}"
+                                    ),
+                                ),
+                            });
+                        }
+                    }
                 }
                 1 => pending.push((unlanded, None)),
                 length => {
@@ -936,6 +1027,70 @@ impl PublisherShared {
             }
         }
         Ok(RunOutcome::Complete { revision })
+    }
+
+    /// Replay one accepted content generation without stale replica CAS state.
+    ///
+    /// The immutable payload is the bytes accepted by the local filesystem. A
+    /// 409/412 after a re-read therefore means the replica's precondition state
+    /// is stale, not that it can overrule the mount. Wrong-kind paths and folded
+    /// creations are cleared first; ordinary overwrites retain the path and drop
+    /// only the stale content/file-id predicate. Later WAL events still replay in
+    /// order, so repairing a historical generation cannot become final state
+    /// when the guest subsequently changed it.
+    async fn repair_rejected_content(&self, event: &MountEvent) -> Result<Option<u64>> {
+        let MountMutation::ReplaceFile {
+            path,
+            mode,
+            base_content_hash,
+            ..
+        } = &event.mutation
+        else {
+            return Ok(None);
+        };
+        let remote = self.client.stat_attributes_versioned(path).await?;
+        let mut revision = self
+            .client
+            .observed_namespace_revision()
+            .max(remote.revision);
+        let wrong_kind = remote.value.as_ref().is_some_and(|metadata| {
+            LocalKind::from_wire_kind(metadata.kind.as_str()) != Some(LocalKind::File)
+        });
+        if wrong_kind || base_content_hash.as_deref() == Some(ABSENT_PRECONDITION) {
+            revision = revision.max(
+                self.remove_remote_subtree(path, event.idempotency_key.as_str())
+                    .await?,
+            );
+        }
+
+        let mut forced = event.clone();
+        forced.mutation = MountMutation::ReplaceFile {
+            path: path.clone(),
+            mode: *mode,
+            expected_file_id: None,
+            base_content_hash: None,
+        };
+        let request = ContentRequest {
+            kind: if forced.payload_length() >= self.options.stream_threshold_bytes {
+                ContentRequestKind::Streamed
+            } else {
+                ContentRequestKind::Batched
+            },
+            events: vec![forced],
+        };
+        let publication = issue_content_request(
+            &self.client,
+            &self.wal,
+            &request,
+            self.options.surface_kind.as_str(),
+        )
+        .await?;
+        tracing::warn!(
+            sequence = event.sequence,
+            path,
+            "replayed authoritative content without stale remote preconditions"
+        );
+        Ok(Some(revision.max(publication.revision)))
     }
 
     // -- reconciliation predicate -------------------------------------------
@@ -1064,14 +1219,77 @@ impl PublisherShared {
         Ok(kind_intent_is_superseded(source.kind(path)?, intended))
     }
 
+    /// Repair a stale remote temporary path that blocks replay of a folded
+    /// create/write operation.
+    ///
+    /// Three independent witnesses are required before removing anything:
+    /// the write carries the fold's absent precondition, the current accepted
+    /// local tree no longer has the path, and the first later conflicting
+    /// committed WAL mutation removes or renames it. The original write is then
+    /// retried rather than acknowledged, so the following rename consumes the
+    /// exact payload the guest accepted.
+    async fn repair_stale_folded_creation(&self, event: &MountEvent) -> Result<Option<u64>> {
+        let MountMutation::ReplaceFile {
+            path,
+            base_content_hash,
+            ..
+        } = &event.mutation
+        else {
+            return Ok(None);
+        };
+        if base_content_hash.as_deref() != Some(ABSENT_PRECONDITION) {
+            return Ok(None);
+        }
+        let Some(source) = self.options.authoritative_paths.as_ref() else {
+            return Ok(None);
+        };
+        if source.kind(path)?.is_some()
+            || !self.wal.committed_successor_removes_primary_path(event)?
+        {
+            return Ok(None);
+        }
+
+        let revision = self
+            .remove_remote_subtree(path, event.idempotency_key.as_str())
+            .await?;
+        tracing::warn!(
+            sequence = event.sequence,
+            path,
+            "removed stale remote path before retrying superseded folded creation"
+        );
+        Ok(Some(revision))
+    }
+
     /// Remove one stale remote subtree through the ordinary gateway namespace
     /// contract. This is used only when the current mount-local view proves the
     /// replayed rename source no longer exists, and therefore cannot delete a
     /// live local path or race another owner under the one-mount invariant.
     async fn remove_remote_subtree(&self, root: &str, operation_prefix: &str) -> Result<u64> {
+        let root_metadata = self.client.stat_attributes_versioned(root).await?;
+        let mut revision = self
+            .client
+            .observed_namespace_revision()
+            .max(root_metadata.revision);
+        let Some(root_metadata) = root_metadata.value else {
+            return Ok(revision);
+        };
+        if LocalKind::from_wire_kind(root_metadata.kind.as_str()) != Some(LocalKind::Directory) {
+            let publication = self
+                .client
+                .apply_namespace_batch(
+                    &[format!("{operation_prefix}:cleanup:0:0")],
+                    &[VfsNamespaceMutation::DeleteFile {
+                        path: root.to_string(),
+                        precondition: None,
+                    }],
+                    self.options.surface_kind.as_str(),
+                )
+                .await?;
+            return Ok(revision.max(publication.revision));
+        }
+
         let mut pending = vec![(root.to_string(), false)];
         let mut removals = Vec::new();
-        let mut revision = self.client.observed_namespace_revision();
         while let Some((path, visited)) = pending.pop() {
             if visited {
                 removals.push(VfsNamespaceMutation::RemoveDirectory { path });
@@ -1408,11 +1626,29 @@ impl<'a> RemoteSnapshots<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ABSENT_PRECONDITION, kind_intent_is_superseded, plan_runs};
-    use crate::fuse::local_view::types::{
-        LocalKind, MountEvent, MountMutation, MountPreImage, PayloadRef, PayloadStorage,
-        PublishBatch, PublishRun,
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    use axum::Json;
+    use axum::response::IntoResponse;
+    use chevalier_sandbox::vfs::{
+        CHEVALIER_VFS_LEASE_MODE_HEADER, CHEVALIER_VFS_LEASE_MODE_IMPLICIT,
+        CHEVALIER_VFS_NAMESPACE_REVISION_HEADER, VfsNamespaceMutation,
+        VfsNamespaceMutationBatchBody,
     };
+    use tokio::sync::Notify;
+
+    use super::{
+        ABSENT_PRECONDITION, AuthoritativePathSource, PublisherOptions, PublisherShared,
+        PublisherState, kind_intent_is_superseded, plan_runs,
+    };
+    use crate::fuse::client::RemoteVfsClient;
+    use crate::fuse::local_view::MountStateLayout;
+    use crate::fuse::local_view::types::{
+        LocalKind, MountEvent, MountMutation, MountPreImage, PayloadRef, PayloadSource,
+        PayloadStorage, PublishBatch, PublishRun,
+    };
+    use crate::fuse::local_view::wal::MountWal;
 
     fn event(sequence: u64, mutation: MountMutation, payload: Option<PayloadRef>) -> MountEvent {
         MountEvent {
@@ -1450,6 +1686,203 @@ mod tests {
             LocalKind::Symlink,
         ));
         assert!(kind_intent_is_superseded(None, LocalKind::Symlink));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_folded_creation_repair_uses_gateway_and_preserves_wal_order() {
+        type Requests = Arc<Mutex<Vec<VfsNamespaceMutationBatchBody>>>;
+
+        async fn gateway(
+            axum::extract::State(requests): axum::extract::State<Requests>,
+            request: axum::http::Request<axum::body::Body>,
+        ) -> axum::response::Response {
+            match request.uri().path() {
+                "/stat" => {
+                    let mut response = Json(serde_json::json!({
+                        "kind": "file",
+                        "size_bytes": 12,
+                        "file_id": "stale-file",
+                        "link_count": 1,
+                        "link_target": null,
+                        "content_hash": "stale-hash",
+                        "executable": false,
+                        "mode": 420,
+                        "updated_at": null
+                    }))
+                    .into_response();
+                    response.headers_mut().insert(
+                        CHEVALIER_VFS_NAMESPACE_REVISION_HEADER,
+                        axum::http::HeaderValue::from_static("6"),
+                    );
+                    response
+                }
+                "/lease" => {
+                    let mut response = Json(serde_json::json!({
+                        "resource_key": "implicit:test",
+                        "owner_token": uuid::Uuid::nil(),
+                        "task_id": null
+                    }))
+                    .into_response();
+                    response.headers_mut().insert(
+                        CHEVALIER_VFS_LEASE_MODE_HEADER,
+                        axum::http::HeaderValue::from_static(CHEVALIER_VFS_LEASE_MODE_IMPLICIT),
+                    );
+                    response
+                }
+                "/namespace-many" => {
+                    let body = axum::body::to_bytes(request.into_body(), 1 << 20)
+                        .await
+                        .expect("read namespace batch");
+                    requests.lock().unwrap().push(
+                        serde_json::from_slice(&body).expect("decode namespace batch request"),
+                    );
+                    let mut response = Json(serde_json::json!({ "entries": [] })).into_response();
+                    response.headers_mut().insert(
+                        CHEVALIER_VFS_NAMESPACE_REVISION_HEADER,
+                        axum::http::HeaderValue::from_static("7"),
+                    );
+                    response
+                }
+                "/write-many" => {
+                    let mut response = Json(serde_json::json!({
+                        "results": [],
+                        "entries": []
+                    }))
+                    .into_response();
+                    response.headers_mut().insert(
+                        CHEVALIER_VFS_NAMESPACE_REVISION_HEADER,
+                        axum::http::HeaderValue::from_static("8"),
+                    );
+                    response
+                }
+                _ => axum::http::StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gateway");
+        let endpoint = format!("http://{}", listener.local_addr().expect("gateway address"));
+        let requests: Requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new()
+                    .route("/{*path}", axum::routing::any(gateway))
+                    .with_state(server_requests),
+            )
+            .await
+            .expect("serve gateway");
+        });
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let wal = MountWal::open(&MountStateLayout::new(temp.path()), None).expect("open WAL");
+        let write = wal
+            .prepare(
+                MountMutation::ReplaceFile {
+                    path: ".progress.json.tmp-439242".to_string(),
+                    mode: 0o644,
+                    expected_file_id: None,
+                    base_content_hash: None,
+                },
+                PayloadSource::Bytes(b"new progress"),
+                MountPreImage::empty(),
+            )
+            .expect("prepare temporary write");
+        wal.commit(write.clone(), None)
+            .expect("commit temporary write");
+        let rename = wal
+            .prepare(
+                MountMutation::Rename {
+                    old_path: ".progress.json.tmp-439242".to_string(),
+                    new_path: "progress.json".to_string(),
+                    flags: 0,
+                },
+                PayloadSource::None,
+                MountPreImage::empty(),
+            )
+            .expect("prepare rename");
+        wal.commit(rename, None).expect("commit rename");
+        let wake = wal.notify_handle();
+        let publisher = PublisherShared {
+            client: RemoteVfsClient::new(&endpoint, "token", "scope").expect("VFS client"),
+            wal,
+            options: PublisherOptions::defaults("test")
+                .with_authoritative_paths(AuthoritativePathSource::new(|_| Ok(None))),
+            wake,
+            progress: Notify::new(),
+            stop: Notify::new(),
+            stopping: AtomicBool::new(false),
+            state: Mutex::new(PublisherState::default()),
+        };
+        let mut folded_write = write.event;
+        let MountMutation::ReplaceFile {
+            base_content_hash, ..
+        } = &mut folded_write.mutation
+        else {
+            panic!("write mutation changed kind");
+        };
+        *base_content_hash = Some(ABSENT_PRECONDITION.to_string());
+
+        assert_eq!(
+            publisher
+                .repair_stale_folded_creation(&folded_write)
+                .await
+                .expect("repair stale folded creation"),
+            Some(7)
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].mutations.len(), 1);
+        assert!(matches!(
+            &requests[0].mutations[0],
+            VfsNamespaceMutation::DeleteFile { path, precondition: None }
+                if path == "scope/.progress.json.tmp-439242"
+        ));
+        drop(requests);
+
+        let remove_directory = event(
+            3,
+            MountMutation::RemoveDirectory {
+                path: "stale-directory".to_string(),
+            },
+            None,
+        );
+        assert_eq!(
+            publisher
+                .repair_rejected_namespace(&remove_directory)
+                .await
+                .expect("repair rejected directory removal"),
+            Some(7)
+        );
+
+        let stale_overwrite = publisher
+            .wal
+            .prepare(
+                MountMutation::ReplaceFile {
+                    path: "current.txt".to_string(),
+                    mode: 0o644,
+                    expected_file_id: None,
+                    base_content_hash: Some("stale-base".to_string()),
+                },
+                PayloadSource::Bytes(b"authoritative bytes"),
+                MountPreImage::empty(),
+            )
+            .expect("prepare stale overwrite");
+        publisher
+            .wal
+            .commit(stale_overwrite.clone(), None)
+            .expect("commit stale overwrite");
+        assert_eq!(
+            publisher
+                .repair_rejected_content(&stale_overwrite.event)
+                .await
+                .expect("repair rejected content generation"),
+            Some(8)
+        );
+        assert_eq!(publisher.wal.acknowledged_sequence(), 0);
+        server.abort();
     }
 
     #[test]

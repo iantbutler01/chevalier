@@ -923,8 +923,8 @@ impl MountLocalView {
         health
     }
 
-    /// Wait until every committed event is remotely acknowledged, or the
-    /// deadline expires, or a permanently rejected event blocks the suffix.
+    /// Wait until every committed event is remotely acknowledged or the
+    /// deadline expires while background repair/retry preserves the suffix.
     ///
     /// Seals dirty content first, so a drain covers what the guest wrote rather
     /// than only what happened to be sealed already. Called by unmount, snapshot,

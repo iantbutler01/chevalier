@@ -784,9 +784,9 @@ impl StoragePressure {
     }
 }
 
-/// Publisher liveness as the mount reports it. A permanently rejected event
-/// blocks its own suffix forever and is surfaced here; it is never dead-lettered,
-/// because the local accepted view is authoritative.
+/// Publisher liveness as the mount reports it. A currently unrepaired event is
+/// surfaced here and remains durable; it is never dead-lettered, because the
+/// local accepted view is authoritative. Replica repair retries in place.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PublicationHealth {
     pub(crate) acknowledged_sequence: u64,
@@ -817,7 +817,8 @@ pub(crate) enum DrainOutcome {
         acknowledged_sequence: u64,
         pending_events: u64,
     },
-    /// A permanently rejected event blocks the suffix. Never silently dropped.
+    /// A rejected event has not yet been repaired before the lifecycle deadline.
+    /// It remains durable and the background reconciler continues retrying.
     Blocked {
         blocked_sequence: u64,
         reason: String,

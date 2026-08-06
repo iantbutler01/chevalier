@@ -39,8 +39,8 @@ use super::types::{
 };
 use super::{
     BACKING_FREE_FRACTION_FLOOR, LOG_TARGET_BYTES, MAX_RECORD_BYTES, MountStateLayout,
-    WAL_FORMAT_VERSION, WAL_HARD_LIMIT_BYTES, WAL_SOFT_LIMIT_BYTES, create_new, open_append,
-    read_json, sync_directory, write_json_atomic,
+    WAL_FORMAT_VERSION, WAL_SOFT_LIMIT_BYTES, create_new, open_append, read_json, sync_directory,
+    write_json_atomic,
 };
 
 /// Wakes the publisher the moment a commit makes new work publishable.
@@ -684,6 +684,47 @@ impl MountWal {
             .unwrap_or(0)
     }
 
+    /// Whether the first later committed gateway mutation that conflicts with
+    /// `event` removes its primary path.
+    ///
+    /// A folded `CreateFile` + `ReplaceFile` publishes as an absent-CAS write.
+    /// If an old remote temporary path survived a prior replay, that write is
+    /// rejected even when the accepted local history immediately renamed the
+    /// temporary path away. Rejection recovery may clean that stale remote path
+    /// only when this ordered WAL suffix proves the cleanup is not skipping a
+    /// live intermediate state. An unresolved sequence or any other conflicting
+    /// gateway mutation fails closed.
+    pub(crate) fn committed_successor_removes_primary_path(
+        &self,
+        event: &MountEvent,
+    ) -> Result<bool> {
+        let state = self.append_lock()?;
+        let event_keys = event.dependency_keys();
+        let path = event.mutation.primary_path();
+        let mut sequence = event.sequence.saturating_add(1);
+        while sequence < state.next_sequence {
+            if state.aborted.contains(&sequence) {
+                sequence = sequence.saturating_add(1);
+                continue;
+            }
+            let Some(record) = state.prepared.get(&sequence) else {
+                return Ok(false);
+            };
+            if !state.committed.contains(&sequence) {
+                return Ok(false);
+            }
+            let successor = &record.event;
+            if successor.mutation.is_local_only()
+                || !dependency_sets_conflict(&event_keys, &successor.dependency_keys())
+            {
+                sequence = sequence.saturating_add(1);
+                continue;
+            }
+            return Ok(mutation_removes_path(&successor.mutation, path));
+        }
+        Ok(false)
+    }
+
     /// Terminal records appended since the last checkpoint. The maintenance task
     /// compares it against `CHECKPOINT_EVENT_INTERVAL`; the time trigger is its
     /// own concern.
@@ -697,8 +738,8 @@ impl MountWal {
 
     /// The next contiguous committed prefix, bounded by event count and the
     /// bytes that a batched request materializes in memory. Stops at the first
-    /// sequence that is missing or still unresolved, which is how one
-    /// permanently failed event preserves and blocks its own WAL suffix.
+    /// sequence that is missing or still unresolved, preserving the ordered WAL
+    /// suffix until the background publisher repairs or retries that event.
     /// Aborted sequences inside the prefix advance `through_sequence` without
     /// producing an event.
     ///
@@ -1138,9 +1179,6 @@ impl MountWal {
         };
         let log_bytes = self.log_bytes().unwrap_or(0);
         let total = log_bytes.saturating_add(payload_bytes);
-        if total >= WAL_HARD_LIMIT_BYTES {
-            return StoragePressure::Hard;
-        }
         if let Some(free) = free_fraction(self.inner.layout.root()) {
             if free < BACKING_FREE_FRACTION_FLOOR {
                 return StoragePressure::Hard;
@@ -1804,6 +1842,15 @@ fn apply_committed_dirty_effect(dirty: &mut BTreeSet<String>, mutation: &MountMu
     }
 }
 
+fn mutation_removes_path(mutation: &MountMutation, path: &str) -> bool {
+    match mutation {
+        MountMutation::RemoveFile { path: removed, .. } => path == removed,
+        MountMutation::RemoveDirectory { path: removed } => is_at_or_below(path, removed),
+        MountMutation::Rename { old_path, .. } => is_at_or_below(path, old_path),
+        _ => false,
+    }
+}
+
 fn remove_subtree(dirty: &mut BTreeSet<String>, prefix: &str) {
     let matched: Vec<String> = dirty
         .iter()
@@ -2106,6 +2153,89 @@ mod tests {
                 .map(|event| event.sequence)
                 .collect::<Vec<_>>(),
             vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn folded_creation_repair_requires_first_conflicting_successor_to_remove_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let wal = open(temp.path());
+        let write = wal
+            .prepare(
+                MountMutation::ReplaceFile {
+                    path: ".progress.json.tmp-439242".to_string(),
+                    mode: 0o644,
+                    expected_file_id: None,
+                    base_content_hash: None,
+                },
+                PayloadSource::Bytes(b"new progress"),
+                MountPreImage::empty(),
+            )
+            .expect("prepare temporary write");
+        wal.commit(write.clone(), None)
+            .expect("commit temporary write");
+        let rename = wal
+            .prepare(
+                MountMutation::Rename {
+                    old_path: ".progress.json.tmp-439242".to_string(),
+                    new_path: "progress.json".to_string(),
+                    flags: 0,
+                },
+                PayloadSource::None,
+                MountPreImage::empty(),
+            )
+            .expect("prepare rename");
+        wal.commit(rename, None).expect("commit rename");
+
+        assert!(
+            wal.committed_successor_removes_primary_path(&write.event)
+                .expect("inspect committed suffix")
+        );
+    }
+
+    #[test]
+    fn folded_creation_repair_fails_closed_on_intervening_conflict() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let wal = open(temp.path());
+        let write = wal
+            .prepare(
+                MountMutation::ReplaceFile {
+                    path: "temporary".to_string(),
+                    mode: 0o644,
+                    expected_file_id: None,
+                    base_content_hash: None,
+                },
+                PayloadSource::Bytes(b"first"),
+                MountPreImage::empty(),
+            )
+            .expect("prepare first write");
+        wal.commit(write.clone(), None).expect("commit first write");
+        let chmod = wal
+            .prepare(
+                MountMutation::SetMode {
+                    path: "temporary".to_string(),
+                    mode: 0o600,
+                },
+                PayloadSource::None,
+                MountPreImage::empty(),
+            )
+            .expect("prepare intervening mode");
+        wal.commit(chmod, None).expect("commit intervening mode");
+        let remove = wal
+            .prepare(
+                MountMutation::RemoveFile {
+                    path: "temporary".to_string(),
+                    expected_file_id: None,
+                },
+                PayloadSource::None,
+                MountPreImage::empty(),
+            )
+            .expect("prepare removal");
+        wal.commit(remove, None).expect("commit removal");
+
+        assert!(
+            !wal.committed_successor_removes_primary_path(&write.event)
+                .expect("inspect committed suffix")
         );
     }
 
