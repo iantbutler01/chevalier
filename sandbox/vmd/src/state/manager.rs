@@ -3082,6 +3082,11 @@ impl Manager {
         vm: Arc<Vm>,
         id: String,
     ) -> ManagerResult<VmMetadata> {
+        // VMD is the shared authority for every client that can wake a VM. Keep
+        // the whole launch attempt single-flight so VM-id-scoped cleanup from a
+        // failed attempt cannot remove the winning attempt's sidecars or proxy
+        // listener. A queued caller rechecks state below after the winner exits.
+        let _launch = vm.lock_launch().await;
         let id = id.as_str();
 
         let (
@@ -6409,6 +6414,36 @@ mod tests {
             .await
             .expect("queued preparation should acquire the released lock")
             .expect("queued preparation task should succeed");
+    }
+
+    #[tokio::test]
+    async fn vm_launch_lock_serializes_same_vm_attempts() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let vm_id = "single-flight-vm";
+        let vm_dir = tmp.path().join(vm_id);
+        fs::create_dir_all(&vm_dir).expect("create VM directory");
+        let vm = Arc::new(Vm::new(
+            qemu_test_metadata(vm_id),
+            VmRuntime::new(&vm_dir),
+            vm_dir,
+        ));
+
+        let first = vm.lock_launch().await;
+        let waiting_vm = Arc::clone(&vm);
+        let waiting = tokio::spawn(async move {
+            let _launch = waiting_vm.lock_launch().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !waiting.is_finished(),
+            "a second launch for the same VM must wait for the active attempt"
+        );
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("queued launch should acquire the released VM lock")
+            .expect("queued launch task should succeed");
     }
 
     fn qemu_img_available() -> bool {

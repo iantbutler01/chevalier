@@ -242,6 +242,7 @@ pub struct VmInner {
 #[derive(Debug)]
 pub struct Vm {
     inner: Arc<tokio::sync::Mutex<VmInner>>,
+    launch: tokio::sync::Mutex<()>,
     pub dir: PathBuf,
 }
 
@@ -249,8 +250,18 @@ impl Vm {
     pub fn new(metadata: VmMetadata, runtime: VmRuntime, dir: PathBuf) -> Self {
         Self {
             inner: Arc::new(tokio::sync::Mutex::new(VmInner { metadata, runtime })),
+            launch: tokio::sync::Mutex::new(()),
             dir,
         }
+    }
+
+    /// Serializes the complete launch lifecycle for this VM.
+    ///
+    /// Launch allocates VM-scoped sidecars and network policy that cleanup also
+    /// addresses by VM id. Allowing two launch attempts to overlap lets a losing
+    /// attempt unregister resources owned by the winner.
+    pub async fn lock_launch(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.launch.lock().await
     }
 
     pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, VmInner> {
