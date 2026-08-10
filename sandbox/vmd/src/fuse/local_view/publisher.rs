@@ -662,13 +662,17 @@ impl PublisherShared {
         // the LIFO stack never changes namespace order.
         let mut pending = vec![(events, Some(reason))];
         let mut revision = initial_revision;
+        let mut remote_symlink_ancestors = Vec::new();
         while let Some((mut events, rejection)) = pending.pop() {
             if let Some(reason) = rejection {
                 if events.len() == 1 {
                     let event = &events[0];
                     let mut snapshots = RemoteSnapshots::new(&self.client);
                     snapshots.observe_revision(revision);
-                    match self.event_landed(event, &mut snapshots).await {
+                    match self
+                        .event_landed(event, &mut snapshots, &mut remote_symlink_ancestors)
+                        .await
+                    {
                         Ok(true) => {
                             revision = revision.max(snapshots.revision());
                         }
@@ -915,6 +919,7 @@ impl PublisherShared {
         // reconciled. `None` means it is an isolated subgroup ready to retry.
         let mut pending = vec![(events, Some(reason))];
         let mut revision = initial_revision;
+        let mut remote_symlink_ancestors = Vec::new();
         while let Some((events, rejection)) = pending.pop() {
             let Some(reason) = rejection else {
                 let request = ContentRequest {
@@ -957,7 +962,10 @@ impl PublisherShared {
             let attempted_len = events.len();
             let mut unlanded = Vec::new();
             for event in events {
-                match self.event_landed(&event, &mut snapshots).await {
+                match self
+                    .event_landed(&event, &mut snapshots, &mut remote_symlink_ancestors)
+                    .await
+                {
                     Ok(true) => {}
                     Ok(false) => unlanded.push(event),
                     Err(read_error) => {
@@ -1103,6 +1111,7 @@ impl PublisherShared {
         &self,
         event: &MountEvent,
         snapshots: &mut RemoteSnapshots<'_>,
+        remote_symlink_ancestors: &mut Vec<String>,
     ) -> Result<bool> {
         match &event.mutation {
             MountMutation::CreateDirectory { path, mode } => {
@@ -1192,7 +1201,29 @@ impl PublisherShared {
                 Ok(false)
             }
             MountMutation::RemoveFile { path, .. } | MountMutation::RemoveDirectory { path } => {
-                Ok(snapshots.get(path).await?.is_none())
+                if remote_symlink_ancestors
+                    .iter()
+                    .any(|ancestor| path_is_beneath(path, ancestor))
+                {
+                    return Ok(true);
+                }
+                match snapshots.get(path).await {
+                    Ok(metadata) => Ok(metadata.is_none()),
+                    Err(error) if is_remote_symlink_ancestor_error(&error) => {
+                        // Point stat deliberately refuses to traverse a symlink
+                        // ancestor. In that case this descendant cannot exist in
+                        // the gateway namespace, so a retained delete has already
+                        // reached its intended state. Keeping it at the WAL head
+                        // would permanently block every later accepted mutation.
+                        if let Some(ancestor) = self.authoritative_symlink_ancestor(path)?
+                            && !remote_symlink_ancestors.contains(&ancestor)
+                        {
+                            remote_symlink_ancestors.push(ancestor);
+                        }
+                        Ok(true)
+                    }
+                    Err(error) => Err(error),
+                }
             }
             MountMutation::SetMode { path, mode } => {
                 let Some(metadata) = snapshots.get(path).await? else {
@@ -1217,6 +1248,20 @@ impl PublisherShared {
             return Ok(false);
         };
         Ok(kind_intent_is_superseded(source.kind(path)?, intended))
+    }
+
+    fn authoritative_symlink_ancestor(&self, path: &str) -> Result<Option<String>> {
+        let Some(source) = self.options.authoritative_paths.as_ref() else {
+            return Ok(None);
+        };
+        let mut descendant = path;
+        while let Some((ancestor, _)) = descendant.rsplit_once('/') {
+            if source.kind(ancestor)? == Some(LocalKind::Symlink) {
+                return Ok(Some(ancestor.to_string()));
+            }
+            descendant = ancestor;
+        }
+        Ok(None)
     }
 
     /// Repair a stale remote temporary path that blocks replay of a folded
@@ -1547,6 +1592,16 @@ fn is_kind(metadata: &RemoteMetadata, kind: LocalKind) -> bool {
     LocalKind::from_wire_kind(metadata.kind.as_str()) == Some(kind)
 }
 
+fn is_remote_symlink_ancestor_error(error: &anyhow::Error) -> bool {
+    let detail = format!("{error:#}");
+    detail.contains("400 Bad Request") && detail.contains("unsupported file type: symlink")
+}
+
+fn path_is_beneath(path: &str, ancestor: &str) -> bool {
+    path.strip_prefix(ancestor)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 fn kind_intent_is_superseded(current: Option<LocalKind>, intended: LocalKind) -> bool {
     current.is_none_or(|kind| kind != intended)
 }
@@ -1640,7 +1695,7 @@ mod tests {
 
     use super::{
         ABSENT_PRECONDITION, AuthoritativePathSource, PublisherOptions, PublisherShared,
-        PublisherState, kind_intent_is_superseded, plan_runs,
+        PublisherState, RemoteSnapshots, kind_intent_is_superseded, plan_runs,
     };
     use crate::fuse::client::RemoteVfsClient;
     use crate::fuse::local_view::MountStateLayout;
@@ -1686,6 +1741,83 @@ mod tests {
             LocalKind::Symlink,
         ));
         assert!(kind_intent_is_superseded(None, LocalKind::Symlink));
+    }
+
+    #[tokio::test]
+    async fn delete_beneath_remote_symlink_is_already_landed() {
+        async fn gateway() -> axum::response::Response {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                "VFS: [VFS_BAD_REQUEST status=400] bad request: unsupported file type: symlink",
+            )
+                .into_response()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gateway");
+        let endpoint = format!("http://{}", listener.local_addr().expect("gateway address"));
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route("/{*path}", axum::routing::any(gateway)),
+            )
+            .await
+            .expect("serve gateway");
+        });
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let wal = MountWal::open(&MountStateLayout::new(temp.path()), None).expect("open WAL");
+        let publisher = PublisherShared {
+            client: RemoteVfsClient::new(&endpoint, "token", "scope").expect("VFS client"),
+            wal,
+            options: PublisherOptions::defaults("test").with_authoritative_paths(
+                AuthoritativePathSource::new(|path| {
+                    Ok((path == "link").then_some(LocalKind::Symlink))
+                }),
+            ),
+            wake: Arc::new(Notify::new()),
+            progress: Notify::new(),
+            stop: Notify::new(),
+            stopping: AtomicBool::new(false),
+            state: Mutex::new(PublisherState::default()),
+        };
+        let removed = event(
+            1,
+            MountMutation::RemoveFile {
+                path: "link/descendant.json".to_string(),
+                expected_file_id: None,
+            },
+            None,
+        );
+        let mut snapshots = RemoteSnapshots::new(&publisher.client);
+        let mut remote_symlink_ancestors = Vec::new();
+
+        assert!(
+            publisher
+                .event_landed(&removed, &mut snapshots, &mut remote_symlink_ancestors,)
+                .await
+                .expect("symlink-hidden delete is complete")
+        );
+        assert_eq!(remote_symlink_ancestors, ["link"]);
+
+        server.abort();
+        let _ = server.await;
+
+        let sibling = event(
+            2,
+            MountMutation::RemoveFile {
+                path: "link/sibling.json".to_string(),
+                expected_file_id: None,
+            },
+            None,
+        );
+        assert!(
+            publisher
+                .event_landed(&sibling, &mut snapshots, &mut remote_symlink_ancestors,)
+                .await
+                .expect("known symlink ancestor avoids another gateway read")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

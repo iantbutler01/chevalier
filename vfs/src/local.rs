@@ -1817,6 +1817,14 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                                 create_symlink_impl(&storage, path.as_str(), target.as_str())?
                             }
                         }
+                        // Earlier mutations in this same replayable batch may have
+                        // created files beneath a temporary directory at this path,
+                        // then removed that directory before replacing it with the
+                        // symlink. Those file mutations retain directory barriers for
+                        // the former subtree. A symlink is never a directory barrier;
+                        // syncing the stale entry after the batch has converged would
+                        // turn a successful namespace transition into a permanent 500.
+                        remove_touched_directory_subtree(&mut touched_directories, &abs_path);
                         if let Some(parent) = abs_path.parent() {
                             collect_directory_chain(
                                 &storage.root,
@@ -2786,6 +2794,10 @@ fn remap_touched_directories_after_rename(
         touched.remove(&source_path);
         touched.insert(destination_path);
     }
+}
+
+fn remove_touched_directory_subtree(touched: &mut HashSet<PathBuf>, root: &Path) {
+    touched.retain(|path| !path.starts_with(root));
 }
 
 fn sync_directories_deepest_first(
@@ -4639,6 +4651,43 @@ mod tests {
         assert_eq!(
             fs::read_link(dir.path().join("links/value")).expect("link"),
             PathBuf::from("missing"),
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_namespace_batch_replaces_temporary_directory_with_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = LocalVfsStorage::new(dir.path());
+
+        storage
+            .apply_namespace_batch(vec![
+                VfsStorageNamespaceMutation::CreateDirectory {
+                    path: "src/package".to_string(),
+                    mode: Some(0o755),
+                },
+                VfsStorageNamespaceMutation::CreateFile {
+                    path: "src/package/.probe".to_string(),
+                    mode: Some(0o644),
+                },
+                VfsStorageNamespaceMutation::DeleteFile {
+                    path: "src/package/.probe".to_string(),
+                    precondition: None,
+                },
+                VfsStorageNamespaceMutation::RemoveDirectory {
+                    path: "src/package".to_string(),
+                },
+                VfsStorageNamespaceMutation::CreateSymlink {
+                    path: "src/package".to_string(),
+                    target: "/opt/package".to_string(),
+                },
+            ])
+            .await
+            .expect("temporary directory to symlink batch");
+
+        assert_eq!(
+            fs::read_link(dir.path().join("src/package")).expect("package symlink"),
+            PathBuf::from("/opt/package"),
         );
     }
 
