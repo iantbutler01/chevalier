@@ -187,6 +187,16 @@ pub struct VfsStorageWritePrecondition {
     /// following a renamed or replaced pathname onto another identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_file_id: Option<String>,
+    /// Version-identity CAS for index-authoritative backends: the id of the
+    /// entry's current committed version at the time the writer observed it.
+    /// When set, the index commit enforces it in place of a content
+    /// predicate (content hashes are derived state in an index-authoritative
+    /// store and may lag or drift; the version chain is transactionally
+    /// owned by the commit path and survives compaction). Backends without a
+    /// version index (local filesystem) ignore this field; callers there use
+    /// `predicate` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_current_version: Option<String>,
 }
 
 impl VfsStorageWritePrecondition {

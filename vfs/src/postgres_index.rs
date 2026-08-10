@@ -940,6 +940,7 @@ impl VfsManifestIndex for PostgresVfsManifestIndex {
         logical_path: &str,
         content_predicate: Option<&VfsStorageCasPredicate>,
         expected_file_id: Option<&str>,
+        expected_current_version: Option<&str>,
     ) -> VfsStorageResult<Option<VfsIndexEntryWithManifest>> {
         let snapshot = self.get_entry_with_manifest(scope, logical_path).await?;
         let content_matches = match content_predicate {
@@ -956,6 +957,19 @@ impl VfsManifestIndex for PostgresVfsManifestIndex {
             return Err(VfsStorageError::Conflict(format!(
                 "vfs content precondition failed for {logical_path}"
             )));
+        }
+        if let Some(expected) = expected_current_version {
+            // "none" asserts the entry has no committed version (mirrors the
+            // version-identity encoding used by index-authoritative callers).
+            let expected = (expected != "none").then_some(expected);
+            let current = snapshot
+                .as_ref()
+                .and_then(|entry| entry.entry.current_version.as_deref());
+            if current != expected {
+                return Err(VfsStorageError::Conflict(format!(
+                    "vfs version precondition failed for {logical_path}"
+                )));
+            }
         }
         if expected_file_id.is_some()
             && snapshot
@@ -1054,6 +1068,7 @@ impl VfsManifestIndex for PostgresVfsManifestIndex {
         to_logical_path: &str,
         to_parent_logical_path: &str,
         to_entry_name: &str,
+        allow_replace: bool,
     ) -> VfsStorageResult<(VfsIndexEntryWithManifest, VfsIndexEntryWithManifest)> {
         let source_snapshot = self
             .get_entry_with_manifest(scope, from_logical_path)
@@ -1122,6 +1137,11 @@ impl VfsManifestIndex for PostgresVfsManifestIndex {
             tx.commit().await.map_err(internal)?;
             let current = destination.expect("same identity destination exists");
             return Ok((previous, current));
+        }
+        if !allow_replace && destination.is_some() {
+            return Err(VfsStorageError::Conflict(format!(
+                "vfs destination already exists: {to_logical_path}"
+            )));
         }
         let replaced_pack_keys = sqlx::query_scalar::<_, String>(
             "SELECT DISTINCT pack_key FROM chevalier_vfs_file_manifests WHERE scope_key = $1 AND logical_path = $2",

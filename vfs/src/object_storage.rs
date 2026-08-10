@@ -83,6 +83,51 @@ struct CachedObjectFile {
 }
 
 impl ObjectBackedVfsStorage {
+    /// Rename with an explicit replace policy. `allow_replace: false` restores
+    /// no-clobber semantics for index-authoritative callers (an existing
+    /// destination refuses with Conflict); `true` is POSIX rename(2) clobber,
+    /// which the `OptimizedVfsStorage::rename_with_metadata` trait method uses
+    /// unconditionally because gateway/guest replay requires it.
+    pub async fn rename_with_metadata_with_policy(
+        &self,
+        from: &str,
+        to: &str,
+        allow_replace: bool,
+    ) -> VfsStorageResult<VfsStorageRenameResult> {
+        let Some(source) = self
+            .index
+            .get_entry_with_manifest(&self.cfg.scope, from)
+            .await?
+        else {
+            return Err(VfsStorageError::NotFound(from.to_string()));
+        };
+        if source.entry.kind != VfsStorageEntryKind::File {
+            return Err(VfsStorageError::BadRequest(format!(
+                "vfs path {from} is not a file"
+            )));
+        }
+        let (to_parent_logical_path, to_entry_name) = Self::path_parts(to);
+        self.create_dir_all_metadata(&to_parent_logical_path)
+            .await?;
+        let (previous, current) = self
+            .index
+            .rename_file_entry(
+                &self.cfg.scope,
+                from,
+                to,
+                &to_parent_logical_path,
+                &to_entry_name,
+                allow_replace,
+            )
+            .await?;
+        self.invalidate_file_bytes(from);
+        self.invalidate_file_bytes(to);
+        Ok(VfsStorageRenameResult {
+            previous: Some(previous.into_storage_metadata()),
+            current: Some(current.into_storage_metadata()),
+        })
+    }
+
     pub fn new(
         cfg: ObjectBackedVfsStorageConfig,
         store: Arc<dyn ObjectStoreClient>,
@@ -613,6 +658,7 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
                             fingerprint: None,
                             secondary_fingerprint: None,
                             expected_file_id: Some(expected_file_id.clone()),
+                            expected_current_version: None,
                         }
                     });
                     writes.push(alias_write);
@@ -717,6 +763,19 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
                             .as_ref()
                             .and_then(VfsStorageWritePrecondition::effective_predicate)
                             .or_else(|| {
+                                // A version-identity precondition supersedes the
+                                // synthesized content predicate: the index enforces
+                                // `expected_current_version` only when no content
+                                // predicate is present, and synthesizing one here
+                                // would silently disable the version check the
+                                // caller asked for.
+                                if write
+                                    .precondition
+                                    .as_ref()
+                                    .is_some_and(|p| p.expected_current_version.is_some())
+                                {
+                                    return None;
+                                }
                                 Some(
                                     match previous
                                         .get(&write.path)
@@ -731,7 +790,10 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
                                     },
                                 )
                             }),
-                        expected_current_version: None,
+                        expected_current_version: write
+                            .precondition
+                            .as_ref()
+                            .and_then(|p| p.expected_current_version.clone()),
                     }
                 })
                 .collect(),
@@ -816,6 +878,9 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
         let expected_file_id = precondition
             .as_ref()
             .and_then(|precondition| precondition.expected_file_id.as_deref());
+        let expected_current_version = precondition
+            .as_ref()
+            .and_then(|precondition| precondition.expected_current_version.as_deref());
         let previous = self
             .index
             .delete_file_entry_with_precondition(
@@ -823,6 +888,7 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
                 path,
                 content_predicate.as_ref(),
                 expected_file_id,
+                expected_current_version,
             )
             .await?
             .map(VfsIndexEntryWithManifest::into_storage_metadata);
@@ -841,37 +907,11 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
         from: &str,
         to: &str,
     ) -> VfsStorageResult<VfsStorageRenameResult> {
-        let Some(source) = self
-            .index
-            .get_entry_with_manifest(&self.cfg.scope, from)
-            .await?
-        else {
-            return Err(VfsStorageError::NotFound(from.to_string()));
-        };
-        if source.entry.kind != VfsStorageEntryKind::File {
-            return Err(VfsStorageError::BadRequest(format!(
-                "vfs path {from} is not a file"
-            )));
-        }
-        let (to_parent_logical_path, to_entry_name) = Self::path_parts(to);
-        self.create_dir_all_metadata(&to_parent_logical_path)
-            .await?;
-        let (previous, current) = self
-            .index
-            .rename_file_entry(
-                &self.cfg.scope,
-                from,
-                to,
-                &to_parent_logical_path,
-                &to_entry_name,
-            )
-            .await?;
-        self.invalidate_file_bytes(from);
-        self.invalidate_file_bytes(to);
-        Ok(VfsStorageRenameResult {
-            previous: Some(previous.into_storage_metadata()),
-            current: Some(current.into_storage_metadata()),
-        })
+        // The storage trait keeps POSIX rename(2) clobber semantics: gateway
+        // and guest namespace replay contractually require a replacing rename.
+        // Index-authoritative product callers that want the pre-clobber
+        // refusal use `rename_with_metadata_with_policy` directly.
+        self.rename_with_metadata_with_policy(from, to, true).await
     }
 
     async fn create_hard_link(
@@ -1488,6 +1528,7 @@ mod tests {
             logical_path: &str,
             content_predicate: Option<&VfsStorageCasPredicate>,
             expected_file_id: Option<&str>,
+            expected_current_version: Option<&str>,
         ) -> VfsStorageResult<Option<VfsIndexEntryWithManifest>> {
             let mut guard = self.inner.lock().unwrap();
             let current = guard.entries.get(logical_path);
@@ -1502,6 +1543,16 @@ mod tests {
                 return Err(VfsStorageError::Conflict(format!(
                     "identity conflict for {logical_path}"
                 )));
+            }
+            if let Some(expected) = expected_current_version {
+                let expected = (expected != "none").then_some(expected);
+                let current_version =
+                    current.and_then(|entry| entry.entry.current_version.as_deref());
+                if current_version != expected {
+                    return Err(VfsStorageError::Conflict(format!(
+                        "version conflict for {logical_path}"
+                    )));
+                }
             }
             let content_matches = match content_predicate {
                 None => true,
@@ -1570,6 +1621,7 @@ mod tests {
             to_logical_path: &str,
             to_parent_logical_path: &str,
             to_entry_name: &str,
+            allow_replace: bool,
         ) -> VfsStorageResult<(VfsIndexEntryWithManifest, VfsIndexEntryWithManifest)> {
             let mut guard = self.inner.lock().unwrap();
             if from_logical_path == to_logical_path {
@@ -1603,6 +1655,11 @@ mod tests {
                     && previous.entry.file_id == destination.entry.file_id
                 {
                     return Ok((previous, destination));
+                }
+                if !allow_replace {
+                    return Err(VfsStorageError::Conflict(format!(
+                        "vfs destination already exists: {to_logical_path}"
+                    )));
                 }
             }
             let replaced_identity = guard.entries.remove(to_logical_path).and_then(|entry| {

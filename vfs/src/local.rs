@@ -650,6 +650,9 @@ impl LocalVfsStorage {
             fingerprint: Some(fingerprint),
             secondary_fingerprint: None,
             expected_file_id: None,
+            // Local storage is disk-authoritative: content fingerprints hash
+            // the actual bytes, so version-identity CAS does not apply here.
+            expected_current_version: None,
         })
     }
 
@@ -3818,6 +3821,7 @@ mod tests {
             fingerprint: Some(hex_hash(b"old")),
             secondary_fingerprint: None,
             expected_file_id: None,
+            expected_current_version: None,
         };
 
         let first = storage
@@ -3922,6 +3926,7 @@ mod tests {
             fingerprint: None,
             secondary_fingerprint: None,
             expected_file_id: None,
+            expected_current_version: None,
         };
 
         let first = storage
@@ -4013,6 +4018,7 @@ mod tests {
             fingerprint: Some(hex_hash(b"old")),
             secondary_fingerprint: None,
             expected_file_id: None,
+            expected_current_version: None,
         };
 
         let replaced = storage
@@ -4055,6 +4061,7 @@ mod tests {
                         fingerprint: Some(hex_hash(b"old")),
                         secondary_fingerprint: None,
                         expected_file_id: None,
+                        expected_current_version: None,
                     }),
                 },
                 VfsStorageWrite {
@@ -4067,6 +4074,7 @@ mod tests {
                         fingerprint: None,
                         secondary_fingerprint: None,
                         expected_file_id: None,
+                        expected_current_version: None,
                     }),
                 },
             ])
@@ -4159,6 +4167,7 @@ mod tests {
             fingerprint: Some(hex_hash(b"old")),
             secondary_fingerprint: None,
             expected_file_id: None,
+            expected_current_version: None,
         };
 
         assert!(
@@ -4357,6 +4366,7 @@ mod tests {
             fingerprint: Some(hex_hash(b"value")),
             secondary_fingerprint: None,
             expected_file_id: None,
+            expected_current_version: None,
         };
         let first = storage
             .delete_file_with_metadata("nested/value", Some(precondition.clone()))
@@ -4524,6 +4534,7 @@ mod tests {
                 fingerprint: Some(hex_hash(b"value")),
                 secondary_fingerprint: None,
                 expected_file_id: None,
+                expected_current_version: None,
             }),
         };
 
@@ -5235,6 +5246,7 @@ mod tests {
                         fingerprint: Some(hash_a.clone()),
                         secondary_fingerprint: None,
                         expected_file_id: None,
+                        expected_current_version: None,
                     }),
                 },
                 VfsStorageNamespaceMutation::DeleteFile {
@@ -5244,6 +5256,7 @@ mod tests {
                         fingerprint: Some("stale".to_string()),
                         secondary_fingerprint: None,
                         expected_file_id: None,
+                        expected_current_version: None,
                     }),
                 },
             ])
@@ -5261,6 +5274,7 @@ mod tests {
                         fingerprint: Some(hash_a),
                         secondary_fingerprint: None,
                         expected_file_id: None,
+                        expected_current_version: None,
                     }),
                 },
                 VfsStorageNamespaceMutation::DeleteFile {
@@ -5270,6 +5284,7 @@ mod tests {
                         fingerprint: Some(hex_hash(b"b")),
                         secondary_fingerprint: None,
                         expected_file_id: None,
+                        expected_current_version: None,
                     }),
                 },
             ])
@@ -5612,6 +5627,7 @@ mod tests {
                     fingerprint: Some("symlink:stale".to_string()),
                     secondary_fingerprint: None,
                     expected_file_id: None,
+                    expected_current_version: None,
                 }),
             )
             .await;
@@ -5626,6 +5642,7 @@ mod tests {
                     fingerprint: Some(expected),
                     secondary_fingerprint: None,
                     expected_file_id: None,
+                    expected_current_version: None,
                 }),
             )
             .await
@@ -5890,6 +5907,7 @@ mod tests {
             fingerprint: Some(first.content_hash),
             secondary_fingerprint: None,
             expected_file_id: Some(file_id),
+            expected_current_version: None,
         };
         storage
             .write_with_options(
@@ -5934,6 +5952,7 @@ mod tests {
                     fingerprint: None,
                     secondary_fingerprint: None,
                     expected_file_id: None,
+                    expected_current_version: None,
                 }),
                 Some(VfsStorageWriteOptions {
                     executable: true,
@@ -5967,6 +5986,7 @@ mod tests {
                     fingerprint: None,
                     secondary_fingerprint: None,
                     expected_file_id: None,
+                    expected_current_version: None,
                 }),
                 Some(VfsStorageWriteOptions {
                     executable: false,
@@ -5993,6 +6013,7 @@ mod tests {
                     fingerprint: None,
                     secondary_fingerprint: None,
                     expected_file_id: Some(file_id.clone()),
+                    expected_current_version: None,
                 }),
             )
             .await
@@ -6578,6 +6599,7 @@ mod tests {
             fingerprint: Some(first.content_hash),
             secondary_fingerprint: None,
             expected_file_id: None,
+            expected_current_version: None,
         };
         storage
             .write("guarded.txt", Bytes::from_static(b"second"), None)
@@ -6619,6 +6641,7 @@ mod tests {
                     fingerprint: None,
                     secondary_fingerprint: None,
                     expected_file_id: Some(file_id.clone()),
+                    expected_current_version: None,
                 }),
             )
             .await
@@ -6632,6 +6655,7 @@ mod tests {
                     fingerprint: None,
                     secondary_fingerprint: None,
                     expected_file_id: Some("unix:0:0".to_string()),
+                    expected_current_version: None,
                 }),
             )
             .await;
@@ -6651,6 +6675,7 @@ mod tests {
                     fingerprint: Some(current_hash),
                     secondary_fingerprint: None,
                     expected_file_id: Some(file_id),
+                    expected_current_version: None,
                 }),
             )
             .await
@@ -6694,6 +6719,7 @@ mod tests {
                     fingerprint: Some(hex_hash(b"old")),
                     secondary_fingerprint: None,
                     expected_file_id: Some(expected_file_id),
+                    expected_current_version: None,
                 }),
             )
             .await;
@@ -6730,6 +6756,7 @@ mod tests {
                     fingerprint: Some(hex_hash(b"old")),
                     secondary_fingerprint: None,
                     expected_file_id: Some("unix:0:0".to_string()),
+                    expected_current_version: None,
                 }),
             )
             .await;
@@ -6754,6 +6781,7 @@ mod tests {
                         fingerprint: None,
                         secondary_fingerprint: None,
                         expected_file_id: None,
+                        expected_current_version: None,
                     }),
                     Some(VfsStorageWriteOptions {
                         executable: false,
@@ -6809,6 +6837,7 @@ mod tests {
                     fingerprint: Some(original.content_hash.clone()),
                     secondary_fingerprint: None,
                     expected_file_id: None,
+                    expected_current_version: None,
                 }),
                 None,
             )
@@ -6851,6 +6880,7 @@ mod tests {
                     fingerprint: Some(original.content_hash),
                     secondary_fingerprint: None,
                     expected_file_id: None,
+                    expected_current_version: None,
                 }),
                 Some(VfsStorageWriteOptions {
                     executable: false,
@@ -6876,6 +6906,7 @@ mod tests {
                     fingerprint: Some(result.content_hash),
                     secondary_fingerprint: None,
                     expected_file_id: None,
+                    expected_current_version: None,
                 }),
                 None,
             )
@@ -6901,6 +6932,7 @@ mod tests {
             fingerprint: Some(first.content_hash),
             secondary_fingerprint: None,
             expected_file_id: None,
+            expected_current_version: None,
         };
         let barrier = Arc::new(Barrier::new(2));
         let left_storage = storage.clone();
@@ -7330,6 +7362,7 @@ mod tests {
             fingerprint: Some(initial.content_hash),
             secondary_fingerprint: None,
             expected_file_id: None,
+            expected_current_version: None,
         };
         let left = {
             let storage = storage.clone();

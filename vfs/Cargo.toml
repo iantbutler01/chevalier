@@ -7,6 +7,7 @@ description = "Optimized VFS storage primitives and interfaces for Chevalier"
 
 [dependencies]
 async-trait = "0.1.89"
+base64 = "0.22.1"
 bytes = { version = "1.10.1", features = ["serde"] }
 chrono = { version = "0.4.42", features = ["serde"] }
 futures = "0.3"

@@ -2,6 +2,7 @@
 // @dive-rel: Lets remote consumers use the same `OptimizedVfsStorage` read surface while
 // @dive-rel: the HTTP/FUSE gateway protocol remains owned by chevalier-sandbox.
 
+use base64::Engine as _;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
@@ -686,7 +687,7 @@ impl OptimizedVfsStorage for GatewayVfsStorage {
                 .into_iter()
                 .map(|write| WriteManyItem {
                     path: self.path_arg(&write.path),
-                    body: write.bytes.to_vec(),
+                    body_base64: base64::engine::general_purpose::STANDARD.encode(&write.bytes),
                     precondition: write.precondition.map(WritePrecondition::from),
                 })
                 .collect(),
@@ -1237,7 +1238,7 @@ struct WriteManyBody {
 #[derive(Serialize)]
 struct WriteManyItem {
     path: String,
-    body: Vec<u8>,
+    body_base64: String,
     precondition: Option<WritePrecondition>,
 }
 
@@ -2132,6 +2133,7 @@ mod tests {
         let changed_body = Bytes::from_static(b"new");
         let unchanged_hash = hex_hash(&unchanged_body);
         let changed_hash = hex_hash(&changed_body);
+        let changed_body_base64 = base64::engine::general_purpose::STANDARD.encode(&changed_body);
         let (endpoint, requests) = serve_sequence(vec![
             format!(
                 r#"{{"entries":[{{"kind":"file","size_bytes":4,"content_hash":"{unchanged_hash}","updated_at":null}},null]}}"#
@@ -2194,6 +2196,13 @@ mod tests {
         assert_eq!(write_request.target, "/write-many");
         assert!(!write_request.body.contains("a.txt"));
         assert!(write_request.body.contains(r#""path":"scope/b.txt""#));
+        let write_body: serde_json::Value =
+            serde_json::from_str(&write_request.body).expect("write-many request JSON");
+        assert_eq!(
+            write_body["writes"][0]["body_base64"].as_str(),
+            Some(changed_body_base64.as_str()),
+        );
+        assert!(write_body["writes"][0].get("body").is_none());
         assert!(
             write_request.body.contains(
                 r#""predicate":{"kind":"content_fingerprint","fingerprint":"version-b"}"#

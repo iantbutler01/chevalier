@@ -248,8 +248,12 @@ pub trait VfsManifestIndex: Send + Sync {
         logical_path: &str,
         content_predicate: Option<&VfsStorageCasPredicate>,
         expected_file_id: Option<&str>,
+        expected_current_version: Option<&str>,
     ) -> VfsStorageResult<Option<VfsIndexEntryWithManifest>> {
-        if content_predicate.is_some() || expected_file_id.is_some() {
+        if content_predicate.is_some()
+            || expected_file_id.is_some()
+            || expected_current_version.is_some()
+        {
             return Err(VfsStorageError::BadRequest(
                 "manifest index does not support typed delete preconditions".to_string(),
             ));
@@ -263,6 +267,10 @@ pub trait VfsManifestIndex: Send + Sync {
         logical_path: &str,
     ) -> VfsStorageResult<()>;
 
+    /// `allow_replace: true` gives POSIX rename(2) clobber semantics (an
+    /// existing destination is replaced); `false` refuses an existing
+    /// destination with a Conflict, except for the POSIX same-identity no-op
+    /// (renaming one hard-link alias onto another of the same file).
     async fn rename_file_entry(
         &self,
         scope: &VfsIndexScope,
@@ -270,6 +278,7 @@ pub trait VfsManifestIndex: Send + Sync {
         to_logical_path: &str,
         to_parent_logical_path: &str,
         to_entry_name: &str,
+        allow_replace: bool,
     ) -> VfsStorageResult<(VfsIndexEntryWithManifest, VfsIndexEntryWithManifest)>;
 }
 
