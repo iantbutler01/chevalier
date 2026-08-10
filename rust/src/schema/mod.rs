@@ -24,7 +24,7 @@ pub fn fix_output_schema_for_provider(schema: &mut Value, provider: &str) {
         | "openai-responses"
         | "openrouter-responses"
         | "openai-codex-responses" => fix_schema_for_openai(schema),
-        "anthropic" | "bedrock" | "google-anthropic" | "vertexai" => {
+        "anthropic" | "kimi-coding" | "bedrock" | "google-anthropic" | "vertexai" => {
             fix_schema_for_anthropic(schema)
         }
         "google" | "google_gemini" | "vertex_gemini" | "gemini" | "google-genai"
@@ -92,7 +92,7 @@ pub fn fix_tool_schema_for_provider(tool: &mut Value, provider: &str) {
     }
 
     match provider {
-        "anthropic" | "bedrock" | "google-anthropic" | "vertexai" => {
+        "anthropic" | "kimi-coding" | "bedrock" | "google-anthropic" | "vertexai" => {
             if let Some(input_schema) = tool.get_mut("input_schema") {
                 fix_output_schema_for_provider(input_schema, provider);
             }
@@ -459,7 +459,7 @@ pub(crate) fn apply_tool_strict_for_provider(
 ) {
     let Some(strict) = strict else { return };
     match provider {
-        "anthropic" | "bedrock" | "google-anthropic" | "vertexai" => {
+        "anthropic" | "kimi-coding" | "bedrock" | "google-anthropic" | "vertexai" => {
             if let Some(object) = tool.as_object_mut() {
                 object.insert("strict".to_string(), Value::Bool(strict));
             }
@@ -484,7 +484,7 @@ pub(crate) fn apply_tool_strict_for_provider(
 /// Get appropriate schema generator for provider
 pub fn get_schema_generator(provider: &str) -> Result<Box<dyn SchemaGenerator>> {
     match provider {
-        "anthropic" => Ok(Box::new(AnthropicSchemaGenerator)),
+        "anthropic" | "kimi-coding" => Ok(Box::new(AnthropicSchemaGenerator)),
         "openai" => Ok(Box::new(OpenAISchemaGenerator)),
         "openrouter" => Ok(Box::new(OpenAISchemaGenerator)), // OpenRouter uses OpenAI format
         "custom-openai" => Ok(Box::new(OpenAISchemaGenerator)), // custom-openai uses OpenAI format

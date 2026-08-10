@@ -10,9 +10,9 @@ use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
 use crate::providers::{
-    AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OAIClient,
-    OpenAICodexResponsesClient, OpenAIResponsesClient, OpenRouterClient, OpenRouterResponsesClient,
-    PromptCacheRetention, ProviderConfig, StreamChunk,
+    AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, KimiCodingAuthKind,
+    KimiCodingProviderConfig, OAIClient, OpenAICodexResponsesClient, OpenAIResponsesClient,
+    OpenRouterClient, OpenRouterResponsesClient, PromptCacheRetention, ProviderConfig, StreamChunk,
 };
 use crate::schema::{
     apply_tool_strict_for_provider, fix_output_schema_for_provider,
@@ -386,6 +386,7 @@ fn create_inference_client_with_config(
         match provider.as_str() {
             "anthropic" => std::env::var("ANTHROPIC_API_KEY")
                 .map_err(|_| Error::NonRetryable("ANTHROPIC_API_KEY not set".to_string()))?,
+            "kimi-coding" => resolve_kimi_coding_token(api_key, provider_config)?,
             "openai" => std::env::var("OPENAI_API_KEY")
                 .map_err(|_| Error::NonRetryable("OPENAI_API_KEY not set".to_string()))?,
             "openai-responses" => std::env::var("OPENAI_API_KEY")
@@ -446,6 +447,26 @@ fn create_inference_client_with_config(
                         r
                     )));
                 }
+            }
+            Box::new(client)
+        }
+        "kimi-coding" => {
+            let config = resolve_kimi_coding_config(key, server_url, provider_config);
+            let base_url = config
+                .base_url
+                .as_deref()
+                .unwrap_or("https://api.kimi.com/coding");
+            let api_url = if base_url.trim_end_matches('/').ends_with("/v1/messages") {
+                base_url.to_string()
+            } else {
+                format!("{}/v1/messages", base_url.trim_end_matches('/'))
+            };
+            let mut client = AnthropicClient::new(config.token, model_name)
+                .with_api_url(api_url)
+                .without_beta_headers()
+                .with_user_agent(config.user_agent.unwrap_or_else(|| "Chevalier".to_string()));
+            if config.auth_kind == KimiCodingAuthKind::OAuth {
+                client = client.with_bearer_auth();
             }
             Box::new(client)
         }
@@ -520,6 +541,40 @@ fn create_inference_client_with_config(
     };
 
     Ok(client)
+}
+
+fn resolve_kimi_coding_token(
+    api_key: Option<&str>,
+    provider_config: Option<&ProviderConfig>,
+) -> Result<String> {
+    if let Some(ProviderConfig::KimiCoding(config)) = provider_config {
+        return Ok(config.token.clone());
+    }
+    if let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) {
+        return Ok(api_key.to_string());
+    }
+    std::env::var("KIMI_API_KEY")
+        .map_err(|_| Error::NonRetryable("KIMI_API_KEY not set".to_string()))
+}
+
+fn resolve_kimi_coding_config(
+    token: String,
+    server_url: Option<String>,
+    provider_config: Option<&ProviderConfig>,
+) -> KimiCodingProviderConfig {
+    if let Some(ProviderConfig::KimiCoding(config)) = provider_config {
+        let mut resolved = config.as_ref().clone();
+        if server_url.is_some() {
+            resolved.base_url = server_url;
+        }
+        return resolved;
+    }
+    KimiCodingProviderConfig {
+        token,
+        auth_kind: KimiCodingAuthKind::ApiKey,
+        base_url: server_url.or_else(|| std::env::var("KIMI_CODE_BASE_URL").ok()),
+        user_agent: None,
+    }
 }
 
 fn resolve_codex_subscription_token(
@@ -859,6 +914,24 @@ mod tests {
     fn test_create_inference_client_anthropic() {
         set_test_env_var("ANTHROPIC_API_KEY", "test-key");
         let result = create_inference_client("anthropic:claude-3-5-sonnet-20241022", None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_inference_client_kimi_coding_api_key() {
+        let result = create_inference_client("kimi-coding:k3", Some("kimi-key"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_inference_client_kimi_coding_oauth() {
+        let config = ProviderConfig::KimiCoding(Box::new(KimiCodingProviderConfig {
+            token: "oauth-token".to_string(),
+            auth_kind: KimiCodingAuthKind::OAuth,
+            base_url: None,
+            user_agent: Some("OpenBracket".to_string()),
+        }));
+        let result = create_inference_client_with_config("kimi-coding:k3", None, Some(&config));
         assert!(result.is_ok());
     }
 

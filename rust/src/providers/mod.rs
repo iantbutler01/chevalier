@@ -23,6 +23,20 @@ pub struct AnthropicProviderConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KimiCodingAuthKind {
+    ApiKey,
+    OAuth,
+}
+
+#[derive(Debug, Clone)]
+pub struct KimiCodingProviderConfig {
+    pub token: String,
+    pub auth_kind: KimiCodingAuthKind,
+    pub base_url: Option<String>,
+    pub user_agent: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexSubscriptionTransport {
     Auto,
     WebSocket,
@@ -46,6 +60,7 @@ pub struct CodexSubscriptionProviderConfig {
 #[derive(Debug, Clone)]
 pub enum ProviderConfig {
     Anthropic(AnthropicProviderConfig),
+    KimiCoding(Box<KimiCodingProviderConfig>),
     // Boxed: this variant is ~208 bytes vs ~2 for Anthropic (clippy large_enum_variant);
     // boxing keeps every ProviderConfig move/clone small.
     CodexSubscription(Box<CodexSubscriptionProviderConfig>),

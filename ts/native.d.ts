@@ -221,6 +221,14 @@ export interface GatewayOptions {
   mutationReason?: string
 }
 
+/** Kimi Coding API/subscription provider config. */
+export interface KimiCodingConfigInput {
+  token: string
+  authKind: string
+  baseUrl?: string
+  userAgent?: string
+}
+
 /** Options for constructing an `McpServer`. */
 export interface McpServerOptions {
   version?: string
@@ -262,6 +270,7 @@ export interface Message {
 export interface ProviderConfigInput {
   anthropic?: AnthropicCacheConfig
   codexSubscription?: CodexSubscriptionConfigInput
+  kimiCoding?: KimiCodingConfigInput
 }
 
 /** Options for a single `run` / `runStream` call. */

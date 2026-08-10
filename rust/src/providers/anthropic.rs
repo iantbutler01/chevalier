@@ -25,12 +25,21 @@ use crate::utils::{
     ConversationMessage, convert_messages_to_provider_format, validate_image_input_supported,
 };
 
+#[derive(Clone, Copy)]
+enum AnthropicAuthKind {
+    ApiKey,
+    Bearer,
+}
+
 /// Anthropic API client
 #[derive(Clone)]
 pub struct AnthropicClient {
     model: String,
     api_key: String,
     api_url: String,
+    auth_kind: AnthropicAuthKind,
+    send_beta_headers: bool,
+    user_agent: Option<String>,
     thinking_budget: Option<u32>,
     /// Adaptive thinking (`thinking: {"type": "adaptive"}`) — the only
     /// supported thinking mode on Opus 4.7+ / Fable, where
@@ -61,6 +70,9 @@ impl AnthropicClient {
             model: model.into(),
             api_key: api_key.into(),
             api_url: "https://api.anthropic.com/v1/messages".to_string(),
+            auth_kind: AnthropicAuthKind::ApiKey,
+            send_beta_headers: true,
+            user_agent: None,
             thinking_budget: None,
             adaptive_thinking: false,
             effort: None,
@@ -89,6 +101,24 @@ impl AnthropicClient {
     /// Set a custom API URL
     pub fn with_api_url(mut self, url: impl Into<String>) -> Self {
         self.api_url = url.into();
+        self
+    }
+
+    /// Authenticate an Anthropic-compatible endpoint with a bearer token.
+    pub fn with_bearer_auth(mut self) -> Self {
+        self.auth_kind = AnthropicAuthKind::Bearer;
+        self
+    }
+
+    /// Omit Anthropic beta headers for compatible providers that do not implement them.
+    pub fn without_beta_headers(mut self) -> Self {
+        self.send_beta_headers = false;
+        self
+    }
+
+    /// Preserve the caller's honest client identity on compatible endpoints.
+    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = Some(user_agent.into());
         self
     }
 
@@ -368,15 +398,22 @@ impl AnthropicClient {
             "prompt-caching-2024-07-31,output-128k-2025-02-19"
         };
 
-        let response = client
+        let mut request = client
             .post(&self.api_url)
             .timeout(timeout.unwrap_or(std::time::Duration::from_secs(300)))
-            .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", beta_header)
-            .json(&body)
-            .send()
-            .await?;
+            .json(&body);
+        request = match self.auth_kind {
+            AnthropicAuthKind::ApiKey => request.header("x-api-key", &self.api_key),
+            AnthropicAuthKind::Bearer => request.bearer_auth(&self.api_key),
+        };
+        if self.send_beta_headers {
+            request = request.header("anthropic-beta", beta_header);
+        }
+        if let Some(user_agent) = self.user_agent.as_deref() {
+            request = request.header(reqwest::header::USER_AGENT, user_agent);
+        }
+        let response = request.send().await?;
 
         Ok(response)
     }
@@ -577,6 +614,20 @@ mod tests {
         assert_eq!(client.model, "claude-3-opus-20240229");
         assert_eq!(client.api_key, "test-key");
         assert_eq!(client.api_url, "https://api.anthropic.com/v1/messages");
+    }
+
+    #[test]
+    fn test_compatible_provider_transport_options() {
+        let client = AnthropicClient::new("oauth-token", "k3")
+            .with_api_url("https://api.kimi.com/coding/v1/messages")
+            .with_bearer_auth()
+            .without_beta_headers()
+            .with_user_agent("OpenBracket");
+
+        assert_eq!(client.api_url, "https://api.kimi.com/coding/v1/messages");
+        assert!(matches!(client.auth_kind, AnthropicAuthKind::Bearer));
+        assert!(!client.send_beta_headers);
+        assert_eq!(client.user_agent.as_deref(), Some("OpenBracket"));
     }
 
     #[test]

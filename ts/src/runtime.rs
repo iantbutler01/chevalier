@@ -8,7 +8,7 @@ use std::time::Duration;
 use chevalier_core::error::{Error as EngineError, Result as EngineResult};
 use chevalier_core::providers::{
     AnthropicProviderConfig, CodexSubscriptionProviderConfig, CodexSubscriptionTransport,
-    ProviderConfig,
+    KimiCodingAuthKind, KimiCodingProviderConfig, ProviderConfig,
 };
 use chevalier_core::runtime::{RunParams, Runtime as EngineRuntime, ToolFunction};
 use chevalier_core::types::{CacheMarker, ToolCall};
@@ -102,6 +102,16 @@ pub struct AnthropicCacheConfig {
 pub struct ProviderConfigInput {
     pub anthropic: Option<AnthropicCacheConfig>,
     pub codex_subscription: Option<CodexSubscriptionConfigInput>,
+    pub kimi_coding: Option<KimiCodingConfigInput>,
+}
+
+/// Kimi Coding API/subscription provider config.
+#[napi(object)]
+pub struct KimiCodingConfigInput {
+    pub token: String,
+    pub auth_kind: String,
+    pub base_url: Option<String>,
+    pub user_agent: Option<String>,
 }
 
 /// ChatGPT Codex subscription provider config.
@@ -305,7 +315,20 @@ impl Runtime {
     /// Set provider-specific request shaping (e.g. Anthropic prompt caching).
     #[napi]
     pub async fn set_provider_config(&self, config: ProviderConfigInput) {
-        let pc = if let Some(codex) = config.codex_subscription {
+        let pc = if let Some(kimi) = config.kimi_coding {
+            Some(ProviderConfig::KimiCoding(Box::new(
+                KimiCodingProviderConfig {
+                    token: kimi.token,
+                    auth_kind: if kimi.auth_kind == "oauth" {
+                        KimiCodingAuthKind::OAuth
+                    } else {
+                        KimiCodingAuthKind::ApiKey
+                    },
+                    base_url: kimi.base_url,
+                    user_agent: kimi.user_agent,
+                },
+            )))
+        } else if let Some(codex) = config.codex_subscription {
             Some(ProviderConfig::CodexSubscription(Box::new(
                 CodexSubscriptionProviderConfig {
                     token: codex.token,

@@ -76,7 +76,7 @@ impl Provider {
         };
 
         let provider = match provider_str {
-            "anthropic" => Provider::Anthropic,
+            "anthropic" | "kimi-coding" => Provider::Anthropic,
             "openai" => Provider::OpenAI,
             "openai-codex-responses" => Provider::OpenAIResponses,
             "bedrock" => Provider::Bedrock,
@@ -1590,6 +1590,10 @@ mod tests {
         let (provider, model) = Provider::from_model_string("openai:gpt-4").unwrap();
         assert_eq!(provider, Provider::OpenAI);
         assert_eq!(model, "gpt-4");
+
+        let (provider, model) = Provider::from_model_string("kimi-coding:k3").unwrap();
+        assert_eq!(provider, Provider::Anthropic);
+        assert_eq!(model, "k3");
 
         let (provider, model) = Provider::from_model_string("openai:resp:gpt-4").unwrap();
         assert_eq!(provider, Provider::OpenAIResponses);
