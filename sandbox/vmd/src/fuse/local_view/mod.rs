@@ -96,10 +96,14 @@ pub(crate) const CHECKPOINT_EVENT_INTERVAL: u64 = 4_096;
 /// free space below.
 pub(crate) const WAL_SOFT_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Fraction of the backing filesystem that must remain free before the hard
-/// limit applies. This is the only synthetic `ENOSPC` guard; actual filesystem
-/// allocation errors continue to propagate directly from the backing tree.
-pub(crate) const BACKING_FREE_FRACTION_FLOOR: f64 = 0.05;
+/// Defaults for the backing-filesystem reserve below which the hard limit
+/// applies. Operators can tune both dimensions for differently sized storage
+/// with `CHEVALIER_VMD_BACKING_FREE_FRACTION_FLOOR` and
+/// `CHEVALIER_VMD_BACKING_FREE_BYTES_FLOOR`. Crossing either floor triggers the
+/// only synthetic `ENOSPC` guard; actual allocation errors still propagate
+/// directly from the backing tree.
+pub(crate) const DEFAULT_BACKING_FREE_FRACTION_FLOOR: f64 = 0.005;
+pub(crate) const DEFAULT_BACKING_FREE_BYTES_FLOOR: u64 = 16 * 1024 * 1024 * 1024;
 
 /// Default bound for an explicit lifecycle drain (unmount, snapshot, delete).
 pub(crate) const DEFAULT_DRAIN_TIMEOUT_MS: u64 = 30_000;

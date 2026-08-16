@@ -38,10 +38,13 @@ use super::types::{
     WalRecord, dependency_sets_conflict, validate_mount_path,
 };
 use super::{
-    BACKING_FREE_FRACTION_FLOOR, LOG_TARGET_BYTES, MAX_RECORD_BYTES, MountStateLayout,
-    WAL_FORMAT_VERSION, WAL_SOFT_LIMIT_BYTES, create_new, open_append, read_json, sync_directory,
-    write_json_atomic,
+    DEFAULT_BACKING_FREE_BYTES_FLOOR, DEFAULT_BACKING_FREE_FRACTION_FLOOR, LOG_TARGET_BYTES,
+    MAX_RECORD_BYTES, MountStateLayout, WAL_FORMAT_VERSION, WAL_SOFT_LIMIT_BYTES, create_new,
+    open_append, read_json, sync_directory, write_json_atomic,
 };
+
+const BACKING_FREE_FRACTION_FLOOR_ENV: &str = "CHEVALIER_VMD_BACKING_FREE_FRACTION_FLOOR";
+const BACKING_FREE_BYTES_FLOOR_ENV: &str = "CHEVALIER_VMD_BACKING_FREE_BYTES_FLOOR";
 
 /// Wakes the publisher the moment a commit makes new work publishable.
 /// `notify_one` is callable from a native FUSE request thread, so the append
@@ -155,6 +158,48 @@ struct WalInner {
     started: Instant,
     pressure_sampled_at: AtomicU64,
     pressure_level: AtomicU8,
+    pressure_limits: StoragePressureLimits,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StoragePressureLimits {
+    free_fraction_floor: f64,
+    free_bytes_floor: u64,
+}
+
+impl StoragePressureLimits {
+    fn from_env() -> Self {
+        Self::from_values(
+            std::env::var(BACKING_FREE_FRACTION_FLOOR_ENV)
+                .ok()
+                .as_deref(),
+            std::env::var(BACKING_FREE_BYTES_FLOOR_ENV).ok().as_deref(),
+        )
+    }
+
+    fn from_values(fraction: Option<&str>, bytes: Option<&str>) -> Self {
+        let free_fraction_floor = fraction
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            .unwrap_or(DEFAULT_BACKING_FREE_FRACTION_FLOOR);
+        let free_bytes_floor = bytes
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_BACKING_FREE_BYTES_FLOOR);
+        Self {
+            free_fraction_floor,
+            free_bytes_floor,
+        }
+    }
+
+    fn is_hard(self, free: BackingFreeSpace) -> bool {
+        free.fraction < self.free_fraction_floor || free.bytes < self.free_bytes_floor
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BackingFreeSpace {
+    fraction: f64,
+    bytes: u64,
 }
 
 /// How long a storage-pressure sample is served before it is measured again.
@@ -307,6 +352,22 @@ impl MountWal {
                 pending_payload_bytes = pending_payload_bytes.saturating_add(payload.length);
             }
         }
+        let referenced_payloads: BTreeSet<String> = scan
+            .prepared
+            .values()
+            .filter_map(|record| record.event.payload.as_ref())
+            .map(|payload| payload.storage.file().to_string())
+            .collect();
+        // Reclamation candidates are deliberately not durable state: the
+        // checkpoint and retained prepare records are the authority. Rebuild
+        // the candidate set on every open so a restart between checkpoint and
+        // compaction cannot strand acknowledged payload generations forever.
+        let reclaim_candidates: BTreeSet<String> = payloads
+            .persisted_names()?
+            .difference(&referenced_payloads)
+            .cloned()
+            .collect();
+        let compaction_pending = !reclaim_candidates.is_empty();
 
         let next_sequence = scan
             .prepared
@@ -376,8 +437,8 @@ impl MountWal {
                     pending_payload_bytes,
                     events_since_checkpoint: 0,
                     last_checkpoint: checkpoint,
-                    reclaim_candidates: BTreeSet::new(),
-                    compaction_pending: false,
+                    reclaim_candidates,
+                    compaction_pending,
                 }),
                 sync: Mutex::new(SyncState {
                     durable_sequence: next_sequence.saturating_sub(1),
@@ -390,6 +451,7 @@ impl MountWal {
                 started: Instant::now(),
                 pressure_sampled_at: AtomicU64::new(NEVER_SAMPLED),
                 pressure_level: AtomicU8::new(encode_pressure(StoragePressure::None)),
+                pressure_limits: StoragePressureLimits::from_env(),
             }),
         };
         // Re-anchor replay on the state we just proved, so the next open never
@@ -1179,8 +1241,8 @@ impl MountWal {
         };
         let log_bytes = self.log_bytes().unwrap_or(0);
         let total = log_bytes.saturating_add(payload_bytes);
-        if let Some(free) = free_fraction(self.inner.layout.root()) {
-            if free < BACKING_FREE_FRACTION_FLOOR {
+        if let Some(free) = backing_free_space(self.inner.layout.root()) {
+            if self.inner.pressure_limits.is_hard(free) {
                 return StoragePressure::Hard;
             }
         }
@@ -1916,7 +1978,7 @@ fn load_checkpoint(layout: &MountStateLayout) -> Result<Option<MountCheckpoint>>
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
-fn free_fraction(root: &Path) -> Option<f64> {
+fn backing_free_space(root: &Path) -> Option<BackingFreeSpace> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -1931,11 +1993,15 @@ fn free_fraction(root: &Path) -> Option<f64> {
     if blocks == 0 {
         return None;
     }
-    Some(stats.f_bavail as f64 / blocks as f64)
+    let available_blocks = stats.f_bavail as u64;
+    Some(BackingFreeSpace {
+        fraction: available_blocks as f64 / blocks as f64,
+        bytes: available_blocks.saturating_mul(stats.f_frsize as u64),
+    })
 }
 
 #[cfg(not(unix))]
-fn free_fraction(_root: &Path) -> Option<f64> {
+fn backing_free_space(_root: &Path) -> Option<BackingFreeSpace> {
     None
 }
 
@@ -1949,13 +2015,45 @@ mod tests {
     use std::io::{Read, Write};
 
     use super::append_record;
-    use super::{MountStateLayout, MountWal};
+    use super::{BackingFreeSpace, MountStateLayout, MountWal, StoragePressureLimits};
     use crate::fuse::local_view::types::{
         MountMutation, MountPreImage, PayloadSource, PayloadStorage, WalRecord,
     };
 
     fn open(state_dir: &std::path::Path) -> MountWal {
         MountWal::open(&MountStateLayout::new(state_dir), None).expect("open WAL")
+    }
+
+    #[test]
+    fn storage_pressure_limits_use_configured_fraction_and_byte_floors() {
+        let limits = StoragePressureLimits::from_values(Some("0.0025"), Some("1073741824"));
+        assert_eq!(limits.free_fraction_floor, 0.0025);
+        assert_eq!(limits.free_bytes_floor, 1_073_741_824);
+        assert!(limits.is_hard(BackingFreeSpace {
+            fraction: 0.002,
+            bytes: 2_000_000_000,
+        }));
+        assert!(limits.is_hard(BackingFreeSpace {
+            fraction: 0.01,
+            bytes: 1_000_000_000,
+        }));
+        assert!(!limits.is_hard(BackingFreeSpace {
+            fraction: 0.01,
+            bytes: 2_000_000_000,
+        }));
+    }
+
+    #[test]
+    fn storage_pressure_limits_reject_invalid_values() {
+        let limits = StoragePressureLimits::from_values(Some("1.5"), Some("not-bytes"));
+        assert_eq!(
+            limits.free_fraction_floor,
+            super::DEFAULT_BACKING_FREE_FRACTION_FLOOR
+        );
+        assert_eq!(
+            limits.free_bytes_floor,
+            super::DEFAULT_BACKING_FREE_BYTES_FLOOR
+        );
     }
 
     #[test]
@@ -2354,6 +2452,54 @@ mod tests {
         assert_eq!(state.acknowledged_sequence, 1);
         assert_eq!(state.remote_revision, 7);
         assert!(state.committed_unacknowledged.is_empty());
+    }
+
+    #[test]
+    fn restart_reclaims_payload_acknowledged_before_compaction() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = MountStateLayout::new(temp.path());
+        let wal = open(temp.path());
+        let event = wal
+            .prepare(
+                MountMutation::ReplaceFile {
+                    path: "repo/file.txt".to_string(),
+                    mode: 0o644,
+                    expected_file_id: None,
+                    base_content_hash: None,
+                },
+                PayloadSource::Bytes(b"published generation"),
+                MountPreImage::empty(),
+            )
+            .expect("prepare payload");
+        let payload_name = event
+            .event
+            .payload
+            .as_ref()
+            .expect("payload")
+            .storage
+            .file()
+            .to_string();
+        wal.commit(event, None).expect("commit payload");
+        wal.acknowledge(1, 1, 1).expect("acknowledge payload");
+        let payload_path = layout.payload_dir().join(payload_name);
+        assert!(payload_path.exists(), "compaction has not run yet");
+        drop(wal);
+
+        let recovered = open(temp.path());
+        assert!(payload_path.exists(), "recovery itself is non-destructive");
+        let outcome = recovered.compact().expect("compact recovered candidates");
+        assert_eq!(outcome.removed_payload_files, 1);
+        assert!(
+            !payload_path.exists(),
+            "maintenance reclaims the acknowledged payload generation"
+        );
+        assert!(
+            recovered
+                .recovery_state()
+                .expect("recovery state")
+                .committed_unacknowledged
+                .is_empty()
+        );
     }
 
     #[test]

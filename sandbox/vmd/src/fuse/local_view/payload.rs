@@ -479,6 +479,17 @@ impl PayloadStore {
         Ok(usage)
     }
 
+    /// Every payload generation persisted by this store. Recovery uses this
+    /// inventory to reconstruct reclamation work that was only held in memory
+    /// when the previous process stopped.
+    pub(crate) fn persisted_names(&self) -> Result<BTreeSet<String>> {
+        Ok(self
+            .scan_directory()?
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect())
+    }
+
     // -- internals -----------------------------------------------------------
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, StoreState>> {
