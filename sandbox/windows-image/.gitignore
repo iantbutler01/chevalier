@@ -1,0 +1,5 @@
+artifacts/
+cache/
+logs/
+output/
+*.auto.pkrvars.hcl
