@@ -109,7 +109,11 @@ impl BackingTree {
             return Ok(self.root.clone());
         }
         validate_mount_path(path)?;
-        Ok(self.root.join(path))
+        let mut resolved = self.root.clone();
+        for component in path.split('/') {
+            resolved.push(backing_name(component));
+        }
+        Ok(resolved)
     }
 
     // -- reads (never touch the WAL) ----------------------------------------
@@ -148,7 +152,7 @@ impl BackingTree {
                 format!("read backing directory entry under {}", backing.display())
             })?;
             let raw_name = entry.file_name();
-            let Some(name) = raw_name.to_str().map(str::to_string) else {
+            let Some(raw_name) = raw_name.to_str() else {
                 // Nothing in this mount can create such a name: every mutation
                 // path is a validated `&str`. Skip it rather than fail a whole
                 // listing, and say so loudly.
@@ -159,7 +163,14 @@ impl BackingTree {
                 );
                 continue;
             };
-            let child = backing.join(&name);
+            let name = logical_name(raw_name).with_context(|| {
+                format!(
+                    "decode backing directory entry {:?} under {}",
+                    raw_name,
+                    backing.display()
+                )
+            })?;
+            let child = entry.path();
             let Some(metadata) = lstat_backing(&child)? else {
                 // Raced with a concurrent unlink; the entry is simply not there.
                 continue;
@@ -777,6 +788,41 @@ impl BackingTree {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn backing_name(logical: &str) -> String {
+    logical
+        .as_bytes()
+        .iter()
+        .map(|byte| char::from_u32(0xE000 + u32::from(*byte)).expect("valid private-use scalar"))
+        .collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn backing_name(logical: &str) -> &str {
+    logical
+}
+
+#[cfg(target_os = "macos")]
+fn logical_name(backing: &str) -> Result<String> {
+    let bytes = backing
+        .chars()
+        .map(|character| {
+            let value = u32::from(character);
+            if (0xE000..=0xE0FF).contains(&value) {
+                Ok((value - 0xE000) as u8)
+            } else {
+                bail!("backing name contains a scalar outside the encoded byte range")
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    String::from_utf8(bytes).context("backing name does not decode to UTF-8")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn logical_name(backing: &str) -> Result<String> {
+    Ok(backing.to_string())
+}
+
 /// An open backing-tree descriptor. This replaces the whole-file `Vec<u8>`
 /// buffer the previous design kept per handle, so a 1 GiB write is a sequence of
 /// positional writes and a first write at any offset never downloads the file.
@@ -832,6 +878,11 @@ impl MountFile {
 
     pub(crate) fn as_raw_fd(&self) -> RawFd {
         self.file.as_raw_fd()
+    }
+
+    pub(crate) fn is_writable(&self) -> bool {
+        let flags = unsafe { libc::fcntl(self.as_raw_fd(), libc::F_GETFL) };
+        flags >= 0 && flags & libc::O_ACCMODE != libc::O_RDONLY
     }
 
     pub(crate) fn read_at(&self, buffer: &mut [u8], offset: u64) -> Result<usize> {
@@ -1134,8 +1185,8 @@ fn permission_bits(mode: u32) -> u32 {
 ///
 /// * creation flags are decided by the caller (`apply_create_file` sets them),
 /// * `O_TRUNC` is a content mutation and must go through the WAL,
-/// * `O_APPEND` would make `pwrite` ignore its offset, and the kernel has
-///   already resolved append offsets before the write reaches us,
+/// * `O_APPEND` would make `pwrite` ignore its offset; each transport must prove
+///   that it supplies append-resolved write offsets before this positional layer,
 /// * `O_DIRECT` existed only to defeat uncoordinated cross-VM page caches, which
 ///   single ownership plus a real backing tree removes.
 fn open_flags(flags: i32) -> i32 {
@@ -1406,5 +1457,38 @@ fn states_match(recorded: &PreImageState, observed: &PreImageState) -> bool {
                 && recorded_target == observed_target
         }
         _ => false,
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoded_backing_names_preserve_case_normalization_and_component_length() {
+        let directory = tempfile::tempdir().unwrap();
+        let tree = BackingTree::open(directory.path()).unwrap();
+        let names = ["readme", "README", "é", "e\u{301}"];
+        for name in names {
+            drop(tree.apply_create_file(name, 0o644, libc::O_WRONLY).unwrap());
+        }
+        let long_name = "x".repeat(255);
+        drop(
+            tree.apply_create_file(&long_name, 0o644, libc::O_WRONLY)
+                .unwrap(),
+        );
+
+        let listed = tree
+            .read_dir("")
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        assert_eq!(listed.len(), 5);
+        for name in names {
+            assert!(listed.contains(&name.to_string()));
+        }
+        assert!(listed.contains(&long_name));
     }
 }

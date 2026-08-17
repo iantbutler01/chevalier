@@ -1,10 +1,16 @@
+#[cfg(target_os = "macos")]
+use std::ffi::{CStr, OsStr};
 use std::fmt;
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chevalier_sandbox::vfs::{VFS_SURFACE_KIND_VM_SHARED, VFS_SURFACE_KIND_VM_WORKSPACE};
+#[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
@@ -31,6 +37,20 @@ use super::local_view::{
 };
 
 const UNMOUNT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+const MACOS_FSKIT_VOLUMES_ROOT: &str = "/Volumes";
+#[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+const MACOS_FSKIT_MOUNT_PREFIX: &str = "OpenBracket-Chevalier-";
+#[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+const MACOS_FSKIT_TOKEN_BYTES: usize = 16;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn getmntinfo_r_np(mount_buffer: *mut *mut libc::statfs, flags: libc::c_int) -> libc::c_int;
+}
+
+const REMOTE_FUSE_MOUNT_SUPPORTED: bool =
+    cfg!(target_os = "linux") || cfg!(all(target_os = "macos", feature = "macos-fskit"));
 
 /// Bound for an ordinary lifecycle drain: unmount, snapshot, fork, delete.
 pub const DEFAULT_VFS_DRAIN_TIMEOUT: Duration = Duration::from_millis(DEFAULT_DRAIN_TIMEOUT_MS);
@@ -46,6 +66,8 @@ const PUBLICATION_HEALTH_INTERVAL: Duration = Duration::from_secs(15);
 pub struct FuseHandle {
     session: Arc<Mutex<Option<fuser::BackgroundSession>>>,
     mountpoint: PathBuf,
+    #[cfg(target_os = "macos")]
+    bare_mountpoint: Arc<std::fs::File>,
     // The mount-local materialized view: the backing tree, the WAL, the payload
     // store and the ownership lock on this mount's state directory. Shared with
     // the `RemoteFuseFs` inside the session, and kept here so lifecycle
@@ -66,6 +88,8 @@ impl Clone for FuseHandle {
         Self {
             session: Arc::clone(&self.session),
             mountpoint: self.mountpoint.clone(),
+            #[cfg(target_os = "macos")]
+            bare_mountpoint: Arc::clone(&self.bare_mountpoint),
             local: Arc::clone(&self.local),
             _follower: self._follower.clone(),
             _publication_watch: self._publication_watch.clone(),
@@ -399,16 +423,16 @@ pub async fn mount_vfs_fuse(
     mount: &SharedMountSpec,
     vm_dir: &Path,
 ) -> Result<FuseHandle> {
-    if !cfg!(target_os = "linux") {
-        bail!("vfs fuse mounts are only supported on linux hosts");
+    if !REMOTE_FUSE_MOUNT_SUPPORTED {
+        bail!("vfs fuse mounts require Linux or a macOS build with macos-fskit");
     }
     let auth_token = cfg.vfs_internal_service_token.as_deref().ok_or_else(|| {
         anyhow!("missing CHEVALIER_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN for fuse-backed mount")
     })?;
-    let mountpoint = vm_dir.join("fuse-mounts").join(&mount.mount_tag);
-    // `<vm_dir>/vfs-state/<tag>`, deliberately outside `fuse-mounts/`: the stale
-    // sidecar reaper lazily unmounts every directory directly under
-    // `fuse-mounts`, and this one is a real backing tree, not a mountpoint.
+    let mountpoint = vfs_mountpoint_for_vm(vm_dir, &mount.mount_tag)?;
+    // `<vm_dir>/vfs-state/<tag>` remains independent of the platform mountpoint:
+    // FSKit requires the latter below `/Volumes`, while this directory is the
+    // durable backing tree/WAL rather than a mount.
     // `configure_qemu_process_identity` skips `vfs-state` in return, so the
     // launch chown never walks the tree nor hands the guest's qemu uid this
     // mount's authoritative local state.
@@ -423,6 +447,99 @@ pub async fn mount_vfs_fuse(
         mount.read_only,
     )
     .await
+}
+
+fn vfs_mountpoint_for_vm(vm_dir: &Path, mount_tag: &str) -> Result<PathBuf> {
+    #[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+    {
+        let prefix = macos_fskit_vm_mount_prefix(vm_dir)?;
+        let tag = stable_macos_fskit_token(b"mount-tag", mount_tag.as_bytes());
+        return Ok(Path::new(MACOS_FSKIT_VOLUMES_ROOT).join(format!("{prefix}{tag}")));
+    }
+    #[cfg(not(all(target_os = "macos", feature = "macos-fskit")))]
+    {
+        Ok(vm_dir.join("fuse-mounts").join(mount_tag))
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+fn macos_fskit_vm_mount_prefix(vm_dir: &Path) -> Result<String> {
+    let canonical_vm_dir = std::fs::canonicalize(vm_dir)
+        .with_context(|| format!("canonicalize VM directory {}", vm_dir.display()))?;
+    let vm = stable_macos_fskit_token(b"vm-directory", canonical_vm_dir.as_os_str().as_bytes());
+    Ok(format!("{MACOS_FSKIT_MOUNT_PREFIX}{vm}-"))
+}
+
+#[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+fn stable_macos_fskit_token(domain: &[u8], value: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"chevalier-vmd-fskit-mount-v1\0");
+    hasher.update(domain);
+    hasher.update([0]);
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+    hasher
+        .finalize()
+        .iter()
+        .take(MACOS_FSKIT_TOKEN_BYTES)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+fn is_macos_fskit_mountpoint_for_vm(prefix: &str, mountpoint: &Path) -> bool {
+    if mountpoint.parent() != Some(Path::new(MACOS_FSKIT_VOLUMES_ROOT)) {
+        return false;
+    }
+    mountpoint
+        .file_name()
+        .and_then(OsStr::to_str)
+        .and_then(|name| name.strip_prefix(prefix))
+        .is_some_and(|token| is_lower_hex_macos_fskit_token(token.as_bytes()))
+}
+
+#[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+fn is_lower_hex_macos_fskit_token(token: &[u8]) -> bool {
+    token.len() == MACOS_FSKIT_TOKEN_BYTES * 2
+        && token
+            .iter()
+            .copied()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+#[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+fn known_macos_fskit_mountpoints_for_vm(vm_dir: &Path) -> Result<Vec<PathBuf>> {
+    let state_root = MountStateLayout::vfs_state_root(vm_dir);
+    let entries = match std::fs::read_dir(&state_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("list VFS state directories under {}", state_root.display())
+            });
+        }
+    };
+    let mut mountpoints = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read entry under {}", state_root.display()))?;
+        if !entry
+            .file_type()
+            .with_context(|| format!("inspect VFS state entry {}", entry.path().display()))?
+            .is_dir()
+        {
+            continue;
+        }
+        let mount_tag = entry.file_name().into_string().map_err(|_| {
+            anyhow!(
+                "VFS state directory has a non-UTF-8 mount tag: {}",
+                entry.path().display()
+            )
+        })?;
+        mountpoints.push(vfs_mountpoint_for_vm(vm_dir, &mount_tag)?);
+    }
+    mountpoints.sort();
+    mountpoints.dedup();
+    Ok(mountpoints)
 }
 
 /// Mount one remote VFS scope.
@@ -440,13 +557,13 @@ pub async fn mount_remote_vfs_fuse(
     state_dir: &Path,
     read_only: bool,
 ) -> Result<FuseHandle> {
-    if !cfg!(target_os = "linux") {
-        bail!("vfs fuse mounts are only supported on linux hosts");
+    if !REMOTE_FUSE_MOUNT_SUPPORTED {
+        bail!("vfs fuse mounts require Linux or a macOS build with macos-fskit");
+    }
+    if cfg!(all(target_os = "macos", feature = "macos-fskit")) && read_only {
+        bail!("read-only VFS mounts are not supported by the macOS FSKit profile");
     }
     clear_process_umask();
-    tokio::fs::create_dir_all(&mountpoint)
-        .await
-        .with_context(|| format!("create fuse mountpoint {}", mountpoint.display()))?;
 
     let client = RemoteVfsClient::new(endpoint, auth_token, scope_path)?;
     let local = open_mount_local_view(
@@ -461,6 +578,13 @@ pub async fn mount_remote_vfs_fuse(
         Arc::clone(&local.view),
         Handle::current(),
     )?;
+    tokio::fs::create_dir_all(&mountpoint)
+        .await
+        .with_context(|| format!("create fuse mountpoint {}", mountpoint.display()))?;
+    #[cfg(target_os = "macos")]
+    let bare_mountpoint = Arc::new(prepare_bare_mountpoint(mountpoint)?);
+    #[cfg(not(target_os = "macos"))]
+    prepare_bare_mountpoint(mountpoint)?;
     let options = filesystem.mount_options(mount_tag);
     // Capture the inode table a post-mount notifier has to resolve through while
     // the fs is still reachable — the fuser notifier only exists after the
@@ -470,8 +594,17 @@ pub async fn mount_remote_vfs_fuse(
     // The wrapper keeps distributed blocking-lock waits on a separate bounded
     // Tokio pool while ordinary callbacks stay on those native threads.
     let filesystem = super::dispatch::SpawnedFuseFs::new(filesystem);
-    let session = fuser::spawn_mount2(filesystem, mountpoint, &options)
-        .with_context(|| format!("mount fuse filesystem at {}", mountpoint.display()))?;
+    let session = match fuser::spawn_mount2(filesystem, mountpoint, &options) {
+        Ok(session) => session,
+        Err(error) => {
+            #[cfg(target_os = "macos")]
+            let _ = finish_bare_mountpoint_with_file(&bare_mountpoint, mountpoint);
+            #[cfg(not(target_os = "macos"))]
+            let _ = finish_bare_mountpoint(mountpoint);
+            return Err(error)
+                .with_context(|| format!("mount fuse filesystem at {}", mountpoint.display()));
+        }
+    };
 
     // A read-only observer holds no local authority over its scope, so it has to
     // follow the gateway: re-read what advanced, then revoke exactly what it
@@ -496,6 +629,8 @@ pub async fn mount_remote_vfs_fuse(
     let handle = FuseHandle {
         session: Arc::new(Mutex::new(Some(session))),
         mountpoint: mountpoint.to_path_buf(),
+        #[cfg(target_os = "macos")]
+        bare_mountpoint: Arc::clone(&bare_mountpoint),
         local: local.view,
         _follower: follower,
         _publication_watch: local.publication_watch,
@@ -504,9 +639,19 @@ pub async fn mount_remote_vfs_fuse(
     // Bounds the kernel mount itself and nothing else: the state directory is
     // already open, recovered and hydrated by this point, so no amount of remote
     // work can push the mount past this deadline.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let readiness_timeout = if cfg!(all(target_os = "macos", feature = "macos-fskit")) {
+        Duration::from_secs(15)
+    } else {
+        Duration::from_secs(5)
+    };
+    let deadline = std::time::Instant::now() + readiness_timeout;
     while std::time::Instant::now() < deadline {
         if mountpoint_is_active(mountpoint).await? {
+            #[cfg(target_os = "macos")]
+            if let Err(error) = protect_bare_mountpoint(&bare_mountpoint, mountpoint) {
+                let _ = unmount_fuse(&handle).await;
+                return Err(error);
+            }
             return Ok(handle);
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -514,8 +659,9 @@ pub async fn mount_remote_vfs_fuse(
 
     let _ = unmount_fuse(&handle).await;
     bail!(
-        "fuse mount {} did not become ready within 5s",
-        mountpoint.display()
+        "fuse mount {} did not become ready within {:?}",
+        mountpoint.display(),
+        readiness_timeout
     )
 }
 
@@ -736,6 +882,10 @@ pub async fn unmount_fuse_with_drain(handle: &FuseHandle, drain_deadline: Durati
             handle.mountpoint.display()
         );
     }
+    #[cfg(target_os = "macos")]
+    finish_bare_mountpoint_with_file(&handle.bare_mountpoint, &handle.mountpoint)?;
+    #[cfg(not(target_os = "macos"))]
+    finish_bare_mountpoint(&handle.mountpoint)?;
     finalize_mount_local_view(handle).await;
     Ok(())
 }
@@ -981,8 +1131,70 @@ pub async fn unmount_active_mountpoints_under(root: &Path) -> Result<()> {
     }
 }
 
+/// Return active FUSE mountpoints owned by one VM. FSKit volumes are direct
+/// children of `/Volumes`, so they are matched by the stable per-VM name token
+/// rather than by path ancestry.
+pub fn active_vfs_mountpoints_for_vm(vm_dir: &Path) -> Result<Vec<PathBuf>> {
+    #[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+    {
+        let prefix = macos_fskit_vm_mount_prefix(vm_dir)?;
+        let known = known_macos_fskit_mountpoints_for_vm(vm_dir)?;
+        return Ok(
+            active_mountpoints_under(Path::new(MACOS_FSKIT_VOLUMES_ROOT))?
+                .into_iter()
+                .filter(|mountpoint| {
+                    is_macos_fskit_mountpoint_for_vm(&prefix, mountpoint)
+                        && known.binary_search(mountpoint).is_ok()
+                })
+                .collect(),
+        );
+    }
+    #[cfg(not(all(target_os = "macos", feature = "macos-fskit")))]
+    {
+        active_mountpoints_under(&vm_dir.join("fuse-mounts"))
+    }
+}
+
+/// Detach both live and abandoned mountpoint paths owned by one VM. This is the
+/// crash-recovery entry point used when the original `BackgroundSession` is gone.
+pub async fn unmount_active_vfs_mountpoints_for_vm(vm_dir: &Path) -> Result<()> {
+    let mut active = active_vfs_mountpoints_for_vm(vm_dir)?;
+    active.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    let mut failures = Vec::new();
+    for mountpoint in active {
+        if let Err(error) = unmount_path(&mountpoint).await {
+            failures.push(format!("{}: {error:#}", mountpoint.display()));
+        }
+    }
+    let remaining = active_vfs_mountpoints_for_vm(vm_dir)?;
+    if !remaining.is_empty() {
+        failures.push(format!(
+            "mountpoints remain active: {}",
+            remaining
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    #[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+    if let Err(error) = cleanup_inactive_macos_fskit_mountpoints_for_vm(vm_dir) {
+        failures.push(format!("abandoned FSKit mountpoint cleanup: {error:#}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("failed retrying FUSE unmounts: {}", failures.join("; "))
+    }
+}
+
 async fn unmount_path(mountpoint: &Path) -> Result<()> {
-    let mut command = Command::new("umount");
+    let program = if cfg!(target_os = "macos") {
+        "/sbin/umount"
+    } else {
+        "umount"
+    };
+    let mut command = Command::new(program);
     command.arg(mountpoint).kill_on_drop(true);
     let status = tokio::time::timeout(UNMOUNT_TIMEOUT, command.status())
         .await
@@ -1001,7 +1213,207 @@ async fn unmount_path(mountpoint: &Path) -> Result<()> {
             status
         );
     }
+    finish_bare_mountpoint(mountpoint)?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_bare_mountpoint(mountpoint: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(mountpoint)
+        .with_context(|| {
+            format!(
+                "open bare mountpoint directory without following symlinks at {}",
+                mountpoint.display()
+            )
+        })?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("make bare mountpoint private at {}", mountpoint.display()))?;
+    Ok(file)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prepare_bare_mountpoint(_mountpoint: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn protect_bare_mountpoint(file: &std::fs::File, mountpoint: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(std::fs::Permissions::from_mode(0o000))
+        .with_context(|| format!("protect bare mountpoint beneath {}", mountpoint.display()))
+}
+
+#[cfg(target_os = "macos")]
+fn restore_bare_mountpoint_file(file: &std::fs::File, mountpoint: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(std::fs::Permissions::from_mode(0o700))
+        .with_context(|| {
+            format!(
+                "restore bare mountpoint permissions at {}",
+                mountpoint.display()
+            )
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn restore_bare_mountpoint(mountpoint: &Path) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(mountpoint)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "open bare mountpoint for permission restore at {}",
+                    mountpoint.display()
+                )
+            });
+        }
+    };
+    file.set_permissions(std::fs::Permissions::from_mode(0o700))
+        .with_context(|| {
+            format!(
+                "restore bare mountpoint permissions at {}",
+                mountpoint.display()
+            )
+        })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn restore_bare_mountpoint(_mountpoint: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn finish_bare_mountpoint(mountpoint: &Path) -> Result<()> {
+    restore_bare_mountpoint(mountpoint)?;
+    remove_managed_macos_fskit_mountpoint(mountpoint)
+}
+
+#[cfg(target_os = "macos")]
+fn finish_bare_mountpoint_with_file(file: &std::fs::File, mountpoint: &Path) -> Result<()> {
+    restore_bare_mountpoint_file(file, mountpoint)?;
+    remove_managed_macos_fskit_mountpoint(mountpoint)
+}
+
+fn remove_managed_macos_fskit_mountpoint(mountpoint: &Path) -> Result<()> {
+    #[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+    if is_managed_macos_fskit_mountpoint(mountpoint) {
+        match std::fs::remove_dir(mountpoint) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                let mut entries = std::fs::read_dir(mountpoint).with_context(|| {
+                    format!(
+                        "verify retained managed FSKit mountpoint is empty at {}",
+                        mountpoint.display()
+                    )
+                })?;
+                if entries.next().is_some() {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "remove nonempty inactive managed FSKit mountpoint {}",
+                            mountpoint.display()
+                        )
+                    });
+                }
+                tracing::warn!(
+                    mountpoint = %mountpoint.display(),
+                    "retaining empty managed FSKit mountpoint because its parent denies removal"
+                );
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "remove inactive managed FSKit mountpoint {}",
+                        mountpoint.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+fn is_managed_macos_fskit_mountpoint(mountpoint: &Path) -> bool {
+    if mountpoint.parent() != Some(Path::new(MACOS_FSKIT_VOLUMES_ROOT)) {
+        return false;
+    }
+    mountpoint
+        .file_name()
+        .and_then(OsStr::to_str)
+        .and_then(|name| name.strip_prefix(MACOS_FSKIT_MOUNT_PREFIX))
+        .is_some_and(|suffix| {
+            let suffix = suffix.as_bytes();
+            suffix.len() == MACOS_FSKIT_TOKEN_BYTES * 4 + 1
+                && suffix[MACOS_FSKIT_TOKEN_BYTES * 2] == b'-'
+                && is_lower_hex_macos_fskit_token(&suffix[..MACOS_FSKIT_TOKEN_BYTES * 2])
+                && is_lower_hex_macos_fskit_token(&suffix[MACOS_FSKIT_TOKEN_BYTES * 2 + 1..])
+        })
+}
+
+#[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+fn cleanup_inactive_macos_fskit_mountpoints_for_vm(vm_dir: &Path) -> Result<()> {
+    let mut failures = Vec::new();
+    for mountpoint in known_macos_fskit_mountpoints_for_vm(vm_dir)? {
+        match std::fs::symlink_metadata(&mountpoint) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                failures.push(format!("inspect {}: {error}", mountpoint.display()));
+                continue;
+            }
+        }
+        if !is_managed_macos_fskit_mountpoint(&mountpoint) {
+            failures.push(format!(
+                "derived FSKit mountpoint failed managed-path validation: {}",
+                mountpoint.display()
+            ));
+            continue;
+        }
+        match active_mountpoints_under(&mountpoint) {
+            Ok(active) if !active.is_empty() => {
+                failures.push(format!(
+                    "{} became mounted again before inactive cleanup",
+                    mountpoint.display()
+                ));
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                failures.push(format!(
+                    "recheck {} before inactive cleanup: {error:#}",
+                    mountpoint.display()
+                ));
+                continue;
+            }
+        }
+        if let Err(error) = finish_bare_mountpoint(&mountpoint) {
+            failures.push(format!("{}: {error:#}", mountpoint.display()));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "failed cleaning inactive FSKit mountpoints: {}",
+            failures.join("; ")
+        )
+    }
 }
 
 async fn mountpoint_is_active(mountpoint: &Path) -> Result<bool> {
@@ -1016,7 +1428,7 @@ async fn mountpoint_is_active(mountpoint: &Path) -> Result<bool> {
 /// traversing a still-mounted FUSE path could delete the remote workspace
 /// rather than disposable VM metadata.
 pub fn active_mountpoints_under(root: &Path) -> Result<Vec<PathBuf>> {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = root;
         return Ok(Vec::new());
@@ -1027,6 +1439,25 @@ pub fn active_mountpoints_under(root: &Path) -> Result<Vec<PathBuf>> {
     #[cfg(target_os = "linux")]
     {
         Ok(active_mountpoints_from_mountinfo(root, &mountinfo))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut mounts = std::ptr::null_mut();
+        let count = unsafe { getmntinfo_r_np(&mut mounts, libc::MNT_NOWAIT) };
+        if count == 0 || mounts.is_null() {
+            return Err(std::io::Error::last_os_error()).context("getmntinfo_r_np");
+        }
+        let entries = unsafe { std::slice::from_raw_parts(mounts, count as usize) };
+        let mut active = entries
+            .iter()
+            .map(|entry| unsafe { CStr::from_ptr(entry.f_mntonname.as_ptr()) })
+            .map(|path| PathBuf::from(OsStr::from_bytes(path.to_bytes())))
+            .filter(|mountpoint| mountpoint.starts_with(root))
+            .collect::<Vec<_>>();
+        unsafe { libc::free(mounts.cast()) };
+        active.sort();
+        active.dedup();
+        Ok(active)
     }
 }
 
@@ -1053,7 +1484,15 @@ fn decode_mountinfo_path(raw: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::active_mountpoints_from_mountinfo;
+    #[cfg(not(all(target_os = "macos", feature = "macos-fskit")))]
+    use super::vfs_mountpoint_for_vm;
+    #[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+    use super::{
+        MACOS_FSKIT_VOLUMES_ROOT, is_macos_fskit_mountpoint_for_vm,
+        known_macos_fskit_mountpoints_for_vm, macos_fskit_vm_mount_prefix, prepare_bare_mountpoint,
+        protect_bare_mountpoint, restore_bare_mountpoint_file, vfs_mountpoint_for_vm,
+    };
+    use super::{active_mountpoints_from_mountinfo, active_mountpoints_under};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -1073,6 +1512,14 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn getmntinfo_probe_reports_root_mount() {
+        let active = active_mountpoints_under(Path::new("/")).unwrap();
+
+        assert!(active.iter().any(|mountpoint| mountpoint == Path::new("/")));
+    }
+
     #[test]
     fn mountinfo_probe_decodes_escaped_mount_paths() {
         let mountinfo = "\
@@ -1085,6 +1532,103 @@ mod tests {
                 PathBuf::from("/data/vms/a/fuse-mounts/with space"),
                 PathBuf::from("/data/vms/a/fuse-mounts/with\\slash"),
             ]
+        );
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "macos-fskit")))]
+    #[test]
+    fn non_fskit_mountpoint_keeps_the_vm_local_layout() {
+        let vm_dir = Path::new("/data/vms/vm-id");
+
+        assert_eq!(
+            vfs_mountpoint_for_vm(vm_dir, "workspace").unwrap(),
+            vm_dir.join("fuse-mounts/workspace")
+        );
+    }
+
+    #[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+    #[test]
+    fn fskit_mountpoint_is_stable_unique_and_directly_below_volumes() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_vm = temp.path().join("first-vm");
+        let second_vm = temp.path().join("second-vm");
+        std::fs::create_dir_all(&first_vm).unwrap();
+        std::fs::create_dir_all(&second_vm).unwrap();
+
+        let first = vfs_mountpoint_for_vm(&first_vm, "workspace/../../unsafe").unwrap();
+        let repeated = vfs_mountpoint_for_vm(&first_vm, "workspace/../../unsafe").unwrap();
+        let different_tag = vfs_mountpoint_for_vm(&first_vm, "runtime").unwrap();
+        let different_vm = vfs_mountpoint_for_vm(&second_vm, "workspace/../../unsafe").unwrap();
+
+        assert_eq!(first.parent(), Some(Path::new(MACOS_FSKIT_VOLUMES_ROOT)));
+        assert_eq!(first, repeated);
+        assert_ne!(first, different_tag);
+        assert_ne!(first, different_vm);
+        assert!(!first.to_string_lossy().contains("unsafe"));
+
+        let prefix = macos_fskit_vm_mount_prefix(&first_vm).unwrap();
+        assert!(is_macos_fskit_mountpoint_for_vm(&prefix, &first));
+        assert!(!is_macos_fskit_mountpoint_for_vm(&prefix, &different_vm));
+        assert!(!is_macos_fskit_mountpoint_for_vm(
+            &prefix,
+            &Path::new("/Volumes/nested").join(first.file_name().unwrap())
+        ));
+        assert!(!is_macos_fskit_mountpoint_for_vm(
+            &prefix,
+            &Path::new("/Volumes")
+                .join(format!("{}0", first.file_name().unwrap().to_string_lossy()))
+        ));
+        assert!(!is_macos_fskit_mountpoint_for_vm(
+            &prefix,
+            &Path::new("/Volumes")
+                .join(first.file_name().unwrap().to_string_lossy().to_uppercase())
+        ));
+    }
+
+    #[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+    #[test]
+    fn stale_fskit_discovery_derives_only_tags_with_durable_vm_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let vm_dir = temp.path().join("vm");
+        std::fs::create_dir_all(vm_dir.join("vfs-state/workspace")).unwrap();
+        std::fs::create_dir_all(vm_dir.join("vfs-state/runtime")).unwrap();
+        std::fs::write(vm_dir.join("vfs-state/not-a-directory"), b"ignored").unwrap();
+
+        let known = known_macos_fskit_mountpoints_for_vm(&vm_dir).unwrap();
+        let mut expected = vec![
+            vfs_mountpoint_for_vm(&vm_dir, "runtime").unwrap(),
+            vfs_mountpoint_for_vm(&vm_dir, "workspace").unwrap(),
+        ];
+        expected.sort();
+
+        assert_eq!(known, expected);
+    }
+
+    #[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+    #[test]
+    fn bare_mountpoint_fence_uses_open_directory_and_restores_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mountpoint = tempfile::tempdir().unwrap();
+        let file = prepare_bare_mountpoint(mountpoint.path()).unwrap();
+        protect_bare_mountpoint(&file, mountpoint.path()).unwrap();
+        assert_eq!(
+            std::fs::metadata(mountpoint.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0
+        );
+
+        restore_bare_mountpoint_file(&file, mountpoint.path()).unwrap();
+        assert_eq!(
+            std::fs::metadata(mountpoint.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
         );
     }
 }

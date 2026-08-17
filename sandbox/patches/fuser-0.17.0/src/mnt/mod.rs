@@ -13,6 +13,8 @@ mod fuse3_sys;
 
 #[cfg(fuser_mount_impl = "pure-rust")]
 mod fuse_pure;
+#[cfg(fuser_mount_impl = "macos-fskit")]
+pub(crate) mod macos_fskit;
 pub(crate) mod mount_options;
 
 use std::io;
@@ -23,7 +25,7 @@ use log::info;
 use log::warn;
 use mount_options::MountOption;
 
-use crate::dev_fuse::DevFuse;
+use crate::channel::Channel;
 
 /// Helper function to provide options as a `fuse_args` struct
 /// (which contains an argc count and an argv pointer)
@@ -59,7 +61,6 @@ fn with_fuse_args<T, F: FnOnce(&fuse_args) -> T>(
 use std::ffi::CStr;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use crate::SessionACL;
 
@@ -71,6 +72,8 @@ enum MountImpl {
     Fuse2(fuse2::MountImpl),
     #[cfg(fuser_mount_impl = "libfuse3")]
     Fuse3(fuse3::MountImpl),
+    #[cfg(fuser_mount_impl = "macos-fskit")]
+    MacosFskit(macos_fskit::MountImpl),
 }
 
 impl MountImpl {
@@ -82,6 +85,8 @@ impl MountImpl {
             MountImpl::Fuse2(mount) => mount.umount_impl(),
             #[cfg(fuser_mount_impl = "libfuse3")]
             MountImpl::Fuse3(mount) => mount.umount_impl(),
+            #[cfg(fuser_mount_impl = "macos-fskit")]
+            MountImpl::MacosFskit(mount) => mount.umount_impl(),
             // This branch is needed because Rust does not consider & empty enum non-empty.
             #[cfg(fuser_mount_impl = "macos-no-mount")]
             _ => Ok(()),
@@ -100,12 +105,12 @@ impl Mount {
         mountpoint: &Path,
         options: &[MountOption],
         acl: SessionACL,
-    ) -> io::Result<(Arc<DevFuse>, Mount)> {
+    ) -> io::Result<(Channel, Mount)> {
         #[cfg(fuser_mount_impl = "pure-rust")]
         {
             let (dev_fuse, mount) = fuse_pure::MountImpl::new(mountpoint, options, acl)?;
             Ok((
-                dev_fuse,
+                Channel::new(dev_fuse),
                 Mount {
                     mount_impl: Some(MountImpl::Pure(mount)),
                     mount_point: mountpoint.to_path_buf(),
@@ -116,7 +121,7 @@ impl Mount {
         {
             let (dev_fuse, mount) = fuse2::MountImpl::new(mountpoint, options, acl)?;
             Ok((
-                dev_fuse,
+                Channel::new(dev_fuse),
                 Mount {
                     mount_impl: Some(MountImpl::Fuse2(mount)),
                     mount_point: mountpoint.to_path_buf(),
@@ -127,9 +132,20 @@ impl Mount {
         {
             let (dev_fuse, mount) = fuse3::MountImpl::new(mountpoint, options, acl)?;
             Ok((
-                dev_fuse,
+                Channel::new(dev_fuse),
                 Mount {
                     mount_impl: Some(MountImpl::Fuse3(mount)),
+                    mount_point: mountpoint.to_path_buf(),
+                },
+            ))
+        }
+        #[cfg(fuser_mount_impl = "macos-fskit")]
+        {
+            let (channel, mount) = macos_fskit::MountImpl::new(mountpoint, options, acl)?;
+            Ok((
+                Channel::new(channel),
+                Mount {
+                    mount_impl: Some(MountImpl::MacosFskit(mount)),
                     mount_point: mountpoint.to_path_buf(),
                 },
             ))
@@ -193,8 +209,7 @@ fn libc_umount(mnt: &CStr) -> nix::Result<()> {
 /// Warning: This will return true if the filesystem has been detached (lazy unmounted), but not
 /// yet destroyed by the kernel.
 #[cfg(any(all(not(target_os = "macos"), test), fuser_mount_impl = "pure-rust"))]
-fn is_mounted(fuse_device: &DevFuse) -> bool {
-    use std::os::unix::io::AsFd;
+fn is_mounted(fuse_device: &impl std::os::fd::AsFd) -> bool {
     use std::slice;
 
     use nix::poll::PollFd;

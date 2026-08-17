@@ -5,8 +5,17 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 
 const DEFAULT_PROXY_ENV_PATH: &str = "/etc/chevalier/proxy.env";
+#[cfg(target_os = "macos")]
+pub const DEFAULT_EXEC_PATH: &str =
+    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+#[cfg(not(target_os = "macos"))]
+pub const DEFAULT_EXEC_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+#[cfg(target_os = "macos")]
+static DEFAULT_EXEC_HOME: OnceLock<String> = OnceLock::new();
 const MANAGED_PROXY_ENV_KEYS: &[&str] = &[
     "http_proxy",
     "https_proxy",
@@ -37,6 +46,24 @@ pub fn build_exec_env(
         merged.entry(key).or_insert(value);
     }
     merged
+}
+
+pub fn default_exec_home() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        DEFAULT_EXEC_HOME
+            .get_or_init(|| {
+                env::var("HOME")
+                    .ok()
+                    .filter(|home| home.starts_with('/'))
+                    .unwrap_or_else(|| "/var/root".to_string())
+            })
+            .as_str()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "/root"
+    }
 }
 
 fn read_managed_proxy_env() -> HashMap<String, String> {
@@ -78,6 +105,20 @@ mod tests {
     use super::*;
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn platform_exec_defaults_match_guest_service_account() {
+        #[cfg(target_os = "macos")]
+        {
+            assert!(default_exec_home().starts_with('/'));
+            assert!(DEFAULT_EXEC_PATH.starts_with("/opt/homebrew/bin:"));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(default_exec_home(), "/root");
+            assert!(DEFAULT_EXEC_PATH.starts_with("/usr/local/sbin:"));
+        }
+    }
 
     #[test]
     fn build_exec_env_merges_managed_proxy_env_and_request_overrides() {

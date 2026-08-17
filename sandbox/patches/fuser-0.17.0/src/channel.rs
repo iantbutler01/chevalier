@@ -1,17 +1,28 @@
 use std::io;
+#[cfg(not(fuser_mount_impl = "macos-fskit"))]
 use std::os::fd::AsFd;
+#[cfg(not(fuser_mount_impl = "macos-fskit"))]
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 
 use nix::errno::Errno;
 
+#[cfg(not(fuser_mount_impl = "macos-fskit"))]
 use crate::dev_fuse::DevFuse;
+#[cfg(fuser_mount_impl = "macos-fskit")]
+use crate::mnt::macos_fskit::MacFuseChannel;
 use crate::passthrough::BackingId;
+
+#[cfg(not(fuser_mount_impl = "macos-fskit"))]
+type ChannelInner = DevFuse;
+#[cfg(fuser_mount_impl = "macos-fskit")]
+type ChannelInner = MacFuseChannel;
 
 /// A raw communication channel to the FUSE kernel driver
 #[derive(Debug, Clone)]
-pub(crate) struct Channel(Arc<DevFuse>);
+pub(crate) struct Channel(Arc<ChannelInner>);
 
+#[cfg(not(fuser_mount_impl = "macos-fskit"))]
 impl AsFd for Channel {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.0.as_fd()
@@ -22,13 +33,20 @@ impl Channel {
     /// Create a new communication channel to the kernel driver by mounting the
     /// given path. The kernel driver will delegate filesystem operations of
     /// the given path to the channel.
-    pub(crate) fn new(device: Arc<DevFuse>) -> Self {
+    pub(crate) fn new(device: Arc<ChannelInner>) -> Self {
         Self(device)
     }
 
     /// Receives data up to the capacity of the given buffer (can block).
     fn receive(&self, buffer: &mut [u8]) -> nix::Result<usize> {
-        nix::unistd::read(&self.0, buffer)
+        #[cfg(not(fuser_mount_impl = "macos-fskit"))]
+        {
+            nix::unistd::read(&self.0, buffer)
+        }
+        #[cfg(fuser_mount_impl = "macos-fskit")]
+        {
+            self.0.receive(buffer)
+        }
     }
 
     /// Receives data up to the capacity of the given buffer (can block),
@@ -41,10 +59,21 @@ impl Channel {
         loop {
             match self.receive(buffer) {
                 Ok(size) => return Ok(size),
-                Err(Errno::ENOENT | Errno::EINTR | Errno::EAGAIN) => continue,
+                Err(Errno::ENOENT | Errno::EINTR | Errno::EAGAIN) => {
+                    #[cfg(fuser_mount_impl = "macos-fskit")]
+                    if self.0.is_closing() {
+                        return Err(self.0.terminal_errno());
+                    }
+                    continue;
+                }
                 Err(err) => return Err(err),
             }
         }
+    }
+
+    #[cfg(fuser_mount_impl = "macos-fskit")]
+    pub(crate) fn mount_error(&self) -> Option<io::Error> {
+        self.0.mount_error()
     }
 
     /// Returns a sender object for this channel. The sender object can be
@@ -80,19 +109,54 @@ impl Channel {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ChannelSender(Arc<DevFuse>);
+pub(crate) struct ChannelSender(Arc<ChannelInner>);
 
 impl ChannelSender {
-    pub(crate) fn send(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<()> {
-        let rc = nix::sys::uio::writev(&self.0, bufs)?;
-        // writev is atomic, so do not need to check how many bytes are written.
-        // libfuse does not do it either
-        // https://github.com/libfuse/libfuse/blob/6278995cca991978abd25ebb2c20ebd3fc9e8a13/lib/fuse_lowlevel.c#L267
-        debug_assert_eq!(bufs.iter().map(|b| b.len()).sum::<usize>(), rc);
-        Ok(())
+    pub(crate) fn complete_without_reply(&self, unique: u64) {
+        #[cfg(fuser_mount_impl = "macos-fskit")]
+        self.0.complete_without_reply(unique);
+        #[cfg(not(fuser_mount_impl = "macos-fskit"))]
+        let _ = unique;
     }
 
+    pub(crate) fn fail_pending_request(&self, unique: u64, errno: libc::c_int) -> io::Result<()> {
+        #[cfg(fuser_mount_impl = "macos-fskit")]
+        {
+            self.0.fail_pending_request(unique, errno)
+        }
+        #[cfg(not(fuser_mount_impl = "macos-fskit"))]
+        {
+            let _ = (unique, errno);
+            Ok(())
+        }
+    }
+
+    pub(crate) fn send(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<()> {
+        #[cfg(not(fuser_mount_impl = "macos-fskit"))]
+        {
+            let rc = nix::sys::uio::writev(&self.0, bufs)?;
+            // writev is atomic, so do not need to check how many bytes are written.
+            // libfuse does not do it either
+            // https://github.com/libfuse/libfuse/blob/6278995cca991978abd25ebb2c20ebd3fc9e8a13/lib/fuse_lowlevel.c#L267
+            debug_assert_eq!(bufs.iter().map(|b| b.len()).sum::<usize>(), rc);
+            Ok(())
+        }
+        #[cfg(fuser_mount_impl = "macos-fskit")]
+        {
+            self.0.send(bufs)
+        }
+    }
+
+    #[cfg(not(fuser_mount_impl = "macos-fskit"))]
     pub(crate) fn open_backing(&self, fd: BorrowedFd<'_>) -> std::io::Result<BackingId> {
         BackingId::create(&self.0, fd)
+    }
+
+    #[cfg(fuser_mount_impl = "macos-fskit")]
+    pub(crate) fn open_backing(&self, _fd: std::os::fd::BorrowedFd<'_>) -> io::Result<BackingId> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "backing file handles are not supported by MFMount channels",
+        ))
     }
 }

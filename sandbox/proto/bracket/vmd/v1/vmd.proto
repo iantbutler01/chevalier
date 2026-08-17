@@ -41,6 +41,74 @@ enum VMSourceType {
   VM_SOURCE_TYPE_UNSPECIFIED = 0;
   VM_SOURCE_TYPE_DOCKER = 1;
   VM_SOURCE_TYPE_SNAPSHOT = 2;
+  VM_SOURCE_TYPE_MACOS_TEMPLATE = 3;
+}
+
+enum GuestPlatform {
+  GUEST_PLATFORM_UNSPECIFIED = 0;
+  GUEST_PLATFORM_LINUX = 1;
+  GUEST_PLATFORM_MACOS = 2;
+}
+
+enum WorkspaceTransport {
+  WORKSPACE_TRANSPORT_UNSPECIFIED = 0;
+  WORKSPACE_TRANSPORT_VIRTIO_FS = 1;
+  WORKSPACE_TRANSPORT_MACFUSE_FSKIT = 2;
+}
+
+enum WorkspaceMode {
+  WORKSPACE_MODE_UNSPECIFIED = 0;
+  WORKSPACE_MODE_OWNER_AND_OBSERVERS = 1;
+  WORKSPACE_MODE_OWNER_ONLY = 2;
+}
+
+enum NetworkPolicyMode {
+  NETWORK_POLICY_MODE_UNSPECIFIED = 0;
+  NETWORK_POLICY_MODE_TAP_TRANSPARENT_PROXY = 1;
+  NETWORK_POLICY_MODE_NO_NIC_VSOCK_PROXY = 2;
+  NETWORK_POLICY_MODE_NO_NIC_ISOLATED = 3;
+}
+
+message GuestProfile {
+  GuestPlatform platform = 1;
+  string architecture = 2;
+  string os_version = 3;
+  string os_build = 4;
+  string template_id = 5;
+  string template_digest = 6;
+  string machine_profile = 7;
+  uint32 schema_version = 8;
+  string minimum_host_version = 9;
+}
+
+message GuestRuntime {
+  GuestPlatform platform = 1;
+  string architecture = 2;
+  string home_dir = 3;
+  string workspace_root = 4;
+  optional string workspace_alias = 5;
+  string temp_dir = 6;
+  string runtime_dir = 7;
+  string environment_file_root = 8;
+  string default_shell = 9;
+  string service_manager = 10;
+}
+
+message VMCapabilities {
+  WorkspaceTransport workspace_transport = 1;
+  WorkspaceMode workspace_mode = 2;
+  NetworkPolicyMode network_policy_mode = 3;
+  bool durable_volume = 4;
+  bool docker = 5;
+  bool managed_services = 6;
+  bool pause_resume = 7;
+  bool cold_checkpoint = 8;
+  bool same_host_saved_state = 9;
+  bool stopped_fork = 10;
+  bool running_fork = 11;
+  bool computer_use = 12;
+  bool pci = 13;
+  bool cross_node_restore = 14;
 }
 
 message VMSource {
@@ -147,6 +215,9 @@ message VM {
   repeated SharedMount shared_mounts = 13;
   repeated PciDeviceAssignment pci_devices = 14;
   DurableVolumeAttachment durable_volume = 15;
+  GuestProfile guest_profile = 16;
+  GuestRuntime guest_runtime = 17;
+  VMCapabilities capabilities = 18;
 }
 
 message ListVMsRequest {
@@ -208,6 +279,9 @@ message CreateVMRequest {
   string storage_profile = 9;
   string volume_owner_key = 10;
   int32 volume_size_gb = 11;
+  GuestProfile guest_profile = 12;
+  GuestRuntime guest_runtime = 13;
+  VMCapabilities capabilities = 14;
 }
 
 message ListHostPciDevicesRequest {}

@@ -11,8 +11,9 @@ pub use manager::{Manager, ManagerError, ManagerResult, PendingSnapshot, Snapsho
 pub use metadata::{load_metadata, save_metadata};
 pub use runtime::VmRuntime;
 pub use types::{
-    CreateVmParams, DurableVolumeAttachment, DurableVolumeMetadata, ForkVmParams, NetworkSpec,
-    ResourceSpec, SharedMountAvailability, SharedMountContinuity, SharedMountSpec,
-    SnapshotMetadata, SnapshotRecord, UpdateVmParams, Vm, VmMetadata, VmSource, VmSourceType,
-    VmState,
+    CreateVmParams, DurableVolumeAttachment, DurableVolumeMetadata, ForkVmParams, GuestPlatform,
+    GuestProfile, GuestRuntime, NetworkPolicyMode, NetworkSpec, ResourceSpec,
+    SharedMountAvailability, SharedMountContinuity, SharedMountSpec, SnapshotMetadata,
+    SnapshotRecord, UpdateVmParams, Vm, VmCapabilities, VmMetadata, VmSource, VmSourceType,
+    VmState, WorkspaceMode, WorkspaceTransport,
 };

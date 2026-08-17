@@ -3874,6 +3874,9 @@ impl Sandbox {
             metadata: Some(Metadata { entries: metadata }),
             auto_start: opts.auto_start,
             architecture: architecture.clone(),
+            guest_profile: None,
+            guest_runtime: None,
+            capabilities: None,
             shared_mounts: opts
                 .shared_mounts
                 .into_iter()

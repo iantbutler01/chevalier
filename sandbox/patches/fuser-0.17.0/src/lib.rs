@@ -135,13 +135,17 @@ mod time;
 const INIT_FLAGS: InitFlags = InitFlags::FUSE_ASYNC_READ.union(InitFlags::FUSE_BIG_WRITES);
 // TODO: Add FUSE_EXPORT_SUPPORT
 
-/// On macOS, we additionally support case insensitiveness, volume renames and xtimes
+/// On legacy macOS transports, we additionally support case insensitiveness, volume renames and xtimes
 /// TODO: we should eventually let the filesystem implementation decide which flags to set
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(fuser_mount_impl = "macos-fskit")))]
 const INIT_FLAGS: InitFlags = InitFlags::FUSE_ASYNC_READ
     .union(InitFlags::FUSE_CASE_INSENSITIVE)
     .union(InitFlags::FUSE_VOL_RENAME)
     .union(InitFlags::FUSE_XTIMES);
+/// FSKit requires the filesystem to opt into stable inode identities even though the
+/// mount request does not advertise that response flag as a capability.
+#[cfg(all(target_os = "macos", fuser_mount_impl = "macos-fskit"))]
+const INIT_FLAGS: InitFlags = InitFlags::FUSE_EXPORT_SUPPORT.union(InitFlags::FUSE_REPLY_BUF);
 // TODO: Add FUSE_EXPORT_SUPPORT and FUSE_BIG_WRITES (requires ABI 7.10)
 
 fn default_init_flags(capabilities: InitFlags) -> InitFlags {
@@ -150,6 +154,30 @@ fn default_init_flags(capabilities: InitFlags) -> InitFlags {
         flags |= InitFlags::FUSE_MAX_PAGES;
     }
     flags
+}
+
+#[cfg(all(test, fuser_mount_impl = "macos-fskit"))]
+mod macos_fskit_init_flags_test {
+    use super::*;
+
+    #[test]
+    fn preserves_case_sensitive_identity() {
+        assert!(!INIT_FLAGS.contains(InitFlags::FUSE_CASE_INSENSITIVE));
+        assert!(INIT_FLAGS.contains(InitFlags::FUSE_EXPORT_SUPPORT));
+        assert!(INIT_FLAGS.contains(InitFlags::FUSE_REPLY_BUF));
+        assert!(!INIT_FLAGS.contains(InitFlags::FUSE_ASYNC_READ));
+        assert!(!INIT_FLAGS.contains(InitFlags::FUSE_BIG_WRITES));
+        assert!(!INIT_FLAGS.contains(InitFlags::FUSE_VOL_RENAME));
+        assert!(!INIT_FLAGS.contains(InitFlags::FUSE_XTIMES));
+    }
+
+    #[test]
+    fn disables_unsupported_background_queue_fields() {
+        let config = KernelConfig::new(InitFlags::empty(), 16 * 1024 * 1024, Version(7, 19));
+
+        assert_eq!(config.max_background, 0);
+        assert_eq!(config.congestion_threshold(), 0);
+    }
 }
 
 /// File types
@@ -254,7 +282,12 @@ impl KernelConfig {
             requested: default_init_flags(capabilities),
             max_readahead,
             max_max_readahead: max_readahead,
-            max_background: 16,
+            // macFUSE's FSKit bridge rejects the Linux-style background queue defaults.
+            max_background: if cfg!(fuser_mount_impl = "macos-fskit") {
+                0
+            } else {
+                16
+            },
             congestion_threshold: None,
             // use a max write size that fits into the session's buffer
             max_write: MAX_WRITE_SIZE as u32,

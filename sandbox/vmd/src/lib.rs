@@ -11,12 +11,18 @@
 #![allow(clippy::ptr_arg)]
 #![allow(clippy::unnecessary_cast)]
 
+#[cfg(all(feature = "macos-macfuse", feature = "macos-fskit"))]
+compile_error!("macos-macfuse and macos-fskit are mutually exclusive");
+#[cfg(all(feature = "macos-macfuse", feature = "macos-no-mount"))]
+compile_error!("macos-macfuse and macos-no-mount are mutually exclusive");
+
 pub mod app;
 pub mod assets;
 pub mod bootstrap;
 pub mod config;
 pub mod control_bus;
 pub mod fuse;
+pub mod guest;
 pub mod guest_exec_probe;
 pub mod health_reconciler;
 pub mod image;

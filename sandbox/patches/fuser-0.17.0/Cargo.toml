@@ -64,6 +64,7 @@ libfuse = []
 libfuse2 = ["libfuse"]
 libfuse3 = ["libfuse"]
 macfuse-4-compat = []
+macos-fskit = []
 macos-no-mount = []
 serializable = ["serde"]
 

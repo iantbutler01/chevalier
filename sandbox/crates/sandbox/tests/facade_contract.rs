@@ -104,6 +104,9 @@ impl MockVmd {
             shared_mounts: Vec::new(),
             pci_devices: Vec::new(),
             durable_volume: None,
+            guest_profile: None,
+            guest_runtime: None,
+            capabilities: None,
         }
     }
 
@@ -1266,6 +1269,60 @@ async fn bidi_exec_shell_and_file_contract() {
     timeout(Duration::from_secs(3), harness.shutdown())
         .await
         .expect("mock harness shutdown timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_stream_closes_after_exit_while_input_handle_is_retained() {
+    let harness = TestHarness::start().await;
+
+    let sandbox = Sandbox::connect(harness.vmd_endpoint.clone(), sandbox_config())
+        .await
+        .expect("connect sandbox facade to mock vmd");
+    let session = sandbox
+        .session(SessionOptions {
+            session_id: Some("session-exec-eof".to_string()),
+            auto_start: true,
+            ..SessionOptions::default()
+        })
+        .await
+        .expect("create exec EOF session");
+
+    let exec = session
+        .exec(
+            "echo complete",
+            ExecOptions {
+                close_stdin_on_start: true,
+                ..ExecOptions::default()
+            },
+        )
+        .await
+        .expect("start exec");
+    let _retained_input = exec.input;
+    let mut events = exec.events;
+
+    loop {
+        let event = timeout(Duration::from_secs(3), events.next())
+            .await
+            .expect("timed out waiting for exec event")
+            .expect("exec stream ended before exit")
+            .expect("exec event should decode");
+        if matches!(event, ExecEvent::Exit(0)) {
+            break;
+        }
+    }
+
+    let terminal = timeout(Duration::from_secs(3), events.next())
+        .await
+        .expect("exec event stream did not close after exit");
+    assert!(
+        terminal.is_none(),
+        "exec event stream should end after exit"
+    );
+
+    session.discard().await.expect("discard exec EOF session");
+    timeout(Duration::from_secs(3), harness.shutdown())
+        .await
+        .expect("harness shutdown should not hang");
 }
 
 #[tokio::test(flavor = "multi_thread")]

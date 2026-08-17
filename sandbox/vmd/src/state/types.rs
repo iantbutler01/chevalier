@@ -42,10 +42,232 @@ impl VmState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum VmSourceType {
     Docker,
     Snapshot,
+    MacosTemplate,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum GuestPlatform {
+    #[default]
+    Linux,
+    Macos,
+}
+
+impl GuestPlatform {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Linux => "linux",
+            Self::Macos => "macos",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceTransport {
+    VirtioFs,
+    MacfuseFskit,
+}
+
+impl Default for WorkspaceTransport {
+    fn default() -> Self {
+        Self::VirtioFs
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceMode {
+    OwnerAndObservers,
+    OwnerOnly,
+}
+
+impl Default for WorkspaceMode {
+    fn default() -> Self {
+        Self::OwnerAndObservers
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkPolicyMode {
+    TapTransparentProxy,
+    NoNicVsockProxy,
+    NoNicIsolated,
+}
+
+impl Default for NetworkPolicyMode {
+    fn default() -> Self {
+        Self::TapTransparentProxy
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuestProfile {
+    #[serde(default)]
+    pub platform: GuestPlatform,
+    #[serde(default)]
+    pub architecture: String,
+    #[serde(default)]
+    pub os_version: String,
+    #[serde(default)]
+    pub os_build: String,
+    #[serde(default)]
+    pub template_id: String,
+    #[serde(default)]
+    pub template_digest: String,
+    #[serde(default)]
+    pub machine_profile: String,
+    #[serde(default)]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub minimum_host_version: String,
+}
+
+impl Default for GuestProfile {
+    fn default() -> Self {
+        Self {
+            platform: GuestPlatform::Linux,
+            architecture: String::new(),
+            os_version: String::new(),
+            os_build: String::new(),
+            template_id: String::new(),
+            template_digest: String::new(),
+            machine_profile: String::new(),
+            schema_version: 0,
+            minimum_host_version: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuestRuntime {
+    #[serde(default)]
+    pub platform: GuestPlatform,
+    #[serde(default)]
+    pub architecture: String,
+    #[serde(default = "linux_home_dir")]
+    pub home_dir: String,
+    #[serde(default = "linux_workspace_root")]
+    pub workspace_root: String,
+    #[serde(default)]
+    pub workspace_alias: Option<String>,
+    #[serde(default = "linux_temp_dir")]
+    pub temp_dir: String,
+    #[serde(default = "linux_runtime_dir")]
+    pub runtime_dir: String,
+    #[serde(default = "linux_environment_file_root")]
+    pub environment_file_root: String,
+    #[serde(default = "linux_default_shell")]
+    pub default_shell: String,
+    #[serde(default = "linux_service_manager")]
+    pub service_manager: String,
+}
+
+impl Default for GuestRuntime {
+    fn default() -> Self {
+        Self {
+            platform: GuestPlatform::Linux,
+            architecture: String::new(),
+            home_dir: linux_home_dir(),
+            workspace_root: linux_workspace_root(),
+            workspace_alias: None,
+            temp_dir: linux_temp_dir(),
+            runtime_dir: linux_runtime_dir(),
+            environment_file_root: linux_environment_file_root(),
+            default_shell: linux_default_shell(),
+            service_manager: linux_service_manager(),
+        }
+    }
+}
+
+fn linux_home_dir() -> String {
+    "/root".to_string()
+}
+
+fn linux_workspace_root() -> String {
+    "/workspace".to_string()
+}
+
+fn linux_temp_dir() -> String {
+    "/tmp".to_string()
+}
+
+fn linux_runtime_dir() -> String {
+    "/run/openbracket".to_string()
+}
+
+fn linux_environment_file_root() -> String {
+    "/run/openbracket/env".to_string()
+}
+
+fn linux_default_shell() -> String {
+    "/bin/bash".to_string()
+}
+
+fn linux_service_manager() -> String {
+    "systemd".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VmCapabilities {
+    #[serde(default)]
+    pub workspace_transport: WorkspaceTransport,
+    #[serde(default)]
+    pub workspace_mode: WorkspaceMode,
+    #[serde(default)]
+    pub network_policy_mode: NetworkPolicyMode,
+    #[serde(default = "legacy_linux_capability_enabled")]
+    pub durable_volume: bool,
+    #[serde(default = "legacy_linux_capability_enabled")]
+    pub docker: bool,
+    #[serde(default = "legacy_linux_capability_enabled")]
+    pub managed_services: bool,
+    #[serde(default = "legacy_linux_capability_enabled")]
+    pub pause_resume: bool,
+    #[serde(default = "legacy_linux_capability_enabled")]
+    pub cold_checkpoint: bool,
+    #[serde(default = "legacy_linux_capability_enabled")]
+    pub same_host_saved_state: bool,
+    #[serde(default = "legacy_linux_capability_enabled")]
+    pub stopped_fork: bool,
+    #[serde(default = "legacy_linux_capability_enabled")]
+    pub running_fork: bool,
+    #[serde(default = "legacy_linux_capability_enabled")]
+    pub computer_use: bool,
+    #[serde(default = "legacy_linux_capability_enabled")]
+    pub pci: bool,
+    #[serde(default = "legacy_linux_capability_enabled")]
+    pub cross_node_restore: bool,
+}
+
+impl Default for VmCapabilities {
+    fn default() -> Self {
+        Self {
+            workspace_transport: WorkspaceTransport::VirtioFs,
+            workspace_mode: WorkspaceMode::OwnerAndObservers,
+            network_policy_mode: NetworkPolicyMode::TapTransparentProxy,
+            durable_volume: true,
+            docker: true,
+            managed_services: true,
+            pause_resume: true,
+            cold_checkpoint: true,
+            same_host_saved_state: true,
+            stopped_fork: true,
+            running_fork: true,
+            computer_use: true,
+            pci: true,
+            cross_node_restore: true,
+        }
+    }
+}
+
+fn legacy_linux_capability_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,6 +401,12 @@ pub struct VmMetadata {
     pub state: VmState,
     #[serde(default)]
     pub architecture: String,
+    #[serde(default)]
+    pub guest_profile: GuestProfile,
+    #[serde(default)]
+    pub guest_runtime: GuestRuntime,
+    #[serde(default)]
+    pub capabilities: VmCapabilities,
     pub source: VmSource,
     pub resources: ResourceSpec,
     pub network: NetworkSpec,
@@ -243,6 +471,7 @@ pub struct VmInner {
 pub struct Vm {
     inner: Arc<tokio::sync::Mutex<VmInner>>,
     launch: tokio::sync::Mutex<()>,
+    runtime_teardown: tokio::sync::Mutex<()>,
     pub dir: PathBuf,
 }
 
@@ -251,6 +480,7 @@ impl Vm {
         Self {
             inner: Arc::new(tokio::sync::Mutex::new(VmInner { metadata, runtime })),
             launch: tokio::sync::Mutex::new(()),
+            runtime_teardown: tokio::sync::Mutex::new(()),
             dir,
         }
     }
@@ -278,6 +508,10 @@ impl Vm {
         self.inner.clone().lock_owned().await
     }
 
+    pub async fn lock_runtime_teardown(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.runtime_teardown.lock().await
+    }
+
     pub fn disk_path(&self) -> PathBuf {
         self.dir.join("disk.qcow2")
     }
@@ -289,7 +523,7 @@ pub struct SnapshotRecord {
     pub snapshot: SnapshotMetadata,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateVmParams {
     pub name: String,
     pub source: VmSource,
@@ -297,6 +531,12 @@ pub struct CreateVmParams {
     pub metadata: HashMap<String, String>,
     pub auto_start: bool,
     pub architecture: String,
+    #[serde(default)]
+    pub guest_profile: GuestProfile,
+    #[serde(default)]
+    pub guest_runtime: GuestRuntime,
+    #[serde(default)]
+    pub capabilities: VmCapabilities,
     pub shared_mounts: Vec<SharedMountSpec>,
     pub pci_device_ids: Vec<String>,
     pub storage_profile: String,
@@ -399,5 +639,82 @@ pub fn sanitize_name(input: &str) -> String {
         )
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn legacy_vm_metadata_defaults_to_linux_guest_model() {
+        let metadata: VmMetadata = serde_json::from_value(json!({
+            "id": "vm-legacy",
+            "name": "legacy",
+            "created_at": "2026-08-09T00:00:00.000Z",
+            "updated_at": "2026-08-09T00:00:00.000Z",
+            "state": "stopped",
+            "source": {
+                "type": "docker",
+                "reference": "docker.io/library/alpine:latest"
+            },
+            "resources": {
+                "vcpu": 2,
+                "memory_mb": 2048,
+                "disk_gb": 20
+            },
+            "network": {
+                "mac": "02:00:00:00:00:01"
+            }
+        }))
+        .expect("legacy metadata should deserialize");
+
+        assert_eq!(metadata.guest_profile.platform, GuestPlatform::Linux);
+        assert_eq!(metadata.guest_runtime, GuestRuntime::default());
+        assert_eq!(metadata.capabilities, VmCapabilities::default());
+        assert_eq!(metadata.guest_runtime.workspace_root, "/workspace");
+        assert_eq!(
+            metadata.capabilities.workspace_transport,
+            WorkspaceTransport::VirtioFs
+        );
+    }
+
+    #[test]
+    fn legacy_create_params_default_to_linux_guest_model() {
+        let params: CreateVmParams = serde_json::from_value(json!({
+            "name": "legacy",
+            "source": {
+                "type": "docker",
+                "reference": "docker.io/library/alpine:latest"
+            },
+            "resources": {
+                "vcpu": 2,
+                "memory_mb": 2048,
+                "disk_gb": 20
+            },
+            "metadata": {},
+            "auto_start": false,
+            "architecture": "x86_64",
+            "shared_mounts": [],
+            "pci_device_ids": [],
+            "storage_profile": "ephemeral",
+            "volume_owner_key": null,
+            "volume_size_gb": null
+        }))
+        .expect("legacy create parameters should deserialize");
+
+        assert_eq!(params.guest_profile.platform, GuestPlatform::Linux);
+        assert_eq!(params.guest_runtime.platform, GuestPlatform::Linux);
+        assert!(params.capabilities.docker);
+        assert!(params.capabilities.running_fork);
+    }
+
+    #[test]
+    fn macos_template_source_uses_stable_kebab_case_metadata_value() {
+        assert_eq!(
+            serde_json::to_value(VmSourceType::MacosTemplate).unwrap(),
+            json!("macos-template")
+        );
     }
 }

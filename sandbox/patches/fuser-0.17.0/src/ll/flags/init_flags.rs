@@ -93,6 +93,9 @@ bitflags! {
         /// kernel supports request timeout
         const FUSE_REQUEST_TIMEOUT = 1 << 42;
 
+        /// filesystem can use MFMessage reply buffers
+        #[cfg(target_os = "macos")]
+        const FUSE_REPLY_BUF = 1 << 21;
         /// pre-allocate space for a file
         #[cfg(target_os = "macos")]
         const FUSE_ALLOCATE = 1 << 27;

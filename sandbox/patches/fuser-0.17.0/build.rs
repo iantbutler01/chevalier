@@ -1,8 +1,10 @@
 fn main() {
     // Register rustc cfg for switching between mount implementations.
     println!(
-        "cargo::rustc-check-cfg=cfg(fuser_mount_impl, values(\"pure-rust\", \"libfuse2\", \"libfuse3\", \"macos-no-mount\"))"
+        "cargo::rustc-check-cfg=cfg(fuser_mount_impl, values(\"pure-rust\", \"libfuse2\", \"libfuse3\", \"macos-fskit\", \"macos-no-mount\"))"
     );
+    println!("cargo::rerun-if-env-changed=MACFUSE_FRAMEWORK_DIR");
+    println!("cargo::rerun-if-env-changed=MACFUSE_LIBRARY_DIR");
 
     let target_os =
         std::env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS should be set");
@@ -14,7 +16,21 @@ fn main() {
     {
         println!("cargo::rustc-cfg=fuser_mount_impl=\"pure-rust\"");
     } else if target_os == "macos" {
-        if cfg!(feature = "macos-no-mount") {
+        if cfg!(feature = "macos-fskit") && cfg!(feature = "macos-no-mount") {
+            panic!("macos-fskit and macos-no-mount cannot be enabled together");
+        } else if cfg!(feature = "macos-fskit") {
+            let framework_dir = std::env::var("MACFUSE_FRAMEWORK_DIR").unwrap_or_else(|_| {
+                "/Library/Filesystems/macfuse.fs/Contents/Frameworks".to_owned()
+            });
+            let library_dir = std::env::var("MACFUSE_LIBRARY_DIR")
+                .unwrap_or_else(|_| "/usr/local/lib".to_owned());
+            println!("cargo::rustc-link-search=framework={framework_dir}");
+            println!("cargo::rustc-link-search=native={library_dir}");
+            println!("cargo::rustc-link-lib=framework=MFMount");
+            println!("cargo::rustc-link-lib=dylib=fuse");
+            println!("cargo::rustc-cfg=fuser_mount_impl=\"macos-fskit\"");
+            println!("cargo::rustc-cfg=feature=\"macfuse-4-compat\"");
+        } else if cfg!(feature = "macos-no-mount") {
             println!("cargo::rustc-cfg=fuser_mount_impl=\"macos-no-mount\"");
         } else {
             pkg_config::Config::new()

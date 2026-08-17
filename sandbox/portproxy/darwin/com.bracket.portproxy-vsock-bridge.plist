@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bracket.portproxy-vsock-bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Library/Application Support/Chevalier/bin/portproxy-darwin-vsock-bridge</string>
+    <string>--vsock-port</string>
+    <string>13338</string>
+    <string>--tcp-address</string>
+    <string>127.0.0.1:13338</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>1</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Library/Logs/Chevalier/portproxy-vsock-bridge.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Library/Logs/Chevalier/portproxy-vsock-bridge.log</string>
+</dict>
+</plist>

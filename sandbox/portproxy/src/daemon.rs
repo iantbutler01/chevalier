@@ -15,12 +15,10 @@ use tracing::{error, info, warn};
 use crate::child_tracker::ChildTracker;
 use crate::pb::bracket::portproxy::v1::{ExecDaemonRequest, ExecDaemonResponse};
 use crate::process_group::{configure_child_process_group, kill_process_group_or_child};
-use crate::system_env::build_exec_env;
+use crate::system_env::{DEFAULT_EXEC_PATH, build_exec_env, default_exec_home};
 
 const CHANNEL_CAPACITY: usize = 100;
 const BACKLOG_MAX_FRAMES: usize = 512;
-const DEFAULT_EXEC_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-const DEFAULT_EXEC_HOME: &str = "/root";
 /// Grace window for keeping an exited daemon's entry around so a slightly-
 /// late `attach_daemon` (or one delayed by guest-network jitter) can still
 /// resolve it and replay backlog + final exit code. 5 minutes is more than
@@ -78,7 +76,7 @@ impl DaemonRegistry {
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
         command.env_clear();
-        for (key, value) in build_exec_env(DEFAULT_EXEC_PATH, DEFAULT_EXEC_HOME, &req.env) {
+        for (key, value) in build_exec_env(DEFAULT_EXEC_PATH, default_exec_home(), &req.env) {
             command.env(key, value);
         }
         configure_child_process_group(&mut command);
@@ -383,7 +381,7 @@ pub fn build_command_builder(
         builder.args(args);
     }
     builder.env_clear();
-    for (k, v) in build_exec_env(DEFAULT_EXEC_PATH, DEFAULT_EXEC_HOME, env) {
+    for (k, v) in build_exec_env(DEFAULT_EXEC_PATH, default_exec_home(), env) {
         builder.env(k, v);
     }
     if let Some(dir) = cwd {

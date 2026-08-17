@@ -4,9 +4,22 @@
 SHELL := /bin/bash
 
 .PHONY: verify verify-strict verify-e2e verify-e2e-leaks verify-api verify-fork verify-mq verify-reconcile verify-chaos verify-soak verify-security verify-slo evaluate-rollout-policy verify-outbox verify-gateway verify-storage verify-admission verify-dr verify-security-ops verify-envelope verify-fence verify-partition verify-gameday verify-continuity verify-drain verify-restore verify-exactly-once verify-fidelity verify-warm-pool verify-strict-real verify-real-gate41 verify-real-gate42 verify-real-gate43 verify-real-gate44 verify-real-gate45 verify-real-gate46 verify-real-gate47 verify-real-gate48 integration-up integration-down integration-reset integration-artifacts integration-verify-two-node integration-verify-gateway-routing integration-verify-real-failover integration-verify-real-failover-distributed integration-verify-control-plane-failures integration-verify-real-warm-pool integration-verify-planned-drain drill-gateway-failover replay-dlq
+.PHONY: build-vz-helper build-vmd-macos verify-vz-helper verify-vmd-macos
 
 verify:
 	./scripts/verify_chevalier_sandbox.sh
+
+build-vz-helper:
+	swift build --package-path vz-helper -c release
+
+build-vmd-macos:
+	cargo build --manifest-path vmd/Cargo.toml --no-default-features --features macos-fskit --bin vmd --bin vmdctl --bin chevalier-vfs-fuse
+
+verify-vz-helper:
+	swift test --package-path vz-helper
+
+verify-vmd-macos:
+	cargo test --manifest-path vmd/Cargo.toml --no-default-features --features macos-fskit --lib
 
 verify-strict:
 	./scripts/verify_chevalier_sandbox.sh --strict

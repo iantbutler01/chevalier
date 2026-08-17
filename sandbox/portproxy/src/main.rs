@@ -115,7 +115,7 @@ async fn run_server_mode(args: Args) -> anyhow::Result<()> {
         }
     });
 
-    let rpc_addr: SocketAddr = format!("0.0.0.0:{}", args.rpc_port).parse()?;
+    let rpc_addr = SocketAddr::new(args.rpc_bind_address, args.rpc_port);
 
     let grpc = serve_grpc(rpc_addr, tracker.clone(), daemon_registry.clone());
     let port_proxy = port_forward::run_server(&args.server_addr);

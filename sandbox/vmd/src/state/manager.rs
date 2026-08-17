@@ -31,7 +31,10 @@ use crate::assets::portproxy;
 use crate::bootstrap;
 use crate::config::{self, Config};
 use crate::fuse;
-use crate::guest_exec_probe::{portproxy_auth_header_from_metadata, run_guest_shell_exec};
+use crate::guest::macos_vz;
+use crate::guest_exec_probe::{
+    portproxy_auth_header_from_metadata, probe_guest_exec_ready_anyhow, run_guest_shell_exec,
+};
 use crate::image::{self, BASE_IMAGE_EXT, BASE_IMAGE_SIZE_GB, PrebuiltImageStatus};
 use crate::network;
 use crate::pci::{self, PciDeviceAssignmentSpec, PciInventoryDevice, PciInventoryState};
@@ -40,9 +43,10 @@ use crate::state::metadata::{
 };
 use crate::state::runtime::VmRuntime;
 use crate::state::types::{
-    CreateVmParams, DurableVolumeAttachment, DurableVolumeMetadata, ForkVmParams, NetworkSpec,
-    SharedMountAvailability, SharedMountContinuity, SharedMountSpec, SnapshotMetadata,
-    SnapshotRecord, UpdateVmParams, Vm, VmInner, VmMetadata, VmSource, VmSourceType, VmState,
+    CreateVmParams, DurableVolumeAttachment, DurableVolumeMetadata, ForkVmParams, GuestPlatform,
+    GuestRuntime, NetworkPolicyMode, NetworkSpec, SharedMountAvailability, SharedMountContinuity,
+    SharedMountSpec, SnapshotMetadata, SnapshotRecord, UpdateVmParams, Vm, VmCapabilities, VmInner,
+    VmMetadata, VmSource, VmSourceType, VmState, WorkspaceMode, WorkspaceTransport,
     new_snapshot_metadata, sanitize_name,
 };
 use crate::virt;
@@ -64,6 +68,7 @@ const ARCH_ARM64: &str = "arm64";
 /// timeouts installed by the bootstrap), so reaching this ceiling means the
 /// guest is genuinely wedged rather than merely busy.
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(180);
+const MACOS_VZ_GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const FORK_BASES_DIR_NAME: &str = "_fork_bases";
 const VOLUMES_DIR_NAME: &str = "volumes";
 const VOLUME_FORK_BASES_DIR_NAME: &str = "_fork_bases";
@@ -87,6 +92,7 @@ const META_NETWORK_POLICY: &str = "chevalier.network_policy";
 const META_NETWORK_POLICY_PROXY_UPSTREAM: &str = "chevalier.network_policy_proxy_upstream";
 const META_NETWORK_EGRESS_SNAPSHOT: &str = "chevalier.network_egress";
 const META_PORTPROXY_AUTH_TOKEN: &str = "chevalier.portproxy_auth_token";
+const META_VZ_RUNTIME_GENERATION: &str = "chevalier.vz_runtime_generation";
 const MAINTENANCE_DIR_NAME: &str = "_maintenance";
 const FORK_COMPACTION_QUEUE_DIR_NAME: &str = "fork_compaction_queue";
 const MAX_VM_VCPU: i32 = 8;
@@ -1144,10 +1150,17 @@ impl Manager {
                             continue;
                         }
                     }
-                    if matches!(
-                        meta.state,
-                        VmState::Running | VmState::Paused | VmState::Creating
-                    ) {
+                    let adopt_macos_runtime = is_macos_vz(&meta)
+                        && matches!(
+                            meta.state,
+                            VmState::Running | VmState::Paused | VmState::Creating
+                        );
+                    if !adopt_macos_runtime
+                        && matches!(
+                            meta.state,
+                            VmState::Running | VmState::Paused | VmState::Creating
+                        )
+                    {
                         meta.state = VmState::Stopped;
                     }
                     if meta.architecture.is_empty() {
@@ -1183,6 +1196,41 @@ impl Manager {
                     {
                         let mut inner = vm.lock().await;
                         inner.runtime.state = meta.state;
+                    }
+                    if adopt_macos_runtime {
+                        match try_adopt_macos_vz_runtime(&vm).await {
+                            Ok(Some(adopted)) => {
+                                meta = adopted;
+                                spawn_vz_adoption_monitor(vm.clone());
+                                info!(
+                                    vm_id = %meta.id,
+                                    state = ?meta.state,
+                                    pid = ?vm.lock().await.runtime.command_pid,
+                                    "reattached to macOS VZ owner during discovery"
+                                );
+                            }
+                            Ok(None) => {
+                                meta.state = VmState::Stopped;
+                                meta.started_at = None;
+                                let mut inner = vm.lock().await;
+                                inner.runtime.state = VmState::Stopped;
+                                inner.runtime.command_pid = None;
+                                inner.runtime.started_at = None;
+                                inner.metadata.state = VmState::Stopped;
+                                inner.metadata.started_at = None;
+                                warn!(
+                                    vm_id = %meta.id,
+                                    "persisted macOS VZ runtime was not adoptable; marking it stopped"
+                                );
+                            }
+                            Err(error) => {
+                                warn!(
+                                    vm_id = %meta.id,
+                                    error = %error,
+                                    "failed to adopt persisted macOS VZ runtime; preserving its nonterminal state for cleanup retry"
+                                );
+                            }
+                        }
                     }
 
                     for snap in &meta.snapshots {
@@ -1291,6 +1339,11 @@ impl Manager {
     }
 
     fn ensure_pci_compatible(&self, metadata: &VmMetadata) -> ManagerResult<()> {
+        if is_macos_vz(metadata) || !metadata.capabilities.pci {
+            return Err(ManagerError::Unsupported(
+                "PCI assignment is unavailable for this guest backend".to_string(),
+            ));
+        }
         if !self.cfg.pci.enabled() {
             return Err(ManagerError::Unsupported(
                 "PCI assignment is disabled on this vmd".to_string(),
@@ -1868,6 +1921,10 @@ impl Manager {
             "creating vm with normalized shared mounts"
         );
 
+        if matches!(params.source.source_type, VmSourceType::MacosTemplate) {
+            return self.create_macos_vz_vm(params, name, progress).await;
+        }
+
         let mac = random_mac().map_err(ManagerError::Other)?;
         let requested_arch_str = normalize_arch(&params.architecture)?;
         let requested_arch = if requested_arch_str.is_empty() {
@@ -1907,6 +1964,7 @@ impl Manager {
                     Some(inner.metadata.architecture.clone())
                 }
             }
+            VmSourceType::MacosTemplate => unreachable!("macOS creation dispatched above"),
         };
 
         let arch = resolved_arch
@@ -1961,6 +2019,9 @@ impl Manager {
             updated_at: Utc::now(),
             state: VmState::Creating,
             architecture: arch.clone(),
+            guest_profile: params.guest_profile.clone(),
+            guest_runtime: params.guest_runtime.clone(),
+            capabilities: params.capabilities.clone(),
             source: VmSource {
                 source_type: params.source.source_type.clone(),
                 reference: params.source.reference.clone(),
@@ -2044,6 +2105,7 @@ impl Manager {
                     )))
                 }
             }
+            VmSourceType::MacosTemplate => unreachable!("macOS creation dispatched above"),
         };
         vm_guard = match create_result {
             Ok(vm_guard) => vm_guard,
@@ -2105,6 +2167,206 @@ impl Manager {
         Ok(created_metadata)
     }
 
+    async fn create_macos_vz_vm(
+        &self,
+        params: CreateVmParams,
+        name: String,
+        progress: Option<CreateVmProgressCallback>,
+    ) -> ManagerResult<VmMetadata> {
+        if !cfg!(target_os = "macos") || self.host_arch != ARCH_ARM64 {
+            return Err(ManagerError::Unsupported(
+                "macOS VZ guests require an Apple Silicon macOS host".to_string(),
+            ));
+        }
+        if params.guest_profile.platform != GuestPlatform::Macos {
+            return Err(ManagerError::Unsupported(
+                "macOS template creation requires an explicit macOS guest profile".to_string(),
+            ));
+        }
+        let requested_arch = normalize_arch(&params.architecture)?;
+        if !requested_arch.is_empty() && requested_arch != ARCH_ARM64 {
+            return Err(ManagerError::Unsupported(
+                "initial macOS VZ guests require arm64 architecture".to_string(),
+            ));
+        }
+        if !params.pci_device_ids.is_empty() {
+            return Err(ManagerError::Unsupported(
+                "PCI assignment is unavailable for macOS VZ guests".to_string(),
+            ));
+        }
+        if !params.storage_profile.trim().is_empty()
+            && params.storage_profile.trim() != "local-ephemeral"
+        {
+            return Err(ManagerError::Unsupported(
+                "durable APFS volumes are not implemented for macOS VZ guests".to_string(),
+            ));
+        }
+        if params.volume_owner_key.is_some() || params.volume_size_gb.is_some() {
+            return Err(ManagerError::Unsupported(
+                "durable APFS volumes are not implemented for macOS VZ guests".to_string(),
+            ));
+        }
+
+        let helper = macos_vz::helper_binary().map_err(ManagerError::Other)?;
+        let template_path = PathBuf::from(params.source.reference.trim());
+        let (template, template_digest) =
+            macos_vz::load_template_descriptor(&template_path).map_err(ManagerError::Other)?;
+        let id = Uuid::new_v4().to_string();
+        let vm_dir = PathBuf::from(&self.cfg.data_dir).join(&id);
+        fs::create_dir_all(&vm_dir)?;
+        let runtime = VmRuntime::new(&vm_dir);
+        let paths = macos_vz::RuntimePaths::new(&vm_dir, &runtime.runtime_dir);
+
+        let mut profile = params.guest_profile;
+        profile.platform = GuestPlatform::Macos;
+        profile.architecture = ARCH_ARM64.to_string();
+        if profile.schema_version == 0 {
+            profile.schema_version = 1;
+        }
+        profile.os_version = template.guest_operating_system_version;
+        profile.os_build = template.guest_build_version;
+        profile.template_id = template_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("macos-template")
+            .to_string();
+        profile.template_digest = template_digest;
+        profile.machine_profile = template.device_profile;
+
+        let guest_runtime = GuestRuntime {
+            platform: GuestPlatform::Macos,
+            architecture: ARCH_ARM64.to_string(),
+            home_dir: "/Users/openbracket".to_string(),
+            workspace_root: "/Volumes/OpenBracketWorkspace".to_string(),
+            workspace_alias: Some("/Users/openbracket/workspace".to_string()),
+            temp_dir: "/private/tmp".to_string(),
+            runtime_dir: "/private/var/run/openbracket".to_string(),
+            environment_file_root: "/private/var/run/openbracket/env".to_string(),
+            default_shell: "/bin/zsh".to_string(),
+            service_manager: "launchd".to_string(),
+        };
+        let capabilities = VmCapabilities {
+            workspace_transport: WorkspaceTransport::VirtioFs,
+            workspace_mode: WorkspaceMode::OwnerOnly,
+            network_policy_mode: NetworkPolicyMode::NoNicIsolated,
+            durable_volume: false,
+            docker: false,
+            managed_services: false,
+            pause_resume: true,
+            cold_checkpoint: false,
+            same_host_saved_state: false,
+            stopped_fork: false,
+            running_fork: false,
+            computer_use: false,
+            pci: false,
+            cross_node_restore: false,
+        };
+
+        let mut metadata = params.metadata;
+        metadata.insert(
+            META_STORAGE_PROFILE.to_string(),
+            "local-ephemeral".to_string(),
+        );
+        metadata.insert(
+            META_PORTPROXY_AUTH_TOKEN.to_string(),
+            macos_vz::portproxy_auth_token().map_err(ManagerError::Other)?,
+        );
+        let mut meta = VmMetadata {
+            id: id.clone(),
+            name,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            state: VmState::Creating,
+            architecture: ARCH_ARM64.to_string(),
+            guest_profile: profile,
+            guest_runtime,
+            capabilities,
+            source: params.source,
+            resources: params.resources,
+            network: NetworkSpec {
+                mac: String::new(),
+                proxy_port: 0,
+                rpc_port: 0,
+            },
+            metadata,
+            snapshots: Vec::new(),
+            shared_mounts: params.shared_mounts,
+            pci_devices: Vec::new(),
+            durable_volume: None,
+            boot_incoming_ram_path: String::new(),
+            started_at: None,
+        };
+        save_metadata(&vm_dir, &mut meta).map_err(ManagerError::Other)?;
+        let vm = Arc::new(Vm::new(meta.clone(), runtime, vm_dir.clone()));
+        if let Err(error) = self
+            .insert_creating_vm_with_capacity(id.clone(), vm.clone())
+            .await
+        {
+            let _ = remove_vm_dir_if_detached(&id, &vm_dir);
+            return Err(error);
+        }
+
+        emit_stage_progress(
+            &progress,
+            CreateVmStage::ConvertImage,
+            0,
+            "cloning macOS VZ template".to_string(),
+        );
+        if let Err(error) = macos_vz::instantiate_bundle(&helper, &template_path, &paths).await {
+            self.vms.write().await.remove(&id);
+            let _ = remove_vm_dir_if_detached(&id, &vm_dir);
+            return Err(ManagerError::Other(error));
+        }
+        emit_stage_progress(
+            &progress,
+            CreateVmStage::ConvertImage,
+            100,
+            "macOS VZ bundle created".to_string(),
+        );
+
+        {
+            let mut inner = vm.lock().await;
+            inner.runtime.state = VmState::Stopped;
+            inner.metadata.state = VmState::Stopped;
+            save_metadata(&vm.dir, &mut inner.metadata).map_err(ManagerError::Other)?;
+            meta = inner.metadata.clone();
+        }
+        if let Some(session_id) = meta
+            .metadata
+            .get(META_SESSION_ID)
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.session_registry
+                .write()
+                .await
+                .insert(session_id.clone(), id.clone());
+        }
+
+        if params.auto_start {
+            emit_stage_progress(
+                &progress,
+                CreateVmStage::StartVm,
+                0,
+                "starting macOS VZ guest".to_string(),
+            );
+            meta = self.start_vm(&id).await?;
+            emit_stage_progress(
+                &progress,
+                CreateVmStage::StartVm,
+                100,
+                "macOS VZ guest started".to_string(),
+            );
+        } else {
+            emit_stage_progress(
+                &progress,
+                CreateVmStage::StartVm,
+                100,
+                "auto-start disabled".to_string(),
+            );
+        }
+        Ok(meta)
+    }
+
     #[instrument(skip(self))]
     pub async fn update_vm(&self, id: &str, params: UpdateVmParams) -> ManagerResult<VmMetadata> {
         let vm = self.vm_by_id(id).await?;
@@ -2158,6 +2420,12 @@ impl Manager {
 
     pub async fn delete_vm(&self, id: &str, _purge_snapshots: bool) -> ManagerResult<()> {
         let vm = self.vm_by_id(id).await?;
+        if {
+            let inner = vm.lock().await;
+            is_macos_vz(&inner.metadata)
+        } {
+            return self.delete_macos_vz_vm(vm, id).await;
+        }
         let (fork_base_path, session_id) = {
             let inner = vm.lock().await;
             (
@@ -2187,7 +2455,7 @@ impl Manager {
             .await
             .with_context(|| format!("clean runtime mounts before deleting VM {id}"))
             .map_err(ManagerError::Other)?;
-        fuse::unmount_active_mountpoints_under(&vm.dir.join("fuse-mounts"))
+        fuse::handle::unmount_active_vfs_mountpoints_for_vm(&vm.dir)
             .await
             .with_context(|| format!("retry path-only FUSE cleanup before deleting VM {id}"))
             .map_err(ManagerError::Other)?;
@@ -2235,6 +2503,51 @@ impl Manager {
         Ok(())
     }
 
+    async fn delete_macos_vz_vm(&self, vm: Arc<Vm>, id: &str) -> ManagerResult<()> {
+        let (state, session_id, runtime_dir) = {
+            let inner = vm.lock().await;
+            (
+                inner.runtime.state,
+                inner.metadata.metadata.get(META_SESSION_ID).cloned(),
+                inner.runtime.runtime_dir.clone(),
+            )
+        };
+        if matches!(
+            state,
+            VmState::Running | VmState::Paused | VmState::Creating
+        ) {
+            self.force_stop_vm(id).await?;
+        }
+        drain_vm_publication(&vm, "delete-macos-vz-vm", fuse::DEFAULT_VFS_DRAIN_TIMEOUT).await;
+        cleanup_runtime_mounts(&vm)
+            .await
+            .with_context(|| format!("clean runtime mounts before deleting macOS VM {id}"))
+            .map_err(ManagerError::Other)?;
+        fuse::handle::unmount_active_vfs_mountpoints_for_vm(&vm.dir)
+            .await
+            .with_context(|| format!("retry path-only FUSE cleanup before deleting macOS VM {id}"))
+            .map_err(ManagerError::Other)?;
+        ensure_vm_fuse_mounts_detached(id, &vm.dir).map_err(ManagerError::Other)?;
+        let residue = fuse::report_unpublished_vfs_state_under(&vm.dir).await;
+        if fuse::warn_unpublished_vfs_state("delete-macos-vz-vm", &residue) {
+            return Err(ManagerError::Other(anyhow!(
+                "refusing to delete macOS VM {id}: unpublished VFS state remains under {}",
+                vm.dir.join("vfs-state").display()
+            )));
+        }
+        remove_vm_dir_if_detached(id, &vm.dir).map_err(ManagerError::Other)?;
+        let _ = fs::remove_dir_all(runtime_dir);
+        self.vms.write().await.remove(id);
+        if let Some(session_id) = session_id {
+            self.session_registry.write().await.remove(&session_id);
+        }
+        self.snapshots
+            .write()
+            .await
+            .retain(|_, record| record.vm_id != id);
+        Ok(())
+    }
+
     pub async fn fork_vm(
         &self,
         parent_id: &str,
@@ -2244,6 +2557,11 @@ impl Manager {
 
         let parent_state = {
             let inner = parent_vm.lock().await;
+            if is_macos_vz(&inner.metadata) {
+                return Err(ManagerError::Unsupported(
+                    "macOS VZ guest fork is not implemented".to_string(),
+                ));
+            }
             if !inner.metadata.pci_devices.is_empty() {
                 return Err(ManagerError::Unsupported(
                     "VMs with assigned PCI devices cannot be forked".to_string(),
@@ -2291,6 +2609,9 @@ impl Manager {
         let (
             parent_name,
             parent_arch,
+            parent_guest_profile,
+            parent_guest_runtime,
+            parent_capabilities,
             parent_resources,
             parent_source,
             parent_metadata,
@@ -2311,6 +2632,9 @@ impl Manager {
             (
                 inner.metadata.name.clone(),
                 inner.metadata.architecture.clone(),
+                inner.metadata.guest_profile.clone(),
+                inner.metadata.guest_runtime.clone(),
+                inner.metadata.capabilities.clone(),
                 inner.metadata.resources.clone(),
                 inner.metadata.source.clone(),
                 inner.metadata.metadata.clone(),
@@ -2383,6 +2707,9 @@ impl Manager {
             updated_at: Utc::now(),
             state: VmState::Stopped,
             architecture: parent_arch.clone(),
+            guest_profile: parent_guest_profile,
+            guest_runtime: parent_guest_runtime,
+            capabilities: parent_capabilities,
             source: VmSource {
                 source_type: parent_source.source_type,
                 reference: parent_source.reference,
@@ -2862,6 +3189,12 @@ impl Manager {
         vm_id: &str,
         params: SnapshotParams,
     ) -> ManagerResult<SnapshotMetadata> {
+        let vm = self.vm_by_id(vm_id).await?;
+        if is_macos_vz(&vm.lock().await.metadata) {
+            return Err(ManagerError::Unsupported(
+                "macOS VZ guest snapshots are not implemented".to_string(),
+            ));
+        }
         let pending = self.create_snapshot_qemu_phase(vm_id, params).await?;
         self.promote_staged_snapshot(vm_id, pending).await
     }
@@ -3055,6 +3388,11 @@ impl Manager {
 
     pub async fn delete_snapshot(&self, vm_id: &str, snapshot_id: &str) -> ManagerResult<()> {
         let vm = self.vm_by_id(vm_id).await?;
+        if is_macos_vz(&vm.lock().await.metadata) {
+            return Err(ManagerError::Unsupported(
+                "macOS VZ guest snapshots are not implemented".to_string(),
+            ));
+        }
         let (state, monitor, disk_path, snapshot, vm_dir) = {
             let inner = vm.lock().await;
             let position = inner
@@ -3135,6 +3473,12 @@ impl Manager {
     #[instrument(skip(self), fields(vm_id = %id))]
     pub async fn start_vm(&self, id: &str) -> ManagerResult<VmMetadata> {
         let vm = self.vm_by_id(id).await?;
+        if {
+            let inner = vm.lock().await;
+            is_macos_vz(&inner.metadata)
+        } {
+            return self.start_macos_vz_vm(vm, id).await;
+        }
         let cfg = self.cfg.clone();
         let host_arch = self.host_arch.clone();
         let id = id.to_string();
@@ -3161,9 +3505,407 @@ impl Manager {
         }
     }
 
+    async fn start_macos_vz_vm(&self, vm: Arc<Vm>, id: &str) -> ManagerResult<VmMetadata> {
+        let _teardown = vm.lock_runtime_teardown().await;
+        let helper = macos_vz::helper_binary().map_err(ManagerError::Other)?;
+        let (paths, existing_generation, existing_state) = {
+            let inner = vm.lock().await;
+            (
+                macos_vz::RuntimePaths::new(&vm.dir, &inner.runtime.runtime_dir),
+                inner
+                    .metadata
+                    .metadata
+                    .get(META_VZ_RUNTIME_GENERATION)
+                    .cloned(),
+                inner.runtime.state,
+            )
+        };
+        if matches!(
+            existing_state,
+            VmState::Running | VmState::Paused | VmState::Creating
+        ) {
+            if let Some(generation) = existing_generation.as_deref() {
+                if let Ok(response) = macos_vz::request(
+                    &paths.control_socket,
+                    generation,
+                    macos_vz::OwnerOperation::Status,
+                )
+                .await
+                {
+                    if response.ok {
+                        match response.state.as_deref() {
+                            Some("running" | "paused") => {
+                                return Ok(vm.lock().await.metadata.clone());
+                            }
+                            Some("starting" | "restoring") => {
+                                let response = macos_vz::wait_for_state(
+                                    &paths.control_socket,
+                                    generation,
+                                    &["running"],
+                                    VM_RUNNING_TIMEOUT,
+                                )
+                                .await
+                                .map_err(ManagerError::Other)?;
+                                let mut inner = vm.lock().await;
+                                inner.runtime.state = VmState::Running;
+                                inner.runtime.command_pid = response.pid;
+                                inner.runtime.started_at = Some(Utc::now());
+                                inner.runtime.reset_health_tracking();
+                                inner.metadata.state = VmState::Running;
+                                inner.metadata.started_at = inner.runtime.started_at;
+                                save_metadata(&vm.dir, &mut inner.metadata)
+                                    .map_err(ManagerError::Other)?;
+                                return Ok(inner.metadata.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(pid) = read_pid_file(&paths.pid).filter(|pid| pid_exists(*pid)) {
+            return Err(ManagerError::Other(anyhow!(
+                "refusing to replace macOS VZ runtime while previous helper {pid} remains live"
+            )));
+        }
+
+        let (resources, shared_mounts, rpc_port, generation, portproxy_metadata) = {
+            let mut inner = vm.lock().await;
+            let mut reserved = HashSet::new();
+            let rpc_port = allocate_host_port(inner.metadata.network.rpc_port, &mut reserved)?;
+            inner.metadata.network.rpc_port = rpc_port;
+            inner.metadata.network.proxy_port = rpc_port;
+            let generation = macos_vz::runtime_generation();
+            inner
+                .metadata
+                .metadata
+                .insert(META_VZ_RUNTIME_GENERATION.to_string(), generation.clone());
+            inner.runtime.state = VmState::Creating;
+            inner.runtime.command_pid = None;
+            inner.runtime.started_at = None;
+            inner.metadata.state = VmState::Creating;
+            inner.metadata.started_at = None;
+            save_metadata(&vm.dir, &mut inner.metadata).map_err(ManagerError::Other)?;
+            (
+                inner.metadata.resources.clone(),
+                inner.metadata.shared_mounts.clone(),
+                rpc_port,
+                generation,
+                inner.metadata.metadata.clone(),
+            )
+        };
+
+        if let Err(error) = cleanup_runtime_mounts(&vm)
+            .await
+            .with_context(|| format!("clean runtime mounts before starting macOS VM {id}"))
+        {
+            mark_vm_state(&vm, VmState::Error).await;
+            return Err(ManagerError::Other(error));
+        }
+        if let Err(error) = fuse::handle::unmount_active_vfs_mountpoints_for_vm(&vm.dir)
+            .await
+            .with_context(|| format!("detach stale FUSE mounts before starting macOS VM {id}"))
+        {
+            mark_vm_state(&vm, VmState::Error).await;
+            return Err(ManagerError::Other(error));
+        }
+
+        let mut launch_mounts = shared_mounts;
+        let mut fuse_handles = Vec::new();
+        for mount in &mut launch_mounts {
+            if !mount.is_fuse_backed() {
+                continue;
+            }
+            let handle = match fuse::mount_vfs_fuse(&self.cfg, mount, vm.dir.as_path()).await {
+                Ok(handle) => handle,
+                Err(error) => {
+                    cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
+                    mark_vm_state(&vm, VmState::Error).await;
+                    return Err(ManagerError::Other(error));
+                }
+            };
+            mount.host_path = handle.mountpoint().to_string_lossy().into_owned();
+            fuse_handles.push(handle);
+        }
+
+        let mut child = match macos_vz::launch(
+            &helper,
+            &paths,
+            &resources,
+            rpc_port,
+            &launch_mounts,
+            &generation,
+        )
+        .await
+        {
+            Ok(child) => child,
+            Err(error) => {
+                cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
+                mark_vm_state(&vm, VmState::Error).await;
+                return Err(ManagerError::Other(error));
+            }
+        };
+        let child_pid = child.id();
+        let response = match macos_vz::wait_for_state(
+            &paths.control_socket,
+            &generation,
+            &["running"],
+            VM_RUNNING_TIMEOUT,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
+                mark_vm_state(&vm, VmState::Error).await;
+                return Err(ManagerError::Other(error));
+            }
+        };
+        let pid = response.pid.or(child_pid);
+        if let Err(error) =
+            prepare_macos_vz_shared_directories(rpc_port, &portproxy_metadata, &launch_mounts).await
+        {
+            let _ = macos_vz::request(
+                &paths.control_socket,
+                &generation,
+                macos_vz::OwnerOperation::ForceStop,
+            )
+            .await;
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
+            mark_vm_state(&vm, VmState::Error).await;
+            return Err(ManagerError::Other(error));
+        }
+        {
+            let mut inner = vm.lock().await;
+            inner.runtime.state = VmState::Running;
+            inner.runtime.started_at = Some(Utc::now());
+            inner.runtime.command_pid = pid;
+            inner.runtime.fuse_handles = fuse_handles;
+            inner.runtime.reset_health_tracking();
+            inner.metadata.state = VmState::Running;
+            inner.metadata.started_at = inner.runtime.started_at;
+            save_metadata(&vm.dir, &mut inner.metadata).map_err(ManagerError::Other)?;
+        }
+        spawn_vz_exit_task(vm.clone(), child, paths, pid, generation);
+        info!(vm_id = %id, pid = ?pid, rpc_port, "macOS VZ guest started");
+        Ok(vm.lock().await.metadata.clone())
+    }
+
+    async fn control_macos_vz_state(
+        &self,
+        vm: Arc<Vm>,
+        id: &str,
+        operation: macos_vz::OwnerOperation,
+        expected_state: &str,
+        state: VmState,
+    ) -> ManagerResult<VmMetadata> {
+        let _teardown = vm.lock_runtime_teardown().await;
+        {
+            let inner = vm.lock().await;
+            if inner.runtime.state == state {
+                return Ok(inner.metadata.clone());
+            }
+            let valid_source_state = match operation {
+                macos_vz::OwnerOperation::Pause => inner.runtime.state == VmState::Running,
+                macos_vz::OwnerOperation::Resume => inner.runtime.state == VmState::Paused,
+                _ => true,
+            };
+            if !valid_source_state {
+                return Ok(inner.metadata.clone());
+            }
+        }
+        let (paths, generation) = macos_vz_runtime_identity(&vm).await?;
+        let response = macos_vz::request(&paths.control_socket, &generation, operation)
+            .await
+            .map_err(ManagerError::Other)?;
+        if !response.ok {
+            return Err(ManagerError::Other(anyhow!(
+                "macOS VZ owner rejected {}: {}",
+                operation.as_str(),
+                response.error.as_deref().unwrap_or("unknown error")
+            )));
+        }
+        if response.state.as_deref() != Some(expected_state) {
+            return Err(ManagerError::Other(anyhow!(
+                "macOS VZ owner returned state {} after {}",
+                response.state.as_deref().unwrap_or("unknown"),
+                operation.as_str()
+            )));
+        }
+        {
+            let mut inner = vm.lock().await;
+            inner.runtime.state = state;
+            inner.metadata.state = state;
+            if state == VmState::Running {
+                inner.runtime.started_at = Some(Utc::now());
+                inner.runtime.reset_health_tracking();
+                inner.metadata.started_at = inner.runtime.started_at;
+            }
+            save_metadata(&vm.dir, &mut inner.metadata).map_err(ManagerError::Other)?;
+        }
+        info!(vm_id = %id, operation = operation.as_str(), state = expected_state, "macOS VZ lifecycle operation completed");
+        Ok(vm.lock().await.metadata.clone())
+    }
+
+    async fn stop_macos_vz_vm(
+        &self,
+        vm: Arc<Vm>,
+        id: &str,
+        operation: macos_vz::OwnerOperation,
+    ) -> ManagerResult<VmMetadata> {
+        let _teardown = vm.lock_runtime_teardown().await;
+        let state = vm.lock().await.runtime.state;
+        if !matches!(
+            state,
+            VmState::Running | VmState::Paused | VmState::Creating
+        ) {
+            return Ok(vm.lock().await.metadata.clone());
+        }
+        let (paths, generation) = macos_vz_runtime_identity(&vm).await?;
+        let helper_pid = vm
+            .lock()
+            .await
+            .runtime
+            .command_pid
+            .or_else(|| read_pid_file(&paths.pid));
+        if helper_pid.is_some_and(pid_exists) {
+            let response = macos_vz::request_stop_or_observe_terminal(
+                &paths.control_socket,
+                &generation,
+                operation,
+            )
+            .await
+            .map_err(ManagerError::Other)?;
+            if !response.ok {
+                return Err(ManagerError::Other(anyhow!(
+                    "macOS VZ owner rejected {}: {}",
+                    operation.as_str(),
+                    response.error.as_deref().unwrap_or("unknown error")
+                )));
+            }
+
+            let timeout = if operation == macos_vz::OwnerOperation::RequestStop {
+                MACOS_VZ_GRACEFUL_STOP_TIMEOUT
+            } else {
+                Duration::from_secs(15)
+            };
+            let deadline = Instant::now() + timeout;
+            loop {
+                match macos_vz::request(
+                    &paths.control_socket,
+                    &generation,
+                    macos_vz::OwnerOperation::Status,
+                )
+                .await
+                {
+                    Ok(status)
+                        if status.ok
+                            && status
+                                .state
+                                .as_deref()
+                                .is_some_and(|state| matches!(state, "stopped" | "error")) =>
+                    {
+                        let _ = macos_vz::request(
+                            &paths.control_socket,
+                            &generation,
+                            macos_vz::OwnerOperation::ShutdownHelper,
+                        )
+                        .await;
+                        break;
+                    }
+                    Err(_) if helper_pid.is_none_or(|pid| !pid_exists(pid)) => break,
+                    _ => {}
+                }
+                if Instant::now() >= deadline {
+                    return Err(ManagerError::Other(anyhow!(
+                        "timed out waiting for macOS VZ guest to stop"
+                    )));
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+        }
+
+        if let Some(pid) = helper_pid {
+            if !wait_for_pid_exit(pid, Duration::from_secs(5)).await {
+                return Err(ManagerError::Other(anyhow!(
+                    "macOS VZ helper {pid} remained live after guest stop"
+                )));
+            }
+        }
+        cleanup_runtime_mounts(&vm)
+            .await
+            .with_context(|| format!("clean host VFS mounts after stopping macOS VM {id}"))
+            .map_err(ManagerError::Other)?;
+        fuse::handle::unmount_active_vfs_mountpoints_for_vm(&vm.dir)
+            .await
+            .with_context(|| {
+                format!("clean recovered host VFS mounts after stopping macOS VM {id}")
+            })
+            .map_err(ManagerError::Other)?;
+        {
+            let mut inner = vm.lock().await;
+            inner.runtime.state = VmState::Stopped;
+            inner.runtime.command_pid = None;
+            inner.runtime.started_at = None;
+            inner.runtime.reset_health_tracking();
+            inner.metadata.state = VmState::Stopped;
+            inner.metadata.started_at = None;
+            save_metadata(&vm.dir, &mut inner.metadata).map_err(ManagerError::Other)?;
+        }
+        let _ = fs::remove_file(&paths.pid);
+        let _ = fs::remove_file(&paths.control_socket);
+        info!(vm_id = %id, operation = operation.as_str(), "macOS VZ guest stopped");
+        Ok(vm.lock().await.metadata.clone())
+    }
+
+    pub async fn shutdown_macos_vz_shared_mounts(&self) -> ManagerResult<()> {
+        let vms = self.vms.read().await.values().cloned().collect::<Vec<_>>();
+        let mut failures = Vec::new();
+        for vm in vms {
+            let (id, state, has_shared_mounts, is_macos) = {
+                let inner = vm.lock().await;
+                (
+                    inner.metadata.id.clone(),
+                    inner.runtime.state,
+                    !inner.metadata.shared_mounts.is_empty(),
+                    is_macos_vz(&inner.metadata),
+                )
+            };
+            if !is_macos || !has_shared_mounts {
+                continue;
+            }
+            if matches!(
+                state,
+                VmState::Running | VmState::Paused | VmState::Creating
+            ) && let Err(error) = self.force_stop_vm(&id).await
+            {
+                failures.push(format!("{id}: {error}"));
+                continue;
+            }
+            if let Err(error) = cleanup_runtime_mounts(&vm).await {
+                failures.push(format!("{id}: {error:#}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ManagerError::Other(anyhow!(
+                "failed stopping mounted macOS VMs during vmd shutdown: {}",
+                failures.join("; ")
+            )))
+        }
+    }
+
     #[instrument(skip(self), fields(vm_id = %id))]
     pub async fn start_vm_for_exec_stream_resume(&self, id: &str) -> ManagerResult<VmMetadata> {
         let vm = self.vm_by_id(id).await?;
+        if is_macos_vz(&vm.lock().await.metadata) {
+            return self.start_vm(id).await;
+        }
         if let Some(meta) = Self::try_adopt_local_runtime_for_resume(&self.cfg, vm, id).await? {
             return Ok(meta);
         }
@@ -3512,7 +4254,7 @@ impl Manager {
             );
             cleanup_stale_runtime_sidecars(id, vm_dir.as_path(), runtime_dir.as_path()).await;
             stale_sidecars_cleaned = true;
-            fuse::unmount_active_mountpoints_under(&vm_dir.join("fuse-mounts"))
+            fuse::handle::unmount_active_vfs_mountpoints_for_vm(&vm_dir)
                 .await
                 .with_context(|| format!("retry stale FUSE cleanup before starting VM {id}"))
                 .map_err(ManagerError::Other)?;
@@ -4056,6 +4798,23 @@ impl Manager {
     #[instrument(skip(self), fields(vm_id = %id))]
     pub async fn stop_vm(&self, id: &str) -> ManagerResult<VmMetadata> {
         let vm = self.vm_by_id(id).await?;
+        if {
+            let inner = vm.lock().await;
+            is_macos_vz(&inner.metadata)
+        } {
+            match self
+                .stop_macos_vz_vm(vm.clone(), id, macos_vz::OwnerOperation::RequestStop)
+                .await
+            {
+                Ok(metadata) => return Ok(metadata),
+                Err(error) => {
+                    warn!(vm_id = %id, error = %error, "graceful macOS VZ stop failed; forcing stop");
+                    return self
+                        .stop_macos_vz_vm(vm, id, macos_vz::OwnerOperation::ForceStop)
+                        .await;
+                }
+            }
+        }
         let (state, monitor) =
             {
                 let inner = vm.lock().await;
@@ -4109,6 +4868,20 @@ impl Manager {
 
     pub async fn pause_vm(&self, id: &str) -> ManagerResult<VmMetadata> {
         let vm = self.vm_by_id(id).await?;
+        if {
+            let inner = vm.lock().await;
+            is_macos_vz(&inner.metadata)
+        } {
+            return self
+                .control_macos_vz_state(
+                    vm,
+                    id,
+                    macos_vz::OwnerOperation::Pause,
+                    "paused",
+                    VmState::Paused,
+                )
+                .await;
+        }
         let monitor = {
             let inner = vm.lock().await;
             if !matches!(inner.runtime.state, VmState::Running) {
@@ -4137,6 +4910,20 @@ impl Manager {
 
     pub async fn resume_vm(&self, id: &str) -> ManagerResult<VmMetadata> {
         let vm = self.vm_by_id(id).await?;
+        if {
+            let inner = vm.lock().await;
+            is_macos_vz(&inner.metadata)
+        } {
+            return self
+                .control_macos_vz_state(
+                    vm,
+                    id,
+                    macos_vz::OwnerOperation::Resume,
+                    "running",
+                    VmState::Running,
+                )
+                .await;
+        }
         let monitor = {
             let inner = vm.lock().await;
             if !matches!(inner.runtime.state, VmState::Paused) {
@@ -4168,6 +4955,14 @@ impl Manager {
 
     pub async fn force_stop_vm(&self, id: &str) -> ManagerResult<VmMetadata> {
         let vm = self.vm_by_id(id).await?;
+        if {
+            let inner = vm.lock().await;
+            is_macos_vz(&inner.metadata)
+        } {
+            return self
+                .stop_macos_vz_vm(vm, id, macos_vz::OwnerOperation::ForceStop)
+                .await;
+        }
         let (runtime_state, monitor, pid, vm_dir, qmp_path, pid_path) = {
             let inner = vm.lock().await;
             let state = inner.runtime.state;
@@ -4313,6 +5108,11 @@ impl Manager {
         snapshot_id: &str,
     ) -> ManagerResult<VmMetadata> {
         let vm = self.vm_by_id(vm_id).await?;
+        if is_macos_vz(&vm.lock().await.metadata) {
+            return Err(ManagerError::Unsupported(
+                "macOS VZ guest snapshots are not implemented".to_string(),
+            ));
+        }
         let (state, snapshot, disk_path, vm_dir, arch) = {
             let inner = vm.lock().await;
             if !inner.metadata.pci_devices.is_empty() {
@@ -5494,14 +6294,12 @@ async fn mark_vm_state(vm: &Arc<Vm>, state: VmState) {
 }
 
 fn ensure_vm_fuse_mounts_detached(vm_id: &str, vm_dir: &Path) -> Result<()> {
-    let fuse_root = vm_dir.join("fuse-mounts");
-    let active = fuse::active_mountpoints_under(&fuse_root)?;
+    let active = fuse::handle::active_vfs_mountpoints_for_vm(vm_dir)?;
     if active.is_empty() {
         return Ok(());
     }
     bail!(
-        "refusing to remove VM {vm_id} directory while mountpoints remain active beneath {}: {}",
-        fuse_root.display(),
+        "refusing to remove VM {vm_id} directory while its mountpoints remain active: {}",
         active
             .iter()
             .map(|path| path.display().to_string())
@@ -5511,8 +6309,8 @@ fn ensure_vm_fuse_mounts_detached(vm_id: &str, vm_dir: &Path) -> Result<()> {
 }
 
 fn remove_vm_dir_if_detached(vm_id: &str, vm_dir: &Path) -> Result<()> {
-    remove_vm_dir_with_mount_probe(vm_id, vm_dir, |fuse_root| {
-        fuse::active_mountpoints_under(fuse_root)
+    remove_vm_dir_with_mount_probe(vm_id, vm_dir, |vm_dir| {
+        fuse::handle::active_vfs_mountpoints_for_vm(vm_dir)
     })
 }
 
@@ -5523,12 +6321,10 @@ where
     if !vm_dir.exists() {
         return Ok(());
     }
-    let fuse_root = vm_dir.join("fuse-mounts");
-    let active = mount_probe(&fuse_root)?;
+    let active = mount_probe(vm_dir)?;
     if !active.is_empty() {
         bail!(
-            "refusing to remove VM {vm_id} directory while mountpoints remain active beneath {}: {}",
-            fuse_root.display(),
+            "refusing to remove VM {vm_id} directory while its mountpoints remain active: {}",
             active
                 .iter()
                 .map(|path| path.display().to_string())
@@ -5622,6 +6418,547 @@ async fn cleanup_runtime_mounts(vm: &Arc<Vm>) -> Result<()> {
             failures.join("; ")
         )
     }
+}
+
+fn is_macos_vz(metadata: &VmMetadata) -> bool {
+    metadata.guest_profile.platform == GuestPlatform::Macos
+        || matches!(metadata.source.source_type, VmSourceType::MacosTemplate)
+}
+
+async fn try_adopt_macos_vz_runtime(vm: &Arc<Vm>) -> ManagerResult<Option<VmMetadata>> {
+    let _teardown = vm.lock_runtime_teardown().await;
+    let (paths, generation) = macos_vz_runtime_identity(vm).await?;
+    let response = match macos_vz::request(
+        &paths.control_socket,
+        &generation,
+        macos_vz::OwnerOperation::Status,
+    )
+    .await
+    {
+        Ok(response) if response.ok => response,
+        Ok(response) => {
+            let helper_pid = response.pid.or_else(|| read_pid_file(&paths.pid));
+            if helper_pid.is_some_and(pid_exists) {
+                return Err(ManagerError::Other(anyhow!(
+                    "macOS VZ owner rejected discovery status while helper {} remained live: {}",
+                    helper_pid.unwrap(),
+                    response.error.as_deref().unwrap_or("unknown owner error")
+                )));
+            }
+            fuse::handle::unmount_active_vfs_mountpoints_for_vm(&vm.dir)
+                .await
+                .map_err(ManagerError::Other)?;
+            warn!(
+                vm_id = %vm.lock().await.metadata.id,
+                error = %response.error.as_deref().unwrap_or("unknown owner error"),
+                "macOS VZ owner rejected discovery status"
+            );
+            return Ok(None);
+        }
+        Err(error) => {
+            let helper_pid = read_pid_file(&paths.pid);
+            if helper_pid.is_none_or(|pid| !pid_exists(pid)) {
+                fuse::handle::unmount_active_vfs_mountpoints_for_vm(&vm.dir)
+                    .await
+                    .map_err(ManagerError::Other)?;
+                debug!(
+                    vm_id = %vm.lock().await.metadata.id,
+                    error = %error,
+                    "cleaned stale macOS VZ mountpoints after confirming the owner process exited"
+                );
+                return Ok(None);
+            }
+            debug!(
+                vm_id = %vm.lock().await.metadata.id,
+                pid = ?helper_pid,
+                error = %error,
+                "macOS VZ owner socket was not adoptable; preserving mounts while its process is live"
+            );
+            return Err(ManagerError::Other(error.context(
+                "macOS VZ owner socket was unavailable while its process remained live",
+            )));
+        }
+    };
+    if !vm.lock().await.metadata.shared_mounts.is_empty()
+        && !matches!(response.state.as_deref(), Some("stopped" | "error"))
+    {
+        let stopped = macos_vz::request_stop_or_observe_terminal(
+            &paths.control_socket,
+            &generation,
+            macos_vz::OwnerOperation::ForceStop,
+        )
+        .await
+        .map_err(ManagerError::Other)?;
+        if !stopped.ok {
+            return Err(ManagerError::Other(anyhow!(
+                "macOS VZ owner rejected fail-stop recovery: {}",
+                stopped.error.as_deref().unwrap_or("unknown error")
+            )));
+        }
+        macos_vz::wait_for_state(
+            &paths.control_socket,
+            &generation,
+            &["stopped", "error"],
+            Duration::from_secs(15),
+        )
+        .await
+        .map_err(ManagerError::Other)?;
+        let _ = macos_vz::request(
+            &paths.control_socket,
+            &generation,
+            macos_vz::OwnerOperation::ShutdownHelper,
+        )
+        .await;
+        if let Some(pid) = response.pid.or_else(|| read_pid_file(&paths.pid))
+            && !wait_for_pid_exit(pid, Duration::from_secs(5)).await
+        {
+            return Err(ManagerError::Other(anyhow!(
+                "macOS VZ helper {pid} remained live after fail-stop recovery"
+            )));
+        }
+        fuse::handle::unmount_active_vfs_mountpoints_for_vm(&vm.dir)
+            .await
+            .map_err(ManagerError::Other)?;
+        return Ok(None);
+    }
+    let Some(state) = response.state.as_deref().and_then(macos_vz_vm_state) else {
+        if matches!(response.state.as_deref(), Some("stopped" | "error")) {
+            let _ = macos_vz::request(
+                &paths.control_socket,
+                &generation,
+                macos_vz::OwnerOperation::ShutdownHelper,
+            )
+            .await;
+            if let Some(pid) = response.pid.or_else(|| read_pid_file(&paths.pid))
+                && !wait_for_pid_exit(pid, Duration::from_secs(5)).await
+            {
+                return Err(ManagerError::Other(anyhow!(
+                    "macOS VZ helper {pid} remained live after stopped-state discovery"
+                )));
+            }
+            fuse::handle::unmount_active_vfs_mountpoints_for_vm(&vm.dir)
+                .await
+                .map_err(ManagerError::Other)?;
+        } else {
+            let helper_pid = response.pid.or_else(|| read_pid_file(&paths.pid));
+            if helper_pid.is_some_and(pid_exists) {
+                return Err(ManagerError::Other(anyhow!(
+                    "macOS VZ owner returned unknown state {:?} while helper {} remained live",
+                    response.state,
+                    helper_pid.unwrap()
+                )));
+            }
+            fuse::handle::unmount_active_vfs_mountpoints_for_vm(&vm.dir)
+                .await
+                .map_err(ManagerError::Other)?;
+        }
+        return Ok(None);
+    };
+    let Some(pid) = response
+        .pid
+        .or_else(|| read_pid_file(&paths.pid))
+        .filter(|pid| pid_exists(*pid))
+    else {
+        fuse::handle::unmount_active_vfs_mountpoints_for_vm(&vm.dir)
+            .await
+            .map_err(ManagerError::Other)?;
+        return Ok(None);
+    };
+
+    let mut inner = vm.lock().await;
+    inner.runtime.state = state;
+    inner.runtime.command_pid = Some(pid);
+    inner.runtime.started_at = inner.metadata.started_at.or_else(|| Some(Utc::now()));
+    inner.runtime.reset_health_tracking();
+    inner.metadata.state = state;
+    inner.metadata.started_at = inner.runtime.started_at;
+    save_metadata(&vm.dir, &mut inner.metadata).map_err(ManagerError::Other)?;
+    Ok(Some(inner.metadata.clone()))
+}
+
+fn macos_vz_vm_state(state: &str) -> Option<VmState> {
+    match state {
+        "running" | "resuming" => Some(VmState::Running),
+        "paused" | "pausing" => Some(VmState::Paused),
+        "starting" | "restoring" => Some(VmState::Creating),
+        _ => None,
+    }
+}
+
+fn macos_vz_runtime_matches(inner: &VmInner, expected_generation: &str, expected_pid: u32) -> bool {
+    inner
+        .metadata
+        .metadata
+        .get(META_VZ_RUNTIME_GENERATION)
+        .is_some_and(|generation| generation == expected_generation)
+        && inner.runtime.command_pid == Some(expected_pid)
+        && inner.metadata.state == inner.runtime.state
+        && matches!(
+            inner.runtime.state,
+            VmState::Running | VmState::Paused | VmState::Creating
+        )
+}
+
+fn macos_vz_response_matches_pid(response: &macos_vz::OwnerResponse, expected_pid: u32) -> bool {
+    response.pid.is_none_or(|pid| pid == expected_pid)
+}
+
+async fn finalize_adopted_macos_vz_terminal(
+    vm: &Arc<Vm>,
+    paths: &macos_vz::RuntimePaths,
+    expected_generation: &str,
+    expected_pid: u32,
+    terminal_state: VmState,
+) -> Result<bool> {
+    let _teardown = vm.lock_runtime_teardown().await;
+    let vm_id = {
+        let inner = vm.lock().await;
+        if !macos_vz_runtime_matches(&inner, expected_generation, expected_pid) {
+            return Ok(false);
+        }
+        inner.metadata.id.clone()
+    };
+
+    if pid_exists(expected_pid) {
+        let status = macos_vz::request(
+            &paths.control_socket,
+            expected_generation,
+            macos_vz::OwnerOperation::Status,
+        )
+        .await
+        .context("recheck adopted macOS VZ owner state before teardown")?;
+        if !status.ok {
+            bail!(
+                "macOS VZ owner rejected teardown status: {}",
+                status.error.as_deref().unwrap_or("unknown owner error")
+            );
+        }
+        if !matches!(status.state.as_deref(), Some("stopped" | "error")) {
+            bail!(
+                "macOS VZ owner returned to nonterminal state {} before adopted-runtime teardown",
+                status.state.as_deref().unwrap_or("unknown")
+            );
+        }
+        if !macos_vz_response_matches_pid(&status, expected_pid) {
+            bail!(
+                "macOS VZ owner PID changed from {expected_pid} to {:?} before adopted-runtime teardown",
+                status.pid
+            );
+        }
+
+        let shutdown = macos_vz::request(
+            &paths.control_socket,
+            expected_generation,
+            macos_vz::OwnerOperation::ShutdownHelper,
+        )
+        .await
+        .context("shut down terminal adopted macOS VZ helper")?;
+        if !shutdown.ok {
+            bail!(
+                "macOS VZ owner rejected helper shutdown: {}",
+                shutdown.error.as_deref().unwrap_or("unknown owner error")
+            );
+        }
+        if !macos_vz_response_matches_pid(&shutdown, expected_pid) {
+            bail!(
+                "macOS VZ owner PID changed from {expected_pid} to {:?} during helper shutdown",
+                shutdown.pid
+            );
+        }
+    }
+
+    if !wait_for_pid_exit(expected_pid, Duration::from_secs(5)).await {
+        bail!("macOS VZ helper {expected_pid} remained live after adopted-runtime teardown");
+    }
+    cleanup_runtime_mounts(vm)
+        .await
+        .with_context(|| format!("clean host VFS mounts for adopted macOS VM {vm_id}"))?;
+    fuse::handle::unmount_active_vfs_mountpoints_for_vm(&vm.dir)
+        .await
+        .with_context(|| format!("clean recovered host VFS mounts for adopted macOS VM {vm_id}"))?;
+
+    {
+        let mut inner = vm.lock().await;
+        if !macos_vz_runtime_matches(&inner, expected_generation, expected_pid) {
+            return Ok(false);
+        }
+        let mut metadata = inner.metadata.clone();
+        metadata.state = terminal_state;
+        metadata.started_at = None;
+        save_metadata(&vm.dir, &mut metadata)?;
+        inner.metadata = metadata;
+        inner.runtime.state = terminal_state;
+        inner.runtime.command_pid = None;
+        inner.runtime.started_at = None;
+        inner.runtime.reset_health_tracking();
+    }
+    if read_pid_file(&paths.pid) == Some(expected_pid) {
+        let _ = fs::remove_file(&paths.pid);
+    }
+    let _ = fs::remove_file(&paths.control_socket);
+    Ok(true)
+}
+
+fn spawn_vz_adoption_monitor(vm: Arc<Vm>) {
+    tokio::spawn(async move {
+        let (paths, generation, expected_pid, vm_id) = {
+            let inner = vm.lock().await;
+            let Some(generation) = inner
+                .metadata
+                .metadata
+                .get(META_VZ_RUNTIME_GENERATION)
+                .filter(|generation| !generation.trim().is_empty())
+                .cloned()
+            else {
+                return;
+            };
+            let Some(expected_pid) = inner.runtime.command_pid else {
+                return;
+            };
+            (
+                macos_vz::RuntimePaths::new(&vm.dir, &inner.runtime.runtime_dir),
+                generation,
+                expected_pid,
+                inner.metadata.id.clone(),
+            )
+        };
+        let mut failures = 0u32;
+        let mut pending_terminal = None;
+        loop {
+            sleep(Duration::from_secs(1)).await;
+            {
+                let inner = vm.lock().await;
+                if !macos_vz_runtime_matches(&inner, &generation, expected_pid) {
+                    return;
+                }
+            }
+            if let Some(terminal_state) = pending_terminal {
+                match finalize_adopted_macos_vz_terminal(
+                    &vm,
+                    &paths,
+                    &generation,
+                    expected_pid,
+                    terminal_state,
+                )
+                .await
+                {
+                    Ok(_) => return,
+                    Err(error) => {
+                        warn!(
+                            vm_id = %vm_id,
+                            pid = expected_pid,
+                            error = %error,
+                            "adopted macOS VZ teardown remains retryable"
+                        );
+                        continue;
+                    }
+                }
+            }
+            match macos_vz::request(
+                &paths.control_socket,
+                &generation,
+                macos_vz::OwnerOperation::Status,
+            )
+            .await
+            {
+                Ok(response) if response.ok => {
+                    failures = 0;
+                    if !macos_vz_response_matches_pid(&response, expected_pid) {
+                        warn!(
+                            vm_id = %vm_id,
+                            expected_pid,
+                            observed_pid = ?response.pid,
+                            "adopted macOS VZ owner PID changed; leaving runtime state untouched"
+                        );
+                        return;
+                    }
+                    let next_state = match response.state.as_deref() {
+                        Some("stopped") => Some(VmState::Stopped),
+                        Some("error") => Some(VmState::Error),
+                        Some(state) => macos_vz_vm_state(state),
+                        None => None,
+                    };
+                    if let Some(next_state) = next_state {
+                        if matches!(next_state, VmState::Stopped | VmState::Error) {
+                            pending_terminal = Some(next_state);
+                            continue;
+                        }
+                        let _teardown = vm.lock_runtime_teardown().await;
+                        let mut inner = vm.lock().await;
+                        if !macos_vz_runtime_matches(&inner, &generation, expected_pid) {
+                            return;
+                        }
+                        inner.runtime.state = next_state;
+                        inner.metadata.state = next_state;
+                        if let Err(error) = save_metadata(&vm.dir, &mut inner.metadata) {
+                            warn!(vm_id = %inner.metadata.id, error = %error, "persist adopted macOS VZ state failed");
+                        }
+                    }
+                }
+                Ok(_) | Err(_) => {
+                    failures += 1;
+                    if failures >= 5 && !pid_exists(expected_pid) {
+                        pending_terminal = Some(VmState::Error);
+                    }
+                }
+            }
+        }
+    });
+}
+
+async fn macos_vz_runtime_identity(
+    vm: &Arc<Vm>,
+) -> ManagerResult<(macos_vz::RuntimePaths, String)> {
+    let inner = vm.lock().await;
+    let generation = inner
+        .metadata
+        .metadata
+        .get(META_VZ_RUNTIME_GENERATION)
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| ManagerError::Other(anyhow!("macOS VZ runtime generation is missing")))?;
+    Ok((
+        macos_vz::RuntimePaths::new(&vm.dir, &inner.runtime.runtime_dir),
+        generation,
+    ))
+}
+
+async fn prepare_macos_vz_shared_directories(
+    rpc_port: i32,
+    metadata: &HashMap<String, String>,
+    shared_mounts: &[SharedMountSpec],
+) -> Result<()> {
+    if shared_mounts.is_empty() {
+        return Ok(());
+    }
+    let port = u16::try_from(rpc_port)
+        .ok()
+        .filter(|port| *port > 0)
+        .ok_or_else(|| anyhow!("macOS VZ guest has no valid portproxy relay port"))?;
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let auth_header = portproxy_auth_header_from_metadata(metadata)?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match probe_guest_exec_ready_anyhow(&endpoint, auth_header.as_ref(), 5).await {
+            Ok(()) => break,
+            Err(error) if Instant::now() < deadline => {
+                debug!(endpoint = %endpoint, error = %error, "waiting for macOS guest portproxy before verifying VirtioFS automount");
+                sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) => {
+                return Err(
+                    error.context("macOS guest portproxy did not become ready for VirtioFS automount verification")
+                );
+            }
+        }
+    }
+
+    for mount in shared_mounts {
+        let script = macos_vz_shared_directory_script(mount)?;
+        let output = run_guest_shell_exec(&endpoint, auth_header.as_ref(), &script, None, 20)
+            .await
+            .with_context(|| {
+                format!(
+                    "prepare macOS guest VirtioFS share {} at {}",
+                    mount.mount_tag, mount.guest_path
+                )
+            })?;
+        if output.exit_code != Some(0) {
+            bail!(
+                "prepare macOS guest VirtioFS share {} at {} failed with status {:?}: {}",
+                mount.mount_tag,
+                mount.guest_path,
+                output.exit_code,
+                output.stderr_lossy().trim()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn macos_vz_shared_directory_script(mount: &SharedMountSpec) -> Result<String> {
+    let automount_root = shell_quote("/Volumes/My Shared Files")?;
+    let shared_directory = shell_quote(&format!("/Volumes/My Shared Files/{}", mount.mount_tag))?;
+    let target = shell_quote(&mount.guest_path)?;
+    let writable_probe = if mount.read_only {
+        String::new()
+    } else {
+        "sentinel=$(/usr/bin/mktemp \"$source/.openbracket-ready.XXXXXX\")\n/bin/rm -f \"$sentinel\"\n"
+            .to_string()
+    };
+    Ok(format!(
+        "set -eu\nautomount_root={automount_root}\nsource={shared_directory}\ntarget={target}\n/sbin/mount | /usr/bin/grep -F -- \" on $automount_root (AppleVirtIOFS\" >/dev/null\n[ -d \"$source\" ]\n/bin/ls -A \"$source\" >/dev/null\n{writable_probe}if /sbin/mount | /usr/bin/grep -F -- \" on $target (\" >/dev/null; then\n  exit 64\nfi\nif [ -L \"$target\" ]; then\n  [ \"$(/usr/bin/readlink \"$target\")\" = \"$source\" ]\nelif [ -e \"$target\" ]; then\n  [ -d \"$target\" ]\n  [ -z \"$(/bin/ls -A \"$target\")\" ]\n  /bin/rmdir \"$target\"\n  /bin/ln -s \"$source\" \"$target\"\nelse\n  /bin/mkdir -p \"$(/usr/bin/dirname \"$target\")\"\n  /bin/ln -s \"$source\" \"$target\"\nfi\n[ -d \"$target\" ]"
+    ))
+}
+
+fn shell_quote(value: &str) -> Result<String> {
+    if value
+        .chars()
+        .any(|character| matches!(character, '\0' | '\n' | '\r'))
+    {
+        bail!("shell value contains a forbidden control character");
+    }
+    Ok(format!("'{}'", value.replace('\'', "'\\''")))
+}
+
+fn spawn_vz_exit_task(
+    vm: Arc<Vm>,
+    mut child: Child,
+    paths: macos_vz::RuntimePaths,
+    expected_pid: Option<u32>,
+    expected_generation: String,
+) {
+    tokio::spawn(async move {
+        let result = child.wait().await;
+        let _teardown = vm.lock_runtime_teardown().await;
+        let inner = vm.lock().await;
+        if inner.runtime.command_pid != expected_pid
+            || inner.metadata.metadata.get(META_VZ_RUNTIME_GENERATION) != Some(&expected_generation)
+        {
+            return;
+        }
+        let mut state = match result {
+            Ok(status) if status.success() => VmState::Stopped,
+            Ok(status) => {
+                let error = anyhow!("macOS VZ helper exited with status {status}");
+                *inner
+                    .runtime
+                    .exit_status
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+                VmState::Error
+            }
+            Err(error) => {
+                *inner
+                    .runtime
+                    .exit_status
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(anyhow!(error));
+                VmState::Error
+            }
+        };
+        drop(inner);
+        if let Err(error) = cleanup_runtime_mounts(&vm).await {
+            warn!(error = %error, "failed cleaning host VFS mounts after macOS VZ helper exit");
+            state = VmState::Error;
+        }
+        let mut inner = vm.lock().await;
+        if inner.runtime.command_pid != expected_pid {
+            return;
+        }
+        inner.runtime.command_pid = None;
+        inner.runtime.started_at = None;
+        inner.runtime.reset_health_tracking();
+        inner.runtime.state = state;
+        inner.metadata.state = state;
+        inner.metadata.started_at = None;
+        if let Err(error) = save_metadata(&vm.dir, &mut inner.metadata) {
+            warn!(vm_id = %inner.metadata.id, error = %error, "persist metadata after macOS VZ helper exit failed");
+        }
+        drop(inner);
+        let _ = fs::remove_file(paths.pid);
+        let _ = fs::remove_file(paths.control_socket);
+    });
 }
 
 fn spawn_launch_child(
@@ -6189,9 +7526,19 @@ async fn cleanup_stale_runtime_sidecars(vm_id: &str, vm_dir: &Path, runtime_dir:
         }
     }
 
+    #[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+    if let Err(error) = fuse::handle::unmount_active_vfs_mountpoints_for_vm(vm_dir).await {
+        warn!(
+            vm_id = %vm_id,
+            error = %error,
+            "failed detaching stale FSKit mountpoints after reclaiming VM runtime ownership"
+        );
+    }
+    #[cfg(not(all(target_os = "macos", feature = "macos-fskit")))]
     lazy_unmount_stale_fuse_mounts(vm_id, vm_dir);
 }
 
+#[cfg(not(all(target_os = "macos", feature = "macos-fskit")))]
 fn lazy_unmount_stale_fuse_mounts(vm_id: &str, vm_dir: &Path) {
     let fuse_dir = vm_dir.join("fuse-mounts");
     let Ok(entries) = fs::read_dir(&fuse_dir) else {
@@ -6575,6 +7922,186 @@ fn enforce_resource_bounds(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::GuestProfile;
+
+    #[test]
+    fn macos_vz_share_readiness_uses_native_automount_and_stable_alias() {
+        let mount = SharedMountSpec {
+            host_path: "/tmp/active-host-fuse".to_string(),
+            guest_path: "/Volumes/OpenBracketWorkspace".to_string(),
+            mount_tag: "workspace".to_string(),
+            read_only: false,
+            availability: SharedMountAvailability::NodeLocal,
+            continuity: SharedMountContinuity::RestartSameNode,
+            backend_profile: "openbracket-vfs-fuse".to_string(),
+            vfs_endpoint: "http://127.0.0.1:63339".to_string(),
+            vfs_scope_path: "scope".to_string(),
+        };
+
+        let script = macos_vz_shared_directory_script(&mount).unwrap();
+
+        assert!(script.contains("/Volumes/My Shared Files/workspace"));
+        assert!(script.contains("AppleVirtIOFS"));
+        assert!(script.contains("/usr/bin/mktemp"));
+        assert!(script.contains("exit 64"));
+        assert!(script.contains("/bin/ln -s \"$source\" \"$target\""));
+        assert!(!script.contains("mount_virtiofs"));
+
+        let mut read_only_mount = mount;
+        read_only_mount.read_only = true;
+        let read_only_script = macos_vz_shared_directory_script(&read_only_mount).unwrap();
+        assert!(!read_only_script.contains("/usr/bin/mktemp"));
+    }
+
+    #[cfg(unix)]
+    fn exited_child_pid() -> u32 {
+        let mut child = StdCommand::new("/usr/bin/true")
+            .spawn()
+            .expect("spawn short-lived owner process");
+        let pid = child.id();
+        child.wait().expect("reap short-lived owner process");
+        assert!(!pid_exists(pid));
+        pid
+    }
+
+    fn adopted_macos_vz_test_vm(vm_dir: PathBuf, generation: &str, pid: u32) -> Arc<Vm> {
+        let mut metadata = qemu_test_metadata("adopted-macos-vz");
+        metadata.state = VmState::Running;
+        metadata.metadata.insert(
+            META_VZ_RUNTIME_GENERATION.to_string(),
+            generation.to_string(),
+        );
+        let mut runtime = VmRuntime::new(&vm_dir);
+        runtime.state = VmState::Running;
+        runtime.command_pid = Some(pid);
+        Arc::new(Vm::new(metadata, runtime, vm_dir))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adopted_terminal_teardown_rechecks_generation_after_waiting_for_gate() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let vm_dir = tmp.path().join("adopted-macos-vz");
+        fs::create_dir_all(&vm_dir).expect("create VM directory");
+        let pid = exited_child_pid();
+        let generation = "adopted-generation";
+        let vm = adopted_macos_vz_test_vm(vm_dir, generation, pid);
+        let paths = {
+            let inner = vm.lock().await;
+            macos_vz::RuntimePaths::new(&vm.dir, &inner.runtime.runtime_dir)
+        };
+
+        let teardown = vm.lock_runtime_teardown().await;
+        let task_vm = Arc::clone(&vm);
+        let task_paths = paths.clone();
+        let teardown_task = tokio::spawn(async move {
+            finalize_adopted_macos_vz_terminal(
+                &task_vm,
+                &task_paths,
+                generation,
+                pid,
+                VmState::Stopped,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !teardown_task.is_finished(),
+            "adoption cleanup must serialize behind another lifecycle transition"
+        );
+        vm.lock().await.metadata.metadata.insert(
+            META_VZ_RUNTIME_GENERATION.to_string(),
+            "replacement-generation".to_string(),
+        );
+        drop(teardown);
+
+        assert!(
+            !teardown_task
+                .await
+                .expect("join adoption cleanup")
+                .expect("stale cleanup should be ignored"),
+            "a stale adoption monitor must not finalize a replacement runtime"
+        );
+        let inner = vm.lock().await;
+        assert_eq!(inner.runtime.state, VmState::Running);
+        assert_eq!(inner.runtime.command_pid, Some(pid));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adopted_runtime_identity_requires_generation_pid_and_matching_nonterminal_state() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let pid = exited_child_pid();
+        let generation = "adopted-generation";
+        let vm = adopted_macos_vz_test_vm(tmp.path().join("adopted-macos-vz"), generation, pid);
+        let mut inner = vm.lock().await;
+
+        assert!(macos_vz_runtime_matches(&inner, generation, pid));
+        inner.runtime.command_pid = Some(pid + 1);
+        assert!(!macos_vz_runtime_matches(&inner, generation, pid));
+        inner.runtime.command_pid = Some(pid);
+        inner.metadata.state = VmState::Paused;
+        assert!(!macos_vz_runtime_matches(&inner, generation, pid));
+        inner.runtime.state = VmState::Paused;
+        assert!(macos_vz_runtime_matches(&inner, generation, pid));
+        inner.metadata.state = VmState::Stopped;
+        inner.runtime.state = VmState::Stopped;
+        assert!(!macos_vz_runtime_matches(&inner, generation, pid));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adopted_terminal_teardown_persists_only_after_cleanup_succeeds() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let vm_dir = tmp.path().join("adopted-macos-vz");
+        fs::create_dir_all(&vm_dir).expect("create VM directory");
+        let pid = exited_child_pid();
+        let generation = "adopted-generation";
+        let vm = adopted_macos_vz_test_vm(vm_dir, generation, pid);
+        let paths = {
+            let inner = vm.lock().await;
+            macos_vz::RuntimePaths::new(&vm.dir, &inner.runtime.runtime_dir)
+        };
+
+        assert!(
+            finalize_adopted_macos_vz_terminal(&vm, &paths, generation, pid, VmState::Stopped,)
+                .await
+                .expect("finalize adopted runtime")
+        );
+        let inner = vm.lock().await;
+        assert_eq!(inner.runtime.state, VmState::Stopped);
+        assert_eq!(inner.runtime.command_pid, None);
+        assert_eq!(inner.metadata.state, VmState::Stopped);
+        drop(inner);
+        assert_eq!(
+            load_metadata(&vm.dir)
+                .expect("load finalized metadata")
+                .state,
+            VmState::Stopped
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adopted_terminal_cleanup_failure_preserves_retryable_nonterminal_state() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let vm_dir = tmp.path().join("missing-vm-directory");
+        let pid = exited_child_pid();
+        let generation = "adopted-generation";
+        let vm = adopted_macos_vz_test_vm(vm_dir, generation, pid);
+        let paths = {
+            let inner = vm.lock().await;
+            macos_vz::RuntimePaths::new(&vm.dir, &inner.runtime.runtime_dir)
+        };
+
+        finalize_adopted_macos_vz_terminal(&vm, &paths, generation, pid, VmState::Stopped)
+            .await
+            .expect_err("missing VM directory must prevent final persistence");
+        let inner = vm.lock().await;
+        assert_eq!(inner.runtime.state, VmState::Running);
+        assert_eq!(inner.runtime.command_pid, Some(pid));
+        assert_eq!(inner.metadata.state, VmState::Running);
+    }
 
     #[test]
     fn default_resource_bounds_preserve_existing_admission_limits() {
@@ -6978,6 +8505,9 @@ mod tests {
             updated_at: Utc::now(),
             state: VmState::Stopped,
             architecture: ARCH_AMD64.to_string(),
+            guest_profile: GuestProfile::default(),
+            guest_runtime: GuestRuntime::default(),
+            capabilities: VmCapabilities::default(),
             source: VmSource {
                 source_type: VmSourceType::Docker,
                 reference: "mock/image:latest".to_string(),
@@ -7185,6 +8715,9 @@ mod tests {
             updated_at: Utc::now(),
             state: VmState::Stopped,
             architecture: test_arch.to_string(),
+            guest_profile: GuestProfile::default(),
+            guest_runtime: GuestRuntime::default(),
+            capabilities: VmCapabilities::default(),
             source: VmSource {
                 source_type: VmSourceType::Docker,
                 reference: "mock/image:latest".to_string(),
@@ -7357,6 +8890,9 @@ mod tests {
             updated_at: Utc::now(),
             state: VmState::Running,
             architecture: ARCH_AMD64.to_string(),
+            guest_profile: GuestProfile::default(),
+            guest_runtime: GuestRuntime::default(),
+            capabilities: VmCapabilities::default(),
             source: VmSource {
                 source_type: VmSourceType::Docker,
                 reference: "mock/image:latest".to_string(),
@@ -7638,6 +9174,9 @@ mod tests {
             updated_at: Utc::now(),
             state: VmState::Running,
             architecture: ARCH_AMD64.to_string(),
+            guest_profile: GuestProfile::default(),
+            guest_runtime: GuestRuntime::default(),
+            capabilities: VmCapabilities::default(),
             source: VmSource {
                 source_type: VmSourceType::Docker,
                 reference: "mock/image:latest".to_string(),
@@ -7798,6 +9337,9 @@ mod tests {
             updated_at: Utc::now(),
             state: VmState::Stopped,
             architecture: ARCH_AMD64.to_string(),
+            guest_profile: GuestProfile::default(),
+            guest_runtime: GuestRuntime::default(),
+            capabilities: VmCapabilities::default(),
             source: VmSource {
                 source_type: VmSourceType::Docker,
                 reference: "mock/image:latest".to_string(),
@@ -7918,6 +9460,9 @@ mod tests {
             updated_at: Utc::now(),
             state: VmState::Stopped,
             architecture: ARCH_AMD64.to_string(),
+            guest_profile: GuestProfile::default(),
+            guest_runtime: GuestRuntime::default(),
+            capabilities: VmCapabilities::default(),
             source: VmSource {
                 source_type: VmSourceType::Docker,
                 reference: "mock/image:latest".to_string(),
@@ -8022,6 +9567,9 @@ mod tests {
             updated_at: Utc::now(),
             state: VmState::Stopped,
             architecture: ARCH_AMD64.to_string(),
+            guest_profile: GuestProfile::default(),
+            guest_runtime: GuestRuntime::default(),
+            capabilities: VmCapabilities::default(),
             source: VmSource {
                 source_type: VmSourceType::Docker,
                 reference: "mock/image:latest".to_string(),
@@ -8281,6 +9829,9 @@ mod tests {
             updated_at: Utc::now(),
             state: VmState::Stopped,
             architecture: ARCH_AMD64.to_string(),
+            guest_profile: GuestProfile::default(),
+            guest_runtime: GuestRuntime::default(),
+            capabilities: VmCapabilities::default(),
             source: VmSource {
                 source_type: VmSourceType::Docker,
                 reference: "mock/image:latest".to_string(),
@@ -8356,6 +9907,9 @@ mod tests {
             updated_at: Utc::now(),
             state: VmState::Stopped,
             architecture: ARCH_AMD64.to_string(),
+            guest_profile: GuestProfile::default(),
+            guest_runtime: GuestRuntime::default(),
+            capabilities: VmCapabilities::default(),
             source: VmSource {
                 source_type: VmSourceType::Docker,
                 reference: "mock/image:latest".to_string(),
@@ -8424,6 +9978,9 @@ mod tests {
             updated_at: Utc::now(),
             state: VmState::Stopped,
             architecture: ARCH_AMD64.to_string(),
+            guest_profile: GuestProfile::default(),
+            guest_runtime: GuestRuntime::default(),
+            capabilities: VmCapabilities::default(),
             source: VmSource {
                 source_type: VmSourceType::Docker,
                 reference: "mock/image:latest".to_string(),
@@ -8551,6 +10108,9 @@ mod tests {
             updated_at: Utc::now(),
             state: VmState::Stopped,
             architecture: ARCH_AMD64.to_string(),
+            guest_profile: GuestProfile::default(),
+            guest_runtime: GuestRuntime::default(),
+            capabilities: VmCapabilities::default(),
             source: VmSource {
                 source_type: VmSourceType::Docker,
                 reference: "mock/image:latest".to_string(),
@@ -8635,6 +10195,9 @@ mod tests {
             updated_at: Utc::now(),
             state: VmState::Stopped,
             architecture: ARCH_AMD64.to_string(),
+            guest_profile: GuestProfile::default(),
+            guest_runtime: GuestRuntime::default(),
+            capabilities: VmCapabilities::default(),
             source: VmSource {
                 source_type: VmSourceType::Docker,
                 reference: "mock/image:latest".to_string(),
@@ -8763,6 +10326,9 @@ mod tests {
             updated_at: Utc::now(),
             state: VmState::Stopped,
             architecture: ARCH_AMD64.to_string(),
+            guest_profile: GuestProfile::default(),
+            guest_runtime: GuestRuntime::default(),
+            capabilities: VmCapabilities::default(),
             source: VmSource {
                 source_type: VmSourceType::Docker,
                 reference: "mock/image:latest".to_string(),
@@ -9024,9 +10590,10 @@ mod tests {
     fn vm_dir_removal_fails_closed_then_retries_after_mount_detaches() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let vm_dir = tmp.path().join("vm-id");
-        let fuse_mount = vm_dir.join("fuse-mounts").join("workspace");
+        let fuse_mount = tmp.path().join("external-volumes").join("workspace");
         let sentinel = vm_dir.join("metadata.json");
         fs::create_dir_all(&fuse_mount).expect("create fake mount path");
+        fs::create_dir_all(&vm_dir).expect("create VM directory");
         fs::write(&sentinel, b"must survive a live mount fence").expect("write sentinel");
 
         let error =
@@ -9045,6 +10612,10 @@ mod tests {
             !vm_dir.exists(),
             "detached retry should remove the disposable VM directory"
         );
+        assert!(
+            fuse_mount.exists(),
+            "VM metadata deletion must not traverse an external mountpoint path"
+        );
     }
 
     #[test]
@@ -9061,6 +10632,19 @@ mod tests {
         .expect_err("unknown mount state must fail closed");
         assert!(error.to_string().contains("mountinfo unavailable"));
         assert!(sentinel.exists(), "probe failure must preserve VM data");
+    }
+
+    #[test]
+    fn vm_dir_removal_probes_the_vm_identity_not_a_legacy_mount_subdirectory() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let vm_dir = tmp.path().join("vm-id");
+        fs::create_dir_all(&vm_dir).expect("create VM directory");
+
+        remove_vm_dir_with_mount_probe("vm-id", &vm_dir, |probed_vm_dir| {
+            assert_eq!(probed_vm_dir, vm_dir);
+            Ok(Vec::new())
+        })
+        .expect("detached VM directory should be removable");
     }
 
     #[cfg(unix)]

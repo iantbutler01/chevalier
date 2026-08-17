@@ -640,6 +640,14 @@ impl InodeTable {
             .unwrap_or_else(|| vec![path.to_string()])
     }
 
+    fn paths_for_identity(&self, identity: &str) -> Vec<String> {
+        self.identity_to_ino
+            .get(identity)
+            .and_then(|ino| self.ino_to_path.get(ino))
+            .map(|record| record.paths.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Kernel-cache invalidation target for one exact path. Read-only and
     /// allocation-free: it never mints an inode for a path the kernel never
     /// looked up here, so it returns `None` when this mount handed the kernel
@@ -1002,12 +1010,16 @@ struct FileState {
 }
 
 impl FileState {
-    /// Whether this description may mutate its file. The guest kernel normally
-    /// enforces it, but every operation that changes bytes checks it too, so a
-    /// read-only descriptor can never dirty a path and pull its content into a
-    /// published generation.
+    /// Whether the backing description may mutate its file.
     fn is_writable(&self) -> bool {
-        self.flags & libc::O_ACCMODE != libc::O_RDONLY
+        #[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+        {
+            self.file.is_writable()
+        }
+        #[cfg(not(all(target_os = "macos", feature = "macos-fskit")))]
+        {
+            self.flags & libc::O_ACCMODE != libc::O_RDONLY
+        }
     }
 }
 
@@ -1211,12 +1223,20 @@ impl RemoteFuseFs {
         }
         let mut config = fuser::Config::default();
         config.mount_options = mount_options;
-        // Package extraction issues large concurrent LOOKUP/CREATE bursts, and
-        // every callback now runs to completion against local storage. Thirty-two
-        // request threads keep those bursts from queueing behind one another
-        // without oversubscribing the device.
-        config.n_threads = Some(32);
-        config.clone_fd = true;
+        if cfg!(target_os = "macos") {
+            // FSKit issues mount-bootstrap requests as root even when the file
+            // system process belongs to the interactive sandbox account.
+            config.acl = fuser::SessionACL::RootAndOwner;
+            config.n_threads = Some(1);
+            config.clone_fd = false;
+        } else {
+            // Package extraction issues large concurrent LOOKUP/CREATE bursts, and
+            // every callback now runs to completion against local storage. Thirty-two
+            // request threads keep those bursts from queueing behind one another
+            // without oversubscribing the device.
+            config.n_threads = Some(32);
+            config.clone_fd = true;
+        }
         config
     }
 
@@ -1392,6 +1412,53 @@ impl RemoteFuseFs {
             .get(&fh)
             .cloned()
             .ok_or(Errno::EBADF)
+    }
+
+    fn mutation_handle_state(&self, fh: u64) -> FuseResult<(FileState, bool)> {
+        for _ in 0..3 {
+            let mut state = self.handle_state(fh)?;
+            let identity = state.file.metadata().map_err(errno_for)?.local_identity;
+            if self
+                .local
+                .tree()
+                .lstat(&state.path)
+                .map_err(errno_for)?
+                .is_some_and(|metadata| metadata.local_identity == identity)
+            {
+                return Ok((state, false));
+            }
+
+            let aliases = self.lock_inodes()?.paths_for_identity(&identity);
+            let mut surviving_alias = None;
+            for alias in aliases {
+                if self
+                    .local
+                    .tree()
+                    .lstat(&alias)
+                    .map_err(errno_for)?
+                    .is_some_and(|metadata| metadata.local_identity == identity)
+                {
+                    surviving_alias = Some(alias);
+                    break;
+                }
+            }
+            let Some(alias) = surviving_alias else {
+                return Ok((state, true));
+            };
+
+            let mut handles = self.lock_handles()?;
+            let Some(current) = handles.files.get_mut(&fh) else {
+                return Err(Errno::EBADF);
+            };
+            if current.path != state.path {
+                continue;
+            }
+            current.path.clone_from(&alias);
+            current.file.retarget(&alias);
+            state.path = alias;
+            return Ok((state, false));
+        }
+        Err(Errno::EAGAIN)
     }
 
     /// Recover the open file description for an inode whose name no longer
@@ -2091,6 +2158,52 @@ mod tests {
     }
 
     #[test]
+    fn displaced_open_handle_retargets_to_a_surviving_hard_link() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let client =
+            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
+        let fs = RemoteFuseFs::new(client, false, "test-scope", runtime.handle().clone());
+
+        let (destination, destination_metadata) = fs
+            .local
+            .create_file("destination", 0o644, libc::O_RDWR)
+            .unwrap();
+        fs.local.write(&destination, b"old", 0).unwrap();
+        fs.local.create_hard_link("destination", "alias").unwrap();
+        {
+            let mut inodes = fs.lock_inodes().unwrap();
+            inodes.lookup_with_identity("destination", Some(&destination_metadata.local_identity));
+            inodes.lookup_with_identity("alias", Some(&destination_metadata.local_identity));
+        }
+        let destination_handle = fs
+            .next_handle(destination, "destination", libc::O_RDWR)
+            .unwrap();
+
+        let (source, _) = fs.local.create_file("source", 0o644, libc::O_RDWR).unwrap();
+        fs.local.write(&source, b"new", 0).unwrap();
+        fs.local.rename("source", "destination", 0).unwrap();
+        fs.rename_inode_path("source", "destination");
+
+        let (state, detached) = fs.mutation_handle_state(destination_handle).unwrap();
+        assert!(!detached);
+        assert_eq!(state.path, "alias");
+        fs.local.write(&state.file, b"OLD", 0).unwrap();
+        fs.seal_handle(destination_handle).unwrap();
+
+        let mut bytes = [0_u8; 3];
+        let alias = fs.local.tree().open_file("alias", libc::O_RDONLY).unwrap();
+        alias.read_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"OLD");
+        let replacement = fs
+            .local
+            .tree()
+            .open_file("destination", libc::O_RDONLY)
+            .unwrap();
+        replacement.read_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"new");
+    }
+
+    #[test]
     fn inode_table_exact_detach_does_not_scan_or_remove_neighboring_paths() {
         let mut table = InodeTable::new();
         let removed = table.lookup("node_modules/pkg/index.js");
@@ -2463,18 +2576,16 @@ impl RemoteFuseFs {
                 }
                 return Ok(self.root_attributes());
             }
-            let handle = fh.and_then(|fh| self.handle_state(fh.0).ok());
+            let (handle, detached) = match fh {
+                Some(fh) => {
+                    let (state, detached) = self.mutation_handle_state(fh.0)?;
+                    (Some(state), detached)
+                }
+                None => (None, false),
+            };
             let path = match handle.as_ref() {
                 Some(state) => state.path.clone(),
                 None => self.path_for_ino(ino)?,
-            };
-            // A descriptor whose name no longer resolves is an unlinked-but-open
-            // file. Its metadata is observable only through that descriptor and
-            // has no remote name to be published under, so it is applied to the
-            // descriptor directly and deliberately not journalled.
-            let detached = match handle.as_ref() {
-                Some(_) => self.local.tree().lstat(&path).map_err(errno_for)?.is_none(),
-                None => false,
             };
 
             // Size first: POSIX applies these independently, and ordering a
@@ -2537,7 +2648,10 @@ impl RemoteFuseFs {
         })();
         match result {
             Ok(attr) => reply.attr(&self.reply_ttl(), &attr),
-            Err(err) => reply.error(err),
+            Err(err) => {
+                tracing::warn!(ino = ino.0, size, errno = ?err, "vfs setattr failed");
+                reply.error(err);
+            }
         }
     }
 
@@ -2679,7 +2793,7 @@ impl RemoteFuseFs {
         match result {
             Ok(fh) => reply.opened(FileHandle(fh), remote_file_open_flags()),
             Err(err) => {
-                tracing::warn!(ino = ino.0, errno = ?err, "vfs open failed");
+                tracing::warn!(ino = ino.0, flags = flags.0, errno = ?err, "vfs open failed");
                 reply.error(err);
             }
         }
@@ -2725,27 +2839,49 @@ impl RemoteFuseFs {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn write(
         &self,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         data: &[u8],
         _write_flags: fuser::WriteFlags,
-        _flags: OpenFlags,
+        flags: OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyWrite,
     ) {
         let result: FuseResult<u32> = (|| {
-            let state = self.handle_state(fh.0)?;
+            let (state, detached) = self.mutation_handle_state(fh.0)?;
             if !state.is_writable() {
+                tracing::warn!(
+                    ino = ino.0,
+                    fh = fh.0,
+                    handle_flags = state.flags,
+                    callback_flags = flags.0,
+                    offset,
+                    size = data.len(),
+                    "vfs write rejected read-only handle"
+                );
                 return Err(Errno::EBADF);
             }
             // A through-write to the backing file. There is no read-modify-write
             // download: the bytes the guest is not overwriting are already there.
             // Durable-storage exhaustion surfaces as the local `ENOSPC` it is.
-            let written = self
-                .local
-                .write(&state.file, data, offset)
-                .map_err(errno_for)?;
+            let written = if detached {
+                state.file.write_at(data, offset)
+            } else {
+                self.local.write(&state.file, data, offset)
+            }
+            .map_err(|error| {
+                tracing::warn!(
+                    ino = ino.0,
+                    fh = fh.0,
+                    offset,
+                    size = data.len(),
+                    flags = state.flags,
+                    error = %format!("{error:#}"),
+                    "vfs write failed"
+                );
+                errno_for(error)
+            })?;
             Ok(written as u32)
         })();
         match result {
@@ -2781,10 +2917,17 @@ impl RemoteFuseFs {
     /// mentions.
     pub(super) fn fsync(&self, _ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
         let result: FuseResult<()> = (|| {
-            let state = self.handle_state(fh.0)?;
-            self.local
-                .fsync_handle(&state.file, datasync)
-                .map_err(errno_for)
+            let (state, detached) = self.mutation_handle_state(fh.0)?;
+            if detached {
+                if datasync {
+                    state.file.sync_data()
+                } else {
+                    state.file.sync_all()
+                }
+            } else {
+                self.local.fsync_handle(&state.file, datasync)
+            }
+            .map_err(errno_for)
         })();
         match result {
             Ok(()) => reply.ok(),
@@ -2862,13 +3005,16 @@ impl RemoteFuseFs {
                 // publish a generation whose bytes the local file never held.
                 return Err(Errno::EOPNOTSUPP);
             }
-            let state = self.handle_state(fh.0)?;
+            let (state, detached) = self.mutation_handle_state(fh.0)?;
             if !state.is_writable() {
                 return Err(Errno::EBADF);
             }
-            self.local
-                .allocate(&state.file, offset, length)
-                .map_err(errno_for)
+            if detached {
+                state.file.allocate(offset, length)
+            } else {
+                self.local.allocate(&state.file, offset, length)
+            }
+            .map_err(errno_for)
         })();
         match result {
             Ok(()) => reply.ok(),
@@ -2892,20 +3038,24 @@ impl RemoteFuseFs {
     ) {
         let result: FuseResult<u32> = (|| {
             let source = self.handle_state(fh_in.0)?;
-            let destination = self.handle_state(fh_out.0)?;
+            let (destination, detached) = self.mutation_handle_state(fh_out.0)?;
             if !destination.is_writable() {
                 return Err(Errno::EBADF);
             }
-            let copied = self
-                .local
-                .copy_range(
+            let copied = if detached {
+                destination
+                    .file
+                    .copy_range_from(&source.file, offset_in, offset_out, length)
+            } else {
+                self.local.copy_range(
                     &destination.file,
                     &source.file,
                     offset_in,
                     offset_out,
                     length,
                 )
-                .map_err(errno_for)?;
+            }
+            .map_err(errno_for)?;
             Ok(copied.min(u32::MAX as u64) as u32)
         })();
         match result {
@@ -3274,7 +3424,16 @@ impl RemoteFuseFs {
                 FileHandle(fh),
                 remote_file_open_flags(),
             ),
-            Err(err) => reply.error(err),
+            Err(err) => {
+                tracing::warn!(
+                    parent = parent.0,
+                    name = ?name,
+                    flags,
+                    errno = ?err,
+                    "vfs create failed"
+                );
+                reply.error(err);
+            }
         }
     }
 
@@ -3284,10 +3443,15 @@ impl RemoteFuseFs {
     /// about is a duplicate FLUSH whose RELEASE already retired it, which is
     /// success, not `EBADF`.
     fn seal_handle(&self, fh: u64) -> FuseResult<()> {
-        let Some(state) = self.lock_handles()?.files.get(&fh).cloned() else {
+        if !self.lock_handles()?.files.contains_key(&fh) {
             return Ok(());
-        };
-        self.local.flush_handle(&state.file).map_err(errno_for)
+        }
+        let (state, detached) = self.mutation_handle_state(fh)?;
+        if detached {
+            Ok(())
+        } else {
+            self.local.flush_handle(&state.file).map_err(errno_for)
+        }
     }
 
     fn join_child(parent: &str, name: &str) -> String {

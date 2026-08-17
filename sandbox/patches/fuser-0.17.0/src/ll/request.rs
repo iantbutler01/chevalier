@@ -996,8 +996,11 @@ mod op {
         }
 
         pub(crate) fn reply(&self, config: &crate::KernelConfig) -> ResponseData {
+            #[cfg(fuser_mount_impl = "macos-fskit")]
+            let flags = config.requested;
+            #[cfg(not(fuser_mount_impl = "macos-fskit"))]
             let flags = config.requested | InitFlags::FUSE_INIT_EXT;
-            // use requested features and reported as capable
+            #[cfg(not(fuser_mount_impl = "macos-fskit"))]
             let flags = flags & self.capabilities();
 
             let mut init = fuse_init_out {

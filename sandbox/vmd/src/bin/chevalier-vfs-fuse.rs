@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
+use tracing_subscriber::EnvFilter;
 use vmd_rs::fuse::{
     DEFAULT_VFS_DRAIN_TIMEOUT, default_vfs_state_dir, mount_remote_vfs_fuse, unmount_fuse,
 };
@@ -41,6 +42,11 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
     let args = Args::parse();
     let mountpoint = args
         .mountpoint
@@ -98,9 +104,19 @@ fn env_truthy(name: &str) -> bool {
 async fn wait_for_shutdown_signal() -> Result<()> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("install SIGTERM handler")?;
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result.context("wait for ctrl-c")?,
-        _ = terminate.recv() => {},
+    if env_truthy("CHEVALIER_VFS_LAUNCHD_SUPERVISED") {
+        let mut supervised =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                .context("install SIGUSR1 handler")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.context("wait for ctrl-c")?,
+            _ = supervised.recv() => {},
+        }
+    } else {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.context("wait for ctrl-c")?,
+            _ = terminate.recv() => {},
+        }
     }
     Ok(())
 }

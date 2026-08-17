@@ -475,13 +475,17 @@ impl MountLocalView {
             self.tree.observe(&paths)?
         };
         let prepared = wal.prepare(mutation, PayloadSource::None, pre_image)?;
-        let (file, applied) = match self.tree.apply_create_file(path, mode, flags) {
-            Ok(created) => created,
-            Err(error) => {
-                wal.abort(prepared, &format!("{error:#}"))?;
-                return Err(error);
-            }
-        };
+        let (file, applied) =
+            match self
+                .tree
+                .apply_create_file(path, mode, backing_handle_flags(flags))
+            {
+                Ok(created) => created,
+                Err(error) => {
+                    wal.abort(prepared, &format!("{error:#}"))?;
+                    return Err(error);
+                }
+            };
         wal.commit(prepared, applied.local_identity.clone())?;
         // The created generation is content the gateway has never seen. Marking
         // it dirty is what lets the publisher fold the creation into the first
@@ -658,7 +662,20 @@ impl MountLocalView {
         // Creation and truncation are the mount's business, not the backing
         // open's: the truncate is a content mutation that has to dirty the path.
         let open_flags = flags & !(libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC);
-        let file = self.tree.open_file(path, open_flags)?;
+        let file = match self.tree.open_file(path, backing_handle_flags(open_flags)) {
+            Ok(file) => file,
+            #[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+            Err(error) if flags & libc::O_ACCMODE == libc::O_RDONLY => {
+                match self.tree.open_file(path, open_flags) {
+                    Ok(file) => file,
+                    Err(_) => self
+                        .tree
+                        .open_file(path, (open_flags & !libc::O_ACCMODE) | libc::O_WRONLY)
+                        .map_err(|_| error)?,
+                }
+            }
+            Err(error) => return Err(error),
+        };
         if wants_truncate {
             let wal = self.writable_wal()?;
             self.reject_content_under_pressure("an O_TRUNC open")?;
@@ -1483,6 +1500,19 @@ pub(crate) struct PathLockGuard {
     held: Vec<DependencyKey>,
 }
 
+fn backing_handle_flags(flags: i32) -> i32 {
+    #[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+    {
+        // FSKit opens every file read/write and does not preserve the caller's
+        // access mode in the bridged FUSE OPEN request.
+        return (flags & !libc::O_ACCMODE) | libc::O_RDWR;
+    }
+    #[cfg(not(all(target_os = "macos", feature = "macos-fskit")))]
+    {
+        flags
+    }
+}
+
 impl Drop for PathLockGuard {
     fn drop(&mut self) {
         while let Some(key) = self.held.pop() {
@@ -1521,7 +1551,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::{MountLocalView, MountLocalViewOptions};
+    use super::{MountLocalView, MountLocalViewOptions, backing_handle_flags};
     use crate::fuse::local_view::MountStateLayout;
     use crate::fuse::local_view::types::{
         MountMutation, MountOwnerRecord, PayloadSource, PayloadStorage,
@@ -1536,6 +1566,61 @@ mod tests {
             read_only: false,
             tokio: tokio.clone(),
         }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+    #[test]
+    fn fskit_uses_read_write_backing_handles_with_permission_fallbacks() {
+        assert_eq!(
+            backing_handle_flags(libc::O_RDONLY) & libc::O_ACCMODE,
+            libc::O_RDWR
+        );
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let opened =
+            MountLocalView::open(options(temp.path(), runtime.handle())).expect("open local view");
+        let view = opened.view;
+        let (ordinary, _) = view
+            .create_file("ordinary", 0o644, libc::O_RDONLY)
+            .expect("create ordinary file");
+        assert!(ordinary.is_writable());
+        drop(ordinary);
+
+        view.set_mode("ordinary", 0o444)
+            .expect("make file nonwritable");
+        let (nonwritable, _) = view
+            .open_file("ordinary", 0)
+            .expect("open nonwritable file for reading");
+        assert!(!nonwritable.is_writable());
+        let write_error = view
+            .write(&nonwritable, b"no", 0)
+            .expect_err("read-only descriptor must reject writes");
+        assert_eq!(
+            write_error
+                .downcast_ref::<std::io::Error>()
+                .and_then(|error| error.raw_os_error()),
+            Some(libc::EBADF)
+        );
+
+        view.set_mode("ordinary", 0o200)
+            .expect("make file write-only");
+        let (write_only, _) = view
+            .open_file("ordinary", 0)
+            .expect("open write-only file through FSKit's erased flags");
+        assert!(write_only.is_writable());
+        view.write(&write_only, b"yes", 0)
+            .expect("write through write-only descriptor");
+        let mut bytes = [0_u8; 3];
+        let read_error = write_only
+            .read_at(&mut bytes, 0)
+            .expect_err("write-only descriptor must reject reads");
+        assert_eq!(
+            read_error
+                .downcast_ref::<std::io::Error>()
+                .and_then(|error| error.raw_os_error()),
+            Some(libc::EBADF)
+        );
     }
 
     #[test]

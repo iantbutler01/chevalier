@@ -27,10 +27,12 @@ use vmd_rs::image::{self, BASE_IMAGE_EXT, BASE_IMAGE_SIZE_GB};
 use vmd_rs::proto::v1::vmd_service_client::VmdServiceClient;
 use vmd_rs::proto::v1::{
     CreateSnapshotRequest, CreateVmPhase, CreateVmRequest, CreateVmStreamResponse,
-    DeleteSnapshotRequest, DeleteVmRequest, ForkVmRequest, GetVmRequest, ListSnapshotsRequest,
-    ListVMsRequest, Metadata, PreDownloadVmImagePhase, PreDownloadVmImageRequest, ResourceSpec,
-    RestoreSnapshotRequest, Snapshot, Vm, VmActionRequest, VmSource,
-    VmSourceType as ProtoVmSourceType, VmState as ProtoVmState, create_vm_stream_response,
+    DeleteSnapshotRequest, DeleteVmRequest, ForkVmRequest, GetVmRequest, GuestPlatform,
+    GuestProfile, ListSnapshotsRequest, ListVMsRequest, Metadata, NetworkPolicyMode,
+    PreDownloadVmImagePhase, PreDownloadVmImageRequest, ResourceSpec, RestoreSnapshotRequest,
+    SharedMount, SharedMountAvailability, SharedMountContinuity, Snapshot, Vm, VmActionRequest,
+    VmSource, VmSourceType as ProtoVmSourceType, VmState as ProtoVmState, WorkspaceMode,
+    WorkspaceTransport, create_vm_stream_response,
 };
 use vmd_rs::virt;
 
@@ -81,6 +83,16 @@ enum Commands {
         auto_start: bool,
         #[arg(long)]
         arch: Option<String>,
+        #[arg(long, requires = "vfs_scope_path")]
+        vfs_endpoint: Option<String>,
+        #[arg(long, requires = "vfs_endpoint")]
+        vfs_scope_path: Option<String>,
+        #[arg(long, default_value = "/Volumes/OpenBracketWorkspace")]
+        guest_path: String,
+        #[arg(long, default_value = "workspace")]
+        mount_tag: String,
+        #[arg(long)]
+        read_only: bool,
         #[arg(long)]
         json: bool,
     },
@@ -186,6 +198,7 @@ enum Commands {
 enum SourceType {
     Docker,
     Snapshot,
+    MacosTemplate,
 }
 
 #[tokio::main]
@@ -224,6 +237,11 @@ async fn main() -> Result<()> {
                     metadata,
                     auto_start,
                     arch,
+                    vfs_endpoint,
+                    vfs_scope_path,
+                    guest_path,
+                    mount_tag,
+                    read_only,
                     json,
                 } => {
                     create_vm(
@@ -237,6 +255,11 @@ async fn main() -> Result<()> {
                         metadata,
                         auto_start,
                         arch,
+                        vfs_endpoint,
+                        vfs_scope_path,
+                        guest_path,
+                        mount_tag,
+                        read_only,
                         json,
                         auth_header.as_ref(),
                     )
@@ -490,6 +513,11 @@ async fn create_vm(
     metadata: Vec<String>,
     auto_start: bool,
     arch: Option<String>,
+    vfs_endpoint: Option<String>,
+    vfs_scope_path: Option<String>,
+    guest_path: String,
+    mount_tag: String,
+    read_only: bool,
     json: bool,
     auth_header: Option<&MetadataValue<Ascii>>,
 ) -> Result<()> {
@@ -507,6 +535,7 @@ async fn create_vm(
             r#type: match source_type {
                 SourceType::Docker => ProtoVmSourceType::Docker as i32,
                 SourceType::Snapshot => ProtoVmSourceType::Snapshot as i32,
+                SourceType::MacosTemplate => ProtoVmSourceType::MacosTemplate as i32,
             },
             reference: source_ref,
         }),
@@ -521,8 +550,36 @@ async fn create_vm(
             Some(Metadata { entries: meta_map })
         },
         auto_start,
-        architecture: arch.unwrap_or_default(),
-        shared_mounts: Vec::new(),
+        architecture: arch.unwrap_or_else(|| {
+            if matches!(source_type, SourceType::MacosTemplate) {
+                "arm64".to_string()
+            } else {
+                String::new()
+            }
+        }),
+        guest_profile: matches!(source_type, SourceType::MacosTemplate).then(|| GuestProfile {
+            platform: GuestPlatform::Macos as i32,
+            architecture: "arm64".to_string(),
+            schema_version: 1,
+            ..Default::default()
+        }),
+        guest_runtime: None,
+        capabilities: None,
+        shared_mounts: match (vfs_endpoint, vfs_scope_path) {
+            (Some(vfs_endpoint), Some(vfs_scope_path)) => vec![SharedMount {
+                host_path: String::new(),
+                guest_path,
+                mount_tag,
+                read_only,
+                availability: SharedMountAvailability::NodeLocal as i32,
+                continuity: SharedMountContinuity::RestartSameNode as i32,
+                backend_profile: "openbracket-vfs-fuse".to_string(),
+                vfs_endpoint,
+                vfs_scope_path,
+            }],
+            (None, None) => Vec::new(),
+            _ => unreachable!("clap requires the VFS endpoint and scope together"),
+        },
         pci_device_ids: Vec::new(),
         storage_profile: "local-ephemeral".to_string(),
         volume_owner_key: String::new(),
@@ -947,6 +1004,45 @@ fn vm_to_json(vm: &Vm) -> serde_json::Value {
         "name": vm.name,
         "state": ProtoVmState::try_from(vm.state).map(|s| format!("{:?}", s)).unwrap_or_default(),
         "architecture": vm.architecture,
+        "guest_profile": vm.guest_profile.as_ref().map(|profile| json!({
+            "platform": format!("{:?}", GuestPlatform::try_from(profile.platform).unwrap_or(GuestPlatform::Unspecified)),
+            "architecture": profile.architecture,
+            "os_version": profile.os_version,
+            "os_build": profile.os_build,
+            "template_id": profile.template_id,
+            "template_digest": profile.template_digest,
+            "machine_profile": profile.machine_profile,
+            "schema_version": profile.schema_version,
+            "minimum_host_version": profile.minimum_host_version,
+        })),
+        "guest_runtime": vm.guest_runtime.as_ref().map(|runtime| json!({
+            "platform": format!("{:?}", GuestPlatform::try_from(runtime.platform).unwrap_or(GuestPlatform::Unspecified)),
+            "architecture": runtime.architecture,
+            "home_dir": runtime.home_dir,
+            "workspace_root": runtime.workspace_root,
+            "workspace_alias": runtime.workspace_alias,
+            "temp_dir": runtime.temp_dir,
+            "runtime_dir": runtime.runtime_dir,
+            "environment_file_root": runtime.environment_file_root,
+            "default_shell": runtime.default_shell,
+            "service_manager": runtime.service_manager,
+        })),
+        "capabilities": vm.capabilities.as_ref().map(|capabilities| json!({
+            "workspace_transport": format!("{:?}", WorkspaceTransport::try_from(capabilities.workspace_transport).unwrap_or(WorkspaceTransport::Unspecified)),
+            "workspace_mode": format!("{:?}", WorkspaceMode::try_from(capabilities.workspace_mode).unwrap_or(WorkspaceMode::Unspecified)),
+            "network_policy_mode": format!("{:?}", NetworkPolicyMode::try_from(capabilities.network_policy_mode).unwrap_or(NetworkPolicyMode::Unspecified)),
+            "durable_volume": capabilities.durable_volume,
+            "docker": capabilities.docker,
+            "managed_services": capabilities.managed_services,
+            "pause_resume": capabilities.pause_resume,
+            "cold_checkpoint": capabilities.cold_checkpoint,
+            "same_host_saved_state": capabilities.same_host_saved_state,
+            "stopped_fork": capabilities.stopped_fork,
+            "running_fork": capabilities.running_fork,
+            "computer_use": capabilities.computer_use,
+            "pci": capabilities.pci,
+            "cross_node_restore": capabilities.cross_node_restore,
+        })),
         "created_at": ts_to_string(vm.created_at.as_ref()),
         "updated_at": ts_to_string(vm.updated_at.as_ref()),
         "started_at": ts_to_string(vm.started_at.as_ref()),

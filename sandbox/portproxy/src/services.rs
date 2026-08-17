@@ -38,7 +38,7 @@ use crate::pb::google::protobuf::Empty;
 use crate::process_group::{
     configure_child_process_group, kill_process_group_or_child, signal_process_group_or_pid,
 };
-use crate::system_env::build_exec_env;
+use crate::system_env::{DEFAULT_EXEC_PATH, build_exec_env, default_exec_home};
 use nix::sys::signal::Signal;
 
 type ExecResponseStream = ReceiverStream<Result<ExecResponse, Status>>;
@@ -58,9 +58,6 @@ fn attach_stream(
         ),
     )
 }
-
-const DEFAULT_EXEC_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-const DEFAULT_EXEC_HOME: &str = "/root";
 
 // STALL DIAGNOSTIC (keep: low-noise): thresholds that elevate the exec timing
 // breadcrumbs from debug to WARN. Sized to surface the ~30s action-boundary
@@ -221,7 +218,7 @@ impl ShellExec for ShellExecService {
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
         command.env_clear();
-        for (key, value) in build_exec_env(DEFAULT_EXEC_PATH, DEFAULT_EXEC_HOME, &start.env) {
+        for (key, value) in build_exec_env(DEFAULT_EXEC_PATH, default_exec_home(), &start.env) {
             command.env(key, value);
         }
         configure_child_process_group(&mut command);

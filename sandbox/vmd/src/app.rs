@@ -186,6 +186,10 @@ pub async fn run_server(mut config: Config) -> Result<()> {
     if let Some(handle) = public_ingress_handle {
         handle.shutdown().await;
     }
+    if let Err(shutdown_error) = manager.shutdown_macos_vz_shared_mounts().await {
+        error!(error = %shutdown_error, "failed to stop mounted macOS VMs during vmd shutdown");
+        return Err(anyhow!(shutdown_error));
+    }
 
     info!("vmd gRPC server stopped");
     Ok(())
@@ -581,6 +585,9 @@ impl VmdService for GrpcService {
             metadata: req.metadata.map_or_else(Default::default, |m| m.entries),
             auto_start: req.auto_start,
             architecture: req.architecture,
+            guest_profile: map_guest_profile(req.guest_profile),
+            guest_runtime: map_guest_runtime(req.guest_runtime),
+            capabilities: map_capabilities(req.capabilities),
             // @dive: Shared mounts stay typed over gRPC so the daemon can validate and persist mount intent independently of opaque metadata keys.
             shared_mounts: req
                 .shared_mounts
@@ -1682,6 +1689,9 @@ fn build_vm(
                 volume_id: volume.volume_id.clone(),
                 size_gb: volume.size_gb,
             }),
+        guest_profile: Some(build_guest_profile(&meta.guest_profile)),
+        guest_runtime: Some(build_guest_runtime(&meta.guest_runtime)),
+        capabilities: Some(build_capabilities(&meta.capabilities)),
     };
 
     if let Some(runtime) = runtime {
@@ -1724,6 +1734,7 @@ fn map_source_type_proto(source_type: &StateVmSourceType) -> i32 {
     match source_type {
         StateVmSourceType::Docker => ProtoVmSourceType::Docker as i32,
         StateVmSourceType::Snapshot => ProtoVmSourceType::Snapshot as i32,
+        StateVmSourceType::MacosTemplate => ProtoVmSourceType::MacosTemplate as i32,
     }
 }
 
@@ -1731,9 +1742,174 @@ fn map_source_type(value: i32) -> Result<StateVmSourceType, Status> {
     match ProtoVmSourceType::try_from(value) {
         Ok(ProtoVmSourceType::Docker) => Ok(StateVmSourceType::Docker),
         Ok(ProtoVmSourceType::Snapshot) => Ok(StateVmSourceType::Snapshot),
+        Ok(ProtoVmSourceType::MacosTemplate) => Ok(StateVmSourceType::MacosTemplate),
         Ok(ProtoVmSourceType::Unspecified) | Err(_) => {
             Err(Status::invalid_argument("source type must be provided"))
         }
+    }
+}
+
+fn map_guest_platform(value: i32) -> crate::state::GuestPlatform {
+    match crate::proto::v1::GuestPlatform::try_from(value) {
+        Ok(crate::proto::v1::GuestPlatform::Macos) => crate::state::GuestPlatform::Macos,
+        _ => crate::state::GuestPlatform::Linux,
+    }
+}
+
+fn build_guest_platform(value: crate::state::GuestPlatform) -> i32 {
+    match value {
+        crate::state::GuestPlatform::Linux => crate::proto::v1::GuestPlatform::Linux as i32,
+        crate::state::GuestPlatform::Macos => crate::proto::v1::GuestPlatform::Macos as i32,
+    }
+}
+
+fn map_guest_profile(value: Option<crate::proto::v1::GuestProfile>) -> crate::state::GuestProfile {
+    value.map_or_else(crate::state::GuestProfile::default, |value| {
+        crate::state::GuestProfile {
+            platform: map_guest_platform(value.platform),
+            architecture: value.architecture,
+            os_version: value.os_version,
+            os_build: value.os_build,
+            template_id: value.template_id,
+            template_digest: value.template_digest,
+            machine_profile: value.machine_profile,
+            schema_version: value.schema_version,
+            minimum_host_version: value.minimum_host_version,
+        }
+    })
+}
+
+fn build_guest_profile(value: &crate::state::GuestProfile) -> crate::proto::v1::GuestProfile {
+    crate::proto::v1::GuestProfile {
+        platform: build_guest_platform(value.platform),
+        architecture: value.architecture.clone(),
+        os_version: value.os_version.clone(),
+        os_build: value.os_build.clone(),
+        template_id: value.template_id.clone(),
+        template_digest: value.template_digest.clone(),
+        machine_profile: value.machine_profile.clone(),
+        schema_version: value.schema_version,
+        minimum_host_version: value.minimum_host_version.clone(),
+    }
+}
+
+fn map_guest_runtime(value: Option<crate::proto::v1::GuestRuntime>) -> crate::state::GuestRuntime {
+    value.map_or_else(crate::state::GuestRuntime::default, |value| {
+        crate::state::GuestRuntime {
+            platform: map_guest_platform(value.platform),
+            architecture: value.architecture,
+            home_dir: value.home_dir,
+            workspace_root: value.workspace_root,
+            workspace_alias: value.workspace_alias,
+            temp_dir: value.temp_dir,
+            runtime_dir: value.runtime_dir,
+            environment_file_root: value.environment_file_root,
+            default_shell: value.default_shell,
+            service_manager: value.service_manager,
+        }
+    })
+}
+
+fn build_guest_runtime(value: &crate::state::GuestRuntime) -> crate::proto::v1::GuestRuntime {
+    crate::proto::v1::GuestRuntime {
+        platform: build_guest_platform(value.platform),
+        architecture: value.architecture.clone(),
+        home_dir: value.home_dir.clone(),
+        workspace_root: value.workspace_root.clone(),
+        workspace_alias: value.workspace_alias.clone(),
+        temp_dir: value.temp_dir.clone(),
+        runtime_dir: value.runtime_dir.clone(),
+        environment_file_root: value.environment_file_root.clone(),
+        default_shell: value.default_shell.clone(),
+        service_manager: value.service_manager.clone(),
+    }
+}
+
+fn map_capabilities(
+    value: Option<crate::proto::v1::VmCapabilities>,
+) -> crate::state::VmCapabilities {
+    value.map_or_else(crate::state::VmCapabilities::default, |value| {
+        crate::state::VmCapabilities {
+            workspace_transport: match crate::proto::v1::WorkspaceTransport::try_from(
+                value.workspace_transport,
+            ) {
+                Ok(crate::proto::v1::WorkspaceTransport::MacfuseFskit) => {
+                    crate::state::WorkspaceTransport::MacfuseFskit
+                }
+                _ => crate::state::WorkspaceTransport::VirtioFs,
+            },
+            workspace_mode: match crate::proto::v1::WorkspaceMode::try_from(value.workspace_mode) {
+                Ok(crate::proto::v1::WorkspaceMode::OwnerOnly) => {
+                    crate::state::WorkspaceMode::OwnerOnly
+                }
+                _ => crate::state::WorkspaceMode::OwnerAndObservers,
+            },
+            network_policy_mode: match crate::proto::v1::NetworkPolicyMode::try_from(
+                value.network_policy_mode,
+            ) {
+                Ok(crate::proto::v1::NetworkPolicyMode::NoNicVsockProxy) => {
+                    crate::state::NetworkPolicyMode::NoNicVsockProxy
+                }
+                Ok(crate::proto::v1::NetworkPolicyMode::NoNicIsolated) => {
+                    crate::state::NetworkPolicyMode::NoNicIsolated
+                }
+                _ => crate::state::NetworkPolicyMode::TapTransparentProxy,
+            },
+            durable_volume: value.durable_volume,
+            docker: value.docker,
+            managed_services: value.managed_services,
+            pause_resume: value.pause_resume,
+            cold_checkpoint: value.cold_checkpoint,
+            same_host_saved_state: value.same_host_saved_state,
+            stopped_fork: value.stopped_fork,
+            running_fork: value.running_fork,
+            computer_use: value.computer_use,
+            pci: value.pci,
+            cross_node_restore: value.cross_node_restore,
+        }
+    })
+}
+
+fn build_capabilities(value: &crate::state::VmCapabilities) -> crate::proto::v1::VmCapabilities {
+    crate::proto::v1::VmCapabilities {
+        workspace_transport: match value.workspace_transport {
+            crate::state::WorkspaceTransport::VirtioFs => {
+                crate::proto::v1::WorkspaceTransport::VirtioFs as i32
+            }
+            crate::state::WorkspaceTransport::MacfuseFskit => {
+                crate::proto::v1::WorkspaceTransport::MacfuseFskit as i32
+            }
+        },
+        workspace_mode: match value.workspace_mode {
+            crate::state::WorkspaceMode::OwnerAndObservers => {
+                crate::proto::v1::WorkspaceMode::OwnerAndObservers as i32
+            }
+            crate::state::WorkspaceMode::OwnerOnly => {
+                crate::proto::v1::WorkspaceMode::OwnerOnly as i32
+            }
+        },
+        network_policy_mode: match value.network_policy_mode {
+            crate::state::NetworkPolicyMode::TapTransparentProxy => {
+                crate::proto::v1::NetworkPolicyMode::TapTransparentProxy as i32
+            }
+            crate::state::NetworkPolicyMode::NoNicVsockProxy => {
+                crate::proto::v1::NetworkPolicyMode::NoNicVsockProxy as i32
+            }
+            crate::state::NetworkPolicyMode::NoNicIsolated => {
+                crate::proto::v1::NetworkPolicyMode::NoNicIsolated as i32
+            }
+        },
+        durable_volume: value.durable_volume,
+        docker: value.docker,
+        managed_services: value.managed_services,
+        pause_resume: value.pause_resume,
+        cold_checkpoint: value.cold_checkpoint,
+        same_host_saved_state: value.same_host_saved_state,
+        stopped_fork: value.stopped_fork,
+        running_fork: value.running_fork,
+        computer_use: value.computer_use,
+        pci: value.pci,
+        cross_node_restore: value.cross_node_restore,
     }
 }
 

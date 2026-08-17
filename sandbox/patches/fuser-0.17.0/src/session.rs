@@ -6,10 +6,14 @@
 //! for filesystem operations under its mount point.
 
 use std::borrow::Cow;
+#[cfg(not(fuser_mount_impl = "macos-fskit"))]
 use std::fs::File;
 use std::io;
+#[cfg(not(fuser_mount_impl = "macos-fskit"))]
 use std::os::fd::AsFd;
+#[cfg(not(fuser_mount_impl = "macos-fskit"))]
 use std::os::fd::BorrowedFd;
+#[cfg(not(fuser_mount_impl = "macos-fskit"))]
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
@@ -32,6 +36,7 @@ use crate::ReplyEmpty;
 use crate::Request;
 use crate::channel::Channel;
 use crate::channel::ChannelSender;
+#[cfg(not(fuser_mount_impl = "macos-fskit"))]
 use crate::dev_fuse::DevFuse;
 use crate::ll;
 use crate::ll::Operation;
@@ -51,6 +56,9 @@ use crate::request::RequestWithSender;
 /// The max size of write requests from the kernel. The absolute minimum is 4k,
 /// FUSE recommends at least 128k, max 16M. The FUSE default is 16M on macOS
 /// and 128k on other systems.
+#[cfg(fuser_mount_impl = "macos-fskit")]
+pub(crate) const MAX_WRITE_SIZE: usize = 32 * 1024 * 1024;
+#[cfg(not(fuser_mount_impl = "macos-fskit"))]
 pub(crate) const MAX_WRITE_SIZE: usize = 16 * 1024 * 1024;
 
 #[derive(Default, Debug, Eq, PartialEq, Clone, Copy)]
@@ -140,6 +148,7 @@ pub struct Session<FS: Filesystem> {
     pub(crate) config: Config,
 }
 
+#[cfg(not(fuser_mount_impl = "macos-fskit"))]
 impl<FS: Filesystem> AsFd for Session<FS> {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.ch.as_fd()
@@ -167,9 +176,7 @@ impl<FS: Filesystem> Session<FS> {
                 format!("auto_unmount requires acl != Owner, got: {:?}", options.acl),
             ));
         }
-        let (file, mount) = Mount::new(mountpoint, &options.mount_options, options.acl)?;
-
-        let ch = Channel::new(file);
+        let (ch, mount) = Mount::new(mountpoint, &options.mount_options, options.acl)?;
 
         let mut session = Session {
             filesystem: FilesystemHolder {
@@ -185,13 +192,20 @@ impl<FS: Filesystem> Session<FS> {
             config: options.clone(),
         };
 
-        session.handshake()?;
+        if let Err(handshake_error) = session.handshake() {
+            #[cfg(fuser_mount_impl = "macos-fskit")]
+            if let Some(mount_error) = session.ch.mount_error() {
+                return Err(mount_error);
+            }
+            return Err(handshake_error);
+        }
 
         Ok(session)
     }
 
     /// Wrap an existing /dev/fuse file descriptor. This doesn't mount the
     /// filesystem anywhere; that must be done separately.
+    #[cfg(not(fuser_mount_impl = "macos-fskit"))]
     pub fn from_fd(
         filesystem: FS,
         fd: OwnedFd,
@@ -351,6 +365,7 @@ impl<FS: Filesystem> Session<FS> {
                 Ok(request) => request,
                 Err(err) => {
                     error!("{err}");
+                    crate::request::reject_malformed_request(&self.ch.sender(), &buf[..size]);
                     return Err(io::Error::new(io::ErrorKind::InvalidData, err.to_string()));
                 }
             };
@@ -359,6 +374,10 @@ impl<FS: Filesystem> Session<FS> {
             let op = match request.operation() {
                 Ok(op) => op,
                 Err(_) => {
+                    let _ = self
+                        .ch
+                        .sender()
+                        .fail_pending_request(request.unique().0, libc::EIO);
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "Failed to parse FUSE operation",
@@ -413,6 +432,10 @@ impl<FS: Filesystem> Session<FS> {
 
             // Call filesystem init method and give it a chance to return an error
             let Some(filesystem) = &mut self.filesystem.fs else {
+                let _ = self
+                    .ch
+                    .sender()
+                    .fail_pending_request(request.unique().0, libc::EIO);
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "Bug: filesystem must be initialized during handshake",

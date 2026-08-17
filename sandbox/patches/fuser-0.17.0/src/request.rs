@@ -6,6 +6,7 @@
 //! TODO: This module is meant to go away soon in favor of `ll::Request`.
 
 use std::convert::TryFrom;
+use std::mem::size_of;
 use std::path::Path;
 
 use log::debug;
@@ -47,6 +48,7 @@ impl<'a> RequestWithSender<'a> {
             Ok(request) => request,
             Err(err) => {
                 error!("{err}");
+                reject_malformed_request(&ch, data);
                 return None;
             }
         };
@@ -118,7 +120,11 @@ impl<'a> RequestWithSender<'a> {
             }
 
             ll::Operation::Interrupt(x) => {
-                return dispatch_interrupt(filesystem, self.request_header(), x.unique());
+                let result = dispatch_interrupt(filesystem, self.request_header(), x.unique());
+                if matches!(result, Ok(None)) {
+                    self.ch.complete_without_reply(self.request.unique().0);
+                }
+                return result;
             }
 
             ll::Operation::Lookup(x) => {
@@ -131,6 +137,7 @@ impl<'a> RequestWithSender<'a> {
             }
             ll::Operation::Forget(x) => {
                 filesystem.forget(self.request_header(), self.request.nodeid(), x.nlookup()); // no reply
+                self.ch.complete_without_reply(self.request.unique().0);
             }
             ll::Operation::GetAttr(_attr) => {
                 filesystem.getattr(
@@ -463,6 +470,7 @@ impl<'a> RequestWithSender<'a> {
                     self.request_header(),
                     ForgetOne::slice_from_inner(x.nodes()),
                 ); // no reply
+                self.ch.complete_without_reply(self.request.unique().0);
             }
             ll::Operation::FAllocate(x) => {
                 filesystem.fallocate(
@@ -566,6 +574,25 @@ impl<'a> RequestWithSender<'a> {
     }
 }
 
+pub(crate) fn request_unique(data: &[u8]) -> Option<u64> {
+    data.get(..size_of::<ll::fuse_abi::fuse_in_header>())?;
+    raw_request_unique(data)
+}
+
+pub(crate) fn reject_malformed_request(ch: &ChannelSender, data: &[u8]) {
+    if let Some(unique) = request_unique(data) {
+        if let Err(error) = ch.fail_pending_request(unique, libc::EIO) {
+            error!("Failed to reject malformed FUSE request {unique}: {error}");
+        }
+    } else if let Some(unique) = raw_request_unique(data) {
+        ch.complete_without_reply(unique);
+    }
+}
+
+fn raw_request_unique(data: &[u8]) -> Option<u64> {
+    Some(u64::from_ne_bytes(data.get(8..16)?.try_into().ok()?))
+}
+
 fn dispatch_interrupt<FS: Filesystem>(
     filesystem: &FS,
     request: &Request,
@@ -592,6 +619,8 @@ mod tests {
     use crate::ll::fuse_abi::fuse_opcode;
 
     use super::dispatch_interrupt;
+    use super::raw_request_unique;
+    use super::request_unique;
 
     struct RecordingFilesystem {
         handled_request: RequestId,
@@ -648,5 +677,16 @@ mod tests {
             Errno::EAGAIN.code()
         );
         assert_eq!(filesystem.target_request.load(Ordering::SeqCst), 100);
+    }
+
+    #[test]
+    fn extracts_unique_from_raw_request_header() {
+        let mut request = [0u8; size_of::<fuse_in_header>()];
+        request[8..16].copy_from_slice(&42u64.to_ne_bytes());
+
+        assert_eq!(request_unique(&request), Some(42));
+        assert_eq!(request_unique(&request[..15]), None);
+        assert_eq!(request_unique(&request[..16]), None);
+        assert_eq!(raw_request_unique(&request[..16]), Some(42));
     }
 }
