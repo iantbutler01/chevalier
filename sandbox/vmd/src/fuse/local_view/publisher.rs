@@ -78,8 +78,8 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, sleep};
 
 use super::types::{
-    DrainOutcome, LocalKind, MountEvent, MountMutation, PublicationHealth, PublishBatch,
-    PublishRun, StoragePressure, dependency_sets_conflict,
+    DrainOutcome, LocalKind, MountEvent, MountMutation, PreImageState, PublicationHealth,
+    PublishBatch, PublishRun, StoragePressure, dependency_sets_conflict,
 };
 use super::wal::{MountWal, WalNotify};
 use crate::fuse::client::{
@@ -1518,9 +1518,19 @@ fn namespace_mutation_for(event: &MountEvent) -> Result<VfsNamespaceMutation> {
         MountMutation::CreateHardLink {
             existing_path,
             new_path,
-        } => VfsNamespaceMutation::CreateHardLink {
-            source_path: existing_path.clone(),
-            destination_path: new_path.clone(),
+        } => match event.pre_image.state_of(existing_path) {
+            Some(PreImageState::Present {
+                kind: LocalKind::Symlink,
+                link_target: Some(target),
+                ..
+            }) => VfsNamespaceMutation::CreateSymlink {
+                path: new_path.clone(),
+                target: target.clone(),
+            },
+            _ => VfsNamespaceMutation::CreateHardLink {
+                source_path: existing_path.clone(),
+                destination_path: new_path.clone(),
+            },
         },
         // `RENAME_NOREPLACE` has no wire form and needs none: `renameat2` already
         // enforced it locally, and single ownership makes that authoritative.
@@ -1695,13 +1705,14 @@ mod tests {
 
     use super::{
         ABSENT_PRECONDITION, AuthoritativePathSource, PublisherOptions, PublisherShared,
-        PublisherState, RemoteSnapshots, kind_intent_is_superseded, plan_runs,
+        PublisherState, RemoteSnapshots, kind_intent_is_superseded, namespace_mutation_for,
+        plan_runs,
     };
     use crate::fuse::client::RemoteVfsClient;
     use crate::fuse::local_view::MountStateLayout;
     use crate::fuse::local_view::types::{
         LocalKind, MountEvent, MountMutation, MountPreImage, PayloadRef, PayloadSource,
-        PayloadStorage, PublishBatch, PublishRun,
+        PayloadStorage, PreImageEntry, PreImageState, PublishBatch, PublishRun,
     };
     use crate::fuse::local_view::wal::MountWal;
 
@@ -1741,6 +1752,37 @@ mod tests {
             LocalKind::Symlink,
         ));
         assert!(kind_intent_is_superseded(None, LocalKind::Symlink));
+    }
+
+    #[test]
+    fn hard_link_to_symlink_publishes_a_symlink_alias() {
+        let mut linked = event(
+            1,
+            MountMutation::CreateHardLink {
+                existing_path: "source".to_string(),
+                new_path: "alias".to_string(),
+            },
+            None,
+        );
+        linked.pre_image.entries.push(PreImageEntry {
+            path: "source".to_string(),
+            state: PreImageState::Present {
+                kind: LocalKind::Symlink,
+                mode: 0o777,
+                local_identity: "1:1".to_string(),
+                size_bytes: 6,
+                link_count: 1,
+                link_target: Some("target".to_string()),
+            },
+        });
+
+        assert_eq!(
+            namespace_mutation_for(&linked).expect("translate hard link"),
+            VfsNamespaceMutation::CreateSymlink {
+                path: "alias".to_string(),
+                target: "target".to_string(),
+            }
+        );
     }
 
     #[tokio::test]
