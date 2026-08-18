@@ -128,6 +128,7 @@ fn precondition_from_options(
         fingerprint: None,
         secondary_fingerprint: None,
         expected_file_id,
+        expected_current_version: None,
     }))
 }
 
