@@ -1088,19 +1088,17 @@ impl MountLocalView {
         }
 
         let acknowledged = wal.acknowledged_sequence();
-        if acknowledged > self.compacted_sequence.load(Ordering::Relaxed) {
-            let outcome = wal.compact()?;
-            self.compacted_sequence
-                .store(acknowledged, Ordering::Relaxed);
-            if outcome.reclaimed_bytes > 0 {
-                tracing::debug!(
-                    state_dir = %self.layout.root().display(),
-                    removed_log_generations = outcome.removed_log_generations,
-                    removed_payload_files = outcome.removed_payload_files,
-                    reclaimed_bytes = outcome.reclaimed_bytes,
-                    "mount-local WAL compaction reclaimed space"
-                );
-            }
+        let outcome = wal.compact()?;
+        self.compacted_sequence
+            .store(acknowledged, Ordering::Relaxed);
+        if outcome.reclaimed_bytes > 0 {
+            tracing::debug!(
+                state_dir = %self.layout.root().display(),
+                removed_log_generations = outcome.removed_log_generations,
+                removed_payload_files = outcome.removed_payload_files,
+                reclaimed_bytes = outcome.reclaimed_bytes,
+                "mount-local WAL compaction reclaimed space"
+            );
         }
 
         let previous = self.storage_pressure();
