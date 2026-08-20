@@ -201,15 +201,22 @@ impl OAIClient {
 
         if let Some(ref reasoning) = reasoning_value {
             if reasoning.chars().all(|c| c.is_ascii_digit()) {
-                // Numeric: max_tokens
+                // Numeric: max_tokens. No top-level equivalent exists on the
+                // OpenAI chat-completions schema, so this stays nested for
+                // every provider.
                 request["reasoning"] = serde_json::json!({
                     "max_tokens": reasoning.parse::<u32>().unwrap_or(1024)
                 });
-            } else {
-                // String: effort level
+            } else if matches!(self.provider, Provider::OpenRouter) {
+                // OpenRouter: nested effort level
                 request["reasoning"] = serde_json::json!({
                     "effort": reasoning
                 });
+            } else {
+                // OpenAI (and OpenAI-compatible servers such as vLLM) require
+                // the top-level `reasoning_effort` string; nested `reasoning`
+                // is ignored there.
+                request["reasoning_effort"] = serde_json::json!(reasoning);
             }
         }
 
@@ -587,7 +594,68 @@ mod tests {
             .build_request_body(&messages, &config, false)
             .unwrap();
 
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn test_build_request_with_reasoning_effort_from_config() {
+        let client = OAIClient::new("test-key", "o3");
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Think"))];
+        let config = GenerationConfig::new("o3").with_reasoning_effort("medium");
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        assert_eq!(body["reasoning_effort"], "medium");
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn test_build_request_with_reasoning_effort_openrouter_stays_nested() {
+        let client = OAIClient::new("test-key", "o3")
+            .with_provider(Provider::OpenRouter)
+            .with_reasoning("high");
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Think"))];
+        let config = GenerationConfig::new("o3");
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
         assert_eq!(body["reasoning"]["effort"], "high");
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_build_request_with_reasoning_numeric_openai_stays_nested() {
+        let client = OAIClient::new("test-key", "o3").with_reasoning("2048");
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Think"))];
+        let config = GenerationConfig::new("o3");
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        assert_eq!(body["reasoning"]["max_tokens"], 2048);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_build_request_with_reasoning_numeric_openrouter_stays_nested() {
+        let client = OAIClient::new("test-key", "o3")
+            .with_provider(Provider::OpenRouter)
+            .with_reasoning("2048");
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Think"))];
+        let config = GenerationConfig::new("o3");
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        assert_eq!(body["reasoning"]["max_tokens"], 2048);
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]
