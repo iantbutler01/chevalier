@@ -3,26 +3,19 @@ requires = ["maturin>=1.8,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "chevalier"
-description = "Python bindings for the Chevalier agent runtime"
+name = "chevalier-sandbox"
+description = "Python bindings for the Chevalier sandbox client"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.8"
-dependencies = [
-    "pydantic>=2,<2.11; python_version < '3.9'",
-    "pydantic>=2,<3; python_version >= '3.9'",
-    "typing-extensions>=4.6.1",
-]
+dependencies = ["typing-extensions>=4.0"]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
 ]
 dynamic = ["version"]
 
-[project.optional-dependencies]
-test = ["pytest>=7"]
-
 [tool.maturin]
 features = ["pyo3/extension-module"]
 python-source = "python"
-module-name = "chevalier.chevalier"
+module-name = "chevalier_sandbox.chevalier_sandbox"

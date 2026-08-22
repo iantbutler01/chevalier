@@ -1,237 +1,123 @@
 # chevalier
 
-Python bindings for the chevalier LLM agent framework. Built on a Rust core via PyO3 for maximum performance with Python ergonomics.
+Python bindings for Chevalier's Rust agent runtime. The package exposes the same Rust-backed runtime, streaming, MCP, and VFS capabilities as the native TypeScript binding.
+
+The sandbox client is packaged separately as `chevalier-sandbox`, matching the TypeScript package split.
 
 ## Installation
 
 ```bash
 pip install chevalier
+pip install chevalier-sandbox  # only when sandbox support is needed
 ```
 
-## Quick Start
+## Runtime
 
 ```python
 import asyncio
-from chevalier import agentic, Runtime
+from chevalier import Runtime
 
-@agentic(model="anthropic:claude-3-5-sonnet")
-async def summarize(text: str, runtime: Runtime) -> str:
-    """Summarize text concisely."""
-    return await runtime.run(prompt=f"Summarize: {text}")
+async def main() -> None:
+    runtime = Runtime({"model": "openai:gpt-4o", "api_key": "..."})
+    result = await runtime.run({
+        "prompt": "Summarize this text",
+        "temperature": 0.2,
+        "max_tokens": 300,
+    })
+    print(result.text())
 
-result = asyncio.run(summarize("Long article text here..."))
-print(result)
+asyncio.run(main())
 ```
 
-## The `@agentic` Decorator
+`Runtime.run()` returns the Rust runtime's canonical `AssistantResponse`. Its ordered
+`output` contains `TextResponsePart`, `ReasoningResponsePart`, `ToolResponsePart`,
+and `SignatureResponsePart` values; `text()`, `reasoning()`, `tool_calls()`, and
+`signatures()` provide the same projections as Rust.
 
-The `@agentic` decorator transforms an async function into an agent. It:
-1. Creates a `Runtime` automatically and injects it as the last parameter
-2. Configures the model from the decorator argument
-3. Handles tool calling loops automatically
+## Tools
+
+Tool handlers are annotated async functions that receive normal Python keyword arguments and
+return a string or `None`. Chevalier derives the tool's JSON Schema from the annotations, then
+validates and hydrates provider arguments before calling the function. A `None` result is sent to
+the Rust runtime as an empty tool-result string.
 
 ```python
-from chevalier import agentic, Runtime
+async def weather(city: str, units: str = "celsius") -> str:
+    return f"Sunny in {city} ({units})"
 
-@agentic(model="openrouter:openai/gpt-4o")
-async def my_agent(query: str, runtime: Runtime) -> str:
-    """Your agent's docstring becomes its system context."""
-    return await runtime.run(prompt=query)
+await runtime.tool(
+    weather,
+    description="Get the weather for a city",
+)
 
-# Call without passing runtime - it's injected automatically
-result = await my_agent("Hello!")
+result = await runtime.execute_tool_call("weather", {"city": "Tokyo"})
 ```
 
-## Tool Registration
-
-Register Python functions as tools the agent can call:
-
-```python
-def get_weather(city: str) -> str:
-    """Get current weather for a city."""
-    return f"Sunny, 22°C in {city}"
-
-def search_web(query: str, max_results: int = 5) -> str:
-    """Search the web for information."""
-    return f"Results for: {query}"
-
-@agentic(model="anthropic:claude-3-5-sonnet")
-async def assistant(question: str, runtime: Runtime) -> str:
-    runtime.tool(get_weather)
-    runtime.tool(search_web)
-    return await runtime.run(prompt=question)
-
-# Agent will call tools as needed
-result = await assistant("What's the weather in Tokyo?")
-```
-
-Tool schemas are generated automatically from:
-- Function name → tool name
-- Docstring → tool description
-- Type hints → parameter types
-- Default values → optional parameters
-
-## Structured Outputs
-
-Return typed data using Pydantic models:
-
-```python
-from typing import List
-from pydantic import BaseModel
-
-class Task(BaseModel):
-    title: str
-    priority: int
-    done: bool = False
-
-class TaskList(BaseModel):
-    tasks: List[Task]
-
-@agentic(model="anthropic:claude-3-5-sonnet")
-async def extract_tasks(notes: str, runtime: Runtime) -> TaskList:
-    """Extract tasks from meeting notes."""
-    return await runtime.run(prompt=notes, output_type=TaskList)
-
-result = await extract_tasks("Need to fix the bug by Friday...")
-for task in result.tasks:
-    print(f"[{'x' if task.done else ' '}] {task.title} (P{task.priority})")
-```
+Nested dataclasses and Pydantic models are hydrated as their declared Python types. Invalid
+arguments fail before the handler runs. `Runtime.run()` performs one model turn and returns the
+requested tool calls; it does not execute them or continue an agent loop automatically. Use
+`execute_tool_call()` to dispatch a registered Python handler, or `register_tool_schema()` when
+the host owns dispatch.
 
 ## Streaming
 
-Get responses as they arrive:
-
 ```python
-@agentic(model="anthropic:claude-3-5-sonnet")
-async def write_story(topic: str, runtime: Runtime) -> str:
-    story = ""
-    async for chunk_type, chunk in runtime.run_stream(prompt=f"Write about {topic}"):
-        if chunk_type == "content":
-            print(chunk, end="", flush=True)
-            story += chunk
-    return story
+from chevalier import OutputStreamEvent, TextResponsePart
+
+stream = await runtime.run_stream({"prompt": "Write a short story"})
+try:
+    while (event := await stream.next()) is not None:
+        if isinstance(event, OutputStreamEvent) and isinstance(
+            event.output, TextResponsePart
+        ):
+            print(event.output.text, end="", flush=True)
+finally:
+    stream.close()
 ```
 
-Chunk types include:
-- `"content"` - Text content
-- `"reasoning"` - Model's thinking/reasoning (when available)
-- `"tool_call"` - Tool invocation
-- `"tool_result"` - Tool execution result
+The stream preserves Rust's `ResponseStreamEvent` variants as
+`OutputStreamEvent`, `ToolPartialStreamEvent`, `UsageStreamEvent`,
+`RateLimitsStreamEvent`, and `CompleteStreamEvent`. In particular,
+`CompleteStreamEvent.response` is an `AssistantResponse`, not untyped JSON.
+Closing a stream cancels its provider request and releases the runtime for another call.
 
-## Generator Functions
-
-Yield intermediate results with `@agentic_generator`:
+## MCP
 
 ```python
-from typing import AsyncGenerator
-from chevalier import agentic_generator, Runtime
+from chevalier import McpClient
 
-@agentic_generator(model="anthropic:claude-3-5-sonnet")
-async def process_batch(items: list, runtime: Runtime) -> AsyncGenerator[dict, None]:
-    for i, item in enumerate(items):
-        result = await runtime.run(prompt=f"Process: {item}")
-        yield {"index": i, "result": result}
+client = await McpClient.connect({
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["@modelcontextprotocol/server-filesystem", "/tmp"],
+})
 
-async for result in process_batch(["item1", "item2", "item3"]):
-    print(f"Processed: {result}")
+tools = await client.list_tools()
+result = await client.call_tool("read_file", {"path": "/tmp/example.txt"})
 ```
 
-## Providers
+`McpServer` exposes the same stdio, HTTP, and WebSocket server transports as the TypeScript binding. `Runtime.mcp()` and `Runtime.mcp_as()` register a remote server's tools directly on a runtime.
 
-Connect to any major LLM provider:
-
-| Provider | Model Format | Example |
-|----------|--------------|---------|
-| Anthropic | `anthropic:model` | `anthropic:claude-3-5-sonnet-20241022` |
-| OpenAI | `openai:model` | `openai:gpt-4o` |
-| OpenAI Responses | `openai:resp:model` | `openai:resp:gpt-4o` |
-| Google Gemini | `google-gemini:model` | `google-gemini:gemini-2.0-flash` |
-| OpenRouter | `openrouter:provider/model` | `openrouter:anthropic/claude-sonnet-4` |
-| OpenRouter Responses | `openrouter:resp:provider/model` | `openrouter:resp:openai/o4-mini` |
-| AWS Bedrock | `bedrock:model-id` | `bedrock:anthropic.claude-3-sonnet-20240229-v1:0` |
-| Vertex AI | `google-anthropic:model` | `google-anthropic:claude-3-opus@20240514` |
-
-API keys are read from environment variables:
-- `ANTHROPIC_API_KEY`
-- `OPENAI_API_KEY`
-- `GOOGLE_GEMINI_API_KEY`
-- `OPENROUTER_API_KEY`
-- AWS credentials for Bedrock
-- Google ADC for Vertex AI
-
-## Runtime API
-
-The `Runtime` object provides:
+## VFS
 
 ```python
-# Tool registration
-runtime.tool(func)                    # Register a Python function as a tool
+from chevalier import VfsStorage
 
-# Execution
-await runtime.run(                    # Run the agent
-    prompt="...",                     # User prompt
-    system="...",                     # System instructions (optional)
-    output_type=MyModel,              # Pydantic model for structured output (optional)
-    temperature=0.7,                  # Sampling temperature (optional)
-    max_tokens=1000,                  # Max response tokens (optional)
-)
-
-# Streaming
-async for chunk_type, chunk in runtime.run_stream(prompt="..."):
-    ...
+storage = VfsStorage.local("./workspace")
+await storage.mkdir("notes")
+await storage.write("notes/today.txt", b"hello")
+body = await storage.read("notes/today.txt")
+metadata = await storage.stat("notes/today.txt")
 ```
 
-## Types
-
-Import commonly used types:
-
-```python
-from chevalier.types import (
-    ChatMessage,      # A message in a conversation
-    ChatRole,         # user, assistant, system
-    ToolCall,         # A tool invocation by the model
-    ToolResult,       # Result of executing a tool
-    ReasoningSegment, # Model's reasoning/thinking
-)
-```
-
-## Direct Client Usage
-
-For lower-level access, use inference clients directly:
-
-```python
-from chevalier.services.inference_clients import InferenceClient, InferenceProvider
-from chevalier.types import ChatMessage, ChatRole
-
-client = InferenceClient(
-    provider=InferenceProvider.Anthropic,
-    model="claude-3-5-sonnet-20241022",
-    api_key="..."  # or use environment variable
-)
-
-# Responses API providers are also available:
-# InferenceProvider.OPENAI_RESPONSES / InferenceProvider.OPENROUTER_RESPONSES
-
-messages = [ChatMessage(role=ChatRole.User, content="Hello!")]
-response = await client.generate(messages)
-print(response.content)
-```
+`VfsStorage.gateway()` selects the HTTP gateway backend. Local and gateway instances share the read, range-read, write, metadata, directory, link, rename, batch, and prefetch operations declared in `chevalier/__init__.pyi`.
 
 ## Development
 
-This package is built from Rust source using maturin:
-
 ```bash
 cd py
-pip install maturin
-maturin develop  # Build and install locally
+python -m pip install maturin
+maturin develop
+cargo test --features pyo3/extension-module
+pytest ../integration_tests
 ```
-
-Run tests:
-```bash
-pytest integration_tests/ -v
-```
-
-## License
-
-Apache-2.0

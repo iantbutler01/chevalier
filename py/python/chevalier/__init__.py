@@ -1,17 +1,81 @@
-import sys
+from typing import Union
 
-# Keep a stable handle to the compiled extension module, then re-export symbols.
-from . import chevalier as _rust
-from .chevalier import *  # noqa: F401,F403
+from .chevalier import (
+    AssistantResponse,
+    ChevalierError,
+    CompleteStreamEvent,
+    McpClient,
+    McpServer,
+    OutputStreamEvent,
+    ProviderRateLimit,
+    RateLimitsStreamEvent,
+    ReasoningResponsePart,
+    Runtime,
+    SignatureResponsePart,
+    StreamHandle,
+    TextResponsePart,
+    TokenUsage,
+    ToolCall,
+    ToolPartialStreamEvent,
+    ToolResponsePart,
+    UsageStreamEvent,
+    VfsContentHasher,
+    VfsStorage,
+    version,
+    vfs_content_hash,
+    vfs_content_hash_algorithm,
+)
 
-# Override Deserializable with the Python version (has model_validate, model_dump, etc.).
-from .deserializable import Deserializable
+ResponsePart = Union[
+    TextResponsePart,
+    ReasoningResponsePart,
+    ToolResponsePart,
+    SignatureResponsePart,
+]
+ResponseStreamEvent = Union[
+    OutputStreamEvent,
+    ToolPartialStreamEvent,
+    UsageStreamEvent,
+    RateLimitsStreamEvent,
+    CompleteStreamEvent,
+]
 
-# Override chevalier.types with our Python _types package (includes Python Deserializable).
-from . import _types as _types_module
-sys.modules["chevalier.types"] = _types_module
 
-__doc__ = _rust.__doc__
-__all__ = list(getattr(_rust, "__all__", []))
-if "Deserializable" not in __all__:
-    __all__.append("Deserializable")
+def _initialize_chevalier_error(
+    self, message, code="ERROR", retryable=False, output=None
+):
+    Exception.__init__(self, message)
+    self.code = code
+    self.retryable = retryable
+    self.output = output
+
+
+ChevalierError.__init__ = _initialize_chevalier_error
+__version__ = version()
+__all__ = [
+    "AssistantResponse",
+    "ChevalierError",
+    "CompleteStreamEvent",
+    "McpClient",
+    "McpServer",
+    "OutputStreamEvent",
+    "ProviderRateLimit",
+    "RateLimitsStreamEvent",
+    "ReasoningResponsePart",
+    "ResponsePart",
+    "ResponseStreamEvent",
+    "Runtime",
+    "SignatureResponsePart",
+    "StreamHandle",
+    "TextResponsePart",
+    "TokenUsage",
+    "ToolCall",
+    "ToolPartialStreamEvent",
+    "ToolResponsePart",
+    "UsageStreamEvent",
+    "VfsContentHasher",
+    "VfsStorage",
+    "version",
+    "vfs_content_hash",
+    "vfs_content_hash_algorithm",
+]

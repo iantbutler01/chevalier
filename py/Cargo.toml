@@ -3,37 +3,25 @@ name = "chevalier-py"
 version = "0.1.1"
 edition = "2024"
 description = "Python bindings for chevalier - Agents are just functions"
-license = "ApacheV2"
+license = "Apache-2.0"
 
 [lib]
 name = "chevalier"
 crate-type = ["cdylib"]
 
 [dependencies]
-# PyO3 for Python bindings (version from maturin)
-pyo3 = "0.23.3"
-
-# Async runtime bridge
+pyo3 = "0.23.5"
 pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
+tokio = { version = "1.49", features = ["sync", "rt", "macros", "time"] }
 
-# Async runtime
-tokio = { version = "1.49", features = ["full"] }
+# Match the native TypeScript binding's Rust capabilities and package split.
+chevalier-core = { package = "chevalier", path = "../rust", features = ["mcp"] }
+chevalier-mcp = { path = "../mcp", default-features = false, features = ["client", "server"] }
+chevalier-vfs = { path = "../vfs", default-features = false, features = ["tokio", "gateway"] }
+chevalier-vfs-hash = { path = "../hash" }
 
-# Core chevalier library
-chevalier-core = { package = "chevalier", path = "../rust", features = ["full"] }
-
-# Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
-# Python <-> Rust serialization (must match pyo3 version)
 pythonize = "0.23"
-
-# Async streams
 futures = "0.3"
-
-# UUID generation
-uuid = { version = "1", features = ["v4"] }
-
-# Lazy static initialization
-once_cell = "1"
+bytes = "1"

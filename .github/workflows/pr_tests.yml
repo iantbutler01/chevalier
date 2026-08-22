@@ -68,9 +68,9 @@ jobs:
         working-directory: rust
         run: cargo fmt --all -- --check
 
-  # Python build test (just verify it compiles)
+  # Python binding packages build independently, matching the TypeScript split.
   python-build:
-    name: Python Build Test
+    name: Python Build Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -86,12 +86,14 @@ jobs:
       - name: Build Python package
         working-directory: py
         run: maturin build --release
+      - name: Build Python sandbox package
+        working-directory: py-sandbox
+        run: maturin build --release
 
-  # Python integration tests (requires API keys)
+  # Offline tests drive the built extensions through real HTTP, MCP, and filesystem boundaries.
   python-integration:
-    name: Python Integration Tests
+    name: Python Binding Integration Tests
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -103,7 +105,7 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install "maturin[patchelf]" pytest
+          pip install "maturin[patchelf]" mypy pytest
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Build and install package
@@ -111,13 +113,18 @@ jobs:
         run: |
           source ../.venv/bin/activate
           maturin develop --release
+      - name: Build and install sandbox package
+        working-directory: py-sandbox
+        run: |
+          source ../.venv/bin/activate
+          maturin develop --release
       - name: Run integration tests
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           source .venv/bin/activate
-          if [ -n "$OPENROUTER_API_KEY" ]; then
-            pytest -v integration_tests/
-          else
-            echo "Skipping integration tests - no API key configured"
-          fi
+          pytest -v integration_tests/
+      - name: Verify Python stubs against extensions
+        run: |
+          source .venv/bin/activate
+          python -m mypy.stubtest chevalier --ignore-missing-stub --allowlist py/stubtest_allowlist.txt
+          python -m mypy.stubtest chevalier_sandbox --ignore-missing-stub --allowlist py-sandbox/stubtest_allowlist.txt
+          python -m mypy --strict integration_tests/typecheck/python_response_contract.py

@@ -1,57 +1,78 @@
-//! Python exception types wrapping chevalier_core::error::Error
-
-use pyo3::exceptions::PyException;
+use chevalier_core::error::Error as EngineError;
+use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-// Define Python exception types
-pyo3::create_exception!(chevalier, NonRetryableException, PyException);
-pyo3::create_exception!(chevalier, InferenceException, PyException);
-pyo3::create_exception!(chevalier, ContextLengthExceeded, InferenceException);
-pyo3::create_exception!(chevalier, RetriesExceeded, InferenceException);
+pyo3::create_exception!(chevalier, ChevalierError, PyException);
 
-/// Convert chevalier_core::error::Error to Python exception
-pub fn to_py_err(err: chevalier_core::error::Error) -> PyErr {
-    match err {
-        chevalier_core::error::Error::Inference(msg) => InferenceException::new_err(msg),
-        chevalier_core::error::Error::ContextLengthExceeded(msg) => {
-            ContextLengthExceeded::new_err(msg)
-        }
-        chevalier_core::error::Error::RetriesExceeded(_) => {
-            RetriesExceeded::new_err("Maximum retries exceeded")
-        }
-        chevalier_core::error::Error::NonRetryable(msg) => NonRetryableException::new_err(msg),
-        chevalier_core::error::Error::Parse(msg) => {
-            NonRetryableException::new_err(format!("Parse error: {}", msg))
-        }
-        chevalier_core::error::Error::Validation(msg) => {
-            NonRetryableException::new_err(format!("Validation error: {}", msg))
-        }
-        chevalier_core::error::Error::ToolNotFound(name) => {
-            NonRetryableException::new_err(format!("Tool not found: {}", name))
-        }
-        chevalier_core::error::Error::Network(e) => {
-            InferenceException::new_err(format!("Network error: {}", e))
-        }
-        chevalier_core::error::Error::Json(e) => {
-            NonRetryableException::new_err(format!("JSON error: {}", e))
-        }
-        chevalier_core::error::Error::Utf8(e) => {
-            NonRetryableException::new_err(format!("UTF-8 error: {}", e))
-        }
-        chevalier_core::error::Error::FromUtf8(e) => {
-            NonRetryableException::new_err(format!("UTF-8 error: {}", e))
-        }
-        chevalier_core::error::Error::Io(e) => {
-            InferenceException::new_err(format!("IO error: {}", e))
-        }
-        chevalier_core::error::Error::InvalidProvider(msg) => {
-            NonRetryableException::new_err(format!("Invalid provider: {}", msg))
-        }
-        chevalier_core::error::Error::MissingApiKey(msg) => {
-            NonRetryableException::new_err(format!("Missing API key: {}", msg))
-        }
-        chevalier_core::error::Error::RuntimeNotUsed => {
-            NonRetryableException::new_err("Runtime was not used in agentic function")
-        }
+pub fn error_code(error: &EngineError) -> &'static str {
+    match error {
+        EngineError::Inference(_) => "INFERENCE",
+        EngineError::ContextLengthExceeded(_) => "CONTEXT_LENGTH_EXCEEDED",
+        EngineError::RetriesExceeded(_) => "RETRIES_EXCEEDED",
+        EngineError::NonRetryable(_) => "NON_RETRYABLE",
+        EngineError::CodexUsageLimit { .. } => "CODEX_USAGE_LIMIT",
+        EngineError::Parse(_) => "PARSE",
+        EngineError::Validation(_) => "VALIDATION",
+        EngineError::ToolNotFound(_) => "TOOL_NOT_FOUND",
+        EngineError::Network(_) => "NETWORK",
+        EngineError::Json(_) => "JSON",
+        EngineError::Utf8(_) | EngineError::FromUtf8(_) => "UTF8",
+        EngineError::Io(_) => "IO",
+        EngineError::InvalidProvider(_) => "INVALID_PROVIDER",
+        EngineError::MissingApiKey(_) => "MISSING_API_KEY",
+        EngineError::RuntimeNotUsed => "RUNTIME_NOT_USED",
     }
+}
+
+pub fn format_error(error: &EngineError) -> String {
+    format!(
+        "[{} retryable={}] {error}",
+        error_code(error),
+        error.is_retryable()
+    )
+}
+
+pub fn to_py_err(error: EngineError) -> PyErr {
+    let code = error_code(&error);
+    let retryable = error.is_retryable();
+    let exception = ChevalierError::new_err(error.to_string());
+    Python::with_gil(|py| {
+        let value = exception.value(py);
+        let _ = value.setattr("code", code);
+        let _ = value.setattr("retryable", retryable);
+        let _ = value.setattr("output", py.None());
+    });
+    exception
+}
+
+pub fn stream_error(message: String) -> PyErr {
+    let (code, retryable, display_message) =
+        parse_formatted_error(&message).unwrap_or(("ERROR", false, message.as_str()));
+    let exception = ChevalierError::new_err(display_message.to_string());
+    Python::with_gil(|py| {
+        let value = exception.value(py);
+        let _ = value.setattr("code", code);
+        let _ = value.setattr("retryable", retryable);
+        let _ = value.setattr("output", py.None());
+    });
+    exception
+}
+
+fn parse_formatted_error(message: &str) -> Option<(&str, bool, &str)> {
+    let rest = message.strip_prefix('[')?;
+    let (prefix, message) = rest.split_once("] ")?;
+    let (code, retryable) = prefix.split_once(" retryable=")?;
+    Some((code, retryable == "true", message))
+}
+
+pub fn invalid_argument(message: impl Into<String>) -> PyErr {
+    PyValueError::new_err(message.into())
+}
+
+pub fn runtime_error(message: impl Into<String>) -> PyErr {
+    PyRuntimeError::new_err(message.into())
+}
+
+pub fn contextual_error(prefix: &str, error: impl std::fmt::Display) -> PyErr {
+    PyRuntimeError::new_err(format!("{prefix}: {error}"))
 }

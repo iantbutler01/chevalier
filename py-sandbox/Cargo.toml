@@ -1,0 +1,24 @@
+[package]
+name = "chevalier-py-sandbox"
+version = "0.1.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Python bindings for the Chevalier sandbox client"
+publish = false
+
+[lib]
+name = "chevalier_sandbox"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = "0.23.5"
+pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
+chevalier-sandbox = { path = "../sandbox/crates/sandbox", default-features = false, features = ["client"] }
+tokio = { version = "1.49", features = ["sync"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+pythonize = "0.23"
+
+[profile.release]
+lto = true
+strip = "symbols"
