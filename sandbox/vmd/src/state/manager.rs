@@ -685,6 +685,59 @@ impl Manager {
         out
     }
 
+    pub async fn resize_durable_volume(
+        &self,
+        owner_key: &str,
+        size_gb: i32,
+    ) -> ManagerResult<DurableVolumeMetadata> {
+        Self::validate_volume_owner_key(owner_key)?;
+        if size_gb <= 0 || size_gb > self.resource_bounds.max_disk_gb {
+            return Err(ManagerError::Other(anyhow!(
+                "durable volume size must be between 1 and {} GB",
+                self.resource_bounds.max_disk_gb
+            )));
+        }
+        let _operation_guards = self.lock_volume_operations(&[owner_key]).await;
+        let attached = self.attached_vm_ids_for_volume(owner_key).await;
+        if !attached.is_empty() {
+            return Err(ManagerError::VolumeInUse(attached.join(",")));
+        }
+        let mut meta = self
+            .volumes
+            .read()
+            .await
+            .get(owner_key)
+            .cloned()
+            .ok_or(ManagerError::VolumeNotFound)?;
+        if size_gb < meta.size_gb {
+            return Err(ManagerError::Other(anyhow!(
+                "durable volume cannot shrink from {} GB to {size_gb} GB",
+                meta.size_gb
+            )));
+        }
+        if size_gb == meta.size_gb {
+            return Ok(meta);
+        }
+
+        let disk_path = self.volume_disk_path(&meta.volume_id);
+        virt::resize_qcow2(&self.cfg.qemu_img_bin, &disk_path, size_gb)
+            .await
+            .map_err(ManagerError::Other)?;
+        meta.size_gb = size_gb;
+        save_volume_metadata(&self.volumes_dir(), &mut meta).map_err(ManagerError::Other)?;
+        self.volumes
+            .write()
+            .await
+            .insert(owner_key.to_string(), meta.clone());
+        info!(
+            owner_key = %owner_key,
+            volume_id = %meta.volume_id,
+            size_gb,
+            "resized durable data volume"
+        );
+        Ok(meta)
+    }
+
     pub async fn delete_durable_volume(&self, owner_key: &str) -> ManagerResult<()> {
         Self::validate_volume_owner_key(owner_key)?;
         let _operation_guards = self.lock_volume_operations(&[owner_key]).await;
@@ -7223,13 +7276,35 @@ mod tests {
             .await
             .expect("create durable volume");
         assert_eq!(created.owner_key, "thread:durable-test");
-        assert!(manager.volume_disk_path(&created.volume_id).is_file());
+        let disk_path = manager.volume_disk_path(&created.volume_id);
+        assert!(disk_path.is_file());
+        let resized = manager
+            .resize_durable_volume("thread:durable-test", 2)
+            .await
+            .expect("grow durable volume");
+        assert_eq!(resized.size_gb, 2);
+        let info = std::process::Command::new("qemu-img")
+            .args(["info", "--output=json"])
+            .arg(&disk_path)
+            .output()
+            .expect("inspect resized durable volume");
+        assert!(info.status.success());
+        let info: serde_json::Value =
+            serde_json::from_slice(&info.stdout).expect("decode qemu-img info");
+        assert_eq!(info["virtual-size"].as_u64(), Some(2 * 1024 * 1024 * 1024));
+        assert!(matches!(
+            manager
+                .resize_durable_volume("thread:durable-test", 1)
+                .await,
+            Err(ManagerError::Other(_))
+        ));
         drop(manager);
 
         let restarted = Manager::new(cfg).await.expect("restart manager");
         let listed = restarted.list_durable_volumes().await;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].0.owner_key, "thread:durable-test");
+        assert_eq!(listed[0].0.size_gb, 2);
         assert!(listed[0].1.is_empty());
         let reattached = restarted
             .ensure_durable_volume("thread:durable-test", 1)

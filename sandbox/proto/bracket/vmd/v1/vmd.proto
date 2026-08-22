@@ -191,6 +191,11 @@ message DeleteDurableVolumeRequest {
   string owner_key = 1;
 }
 
+message ResizeDurableVolumeRequest {
+  string owner_key = 1;
+  int32 size_gb = 2;
+}
+
 message CreateVMRequest {
   string name = 1;
   VMSource source = 2;
@@ -345,6 +350,7 @@ service VMDService {
   rpc ForkVM(ForkVMRequest) returns (ForkVMResponse);
 
   rpc ListDurableVolumes(ListDurableVolumesRequest) returns (ListDurableVolumesResponse);
+  rpc ResizeDurableVolume(ResizeDurableVolumeRequest) returns (DurableVolume);
   rpc DeleteDurableVolume(DeleteDurableVolumeRequest) returns (google.protobuf.Empty);
 
   rpc StartVM(VMActionRequest) returns (VM);

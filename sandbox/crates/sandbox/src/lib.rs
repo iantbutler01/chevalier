@@ -69,8 +69,8 @@ use proto::vmd::v1::{
     AttachPciDeviceRequest, CreateSnapshotRequest, CreateVmRequest, DeleteDurableVolumeRequest,
     DeleteSnapshotRequest, DetachPciDeviceRequest, ForkVmRequest, GetVmBySessionRequest,
     GetVmRequest, ListDurableVolumesRequest, ListHostPciDevicesRequest, ListSnapshotsRequest,
-    ListVMsRequest, Metadata, PreDownloadVmImageRequest, ResourceSpec, RestoreSnapshotRequest, Vm,
-    VmActionRequest, VmSource, VmSourceType,
+    ListVMsRequest, Metadata, PreDownloadVmImageRequest, ResizeDurableVolumeRequest, ResourceSpec,
+    RestoreSnapshotRequest, Vm, VmActionRequest, VmSource, VmSourceType,
 };
 
 const PCI_CAPABILITY_HEADER: &str = "x-chevalier-pci-token";
@@ -3709,6 +3709,71 @@ impl Sandbox {
                 "durable volume not found: {owner_key}"
             )))
         }
+    }
+
+    pub async fn resize_durable_volume(
+        &self,
+        owner_key: &str,
+        size_gb: i32,
+    ) -> Result<DurableVolumeInfo> {
+        if matches!(&self.inner.control_backend, ControlBackend::OpenComputer(_)) {
+            return Err(SandboxError::Unsupported(
+                "durable data volumes are only available for vmd-backed sandboxes".to_string(),
+            ));
+        }
+        let mut contacted = false;
+        let mut last_connect_error = None;
+        for endpoint in self.candidate_endpoints().await? {
+            let mut client = match self.vmd_client_for_endpoint(&endpoint).await {
+                Ok(client) => client,
+                Err(error) => {
+                    last_connect_error = Some(error);
+                    continue;
+                }
+            };
+            contacted = true;
+            match client
+                .resize_durable_volume(self.request_with_auth(ResizeDurableVolumeRequest {
+                    owner_key: owner_key.to_string(),
+                    size_gb,
+                }))
+                .await
+            {
+                Ok(response) => {
+                    let volume = response.into_inner();
+                    let timestamp_ms = |value: Option<proto::google::protobuf::Timestamp>| {
+                        value
+                            .map(|timestamp| {
+                                timestamp.seconds.saturating_mul(1_000)
+                                    + i64::from(timestamp.nanos).saturating_div(1_000_000)
+                            })
+                            .unwrap_or_default()
+                    };
+                    return Ok(DurableVolumeInfo {
+                        owner_key: volume.owner_key,
+                        volume_id: volume.volume_id,
+                        size_gb: volume.size_gb,
+                        created_at_ms: timestamp_ms(volume.created_at),
+                        updated_at_ms: timestamp_ms(volume.updated_at),
+                        backing_volume_id: (!volume.backing_volume_id.is_empty())
+                            .then_some(volume.backing_volume_id),
+                        attached_vm_ids: volume.attached_vm_ids,
+                    });
+                }
+                Err(status) if status.code() == tonic::Code::NotFound => continue,
+                Err(status) => return Err(SandboxError::Grpc(status)),
+            }
+        }
+        if !contacted {
+            return Err(last_connect_error.unwrap_or_else(|| {
+                SandboxError::DaemonUnavailable(
+                    "no sandbox endpoint available for durable volume resize".to_string(),
+                )
+            }));
+        }
+        Err(SandboxError::InvalidResponse(format!(
+            "durable volume not found: {owner_key}"
+        )))
     }
 
     async fn build_control_backend(config: &SandboxConfig) -> Result<ControlBackend> {

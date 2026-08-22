@@ -30,6 +30,7 @@ export declare class Sandbox {
   /** List live sessions visible to this sandbox provider. */
   listSessions(): Promise<Array<SessionInfoJs>>
   listDurableVolumes(): Promise<Array<DurableVolumeInfoJs>>
+  resizeDurableVolume(ownerKey: string, sizeGb: number): Promise<DurableVolumeInfoJs>
   deleteDurableVolume(ownerKey: string): Promise<void>
   listHostPciDevices(): Promise<HostPciInventoryJs>
   /** Discard a provider session by id, even if this process does not hold a Session handle. */

@@ -1090,6 +1090,19 @@ impl Sandbox {
     }
 
     #[napi]
+    pub async fn resize_durable_volume(
+        &self,
+        owner_key: String,
+        size_gb: i32,
+    ) -> napi::Result<DurableVolumeInfoJs> {
+        self.inner
+            .resize_durable_volume(&owner_key, size_gb)
+            .await
+            .map(Into::into)
+            .map_err(sb_err)
+    }
+
+    #[napi]
     pub async fn list_host_pci_devices(&self) -> napi::Result<HostPciInventoryJs> {
         self.inner
             .list_host_pci_devices()

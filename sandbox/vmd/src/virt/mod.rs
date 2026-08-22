@@ -298,6 +298,19 @@ pub async fn create_qcow2(qemu_img_bin: &str, path: &Path, size_gb: i32) -> Resu
     Ok(())
 }
 
+pub async fn resize_qcow2(qemu_img_bin: &str, path: &Path, size_gb: i32) -> Result<()> {
+    if size_gb <= 0 {
+        bail!("invalid qcow2 size: {size_gb}GB");
+    }
+    let size_arg = format!("{size_gb}G");
+    let args = [
+        OsStr::new("resize"),
+        path.as_os_str(),
+        OsStr::new(&size_arg),
+    ];
+    run_qemu_img(qemu_img_bin, &args, "resize").await
+}
+
 pub async fn delete_snapshot_offline(
     qemu_img_bin: &str,
     disk_path: &Path,

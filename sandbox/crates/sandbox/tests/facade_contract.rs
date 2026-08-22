@@ -28,8 +28,8 @@ use chevalier_sandbox::proto::vmd::v1::{
     ListDurableVolumesResponse, ListHostPciDevicesRequest, ListHostPciDevicesResponse,
     ListSnapshotsRequest, ListSnapshotsResponse, ListVMsRequest, ListVMsResponse, NetworkSpec,
     PciDeviceActionResponse, PortProxyPorts, PreDownloadVmImageRequest, PreDownloadVmImageResponse,
-    ResourceSpec, RestoreSnapshotRequest, Snapshot, UpdateVmRequest, Vm, VmActionRequest, VmSource,
-    VmSourceType, VmState, create_vm_stream_response,
+    ResizeDurableVolumeRequest, ResourceSpec, RestoreSnapshotRequest, Snapshot, UpdateVmRequest,
+    Vm, VmActionRequest, VmSource, VmSourceType, VmState, create_vm_stream_response,
 };
 use chevalier_sandbox::{
     ExecEvent, ExecInput, ExecOptions, ForkOptions, Sandbox, SandboxConfig, SandboxError,
@@ -302,6 +302,13 @@ impl VmdService for MockVmd {
         &self,
         _request: Request<DeleteDurableVolumeRequest>,
     ) -> Result<Response<Empty>, Status> {
+        Err(Status::not_found("durable volume not found"))
+    }
+
+    async fn resize_durable_volume(
+        &self,
+        _request: Request<ResizeDurableVolumeRequest>,
+    ) -> Result<Response<chevalier_sandbox::proto::vmd::v1::DurableVolume>, Status> {
         Err(Status::not_found("durable volume not found"))
     }
 

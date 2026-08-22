@@ -40,9 +40,9 @@ use crate::proto::v1::{
     ListDurableVolumesRequest, ListDurableVolumesResponse, ListHostPciDevicesRequest,
     ListHostPciDevicesResponse, ListSnapshotsRequest, ListSnapshotsResponse, ListVMsRequest,
     ListVMsResponse, PciDeviceActionResponse, PreDownloadVmImagePhase, PreDownloadVmImageRequest,
-    PreDownloadVmImageResponse, ResourceSpec, RestoreSnapshotRequest, Snapshot, UpdateVmRequest,
-    Vm, VmActionRequest, VmSource, VmSourceType as ProtoVmSourceType, VmState as ProtoVmState,
-    create_vm_stream_response,
+    PreDownloadVmImageResponse, ResizeDurableVolumeRequest, ResourceSpec, RestoreSnapshotRequest,
+    Snapshot, UpdateVmRequest, Vm, VmActionRequest, VmSource, VmSourceType as ProtoVmSourceType,
+    VmState as ProtoVmState, create_vm_stream_response,
     vmd_service_server::{VmdService, VmdServiceServer},
 };
 use crate::state::manager::{CreateVmProgressCallback, CreateVmProgressEvent, CreateVmStage};
@@ -811,6 +811,31 @@ impl VmdService for GrpcService {
             .await
             .map_err(status_from_error)?;
         Ok(Response::new(()))
+    }
+
+    async fn resize_durable_volume(
+        &self,
+        request: Request<ResizeDurableVolumeRequest>,
+    ) -> GrpcResult<DurableVolume> {
+        self.authorize(&request, AccessLevel::Write).await?;
+        let request = request.into_inner();
+        if request.owner_key.trim().is_empty() {
+            return Err(Status::invalid_argument("owner_key is required"));
+        }
+        let volume = self
+            .manager
+            .resize_durable_volume(&request.owner_key, request.size_gb)
+            .await
+            .map_err(status_from_error)?;
+        Ok(Response::new(DurableVolume {
+            owner_key: volume.owner_key,
+            volume_id: volume.volume_id,
+            size_gb: volume.size_gb,
+            created_at: Some(to_timestamp(volume.created_at)),
+            updated_at: Some(to_timestamp(volume.updated_at)),
+            backing_volume_id: volume.backing_volume_id.unwrap_or_default(),
+            attached_vm_ids: Vec::new(),
+        }))
     }
 
     async fn start_vm(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {

@@ -543,6 +543,8 @@ repair_durable_volume() {
     log "durable volume STILL reports uncorrected errors (status $STATUS); mounting anyway"
   else
     log "durable volume repaired/verified (status $STATUS)"
+    log "growing durable filesystem to fill its block device"
+    resize2fs "$DEVICE"
   fi
 
   # Stop writing through damage. A fresh error now remounts the volume read-only
@@ -1594,6 +1596,7 @@ mod tests {
         // Unattended by design: nothing inside a sandbox VM can answer a prompt.
         assert!(script.contains("e2fsck -p \"$DEVICE\""));
         assert!(script.contains("e2fsck -f -y \"$DEVICE\""));
+        assert!(script.contains("resize2fs \"$DEVICE\""));
         assert!(
             !script.contains("e2fsck -n"),
             "a dry run would repair nothing"
