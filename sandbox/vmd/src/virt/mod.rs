@@ -1424,6 +1424,18 @@ impl MonitorHandle {
         execute_raw(&mut conn, command, args).await
     }
 
+    pub async fn resize_block_device(&self, device: &str, size_bytes: u64) -> Result<()> {
+        self.execute(
+            "block_resize",
+            Some(json!({
+                "device": device,
+                "size": size_bytes,
+            })),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn device_add_vfio(&self, id: &str, bdf: &str) -> Result<()> {
         self.execute(
             "device_add",
@@ -1609,6 +1621,47 @@ mod tests {
                 .await
                 .expect("write scripted qmp response");
         }
+    }
+
+    #[tokio::test]
+    async fn block_resize_targets_the_durable_drive_by_id() {
+        let temp = tempfile::tempdir().expect("create qmp tempdir");
+        let socket = temp.path().join("qmp.sock");
+        let listener = UnixListener::bind(&socket).expect("bind qmp socket");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept qmp client");
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+
+            write_command(&mut write, &json!({ "QMP": {} }))
+                .await
+                .expect("write qmp greeting");
+            let mut line = String::new();
+            read.read_line(&mut line)
+                .await
+                .expect("read qmp capabilities");
+            write_command(&mut write, &json!({ "return": {} }))
+                .await
+                .expect("ack qmp capabilities");
+
+            line.clear();
+            read.read_line(&mut line)
+                .await
+                .expect("read block resize command");
+            let command: Value = serde_json::from_str(&line).expect("parse block resize command");
+            assert_eq!(command["execute"], "block_resize");
+            assert_eq!(command["arguments"]["device"], "openbracket-durable");
+            assert_eq!(command["arguments"]["size"], 128 * 1024 * 1024 * 1024_u64);
+            write_command(&mut write, &json!({ "return": {} }))
+                .await
+                .expect("ack block resize");
+        });
+
+        MonitorHandle { path: socket }
+            .resize_block_device("openbracket-durable", 128 * 1024 * 1024 * 1024)
+            .await
+            .expect("resize durable block device");
+        server.await.expect("qmp mock should finish");
     }
 
     #[tokio::test]

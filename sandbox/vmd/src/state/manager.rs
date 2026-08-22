@@ -31,6 +31,7 @@ use crate::assets::portproxy;
 use crate::bootstrap;
 use crate::config::{self, Config};
 use crate::fuse;
+use crate::guest_exec_probe::{portproxy_auth_header_from_metadata, run_guest_shell_exec};
 use crate::image::{self, BASE_IMAGE_EXT, BASE_IMAGE_SIZE_GB, PrebuiltImageStatus};
 use crate::network;
 use crate::pci::{self, PciDeviceAssignmentSpec, PciInventoryDevice, PciInventoryState};
@@ -691,17 +692,12 @@ impl Manager {
         size_gb: i32,
     ) -> ManagerResult<DurableVolumeMetadata> {
         Self::validate_volume_owner_key(owner_key)?;
-        if size_gb <= 0 || size_gb > self.resource_bounds.max_disk_gb {
+        if size_gb <= 0 {
             return Err(ManagerError::Other(anyhow!(
-                "durable volume size must be between 1 and {} GB",
-                self.resource_bounds.max_disk_gb
+                "durable volume size must be positive"
             )));
         }
         let _operation_guards = self.lock_volume_operations(&[owner_key]).await;
-        let attached = self.attached_vm_ids_for_volume(owner_key).await;
-        if !attached.is_empty() {
-            return Err(ManagerError::VolumeInUse(attached.join(",")));
-        }
         let mut meta = self
             .volumes
             .read()
@@ -719,10 +715,91 @@ impl Manager {
             return Ok(meta);
         }
 
-        let disk_path = self.volume_disk_path(&meta.volume_id);
-        virt::resize_qcow2(&self.cfg.qemu_img_bin, &disk_path, size_gb)
-            .await
-            .map_err(ManagerError::Other)?;
+        let mut attached_vms = Vec::new();
+        for vm in self.vm_refs().await {
+            let attached = vm
+                .lock()
+                .await
+                .metadata
+                .durable_volume
+                .as_ref()
+                .is_some_and(|volume| volume.owner_key == owner_key);
+            if attached {
+                attached_vms.push(vm);
+            }
+        }
+        if attached_vms.len() > 1 {
+            let mut ids = Vec::with_capacity(attached_vms.len());
+            for vm in &attached_vms {
+                ids.push(vm.lock().await.metadata.id.clone());
+            }
+            return Err(ManagerError::VolumeInUse(ids.join(",")));
+        }
+
+        if let Some(vm) = attached_vms.first() {
+            let mut inner = vm.lock().await;
+            match inner.runtime.state {
+                VmState::Running => {
+                    let monitor = inner.runtime.monitor.clone().ok_or_else(|| {
+                        ManagerError::Other(anyhow!("running VM has no QMP monitor"))
+                    })?;
+                    monitor
+                        .resize_block_device(
+                            "openbracket-durable",
+                            size_gb as u64 * 1024 * 1024 * 1024,
+                        )
+                        .await
+                        .map_err(ManagerError::Other)?;
+                    let rpc_port = inner.metadata.network.rpc_port;
+                    if rpc_port <= 0 {
+                        return Err(ManagerError::Other(anyhow!(
+                            "running VM has no guest RPC port for filesystem growth"
+                        )));
+                    }
+                    let auth_header = portproxy_auth_header_from_metadata(&inner.metadata.metadata)
+                        .map_err(ManagerError::Other)?;
+                    let output = run_guest_shell_exec(
+                        &format!("http://127.0.0.1:{rpc_port}"),
+                        auth_header.as_ref(),
+                        "resize2fs /dev/disk/by-id/virtio-openbracket-durable",
+                        None,
+                        120,
+                    )
+                    .await
+                    .map_err(ManagerError::Other)?;
+                    if output.exit_code != Some(0) {
+                        return Err(ManagerError::Other(anyhow!(
+                            "guest filesystem growth failed with exit {:?}: {}",
+                            output.exit_code,
+                            output.stderr_lossy().trim()
+                        )));
+                    }
+                }
+                VmState::Stopped => {
+                    let disk_path = self.volume_disk_path(&meta.volume_id);
+                    virt::resize_qcow2(&self.cfg.qemu_img_bin, &disk_path, size_gb)
+                        .await
+                        .map_err(ManagerError::Other)?;
+                }
+                VmState::Paused => {
+                    return Err(ManagerError::Other(anyhow!(
+                        "resume the paused VM before growing its durable volume"
+                    )));
+                }
+                VmState::Creating | VmState::Error => {
+                    return Err(ManagerError::InvalidState);
+                }
+            }
+            if let Some(volume) = inner.metadata.durable_volume.as_mut() {
+                volume.size_gb = size_gb;
+            }
+            save_metadata(&vm.dir, &mut inner.metadata).map_err(ManagerError::Other)?;
+        } else {
+            let disk_path = self.volume_disk_path(&meta.volume_id);
+            virt::resize_qcow2(&self.cfg.qemu_img_bin, &disk_path, size_gb)
+                .await
+                .map_err(ManagerError::Other)?;
+        }
         meta.size_gb = size_gb;
         save_volume_metadata(&self.volumes_dir(), &mut meta).map_err(ManagerError::Other)?;
         self.volumes
@@ -7279,10 +7356,10 @@ mod tests {
         let disk_path = manager.volume_disk_path(&created.volume_id);
         assert!(disk_path.is_file());
         let resized = manager
-            .resize_durable_volume("thread:durable-test", 2)
+            .resize_durable_volume("thread:durable-test", 120)
             .await
             .expect("grow durable volume");
-        assert_eq!(resized.size_gb, 2);
+        assert_eq!(resized.size_gb, 120);
         let info = std::process::Command::new("qemu-img")
             .args(["info", "--output=json"])
             .arg(&disk_path)
@@ -7291,7 +7368,10 @@ mod tests {
         assert!(info.status.success());
         let info: serde_json::Value =
             serde_json::from_slice(&info.stdout).expect("decode qemu-img info");
-        assert_eq!(info["virtual-size"].as_u64(), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(
+            info["virtual-size"].as_u64(),
+            Some(120 * 1024 * 1024 * 1024)
+        );
         assert!(matches!(
             manager
                 .resize_durable_volume("thread:durable-test", 1)
@@ -7304,7 +7384,7 @@ mod tests {
         let listed = restarted.list_durable_volumes().await;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].0.owner_key, "thread:durable-test");
-        assert_eq!(listed[0].0.size_gb, 2);
+        assert_eq!(listed[0].0.size_gb, 120);
         assert!(listed[0].1.is_empty());
         let reattached = restarted
             .ensure_durable_volume("thread:durable-test", 1)
