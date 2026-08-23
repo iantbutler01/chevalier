@@ -5,12 +5,360 @@
 // @dive-rel: Exercised only when the `apps` feature is enabled via Cargo required-features gating.
 // @dive-rel: Verifies server-side UI metadata wiring implemented under src/apps and src/server/handler.rs.
 
-use chevalier_mcp::apps::{MCP_APP_MIME_TYPE, UiResource, UiResourceCsp, UiToolMeta, Visibility};
+use chevalier_mcp::apps::{
+    EXTENSION_ID, MCP_APP_MIME_TYPE, UiPermissions, UiResource, UiResourceCsp, UiResourceMeta,
+    UiResourceRegistry, UiResourceRender, UiToolMeta, Visibility,
+};
+
+#[tokio::test]
+async fn runtime_prefix_resource_routes_and_preserves_opaque_child_uri() {
+    let mut registry = UiResourceRegistry::new();
+    registry.insert_runtime_prefix(
+        UiResource::new("other-you", "app", "placeholder"),
+        |request: chevalier_mcp::apps::UiResourceReadRequest| -> chevalier_mcp::apps::UiResourceResolveFuture {
+            let uri = request.uri.to_string();
+            Box::pin(async move { Ok(UiResourceRender::new(format!("rendered:{uri}"))) })
+        },
+    );
+
+    assert_eq!(registry.list_resources()[0].raw.uri, "ui://other-you/app");
+    let requested = "ui://other-you/app/1e62bd6d-74d3-4f9f-b60f-1bcfd76db6ca";
+    let rendered = registry
+        .read_resource(requested)
+        .await
+        .expect("prefix registered")
+        .expect("rendered");
+    let value = serde_json::to_value(rendered).expect("serializable");
+    assert_eq!(value["contents"][0]["uri"], requested);
+    assert_eq!(
+        value["contents"][0]["text"],
+        format!("rendered:{requested}")
+    );
+    assert!(
+        registry
+            .read_resource("ui://other-you/application/nope")
+            .await
+            .is_none()
+    );
+}
 use chevalier_mcp::server::{McpServer, ServerTransport};
 use rmcp::model::{CallToolResult, Content};
 use serde_json::json;
 
 const TEST_HTML: &str = "<html><body><h1>Chart</h1></body></html>";
+const STATIC_LAUNCH_CREDENTIAL: &str = "static-launch-credential-must-never-be-served";
+
+#[tokio::test]
+async fn runtime_resource_lists_without_rendering_and_refreshes_read_metadata() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let renders = Arc::new(AtomicUsize::new(0));
+    let observed_renders = Arc::clone(&renders);
+    let mut registry = UiResourceRegistry::new();
+    registry.insert_runtime(
+        UiResource::new("other-you", "reference", STATIC_LAUNCH_CREDENTIAL)
+            .with_description("Runtime reference UI")
+            .with_csp(UiResourceCsp {
+                connect_domains: Some(vec!["https://listed.invalid".into()]),
+                ..Default::default()
+            })
+            .with_border(false),
+        move |_request| -> chevalier_mcp::apps::UiResourceResolveFuture {
+            let render_no = renders.fetch_add(1, Ordering::SeqCst) + 1;
+            Box::pin(async move {
+                Ok(UiResourceRender::new(format!(
+                    "<script src=\"/assets/app.js\"></script><script>window.launch={{credential:'short-lived-{render_no}',backend:'/api/state'}}</script>"
+                ))
+                .with_meta(UiResourceMeta {
+                    csp: Some(UiResourceCsp {
+                        connect_domains: Some(vec!["https://embed.other-you.invalid".into()]),
+                        resource_domains: Some(vec!["https://embed.other-you.invalid".into()]),
+                        frame_domains: Some(vec![]),
+                        base_uri_domains: Some(vec![]),
+                    }),
+                    permissions: Some(UiPermissions::default()),
+                    prefers_border: Some(true),
+                    domain: None,
+                }))
+            })
+        },
+    );
+
+    let listed = registry.list_resources();
+    assert_eq!(observed_renders.load(Ordering::SeqCst), 0);
+    assert!(
+        !serde_json::to_string(&listed)
+            .expect("serializable")
+            .contains(STATIC_LAUNCH_CREDENTIAL)
+    );
+    assert!(!format!("{registry:?}").contains(STATIC_LAUNCH_CREDENTIAL));
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].raw.uri, "ui://other-you/reference");
+    assert_eq!(listed[0].raw.name, "reference");
+    assert_eq!(
+        listed[0].raw.description.as_deref(),
+        Some("Runtime reference UI")
+    );
+    assert_eq!(
+        listed[0]
+            .raw
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.0.get("ui")),
+        Some(&json!({
+            "csp": {"connectDomains": ["https://listed.invalid"]},
+            "prefersBorder": false
+        }))
+    );
+
+    let first = registry
+        .read_resource("ui://other-you/reference")
+        .await
+        .expect("registered")
+        .expect("rendered");
+    let second = registry
+        .read_resource("ui://other-you/reference")
+        .await
+        .expect("registered")
+        .expect("rendered");
+    let first = serde_json::to_value(first).expect("serializable");
+    let second = serde_json::to_value(second).expect("serializable");
+    assert_eq!(
+        first,
+        json!({
+            "contents": [{
+                "uri": "ui://other-you/reference",
+                "mimeType": MCP_APP_MIME_TYPE,
+                "text": "<script src=\"/assets/app.js\"></script><script>window.launch={credential:'short-lived-1',backend:'/api/state'}</script>",
+                "_meta": {"ui": {
+                    "csp": {
+                        "connectDomains": ["https://embed.other-you.invalid"],
+                        "resourceDomains": ["https://embed.other-you.invalid"],
+                        "frameDomains": [],
+                        "baseUriDomains": []
+                    },
+                    "permissions": {},
+                    "prefersBorder": true
+                }}
+            }]
+        })
+    );
+    let second = second.to_string();
+    assert!(second.contains("short-lived-2"));
+    assert!(
+        !second.contains("short-lived-1"),
+        "credentials must not be reused"
+    );
+    assert!(!second.contains(STATIC_LAUNCH_CREDENTIAL));
+}
+
+#[tokio::test]
+async fn runtime_resource_preserves_resolver_errors_and_skips_unknown_uris() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed_calls = Arc::clone(&calls);
+    let expected = rmcp::ErrorData::internal_error("render failed", Some(json!({"retry": true})));
+    let resolver_error = expected.clone();
+    let mut registry = UiResourceRegistry::new();
+    registry.insert_runtime(
+        UiResource::new("other-you", "reference", "placeholder"),
+        move |_request| -> chevalier_mcp::apps::UiResourceResolveFuture {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let error = resolver_error.clone();
+            Box::pin(async move { Err(error) })
+        },
+    );
+
+    assert!(
+        registry
+            .read_resource("ui://other-you/not-registered")
+            .await
+            .is_none()
+    );
+    assert_eq!(observed_calls.load(Ordering::SeqCst), 0);
+
+    let error = registry
+        .read_resource("ui://other-you/reference")
+        .await
+        .expect("registered")
+        .expect_err("resolver should fail");
+    assert_eq!(error, expected);
+    assert_eq!(observed_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn runtime_resource_reads_can_resolve_concurrently() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::sync::Barrier;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed_calls = Arc::clone(&calls);
+    let barrier = Arc::new(Barrier::new(2));
+    let mut registry = UiResourceRegistry::new();
+    registry.insert_runtime(
+        UiResource::new("other-you", "reference", "placeholder"),
+        move |_request| -> chevalier_mcp::apps::UiResourceResolveFuture {
+            let render_no = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let barrier = Arc::clone(&barrier);
+            Box::pin(async move {
+                barrier.wait().await;
+                Ok(UiResourceRender::new(format!("render-{render_no}")))
+            })
+        },
+    );
+
+    let (first, second) = tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+        tokio::join!(
+            registry.read_resource("ui://other-you/reference"),
+            registry.read_resource("ui://other-you/reference")
+        )
+    })
+    .await
+    .expect("concurrent reads should both enter the resolver");
+
+    let mut rendered = [first, second]
+        .into_iter()
+        .map(|result| {
+            let result = result.expect("registered").expect("rendered");
+            match result.contents.into_iter().next().expect("one content") {
+                rmcp::model::ResourceContents::TextResourceContents { text, .. } => text,
+                _ => panic!("expected text resource"),
+            }
+        })
+        .collect::<Vec<_>>();
+    rendered.sort();
+    assert_eq!(rendered, ["render-1", "render-2"]);
+    assert_eq!(observed_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn runtime_resource_resolver_is_wired_through_mcp_transport() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed_calls = Arc::clone(&calls);
+    let observed_meta: Arc<std::sync::Mutex<Option<rmcp::model::Meta>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let resolver_meta = Arc::clone(&observed_meta);
+    let server = McpServer::builder("runtime-apps-server")
+        .with_tool(
+            "runtime",
+            "Runtime-rendered UI",
+            json!({"type": "object"}),
+            |_name, _args| {
+                Box::pin(async move { Ok(CallToolResult::success(vec![Content::text("ok")])) })
+            },
+        )
+        .with_ui_resolver(
+            UiResource::new("runtime-apps-server", "runtime", "placeholder").with_csp(
+                UiResourceCsp {
+                    connect_domains: Some(vec!["https://listed.invalid".into()]),
+                    ..Default::default()
+                },
+            ),
+            move |request: chevalier_mcp::apps::UiResourceReadRequest| -> chevalier_mcp::apps::UiResourceResolveFuture {
+                assert_eq!(request.uri.as_str(), "ui://runtime-apps-server/runtime");
+                *resolver_meta.lock().expect("meta lock poisoned") = request.meta;
+                let render_no = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                Box::pin(async move {
+                    Ok(
+                        UiResourceRender::new(format!("render-{render_no}")).with_meta(
+                            UiResourceMeta {
+                                csp: Some(UiResourceCsp {
+                                    connect_domains: Some(vec![format!(
+                                        "https://render-{render_no}.invalid"
+                                    )]),
+                                    ..Default::default()
+                                }),
+                                permissions: Some(UiPermissions::default()),
+                                ..Default::default()
+                            },
+                        ),
+                    )
+                })
+            },
+        )
+        .build();
+
+    let server_task = tokio::spawn(async move {
+        server
+            .serve(ServerTransport::WebSocket("127.0.0.1:18209".into()))
+            .await
+            .expect("server failed");
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let client = chevalier_mcp::client::McpClient::websocket("ws://127.0.0.1:18209")
+        .await
+        .expect("client failed to connect");
+
+    let listed = client
+        .list_resources()
+        .await
+        .expect("resource listing failed");
+    assert_eq!(listed.resources.len(), 1);
+    assert_eq!(
+        listed.resources[0].raw.uri,
+        "ui://runtime-apps-server/runtime"
+    );
+    assert_eq!(observed_calls.load(Ordering::SeqCst), 0);
+
+    let request_meta = || {
+        Some(rmcp::model::Meta(serde_json::Map::from_iter([(
+            "requester".into(),
+            json!("authenticated-host"),
+        )])))
+    };
+    let rendered = serde_json::to_value(
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            client.read_resource_with_meta("ui://runtime-apps-server/runtime", request_meta()),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "resource read timed out after {} resolver calls with metadata {:?}",
+                observed_calls.load(Ordering::SeqCst),
+                observed_meta.lock().expect("meta lock poisoned")
+            )
+        })
+        .expect("resource read failed"),
+    )
+    .unwrap();
+    assert_eq!(rendered["contents"][0]["text"], "render-1");
+    assert_eq!(
+        rendered["contents"][0]["_meta"]["ui"],
+        json!({
+            "csp": {"connectDomains": ["https://render-1.invalid"]},
+            "permissions": {}
+        })
+    );
+    assert_eq!(observed_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        observed_meta
+            .lock()
+            .expect("meta lock poisoned")
+            .as_ref()
+            .and_then(|meta| meta.0.get("requester")),
+        Some(&json!("authenticated-host"))
+    );
+
+    drop(client);
+    server_task.abort();
+}
 
 fn build_apps_server() -> McpServer {
     McpServer::builder("apps-test-server")
@@ -208,6 +556,14 @@ async fn test_server_capabilities_include_resources() {
     assert!(
         info.capabilities.resources.is_some(),
         "Server with UI tools should have resources capability"
+    );
+    assert_eq!(
+        info.capabilities
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.get(EXTENSION_ID)),
+        Some(&Default::default()),
+        "Server with UI tools should advertise the MCP Apps extension"
     );
 
     client.close().await.expect("Failed to close");

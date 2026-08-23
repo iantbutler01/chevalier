@@ -28,7 +28,7 @@ use crate::error::{Error, Result};
 use crate::transport::WebSocketTransport;
 
 #[cfg(feature = "apps")]
-use crate::apps::{UiResource, UiResourceRegistry, UiToolMeta};
+use crate::apps::{EXTENSION_ID, UiResource, UiResourceRegistry, UiResourceResolver, UiToolMeta};
 #[cfg(feature = "apps")]
 use rmcp::model::Meta;
 
@@ -201,10 +201,16 @@ impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
         #[cfg(feature = "apps")]
         let capabilities = if !self.ui_registry.is_empty() {
-            ServerCapabilities::builder()
+            let mut capabilities = ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
-                .build()
+                .build();
+            capabilities.extensions = Some(
+                [(EXTENSION_ID.to_string(), Default::default())]
+                    .into_iter()
+                    .collect(),
+            );
+            capabilities
         } else {
             ServerCapabilities::builder().enable_tools().build()
         };
@@ -284,12 +290,20 @@ impl ServerHandler for McpServer {
         async move {
             #[cfg(feature = "apps")]
             {
-                self.ui_registry.read_resource(&request.uri).ok_or_else(|| {
-                    ErrorData::resource_not_found(
+                match self
+                    .ui_registry
+                    .read_resource_with_meta(
+                        &request.uri,
+                        (!_context.meta.0.is_empty()).then_some(_context.meta),
+                    )
+                    .await
+                {
+                    Some(result) => result,
+                    None => Err(ErrorData::resource_not_found(
                         format!("Resource not found: {}", request.uri),
                         None,
-                    )
-                })
+                    )),
+                }
             }
             #[cfg(not(feature = "apps"))]
             {
@@ -338,6 +352,20 @@ impl McpServerBuilder {
     /// Set the server version (defaults to crate version)
     pub fn with_version(mut self, version: impl Into<String>) -> Self {
         self.version = version.into();
+        self
+    }
+
+    /// Attach runtime-rendered UI whose resolver accepts opaque child paths.
+    ///
+    /// The base resource is advertised on the tool and by `resources/list`;
+    /// reads below that URI are resolved independently and retain their exact URI.
+    #[cfg(feature = "apps")]
+    pub fn with_ui_prefix_resolver<R>(mut self, resource: UiResource, resolver: R) -> Self
+    where
+        R: UiResourceResolver,
+    {
+        self.attach_ui_to_last_tool(&resource);
+        self.ui_registry.insert_runtime_prefix(resource, resolver);
         self
     }
 
@@ -416,6 +444,27 @@ impl McpServerBuilder {
     /// Panics if called without a preceding `with_tool` call.
     #[cfg(feature = "apps")]
     pub fn with_ui(mut self, resource: UiResource) -> Self {
+        self.attach_ui_to_last_tool(&resource);
+        self.ui_registry.insert(resource);
+        self
+    }
+
+    /// Attach runtime-rendered UI to the most recently registered tool.
+    ///
+    /// The resolver is invoked for each `resources/read`, so launch URLs, tokens,
+    /// and other per-render configuration are not frozen at server construction.
+    #[cfg(feature = "apps")]
+    pub fn with_ui_resolver<R>(mut self, resource: UiResource, resolver: R) -> Self
+    where
+        R: UiResourceResolver,
+    {
+        self.attach_ui_to_last_tool(&resource);
+        self.ui_registry.insert_runtime(resource, resolver);
+        self
+    }
+
+    #[cfg(feature = "apps")]
+    fn attach_ui_to_last_tool(&mut self, resource: &UiResource) {
         let tool_name = self
             .last_tool_name
             .as_ref()
@@ -434,10 +483,6 @@ impl McpServerBuilder {
                 .get_or_insert_with(|| Meta(serde_json::Map::new()));
             meta.0.insert("ui".to_string(), ui_value);
         }
-
-        // Store the resource for serving via resources/read
-        self.ui_registry.insert(resource);
-        self
     }
 
     /// Set the visibility of the most recently registered tool.

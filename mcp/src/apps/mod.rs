@@ -14,7 +14,10 @@ pub use bridge::{
     ToolResultParams, UiInitializeParams, UiInitializeResult, UpdateModelContextParams,
     methods as bridge_methods,
 };
-pub use resource::UiResourceRegistry;
+pub use resource::{
+    UiResourceReadRequest, UiResourceRegistry, UiResourceRender, UiResourceResolveFuture,
+    UiResourceResolver,
+};
 pub use types::{
     DisplayMode, EXTENSION_ID, MCP_APP_MIME_TYPE, UI_SCHEME, UiPermissions, UiResource,
     UiResourceCsp, UiResourceMeta, UiToolMeta, Visibility, ui_uri,
