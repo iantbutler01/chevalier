@@ -194,10 +194,6 @@ impl OpenAICodexResponsesClient {
             request["instructions"] = serde_json::json!(instructions);
         }
 
-        if let Some(ref previous_response_id) = config.previous_response_id {
-            request["previous_response_id"] = serde_json::json!(previous_response_id);
-        }
-
         if let Some(ref prompt_cache_key) = self.prompt_cache_key {
             request["prompt_cache_key"] = serde_json::json!(prompt_cache_key);
         }
@@ -1180,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_codex_request_body() {
+    fn test_build_codex_request_body_ignores_http_previous_response_id() {
         let client = OpenAICodexResponsesClient::new(
             CodexSubscriptionProviderConfig {
                 token: "header.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xMjMifX0.signature".to_string(),
@@ -1213,8 +1209,8 @@ mod tests {
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["reasoning"]["summary"], "concise");
         assert_eq!(body["service_tier"], "priority");
-        assert_eq!(body["previous_response_id"], "resp_123");
         assert_eq!(body["prompt_cache_key"], "task-123");
+        assert!(body.get("previous_response_id").is_none());
     }
 
     #[test]
