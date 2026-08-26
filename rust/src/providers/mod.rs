@@ -47,6 +47,7 @@ pub enum CodexSubscriptionTransport {
 pub struct CodexSubscriptionProviderConfig {
     pub token: String,
     pub account_id: Option<String>,
+    pub prompt_cache_key: Option<String>,
     pub base_url: Option<String>,
     pub transport: Option<CodexSubscriptionTransport>,
     pub sse_header_timeout: Option<std::time::Duration>,

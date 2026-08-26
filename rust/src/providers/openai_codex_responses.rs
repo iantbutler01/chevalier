@@ -56,6 +56,7 @@ pub struct OpenAICodexResponsesClient {
     model: String,
     token: String,
     account_id: String,
+    prompt_cache_key: Option<String>,
     api_url: String,
     websocket_url: String,
     reasoning: Option<String>,
@@ -74,6 +75,7 @@ impl Clone for OpenAICodexResponsesClient {
             model: self.model.clone(),
             token: self.token.clone(),
             account_id: self.account_id.clone(),
+            prompt_cache_key: self.prompt_cache_key.clone(),
             api_url: self.api_url.clone(),
             websocket_url: self.websocket_url.clone(),
             reasoning: self.reasoning.clone(),
@@ -94,6 +96,7 @@ impl std::fmt::Debug for OpenAICodexResponsesClient {
             .field("model", &self.model)
             .field("api_url", &self.api_url)
             .field("websocket_url", &self.websocket_url)
+            .field("prompt_cache_key", &self.prompt_cache_key)
             .field("reasoning", &self.reasoning)
             .field("reasoning_summary", &self.reasoning_summary)
             .field("text_verbosity", &self.text_verbosity)
@@ -125,6 +128,10 @@ impl OpenAICodexResponsesClient {
             model: model.into(),
             token: config.token,
             account_id,
+            prompt_cache_key: config
+                .prompt_cache_key
+                .map(|key| key.trim().chars().take(64).collect::<String>())
+                .filter(|key| !key.is_empty()),
             api_url,
             websocket_url,
             reasoning: config.reasoning_effort,
@@ -185,6 +192,10 @@ impl OpenAICodexResponsesClient {
             && !instructions.is_empty()
         {
             request["instructions"] = serde_json::json!(instructions);
+        }
+
+        if let Some(ref prompt_cache_key) = self.prompt_cache_key {
+            request["prompt_cache_key"] = serde_json::json!(prompt_cache_key);
         }
 
         if let Some(temperature) = config.temperature {
@@ -1050,6 +1061,7 @@ mod tests {
             CodexSubscriptionProviderConfig {
                 token: TEST_CODEX_TOKEN.to_string(),
                 account_id: Some("acct_123".to_string()),
+                prompt_cache_key: None,
                 base_url: None,
                 transport: Some(CodexSubscriptionTransport::Sse),
                 sse_header_timeout: None,
@@ -1165,6 +1177,7 @@ mod tests {
             CodexSubscriptionProviderConfig {
                 token: "header.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xMjMifX0.signature".to_string(),
                 account_id: Some("acct_123".to_string()),
+                prompt_cache_key: Some("task-123".to_string()),
                 base_url: None,
                 transport: Some(CodexSubscriptionTransport::Sse),
                 sse_header_timeout: None,
@@ -1191,6 +1204,7 @@ mod tests {
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["reasoning"]["summary"], "concise");
         assert_eq!(body["service_tier"], "priority");
+        assert_eq!(body["prompt_cache_key"], "task-123");
     }
 
     #[test]
@@ -1199,6 +1213,7 @@ mod tests {
             CodexSubscriptionProviderConfig {
                 token: "header.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xMjMifX0.signature".to_string(),
                 account_id: Some("acct_123".to_string()),
+                prompt_cache_key: None,
                 base_url: None,
                 transport: Some(CodexSubscriptionTransport::Sse),
                 sse_header_timeout: None,
