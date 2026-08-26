@@ -240,8 +240,10 @@ impl MountWal {
     /// the previous one only when the current file is absent or truncated),
     /// validate it, open the log generations it declares, replay forward from
     /// its replay point, truncate a torn final append, fail closed on interior
-    /// corruption or on a payload that a committed event references but that no
-    /// longer verifies, then open the active generation for append.
+    /// corruption, then open the active generation for append. Committed payloads
+    /// are verified by the publisher after obsolete generations are collapsed
+    /// into a bounded batch, so a deep backlog never requires a full payload scan
+    /// before the mount can resume.
     ///
     /// `expected_epoch` is the ownership epoch the caller believes it holds.
     /// `None` accepts whatever the durable state carries (and mints one for a
@@ -346,9 +348,6 @@ impl MountWal {
                 continue;
             }
             if let Some(payload) = record.event.payload.as_ref() {
-                payloads.verify(payload).with_context(|| {
-                    format!("verify the payload of committed mount sequence {sequence}")
-                })?;
                 pending_payload_bytes = pending_payload_bytes.saturating_add(payload.length);
             }
         }
@@ -1040,10 +1039,10 @@ impl MountWal {
 
     /// Prove an event's immutable payload is still complete and unchanged.
     ///
-    /// Committed events are verified while the WAL opens. Recovery also calls
-    /// this before promoting an applied-but-uncommitted prepare: otherwise a
-    /// missing payload would be committed locally and surface later as a
-    /// retryable publication error even though no retry could repair it.
+    /// Committed events are verified by the publisher after it collapses a
+    /// bounded batch. Recovery also calls this before promoting an
+    /// applied-but-uncommitted prepare: otherwise a missing payload would be
+    /// committed locally even though no retry could repair it.
     pub(crate) fn verify_event_payload(&self, event: &MountEvent) -> Result<()> {
         match event.payload.as_ref() {
             Some(payload) => self
@@ -2015,6 +2014,7 @@ mod tests {
 
     use super::append_record;
     use super::{BackingFreeSpace, MountStateLayout, MountWal, StoragePressureLimits};
+    use crate::fuse::local_view::MAX_SEGMENTED_PAYLOAD_BYTES;
     use crate::fuse::local_view::types::{
         MountMutation, MountPreImage, PayloadSource, PayloadStorage, WalRecord,
     };
@@ -2413,7 +2413,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_corrupt_committed_payload_fails_recovery_closed() {
+    fn missing_or_corrupt_committed_payload_fails_at_publication() {
         for damage in ["missing", "corrupt"] {
             let temp = tempfile::tempdir().expect("tempdir");
             let layout = MountStateLayout::new(temp.path());
@@ -2449,16 +2449,80 @@ mod tests {
                 _ => unreachable!(),
             }
 
-            let error = match MountWal::open(&layout, None) {
-                Ok(_) => panic!("{damage} committed payload must fail recovery"),
-                Err(error) => error,
-            };
+            let recovered = MountWal::open(&layout, None).expect("recover WAL metadata");
+            let batch = recovered
+                .next_publish_batch(4096, 16 * 1024 * 1024, 8 * 1024 * 1024)
+                .expect("read publish batch")
+                .expect("pending publish batch");
+            let error = recovered
+                .verify_event_payload(&batch.events[0])
+                .expect_err("damaged surviving payload must fail before publication");
             let message = format!("{error:#}");
             assert!(
-                message.contains("payload of committed mount sequence 1"),
+                message.contains("mount event 1 payload"),
                 "{damage}: {message}"
             );
         }
+    }
+
+    #[test]
+    fn damaged_superseded_payload_does_not_block_latest_generation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = MountStateLayout::new(temp.path());
+        let wal = open(temp.path());
+        let obsolete_bytes = vec![b'o'; MAX_SEGMENTED_PAYLOAD_BYTES + 1];
+        let first = wal
+            .prepare(
+                MountMutation::ReplaceFile {
+                    path: "repo/file.txt".to_string(),
+                    mode: 0o644,
+                    expected_file_id: None,
+                    base_content_hash: None,
+                },
+                PayloadSource::Bytes(&obsolete_bytes),
+                MountPreImage::empty(),
+            )
+            .expect("prepare obsolete payload");
+        let obsolete_name = first
+            .event
+            .payload
+            .as_ref()
+            .expect("obsolete payload")
+            .storage
+            .file()
+            .to_string();
+        wal.commit(first, None).expect("commit obsolete payload");
+        let latest_bytes = vec![b'l'; MAX_SEGMENTED_PAYLOAD_BYTES + 1];
+        let latest = wal
+            .prepare(
+                MountMutation::ReplaceFile {
+                    path: "repo/file.txt".to_string(),
+                    mode: 0o644,
+                    expected_file_id: None,
+                    base_content_hash: None,
+                },
+                PayloadSource::Bytes(&latest_bytes),
+                MountPreImage::empty(),
+            )
+            .expect("prepare latest payload");
+        wal.commit(latest, None).expect("commit latest payload");
+        wal.sync_local().expect("sync payloads and WAL");
+        drop(wal);
+
+        std::fs::remove_file(layout.payload_dir().join(obsolete_name))
+            .expect("remove obsolete payload");
+        let recovered = MountWal::open(&layout, None).expect("recover WAL metadata");
+        let batch = recovered
+            .next_publish_batch(4096, 16 * 1024 * 1024, 8 * 1024 * 1024)
+            .expect("read publish batch")
+            .expect("pending publish batch");
+
+        assert_eq!(batch.through_sequence, 2);
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].sequence, 2);
+        recovered
+            .verify_event_payload(&batch.events[0])
+            .expect("latest payload verifies");
     }
 
     #[test]

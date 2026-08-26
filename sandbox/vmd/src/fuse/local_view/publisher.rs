@@ -567,6 +567,14 @@ impl PublisherShared {
         else {
             return Ok(PublishProgress::Idle);
         };
+        for event in &batch.events {
+            self.wal.verify_event_payload(event).with_context(|| {
+                format!(
+                    "verify vfs publication batch through sequence {}",
+                    batch.through_sequence
+                )
+            })?;
+        }
         let runs = plan_runs(&batch)?;
         if runs.is_empty() {
             return Ok(PublishProgress::Idle);
