@@ -813,10 +813,10 @@ impl MountWal {
     /// 65 MiB generation merely because the gateway models whole files.
     ///
     /// Payloads at or above `stream_threshold_bytes` do not consume the batched
-    /// byte budget because the publisher streams them from disk. At most one
-    /// distinct streamed generation survives in a batch, preserving the old
-    /// bound on concurrent oversized uploads while still allowing many queued
-    /// generations of that same path to collapse to the newest one.
+    /// byte budget because the publisher streams them from disk. The publisher's
+    /// request semaphore bounds concurrent oversized uploads; retaining several
+    /// distinct streamed paths here lets interleaved generations collapse to the
+    /// newest snapshot of each path across the whole bounded prefix.
     pub(crate) fn next_publish_batch(
         &self,
         max_events: usize,
@@ -833,7 +833,6 @@ impl MountWal {
         let mut sequence = state.acknowledged_sequence.saturating_add(1);
         let mut through_sequence = state.acknowledged_sequence;
         let mut payload_bytes = 0_u64;
-        let mut streamed_events = 0_usize;
         let mut scanned_events = 0_usize;
         let mut events: Vec<MountEvent> = Vec::new();
         loop {
@@ -857,24 +856,24 @@ impl MountWal {
                 .map(|index| events[index].payload_length())
                 .unwrap_or(0);
             let event_payload = record.event.payload_length();
-            let old_streamed = old_payload >= stream_threshold_bytes;
-            let event_streamed = event_payload >= stream_threshold_bytes;
             let next_payload_bytes = payload_bytes
-                .saturating_sub(if old_streamed { 0 } else { old_payload })
-                .saturating_add(if event_streamed { 0 } else { event_payload });
-            let next_streamed_events = streamed_events
-                .saturating_sub(usize::from(old_streamed))
-                .saturating_add(usize::from(event_streamed));
-            if !events.is_empty()
-                && (next_payload_bytes > max_payload_bytes || next_streamed_events > 1)
-            {
+                .saturating_sub(if old_payload >= stream_threshold_bytes {
+                    0
+                } else {
+                    old_payload
+                })
+                .saturating_add(if event_payload >= stream_threshold_bytes {
+                    0
+                } else {
+                    event_payload
+                });
+            if !events.is_empty() && next_payload_bytes > max_payload_bytes {
                 break;
             }
             if let Some(index) = superseded {
                 events.remove(index);
             }
             payload_bytes = next_payload_bytes;
-            streamed_events = next_streamed_events;
             events.push(record.event.clone());
             scanned_events += 1;
             through_sequence = sequence;
@@ -2195,6 +2194,42 @@ mod tests {
         assert_eq!(batch.events.len(), 1);
         assert_eq!(batch.events[0].sequence, 3);
         assert_eq!(batch.events[0].payload_length(), 5);
+    }
+
+    #[test]
+    fn interleaved_streamed_paths_collapse_across_the_bounded_prefix() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let wal = open(temp.path());
+        for generation in 0..64 {
+            let event = wal
+                .prepare(
+                    MountMutation::ReplaceFile {
+                        path: format!("logs/shard-{}.log", generation % 8),
+                        mode: 0o644,
+                        expected_file_id: None,
+                        base_content_hash: None,
+                    },
+                    PayloadSource::Bytes(&[generation as u8; 5]),
+                    MountPreImage::empty(),
+                )
+                .expect("prepare streamed generation");
+            wal.commit(event, None).expect("commit streamed generation");
+        }
+
+        let batch = wal
+            .next_publish_batch(64, 1, 4)
+            .expect("batch")
+            .expect("pending batch");
+        assert_eq!(batch.through_sequence, 64);
+        assert_eq!(batch.events.len(), 8);
+        assert_eq!(
+            batch
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            (57..=64).collect::<Vec<_>>()
+        );
     }
 
     #[test]
