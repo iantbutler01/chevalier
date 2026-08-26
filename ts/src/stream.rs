@@ -24,7 +24,7 @@ pub(crate) fn to_value_or_marker<T: serde::Serialize>(v: T) -> serde_json::Value
 }
 
 /// A single streamed event. Discriminated by `type`:
-/// `content` | `reasoning` | `signature` | `toolCall` | `toolPartial` | `usage` | `rateLimits` | `complete`.
+/// `content` | `reasoning` | `signature` | `toolCall` | `toolPartial` | `usage` | `rateLimits` | `responseId` | `complete`.
 #[napi(object)]
 pub struct StreamEvent {
     #[napi(js_name = "type")]
@@ -75,6 +75,10 @@ impl From<ResponseStreamEvent> for StreamEvent {
             ResponseStreamEvent::RateLimits(rate_limits) => StreamEvent {
                 data: Some(to_value_or_marker(rate_limits)),
                 ..base("rateLimits")
+            },
+            ResponseStreamEvent::ResponseId(response_id) => StreamEvent {
+                text: Some(response_id),
+                ..base("responseId")
             },
             ResponseStreamEvent::Complete(r) => StreamEvent {
                 data: Some(to_value_or_marker(r)),
@@ -150,5 +154,13 @@ mod tests {
                 "resetsAtEpochSec": 1_783_504_800_u64
             }]))
         );
+    }
+
+    #[test]
+    fn test_response_id_event_is_js_visible() {
+        let event = StreamEvent::from(ResponseStreamEvent::ResponseId("resp_123".to_string()));
+
+        assert_eq!(event.kind, "responseId");
+        assert_eq!(event.text.as_deref(), Some("resp_123"));
     }
 }

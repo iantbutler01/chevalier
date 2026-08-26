@@ -292,6 +292,8 @@ export interface RunOptions {
   history?: Array<Message>
   /** Per-call timeout in milliseconds. */
   timeoutMs?: number
+  /** Responses API response to continue from. */
+  previousResponseId?: string
 }
 
 /** Result of a non-streaming `Runtime.run`. */
@@ -322,7 +324,7 @@ export interface RuntimeOptions {
 
 /**
  * A single streamed event. Discriminated by `type`:
- * `content` | `reasoning` | `signature` | `toolCall` | `toolPartial` | `usage` | `rateLimits` | `complete`.
+ * `content` | `reasoning` | `signature` | `toolCall` | `toolPartial` | `usage` | `rateLimits` | `responseId` | `complete`.
  */
 export interface StreamEvent {
   type: string

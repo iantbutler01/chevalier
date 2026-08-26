@@ -187,6 +187,9 @@ impl OpenAICodexResponsesClient {
             request["instructions"] = serde_json::json!(instructions);
         }
 
+        if let Some(ref previous_response_id) = config.previous_response_id {
+            request["previous_response_id"] = serde_json::json!(previous_response_id);
+        }
         if let Some(temperature) = config.temperature {
             request["temperature"] = serde_json::json!(temperature);
         }
@@ -570,6 +573,7 @@ impl InferenceClient for OpenAICodexResponsesClient {
                 }
                 StreamChunk::ToolCallPartial(_) => {}
                 StreamChunk::RateLimits(_) => {}
+                StreamChunk::ResponseId(_) => {}
                 StreamChunk::Usage {
                     input_tokens,
                     output_tokens,
@@ -1177,7 +1181,8 @@ mod tests {
             "gpt-5.1-codex",
         )
         .unwrap();
-        let config = GenerationConfig::new("gpt-5.1-codex");
+        let mut config = GenerationConfig::new("gpt-5.1-codex");
+        config.previous_response_id = Some("resp_123".to_string());
         let messages = vec![ConversationMessage::Chat(crate::types::ChatMessage::user(
             "Hello",
         ))];
@@ -1191,6 +1196,7 @@ mod tests {
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["reasoning"]["summary"], "concise");
         assert_eq!(body["service_tier"], "priority");
+        assert_eq!(body["previous_response_id"], "resp_123");
     }
 
     #[test]

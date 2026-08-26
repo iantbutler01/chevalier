@@ -305,6 +305,13 @@ pub fn parse_openai_responses_event(
             }
         }
         "response.done" => {
+            if let Some(response_id) = event_json
+                .get("response")
+                .and_then(|response| response.get("id"))
+                .and_then(|value| value.as_str())
+            {
+                chunks.push(StreamChunk::ResponseId(response_id.to_string()));
+            }
             if let Some(response) = event_json.get("response")
                 && let Some(usage) = response.get("usage")
             {
@@ -536,5 +543,20 @@ mod tests {
             }
             _ => panic!("Expected Usage chunk"),
         }
+    }
+
+    #[test]
+    fn test_parse_response_id() {
+        let event = serde_json::json!({
+            "type": "response.done",
+            "response": { "id": "resp_123" }
+        });
+        let mut acc = ResponsesToolAccumulator::new();
+        let chunks = parse_openai_responses_event(&event, &mut acc, false);
+
+        assert!(matches!(
+            chunks.as_slice(),
+            [StreamChunk::ResponseId(response_id)] if response_id == "resp_123"
+        ));
     }
 }

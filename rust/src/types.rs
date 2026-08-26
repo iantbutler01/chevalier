@@ -465,6 +465,8 @@ pub enum ResponseStreamEvent {
     Usage(TokenUsage),
     /// Provider rate-limit window usage for the streamed response.
     RateLimits(Vec<ProviderRateLimit>),
+    /// Responses API identifier for the completed response.
+    ResponseId(String),
     /// Final canonical assistant response.
     Complete(AssistantResponse),
 }
