@@ -157,6 +157,10 @@ impl OpenAIResponsesClient {
             request["instructions"] = serde_json::json!(instructions);
         }
 
+        if let Some(ref previous_response_id) = config.previous_response_id {
+            request["previous_response_id"] = serde_json::json!(previous_response_id);
+        }
+
         if let Some(ref tools) = config.tools
             && !tools.is_empty()
         {
@@ -487,6 +491,18 @@ mod tests {
         assert_eq!(body["max_output_tokens"], 2048);
         assert_eq!(body["stream"], false);
         assert!(body["input"].is_array());
+    }
+
+    #[test]
+    fn test_build_request_with_previous_response_id() {
+        let client = OpenAIResponsesClient::new("test-key", "gpt-4");
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Continue"))];
+        let mut config = GenerationConfig::new("gpt-4");
+        config.previous_response_id = Some("resp_123".to_string());
+
+        let body = client.build_request_body(&messages, &config, true).unwrap();
+
+        assert_eq!(body["previous_response_id"], "resp_123");
     }
 
     #[test]

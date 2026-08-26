@@ -250,6 +250,9 @@ async fn stream_chunk_to_runtime_events(
         StreamChunk::RateLimits(rate_limits) => {
             Ok(vec![ResponseStreamEvent::RateLimits(rate_limits)])
         }
+        StreamChunk::ResponseId(response_id) => {
+            Ok(vec![ResponseStreamEvent::ResponseId(response_id)])
+        }
     }
 }
 
@@ -690,6 +693,7 @@ pub async fn call_llm(
     max_tokens: Option<u32>,
     timeout: Option<std::time::Duration>,
     retry_config: Option<crate::retry::RetryConfig>,
+    previous_response_id: Option<String>,
     provider_config: Option<ProviderConfig>,
     _call_context: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>>,
 ) -> Result<CallResult> {
@@ -750,6 +754,7 @@ pub async fn call_llm(
             _ => None,
         },
         provider_config,
+        previous_response_id,
     };
 
     // Make API call
@@ -785,6 +790,7 @@ pub async fn call_llm_stream(
     max_tokens: Option<u32>,
     timeout: Option<std::time::Duration>,
     retry_config: Option<crate::retry::RetryConfig>,
+    previous_response_id: Option<String>,
     provider_config: Option<ProviderConfig>,
     _call_context: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>>,
     accumulators: Arc<RwLock<Accumulators>>,
@@ -846,6 +852,7 @@ pub async fn call_llm_stream(
             _ => None,
         },
         provider_config,
+        previous_response_id,
     };
 
     // Get streaming response

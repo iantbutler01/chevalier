@@ -66,6 +66,8 @@ pub struct RunOptions {
     pub history: Option<Vec<Message>>,
     /// Per-call timeout in milliseconds.
     pub timeout_ms: Option<f64>,
+    /// Responses API response to continue from.
+    pub previous_response_id: Option<String>,
 }
 
 impl RunOptions {
@@ -86,6 +88,7 @@ impl RunOptions {
             api_key: self.api_key,
             timeout: self.timeout_ms.map(|ms| Duration::from_millis(ms as u64)),
             retry_config: None,
+            previous_response_id: self.previous_response_id,
         }
     }
 }

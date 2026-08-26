@@ -195,6 +195,8 @@ export interface RunArgs<T = unknown> {
   outputType?: string;
   history?: native.Message[];
   timeoutMs?: number;
+  /** Responses API response to continue from. */
+  previousResponseId?: string;
 }
 
 export interface ToolDef {

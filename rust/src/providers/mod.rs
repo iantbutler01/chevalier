@@ -160,6 +160,9 @@ pub struct GenerationConfig {
 
     /// Provider-specific request-shaping options.
     pub provider_config: Option<ProviderConfig>,
+
+    /// Responses API response to continue from.
+    pub previous_response_id: Option<String>,
 }
 
 impl Default for GenerationConfig {
@@ -179,6 +182,7 @@ impl Default for GenerationConfig {
             retry_config: None,
             prompt_cache_retention: None,
             provider_config: None,
+            previous_response_id: None,
         }
     }
 }
@@ -418,6 +422,9 @@ pub enum StreamChunk {
 
     /// Provider rate-limit window usage.
     RateLimits(Vec<ProviderRateLimit>),
+
+    /// Responses API identifier for the completed response.
+    ResponseId(String),
 }
 
 /// Trace callback type for monitoring (wrapped in Arc for Clone support)

@@ -104,6 +104,7 @@ pub struct RunParams {
     /// to `RetryConfig::default()`. Inject a longer-horizon policy from the
     /// caller for LLM workloads that may exceed the 60s default max_time.
     pub retry_config: Option<crate::retry::RetryConfig>,
+    pub previous_response_id: Option<String>,
 }
 
 /// Metadata about a tool call for execution context
@@ -463,6 +464,7 @@ impl Runtime {
             params.max_tokens,
             params.timeout,
             params.retry_config,
+            params.previous_response_id,
             runtime_provider_config,
             self.current_call_args.clone(),
         )
@@ -532,6 +534,7 @@ impl Runtime {
             params.max_tokens,
             params.timeout,
             params.retry_config,
+            params.previous_response_id,
             runtime_provider_config,
             self.current_call_args.clone(),
             self.accumulators.clone(),
