@@ -123,6 +123,7 @@ pub struct KimiCodingConfigInput {
 pub struct CodexSubscriptionConfigInput {
     pub token: String,
     pub account_id: Option<String>,
+    pub prompt_cache_key: Option<String>,
     pub base_url: Option<String>,
     pub transport: Option<String>,
     pub sse_header_timeout_ms: Option<f64>,
@@ -337,6 +338,7 @@ impl Runtime {
                 CodexSubscriptionProviderConfig {
                     token: codex.token,
                     account_id: codex.account_id,
+                    prompt_cache_key: codex.prompt_cache_key,
                     base_url: codex.base_url,
                     transport: codex
                         .transport

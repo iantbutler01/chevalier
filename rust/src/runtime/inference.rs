@@ -644,6 +644,7 @@ fn resolve_codex_subscription_config(
     Ok(crate::providers::CodexSubscriptionProviderConfig {
         token,
         account_id,
+        prompt_cache_key: None,
         base_url,
         transport,
         sse_header_timeout,

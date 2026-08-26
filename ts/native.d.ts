@@ -202,6 +202,7 @@ export interface AnthropicCacheConfig {
 export interface CodexSubscriptionConfigInput {
   token: string
   accountId?: string
+  promptCacheKey?: string
   baseUrl?: string
   transport?: string
   sseHeaderTimeoutMs?: number
