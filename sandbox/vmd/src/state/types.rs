@@ -308,6 +308,7 @@ pub struct CreateVmParams {
 pub struct UpdateVmParams {
     pub name: Option<String>,
     pub metadata: Option<HashMap<String, String>>,
+    pub resources: Option<ResourceSpec>,
 }
 
 #[derive(Debug, Clone, Default)]

@@ -2062,6 +2062,18 @@ impl Manager {
                     Self::preserve_runtime_managed_metadata(&existing_metadata, &mut meta);
                     inner.metadata.metadata = meta;
                 }
+                if let Some(resources) = params.resources {
+                    if !matches!(inner.runtime.state, VmState::Stopped) {
+                        return Err(ManagerError::InvalidState);
+                    }
+                    if resources.vcpu <= 0 || resources.memory_mb <= 0 || resources.disk_gb <= 0 {
+                        return Err(ManagerError::Other(anyhow!(
+                            "VM resources must be positive"
+                        )));
+                    }
+                    enforce_resource_bounds(&resources, self.resource_bounds)?;
+                    inner.metadata.resources = resources;
+                }
                 save_metadata(&vm.dir, &mut inner.metadata).map_err(ManagerError::Other)?;
             }
             (inner.metadata.clone(), inner.runtime.state)
@@ -7931,6 +7943,7 @@ mod tests {
                         META_PORTPROXY_AUTH_TOKEN.to_string(),
                         "caller-supplied-token".to_string(),
                     )])),
+                    resources: None,
                 },
             )
             .await
@@ -7975,6 +7988,52 @@ mod tests {
                 .get(META_NETWORK_POLICY)
                 .is_some_and(|value| value.contains("api.openai.com"))
         );
+
+        let resized = manager
+            .update_vm(
+                &vm_id,
+                UpdateVmParams {
+                    name: None,
+                    metadata: None,
+                    resources: Some(crate::state::ResourceSpec {
+                        vcpu: 2,
+                        memory_mb: 1024,
+                        disk_gb: 10,
+                    }),
+                },
+            )
+            .await
+            .expect("update stopped vm resources");
+        assert_eq!(resized.resources.vcpu, 2);
+        assert_eq!(resized.resources.memory_mb, 1024);
+
+        manager
+            .vms
+            .read()
+            .await
+            .get(&vm_id)
+            .expect("vm")
+            .lock()
+            .await
+            .runtime
+            .state = VmState::Running;
+        assert!(matches!(
+            manager
+                .update_vm(
+                    &vm_id,
+                    UpdateVmParams {
+                        name: None,
+                        metadata: None,
+                        resources: Some(crate::state::ResourceSpec {
+                            vcpu: 4,
+                            memory_mb: 2048,
+                            disk_gb: 10,
+                        }),
+                    },
+                )
+                .await,
+            Err(ManagerError::InvalidState)
+        ));
     }
 
     #[test]

@@ -30,8 +30,8 @@ export declare class Sandbox {
   /** List live sessions visible to this sandbox provider. */
   listSessions(): Promise<Array<SessionInfoJs>>
   listDurableVolumes(): Promise<Array<DurableVolumeInfoJs>>
-  resizeDurableVolume(ownerKey: string, sizeGb: number): Promise<DurableVolumeInfoJs>
   deleteDurableVolume(ownerKey: string): Promise<void>
+  resizeDurableVolume(ownerKey: string, sizeGb: number): Promise<DurableVolumeInfoJs>
   listHostPciDevices(): Promise<HostPciInventoryJs>
   /** Discard a provider session by id, even if this process does not hold a Session handle. */
   discardSessionById(sessionId: string): Promise<void>
@@ -61,6 +61,7 @@ export declare class Session {
   restoreCheckpoint(checkpointId: string): Promise<Session>
   /** Read the current VM state from the sandbox provider. */
   getState(): Promise<string>
+  updateResources(options: SessionResourceOptions): Promise<string>
   listPciDevices(): Promise<HostPciInventoryJs>
   attachPciDevice(deviceId: string): Promise<PciDeviceActionJs>
   detachPciDevice(deviceId: string): Promise<PciDeviceActionJs>
@@ -237,6 +238,11 @@ export interface SessionOpts {
   storageProfile?: string
   volumeOwnerKey?: string
   volumeSizeGb?: number
+}
+
+export interface SessionResourceOptions {
+  vcpu?: number
+  memoryMb?: number
 }
 
 export interface SessionSnapshotJs {

@@ -708,6 +708,13 @@ impl VmdService for GrpcService {
         if let Some(meta) = req.metadata {
             params.metadata = Some(meta.entries);
         }
+        if let Some(resources) = req.resources {
+            params.resources = Some(crate::state::ResourceSpec {
+                vcpu: resources.vcpu,
+                memory_mb: resources.memory_mb,
+                disk_gb: resources.disk_gb,
+            });
+        }
         let meta = self
             .manager
             .update_vm(&req.vm_id, params)

@@ -3604,6 +3604,7 @@ async fn disable_tier_b_after_unsupported(
             UpdateVmParams {
                 name: None,
                 metadata: Some(degraded_metadata),
+                resources: None,
             },
         )
         .await
@@ -3653,6 +3654,7 @@ async fn finalize_execution_restore_snapshot_marker(
             UpdateVmParams {
                 name: None,
                 metadata: Some(updated_metadata),
+                resources: None,
             },
         )
         .await

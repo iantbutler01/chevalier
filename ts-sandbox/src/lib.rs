@@ -418,6 +418,12 @@ pub struct SessionSnapshotOpts {
 }
 
 #[napi(object)]
+pub struct SessionResourceOptions {
+    pub vcpu: Option<u32>,
+    pub memory_mb: Option<u32>,
+}
+
+#[napi(object)]
 pub struct SessionSnapshotJs {
     pub id: String,
     pub name: String,
@@ -693,6 +699,20 @@ impl Session {
     #[napi]
     pub async fn get_state(&self) -> napi::Result<String> {
         self.inner.state().await.map(vm_state_label).map_err(sb_err)
+    }
+
+    #[napi]
+    pub async fn update_resources(&self, options: SessionResourceOptions) -> napi::Result<String> {
+        if options.vcpu.is_none() && options.memory_mb.is_none() {
+            return Err(napi::Error::from_reason("vcpu or memoryMb is required"));
+        }
+        let vcpu = positive_resource(options.vcpu, "vCPU count").map_err(sb_err)?;
+        let memory_mb = positive_resource(options.memory_mb, "memory MB").map_err(sb_err)?;
+        self.inner
+            .update_resources(vcpu, memory_mb)
+            .await
+            .map(vm_state_label)
+            .map_err(sb_err)
     }
 
     #[napi]

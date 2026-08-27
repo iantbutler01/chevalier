@@ -263,6 +263,7 @@ message UpdateVMRequest {
   string vm_id = 1;
   google.protobuf.StringValue name = 2;
   Metadata metadata = 3;
+  ResourceSpec resources = 4;
 }
 
 message DeleteVMRequest {

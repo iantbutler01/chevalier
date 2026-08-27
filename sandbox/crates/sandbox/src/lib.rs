@@ -70,7 +70,7 @@ use proto::vmd::v1::{
     DeleteSnapshotRequest, DetachPciDeviceRequest, ForkVmRequest, GetVmBySessionRequest,
     GetVmRequest, ListDurableVolumesRequest, ListHostPciDevicesRequest, ListSnapshotsRequest,
     ListVMsRequest, Metadata, PreDownloadVmImageRequest, ResizeDurableVolumeRequest, ResourceSpec,
-    RestoreSnapshotRequest, Vm, VmActionRequest, VmSource, VmSourceType,
+    RestoreSnapshotRequest, UpdateVmRequest, Vm, VmActionRequest, VmSource, VmSourceType,
 };
 
 const PCI_CAPABILITY_HEADER: &str = "x-chevalier-pci-token";
@@ -2604,6 +2604,44 @@ impl Session {
             }))
             .await?
             .into_inner();
+        Ok(vm.state)
+    }
+
+    pub async fn update_resources(&self, vcpu: Option<i32>, memory_mb: Option<i32>) -> Result<i32> {
+        if matches!(
+            &self.sandbox.inner.control_backend,
+            ControlBackend::OpenComputer(_)
+        ) {
+            return Err(SandboxError::Unsupported(
+                "resource updates are only available for vmd-backed sandboxes".to_string(),
+            ));
+        }
+
+        let node_endpoint = self.resolve_session_endpoint().await?;
+        let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
+        let current = client
+            .get_vm(self.sandbox.request_with_auth(GetVmRequest {
+                vm_id: self.vm_id.clone(),
+            }))
+            .await?
+            .into_inner();
+        let current_resources = current.resources.unwrap_or_default();
+        let vm = client
+            .update_vm(self.sandbox.request_with_auth(UpdateVmRequest {
+                vm_id: self.vm_id.clone(),
+                name: None,
+                metadata: None,
+                resources: Some(ResourceSpec {
+                    vcpu: vcpu.unwrap_or(current_resources.vcpu),
+                    memory_mb: memory_mb.unwrap_or(current_resources.memory_mb),
+                    disk_gb: current_resources.disk_gb,
+                }),
+            }))
+            .await?
+            .into_inner();
+        self.sandbox
+            .invalidate_ready_vm_rpc(&self.vm_id, &node_endpoint)
+            .await;
         Ok(vm.state)
     }
 
