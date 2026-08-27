@@ -2063,7 +2063,7 @@ impl Manager {
                     inner.metadata.metadata = meta;
                 }
                 if let Some(resources) = params.resources {
-                    if !matches!(inner.runtime.state, VmState::Stopped) {
+                    if matches!(inner.runtime.state, VmState::Creating | VmState::Error) {
                         return Err(ManagerError::InvalidState);
                     }
                     if resources.vcpu <= 0 || resources.memory_mb <= 0 || resources.disk_gb <= 0 {
@@ -8017,23 +8017,23 @@ mod tests {
             .await
             .runtime
             .state = VmState::Running;
-        assert!(matches!(
-            manager
-                .update_vm(
-                    &vm_id,
-                    UpdateVmParams {
-                        name: None,
-                        metadata: None,
-                        resources: Some(crate::state::ResourceSpec {
-                            vcpu: 4,
-                            memory_mb: 2048,
-                            disk_gb: 10,
-                        }),
-                    },
-                )
-                .await,
-            Err(ManagerError::InvalidState)
-        ));
+        let next_boot = manager
+            .update_vm(
+                &vm_id,
+                UpdateVmParams {
+                    name: None,
+                    metadata: None,
+                    resources: Some(crate::state::ResourceSpec {
+                        vcpu: 4,
+                        memory_mb: 2048,
+                        disk_gb: 10,
+                    }),
+                },
+            )
+            .await
+            .expect("update running vm next-boot resources");
+        assert_eq!(next_boot.resources.vcpu, 4);
+        assert_eq!(next_boot.resources.memory_mb, 2048);
     }
 
     #[test]
