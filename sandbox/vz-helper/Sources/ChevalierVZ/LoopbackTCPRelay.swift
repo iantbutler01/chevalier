@@ -4,6 +4,7 @@ import Virtualization
 
 final class LoopbackTCPRelay: @unchecked Sendable {
   static let address = "127.0.0.1"
+  static let maximumConcurrentSessions = 16
 
   private final class Session: @unchecked Sendable {
     let guestConnection: VZVirtioSocketConnection
@@ -21,9 +22,9 @@ final class LoopbackTCPRelay: @unchecked Sendable {
   private let acceptQueue = DispatchQueue(label: "dev.chevalier.vz.loopback-relay.accept")
   private let lock = NSLock()
   private var started = false
-  private var pendingGuestConnection: VZVirtioSocketConnection?
-  private var pendingTCPFileDescriptor: Int32?
-  private var sessionActive = false
+  private var pendingGuestConnections: [VZVirtioSocketConnection] = []
+  private var pendingTCPFileDescriptors: [Int32] = []
+  private var activeSessions = 0
 
   init(port: UInt16) throws {
     guard port > 0 else {
@@ -49,7 +50,7 @@ final class LoopbackTCPRelay: @unchecked Sendable {
       guard bindResult == 0 else {
         throw Self.systemError("bind \(Self.address):\(port)")
       }
-      guard Darwin.listen(descriptor, 1) == 0 else {
+      guard Darwin.listen(descriptor, Int32(Self.maximumConcurrentSessions)) == 0 else {
         throw Self.systemError("listen on \(Self.address):\(port)")
       }
     } catch {
@@ -64,15 +65,17 @@ final class LoopbackTCPRelay: @unchecked Sendable {
   deinit {
     Darwin.close(listenerFileDescriptor)
     lock.withLock {
-      if let pendingTCPFileDescriptor {
-        Darwin.close(pendingTCPFileDescriptor)
+      for descriptor in pendingTCPFileDescriptors {
+        Darwin.close(descriptor)
       }
-      pendingGuestConnection?.close()
+      for connection in pendingGuestConnections {
+        connection.close()
+      }
     }
   }
 
   var guestConnectionCount: Int {
-    lock.withLock { pendingGuestConnection == nil && !sessionActive ? 0 : 1 }
+    lock.withLock { pendingGuestConnections.count + activeSessions }
   }
 
   func start() {
@@ -101,11 +104,11 @@ final class LoopbackTCPRelay: @unchecked Sendable {
       return false
     }
 
-    var session: Session?
+    var sessions: [Session] = []
     let accepted = lock.withLock {
-      guard pendingGuestConnection == nil, !sessionActive else { return false }
-      pendingGuestConnection = connection
-      session = makeSessionIfReady()
+      guard pendingGuestConnections.count < Self.maximumConcurrentSessions else { return false }
+      pendingGuestConnections.append(connection)
+      sessions = makeSessionsIfReady()
       return true
     }
     guard accepted else {
@@ -117,7 +120,7 @@ final class LoopbackTCPRelay: @unchecked Sendable {
       "chevalier-vz: guest control connection ready for loopback relay source=%u fd=%d",
       connection.sourcePort,
       connection.fileDescriptor)
-    if let session {
+    for session in sessions {
       startRelay(session)
     }
     return true
@@ -139,11 +142,13 @@ final class LoopbackTCPRelay: @unchecked Sendable {
         continue
       }
 
-      var session: Session?
+      var sessions: [Session] = []
       let accepted = lock.withLock {
-        guard pendingTCPFileDescriptor == nil, !sessionActive else { return false }
-        pendingTCPFileDescriptor = descriptor
-        session = makeSessionIfReady()
+        guard pendingTCPFileDescriptors.count < Self.maximumConcurrentSessions else {
+          return false
+        }
+        pendingTCPFileDescriptors.append(descriptor)
+        sessions = makeSessionsIfReady()
         return true
       }
       guard accepted else {
@@ -153,24 +158,25 @@ final class LoopbackTCPRelay: @unchecked Sendable {
       }
 
       NSLog("chevalier-vz: accepted loopback relay client fd=%d", descriptor)
-      if let session {
+      for session in sessions {
         startRelay(session)
       }
     }
   }
 
-  private func makeSessionIfReady() -> Session? {
-    guard let guestConnection = pendingGuestConnection,
-      let tcpFileDescriptor = pendingTCPFileDescriptor
-    else {
-      return nil
+  private func makeSessionsIfReady() -> [Session] {
+    var sessions: [Session] = []
+    while activeSessions < Self.maximumConcurrentSessions,
+      !pendingGuestConnections.isEmpty,
+      !pendingTCPFileDescriptors.isEmpty
+    {
+      activeSessions += 1
+      sessions.append(
+        Session(
+          guestConnection: pendingGuestConnections.removeFirst(),
+          tcpFileDescriptor: pendingTCPFileDescriptors.removeFirst()))
     }
-    pendingGuestConnection = nil
-    pendingTCPFileDescriptor = nil
-    sessionActive = true
-    return Session(
-      guestConnection: guestConnection,
-      tcpFileDescriptor: tcpFileDescriptor)
+    return sessions
   }
 
   private func startRelay(_ session: Session) {
@@ -181,8 +187,12 @@ final class LoopbackTCPRelay: @unchecked Sendable {
         right: session.guestConnection.fileDescriptor)
       Darwin.close(session.tcpFileDescriptor)
       session.guestConnection.close()
-      lock.withLock {
-        sessionActive = false
+      let nextSessions = lock.withLock {
+        activeSessions -= 1
+        return makeSessionsIfReady()
+      }
+      for nextSession in nextSessions {
+        startRelay(nextSession)
       }
       NSLog("chevalier-vz: loopback relay session closed")
     }

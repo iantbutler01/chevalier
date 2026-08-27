@@ -11,10 +11,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::{Code, Request, Status};
 
+use crate::proto::bracket::portproxy::v1::port_proxy_client::PortProxyClient;
 use crate::proto::bracket::portproxy::v1::shell_exec_client::ShellExecClient;
 use crate::proto::bracket::portproxy::v1::{
-    ExecRequest, ExecResponse, ExecStart, exec_request, exec_response,
+    ExecRequest, ExecResponse, ExecStart, WriteFileRequest, exec_request, exec_response,
 };
+use crate::state::types::GuestPlatform;
 
 pub const META_PORTPROXY_AUTH_TOKEN: &str = "chevalier.portproxy_auth_token";
 
@@ -104,10 +106,63 @@ pub fn request_with_portproxy_auth<T>(
     request
 }
 
+pub async fn prepare_guest_shutdown(
+    endpoint: &str,
+    auth_header: Option<&MetadataValue<Ascii>>,
+) -> Result<()> {
+    let mut client = PortProxyClient::connect(endpoint.to_string())
+        .await
+        .context("connect guest shutdown client")?;
+    client
+        .prepare_shutdown(request_with_portproxy_auth((), auth_header))
+        .await
+        .context("prepare guest shutdown")?;
+    Ok(())
+}
+
+pub async fn write_guest_file(
+    endpoint: &str,
+    auth_header: Option<&MetadataValue<Ascii>>,
+    path: &str,
+    data: Vec<u8>,
+    create_parents: bool,
+) -> Result<()> {
+    let mut client = PortProxyClient::connect(endpoint.to_string())
+        .await
+        .context("connect guest file client")?;
+    client
+        .write_file(request_with_portproxy_auth(
+            WriteFileRequest {
+                path: path.to_string(),
+                data,
+                create_parents,
+            },
+            auth_header,
+        ))
+        .await
+        .with_context(|| format!("write guest file {path}"))?;
+    Ok(())
+}
+
 pub async fn probe_guest_exec_ready(
     endpoint: &str,
     auth_header: Option<&MetadataValue<Ascii>>,
     command_timeout_secs: i32,
+) -> Result<(), GuestExecProbeFailure> {
+    probe_guest_exec_ready_for_platform(
+        endpoint,
+        auth_header,
+        command_timeout_secs,
+        GuestPlatform::Linux,
+    )
+    .await
+}
+
+pub async fn probe_guest_exec_ready_for_platform(
+    endpoint: &str,
+    auth_header: Option<&MetadataValue<Ascii>>,
+    command_timeout_secs: i32,
+    platform: GuestPlatform,
 ) -> Result<(), GuestExecProbeFailure> {
     let mut client = ShellExecClient::connect(endpoint.to_string())
         .await
@@ -115,14 +170,28 @@ pub async fn probe_guest_exec_ready(
             GuestExecProbeFailure::transient(format!("connect shell exec readiness probe: {error}"))
         })?;
     let (req_tx, req_rx) = mpsc::channel(2);
+    let args = match platform {
+        GuestPlatform::Windows => vec![
+            r"C:\Program Files\PowerShell\7\pwsh.exe".to_string(),
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            "exit 0".to_string(),
+        ],
+        GuestPlatform::Linux | GuestPlatform::Macos => {
+            vec!["/bin/sh".to_string(), "-lc".to_string(), "true".to_string()]
+        }
+    };
     req_tx
         .send(ExecRequest {
             request: Some(exec_request::Request::Start(ExecStart {
                 execution_id: String::new(),
-                args: vec!["/bin/sh".to_string(), "-lc".to_string(), "true".to_string()],
+                args,
                 env: HashMap::new(),
                 detach: false,
                 timeout: Some(command_timeout_secs),
+                run_as_root: false,
             })),
         })
         .await
@@ -178,6 +247,30 @@ pub async fn run_guest_shell_exec(
     stdin: Option<&[u8]>,
     command_timeout_secs: i32,
 ) -> Result<GuestShellExecOutput> {
+    run_guest_exec_args(
+        endpoint,
+        auth_header,
+        vec![
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            command.to_string(),
+        ],
+        stdin,
+        command_timeout_secs,
+    )
+    .await
+}
+
+pub async fn run_guest_exec_args(
+    endpoint: &str,
+    auth_header: Option<&MetadataValue<Ascii>>,
+    args: Vec<String>,
+    stdin: Option<&[u8]>,
+    command_timeout_secs: i32,
+) -> Result<GuestShellExecOutput> {
+    if args.is_empty() {
+        bail!("guest exec args must not be empty");
+    }
     let mut client = ShellExecClient::connect(endpoint.to_string())
         .await
         .context("connect shell exec client")?;
@@ -186,14 +279,11 @@ pub async fn run_guest_shell_exec(
         .send(ExecRequest {
             request: Some(exec_request::Request::Start(ExecStart {
                 execution_id: String::new(),
-                args: vec![
-                    "/bin/sh".to_string(),
-                    "-lc".to_string(),
-                    command.to_string(),
-                ],
+                args,
                 env: HashMap::new(),
                 detach: false,
                 timeout: Some(command_timeout_secs),
+                run_as_root: true,
             })),
         })
         .await

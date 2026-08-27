@@ -199,6 +199,7 @@ enum SourceType {
     Docker,
     Snapshot,
     MacosTemplate,
+    WindowsTemplate,
 }
 
 #[tokio::main]
@@ -529,6 +530,10 @@ async fn create_vm(
             bail!("invalid metadata entry {entry}, expected key=value");
         }
     }
+    let architecture = arch.unwrap_or_else(|| match source_type {
+        SourceType::MacosTemplate => "arm64".to_string(),
+        SourceType::Docker | SourceType::Snapshot | SourceType::WindowsTemplate => String::new(),
+    });
     let request = CreateVmRequest {
         name: name.unwrap_or_default(),
         source: Some(VmSource {
@@ -536,6 +541,7 @@ async fn create_vm(
                 SourceType::Docker => ProtoVmSourceType::Docker as i32,
                 SourceType::Snapshot => ProtoVmSourceType::Snapshot as i32,
                 SourceType::MacosTemplate => ProtoVmSourceType::MacosTemplate as i32,
+                SourceType::WindowsTemplate => ProtoVmSourceType::WindowsTemplate as i32,
             },
             reference: source_ref,
         }),
@@ -550,16 +556,18 @@ async fn create_vm(
             Some(Metadata { entries: meta_map })
         },
         auto_start,
-        architecture: arch.unwrap_or_else(|| {
-            if matches!(source_type, SourceType::MacosTemplate) {
-                "arm64".to_string()
+        architecture: architecture.clone(),
+        guest_profile: matches!(
+            source_type,
+            SourceType::MacosTemplate | SourceType::WindowsTemplate
+        )
+        .then(|| GuestProfile {
+            platform: if matches!(source_type, SourceType::MacosTemplate) {
+                GuestPlatform::Macos as i32
             } else {
-                String::new()
-            }
-        }),
-        guest_profile: matches!(source_type, SourceType::MacosTemplate).then(|| GuestProfile {
-            platform: GuestPlatform::Macos as i32,
-            architecture: "arm64".to_string(),
+                GuestPlatform::Windows as i32
+            },
+            architecture,
             schema_version: 1,
             ..Default::default()
         }),

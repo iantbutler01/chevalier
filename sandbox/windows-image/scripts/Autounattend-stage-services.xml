@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>Stage the secret-free Chevalier Windows runtime services</Description>
+          <Path>cmd.exe /d /c "for %D in (C D E F G H I J K L M N O P Q R S T U V W X Y Z) do @if exist %D:\stage-runtime-services.cmd call %D:\stage-runtime-services.cmd %D:"</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+</unattend>

@@ -46,6 +46,7 @@ ENDPOINT=$(tr -d '\r\n' <"$ENDPOINT_FILE")
 SCOPE=$(tr -d '\r\n' <"$SCOPE_FILE")
 export CHEVALIER_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN
 export CHEVALIER_VFS_LAUNCHD_SUPERVISED=1
+export CHEVALIER_VFS_HASH_ALGORITHM=blake3
 
 exec "$RUNTIME_ROOT/bin/chevalier-vfs-fuse" \
   --endpoint "$ENDPOINT" \

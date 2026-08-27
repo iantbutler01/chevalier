@@ -16,7 +16,7 @@ use tracing::{info, warn};
 
 use crate::guest_exec_probe::{
     GuestExecProbeFailure, GuestExecProbeFailureKind, portproxy_auth_header_from_token,
-    probe_guest_exec_ready,
+    probe_guest_exec_ready_for_platform,
 };
 use crate::state::manager::VmHealthProbeTarget;
 use crate::state::{Manager, ManagerResult};
@@ -179,10 +179,11 @@ async fn probe_target(target: &VmHealthProbeTarget) -> Result<(), ProbeFailure> 
     let endpoint = format!("http://127.0.0.1:{}", target.rpc_port);
     match tokio::time::timeout(
         HEALTH_RECONCILE_PROBE_TIMEOUT,
-        probe_guest_exec_ready(
+        probe_guest_exec_ready_for_platform(
             endpoint.as_str(),
             auth_header.as_ref(),
             HEALTH_RECONCILE_COMMAND_TIMEOUT_SECS,
+            target.platform,
         ),
     )
     .await

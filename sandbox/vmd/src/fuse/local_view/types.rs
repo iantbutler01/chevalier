@@ -160,7 +160,18 @@ impl MountMutation {
     /// True when the gateway contract cannot express this mutation. The
     /// publisher acknowledges these without a request.
     pub(crate) fn is_local_only(&self) -> bool {
-        matches!(self, Self::SetTimes { .. } | Self::SetOwner { .. })
+        if matches!(self, Self::SetTimes { .. } | Self::SetOwner { .. }) {
+            return true;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            return self
+                .affected_paths()
+                .into_iter()
+                .all(is_local_only_content_path);
+        }
+        #[cfg(not(target_os = "macos"))]
+        false
     }
 
     /// True when the publisher routes this through `write-many` /
@@ -251,6 +262,26 @@ impl MountMutation {
             }
         }
         merge_dependency_keys(keys)
+    }
+}
+
+pub(crate) fn is_local_only_content_path(path: &str) -> bool {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let root = path.split('/').next().unwrap_or(path);
+        matches!(
+            root,
+            ".fseventsd"
+                | ".Spotlight-V100"
+                | ".Trashes"
+                | ".DocumentRevisions-V100"
+                | ".TemporaryItems"
+        )
     }
 }
 
@@ -895,4 +926,41 @@ pub(crate) struct AppliedMutation {
     pub(crate) tree_generation: u64,
     pub(crate) local_identity: Option<String>,
     pub(crate) metadata: Option<LocalMetadata>,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::MountMutation;
+
+    #[test]
+    fn macos_volume_metadata_stays_in_the_guest_state_tree() {
+        assert!(
+            MountMutation::CreateFile {
+                path: ".fseventsd/fseventsd-uuid".to_string(),
+                mode: 0o600,
+            }
+            .is_local_only()
+        );
+        assert!(
+            MountMutation::RemoveDirectory {
+                path: ".Trashes/501".to_string(),
+            }
+            .is_local_only()
+        );
+        assert!(
+            !MountMutation::Rename {
+                old_path: ".TemporaryItems/work".to_string(),
+                new_path: "project/work".to_string(),
+                flags: 0,
+            }
+            .is_local_only()
+        );
+        assert!(
+            !MountMutation::CreateFile {
+                path: "project/.fseventsd".to_string(),
+                mode: 0o600,
+            }
+            .is_local_only()
+        );
+    }
 }

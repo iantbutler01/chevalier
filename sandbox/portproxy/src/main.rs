@@ -11,6 +11,7 @@ mod daemon;
 mod exec_control;
 #[cfg(test)]
 mod exec_control_tests;
+mod execution_identity;
 mod port_forward;
 mod process_group;
 mod services;
@@ -33,7 +34,9 @@ pub mod pb {
 }
 
 use std::env;
+use std::fs;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process;
 use std::time::Duration;
 
@@ -61,6 +64,7 @@ use crate::pb::bracket::portproxy::v1::port_proxy_server::PortProxyServer;
 use crate::pb::bracket::portproxy::v1::shell_exec_server::ShellExecServer;
 
 const PORTPROXY_AUTH_TOKEN_ENV: &str = "CHEVALIER_PORTPROXY_AUTH_TOKEN";
+const PORTPROXY_AUTH_TOKEN_FILE_ENV: &str = "CHEVALIER_PORTPROXY_AUTH_TOKEN_FILE";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -138,7 +142,7 @@ async fn serve_grpc(
     let shell_exec = ShellExecService::new(tracker.clone());
     let port_proxy = PortProxyService::new(tracker.clone());
     let daemon_manager = DaemonManagerService::new(daemon_registry);
-    let auth_interceptor = PortproxyAuthInterceptor::from_env();
+    let auth_interceptor = PortproxyAuthInterceptor::from_env()?;
 
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
 
@@ -179,18 +183,43 @@ struct PortproxyAuthInterceptor {
 }
 
 impl PortproxyAuthInterceptor {
-    fn from_env() -> Self {
-        let token = env::var(PORTPROXY_AUTH_TOKEN_ENV)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+    fn from_env() -> anyhow::Result<Self> {
+        let token = load_auth_token(
+            env::var(PORTPROXY_AUTH_TOKEN_ENV).ok(),
+            env::var_os(PORTPROXY_AUTH_TOKEN_FILE_ENV).map(PathBuf::from),
+        )?;
         if token.is_some() {
             info!("portproxy RPC auth is enabled");
         } else {
-            warn!("portproxy RPC auth is disabled because {PORTPROXY_AUTH_TOKEN_ENV} is not set");
+            warn!(
+                "portproxy RPC auth is disabled because neither {PORTPROXY_AUTH_TOKEN_ENV} nor {PORTPROXY_AUTH_TOKEN_FILE_ENV} is set"
+            );
         }
-        Self { token }
+        Ok(Self { token })
     }
+}
+
+fn load_auth_token(
+    direct: Option<String>,
+    token_file: Option<PathBuf>,
+) -> anyhow::Result<Option<String>> {
+    if let Some(token) = direct
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        return Ok(Some(token.to_string()));
+    }
+    let Some(path) = token_file else {
+        return Ok(None);
+    };
+    let contents = fs::read_to_string(&path)
+        .with_context(|| format!("read portproxy auth token file {}", path.display()))?;
+    let token = contents.trim();
+    if token.is_empty() {
+        anyhow::bail!("portproxy auth token file {} is empty", path.display());
+    }
+    Ok(Some(token.to_string()))
 }
 
 impl Interceptor for PortproxyAuthInterceptor {
@@ -321,6 +350,27 @@ async fn forward_signals(tracker: ChildTracker) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_token_file_is_loaded_without_exposing_the_token_in_service_arguments() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let token_file = directory.path().join("portproxy.token");
+        fs::write(&token_file, "file-token\n").expect("write token");
+
+        assert_eq!(
+            load_auth_token(None, Some(token_file))
+                .expect("load token")
+                .as_deref(),
+            Some("file-token")
+        );
+    }
+
+    #[test]
+    fn configured_auth_token_file_fails_closed() {
+        let directory = tempfile::tempdir().expect("tempdir");
+
+        assert!(load_auth_token(None, Some(directory.path().join("missing.token"))).is_err());
+    }
 
     #[test]
     fn bearer_token_from_metadata_extracts_authorization_value() {

@@ -26,7 +26,6 @@ install -m 0755 \
 install -m 0755 \
   "$BRIDGE_DIR/target/$TARGET/release/portproxy-darwin-vsock-bridge" \
   "$OUT_DIR/portproxy-darwin-vsock-bridge"
-install -m 0755 "$SCRIPT_DIR/launch-portproxy.sh" "$OUT_DIR/launch-portproxy.sh"
 install -m 0755 "$SCRIPT_DIR/install-guest-assets.sh" "$OUT_DIR/install-guest-assets.sh"
 install -m 0644 "$SCRIPT_DIR/com.bracket.portproxy.plist" "$OUT_DIR/com.bracket.portproxy.plist"
 install -m 0644 \

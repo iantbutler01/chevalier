@@ -81,6 +81,27 @@ pub fn create_iso<P: AsRef<Path>>(path: P, cfg: Config) -> Result<()> {
     write_iso(path.as_ref(), VOLUME_ID, &entries)
 }
 
+pub fn create_data_iso<P: AsRef<Path>>(
+    path: P,
+    volume_id: &str,
+    files: Vec<(String, Vec<u8>)>,
+) -> Result<()> {
+    if volume_id.trim().is_empty() {
+        bail!("data iso: volume ID required");
+    }
+    if let Some(parent) = path.as_ref().parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("data iso: ensure directory {}", parent.display()))?;
+        }
+    }
+    let entries = files
+        .into_iter()
+        .map(|(name, data)| IsoEntry::new(&name, data))
+        .collect::<Vec<_>>();
+    write_iso(path.as_ref(), volume_id, &entries)
+}
+
 fn build_init_script(
     hostname: &str,
     network: Option<&NetworkConfig>,

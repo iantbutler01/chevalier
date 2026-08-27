@@ -24,7 +24,7 @@ use chevalier_sandbox::proto::vmd::v1::{
     AttachPciDeviceRequest, CreateSnapshotRequest, CreateVmRequest, CreateVmStreamResponse,
     DeleteDurableVolumeRequest, DeleteSnapshotRequest, DeleteVmRequest, DetachPciDeviceRequest,
     ForkVmRequest, ForkVmResponse, GetSnapshotRequest, GetVmBySessionRequest, GetVmRequest,
-    HealthRequest, HealthResponse, InfoRequest, InfoResponse, ListDurableVolumesRequest,
+    GuestPlatform, HealthRequest, HealthResponse, InfoRequest, InfoResponse, ListDurableVolumesRequest,
     ListDurableVolumesResponse, ListHostPciDevicesRequest, ListHostPciDevicesResponse,
     ListSnapshotsRequest, ListSnapshotsResponse, ListVMsRequest, ListVMsResponse, NetworkSpec,
     PciDeviceActionResponse, PortProxyPorts, PreDownloadVmImageRequest, PreDownloadVmImageResponse,
@@ -33,8 +33,8 @@ use chevalier_sandbox::proto::vmd::v1::{
 };
 use chevalier_sandbox::{
     ExecEvent, ExecInput, ExecOptions, ForkOptions, Sandbox, SandboxConfig, SandboxError,
-    SessionOptions, SharedMount, SharedMountAvailability, SharedMountContinuity, ShellEvent,
-    ShellInput, WarmPoolProfile,
+    SessionOptions, SessionSourceType, SharedMount, SharedMountAvailability, SharedMountContinuity,
+    ShellEvent, ShellInput, WarmPoolProfile,
 };
 use futures::{Stream, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -1022,6 +1022,79 @@ async fn session_create_forwards_shared_mounts_contract() {
     assert_eq!(req.storage_profile, "durable-data");
     assert_eq!(req.volume_owner_key, "workspace:test:thread:session-mounts");
     assert_eq!(req.volume_size_gb, 64);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_create_forwards_native_guest_source_profiles() {
+    let harness = TestHarness::start().await;
+    let sandbox = Sandbox::connect(harness.vmd_endpoint.clone(), sandbox_config())
+        .await
+        .expect("connect sandbox facade to mock vmd");
+
+    for (
+        session_id,
+        source_type,
+        architecture,
+        expected_source,
+        expected_platform,
+        expected_architecture,
+    ) in [
+        (
+            "session-macos-template",
+            SessionSourceType::MacosTemplate,
+            None,
+            VmSourceType::MacosTemplate,
+            GuestPlatform::Macos,
+            "arm64",
+        ),
+        (
+            "session-windows-template",
+            SessionSourceType::WindowsTemplate,
+            None,
+            VmSourceType::WindowsTemplate,
+            GuestPlatform::Windows,
+            "",
+        ),
+        (
+            "session-windows-x86-template",
+            SessionSourceType::WindowsTemplate,
+            Some("x86_64".to_string()),
+            VmSourceType::WindowsTemplate,
+            GuestPlatform::Windows,
+            "amd64",
+        ),
+    ] {
+        sandbox
+            .session(SessionOptions {
+                session_id: Some(session_id.to_string()),
+                image: Some(format!("/templates/{session_id}")),
+                source_type,
+                architecture,
+                auto_start: false,
+                ..SessionOptions::default()
+            })
+            .await
+            .expect("create native guest session");
+
+        let guard = harness.vmd_state.lock().await;
+        let request = guard
+            .create_requests
+            .last()
+            .expect("expected create request to be recorded");
+        assert_eq!(
+            request.source.as_ref().unwrap().r#type,
+            expected_source as i32
+        );
+        assert_eq!(
+            request.guest_profile.as_ref().unwrap().platform,
+            expected_platform as i32
+        );
+        assert_eq!(request.architecture, expected_architecture);
+        assert_eq!(
+            request.guest_profile.as_ref().unwrap().architecture,
+            expected_architecture
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

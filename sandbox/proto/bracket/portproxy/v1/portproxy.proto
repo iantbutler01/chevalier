@@ -73,6 +73,7 @@ message ExecStart {
   bool detach = 3;
   optional int32 timeout = 4;
   string execution_id = 5;
+  bool run_as_root = 6;
 }
 
 message ExecControlRequest {

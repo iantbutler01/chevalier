@@ -6,8 +6,28 @@
   <string>com.bracket.portproxy</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Library/Application Support/Chevalier/bin/launch-portproxy.sh</string>
+    <string>/Library/Application Support/Chevalier/bin/portproxy</string>
+    <string>--server</string>
+    <string>--rpc-bind-address</string>
+    <string>127.0.0.1</string>
+    <string>--rpc-port</string>
+    <string>13338</string>
+    <string>--server-addr</string>
+    <string>127.0.0.1:13337</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CHEVALIER_PORTPROXY_AUTH_TOKEN_FILE</key>
+    <string>/Library/Application Support/Chevalier/etc/portproxy.token</string>
+    <key>CHEVALIER_PORTPROXY_EXEC_USER</key>
+    <string>openbracket</string>
+    <key>HOME</key>
+    <string>/Users/openbracket</string>
+    <key>LOGNAME</key>
+    <string>openbracket</string>
+    <key>USER</key>
+    <string>openbracket</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>

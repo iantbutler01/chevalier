@@ -47,6 +47,7 @@ pub enum VmSourceType {
     Docker,
     Snapshot,
     MacosTemplate,
+    WindowsTemplate,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -55,6 +56,7 @@ pub enum GuestPlatform {
     #[default]
     Linux,
     Macos,
+    Windows,
 }
 
 impl GuestPlatform {
@@ -62,6 +64,7 @@ impl GuestPlatform {
         match self {
             Self::Linux => "linux",
             Self::Macos => "macos",
+            Self::Windows => "windows",
         }
     }
 }
@@ -71,6 +74,7 @@ impl GuestPlatform {
 pub enum WorkspaceTransport {
     VirtioFs,
     MacfuseFskit,
+    Winfsp,
 }
 
 impl Default for WorkspaceTransport {
@@ -98,6 +102,7 @@ pub enum NetworkPolicyMode {
     TapTransparentProxy,
     NoNicVsockProxy,
     NoNicIsolated,
+    QemuUserNetworking,
 }
 
 impl Default for NetworkPolicyMode {

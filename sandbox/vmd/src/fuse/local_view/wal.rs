@@ -35,7 +35,7 @@ use super::payload::{PayloadReader, PayloadStore};
 use super::types::{
     CompactionOutcome, MountCheckpoint, MountEvent, MountMutation, MountPreImage, PayloadRef,
     PayloadSource, PreparedEvent, PublishBatch, RecoveryResolution, RecoveryState, StoragePressure,
-    WalRecord, dependency_sets_conflict, validate_mount_path,
+    WalRecord, dependency_sets_conflict, is_local_only_content_path, validate_mount_path,
 };
 use super::{
     DEFAULT_BACKING_FREE_BYTES_FLOOR, DEFAULT_BACKING_FREE_FRACTION_FLOOR, LOG_TARGET_BYTES,
@@ -269,7 +269,9 @@ impl MountWal {
         if let Some(checkpoint) = checkpoint.as_ref() {
             for path in &checkpoint.dirty_content_paths {
                 validate_mount_path(path)?;
-                scan.dirty_content.insert(path.clone());
+                if !is_local_only_content_path(path) {
+                    scan.dirty_content.insert(path.clone());
+                }
             }
         }
 
@@ -636,6 +638,9 @@ impl MountWal {
     /// exactly the state the guest already read back.
     pub(crate) fn record_content_dirty(&self, path: &str) -> Result<bool> {
         validate_mount_path(path)?;
+        if is_local_only_content_path(path) {
+            return Ok(false);
+        }
         let mut state = self.append_lock()?;
         if state.dirty_content.contains(path) {
             return Ok(false);
@@ -1766,7 +1771,9 @@ fn apply_scanned_record(
         WalRecord::ContentDirty { epoch, path } => {
             observe_epoch(&mut scan.epoch, &epoch)?;
             validate_mount_path(&path)?;
-            scan.dirty_content.insert(path);
+            if !is_local_only_content_path(&path) {
+                scan.dirty_content.insert(path);
+            }
         }
         WalRecord::RemoteAcknowledged {
             epoch,
@@ -2127,6 +2134,19 @@ mod tests {
             .read_to_end(&mut bytes)
             .expect("read payload");
         assert_eq!(bytes, b"hello");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_volume_metadata_never_enters_the_publication_dirty_set() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let wal = open(temp.path());
+
+        assert!(
+            !wal.record_content_dirty(".fseventsd/fseventsd-uuid")
+                .expect("record local-only dirty content")
+        );
+        assert!(wal.dirty_content_paths().expect("dirty paths").is_empty());
     }
 
     #[test]

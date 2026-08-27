@@ -1735,6 +1735,7 @@ fn map_source_type_proto(source_type: &StateVmSourceType) -> i32 {
         StateVmSourceType::Docker => ProtoVmSourceType::Docker as i32,
         StateVmSourceType::Snapshot => ProtoVmSourceType::Snapshot as i32,
         StateVmSourceType::MacosTemplate => ProtoVmSourceType::MacosTemplate as i32,
+        StateVmSourceType::WindowsTemplate => ProtoVmSourceType::WindowsTemplate as i32,
     }
 }
 
@@ -1743,6 +1744,7 @@ fn map_source_type(value: i32) -> Result<StateVmSourceType, Status> {
         Ok(ProtoVmSourceType::Docker) => Ok(StateVmSourceType::Docker),
         Ok(ProtoVmSourceType::Snapshot) => Ok(StateVmSourceType::Snapshot),
         Ok(ProtoVmSourceType::MacosTemplate) => Ok(StateVmSourceType::MacosTemplate),
+        Ok(ProtoVmSourceType::WindowsTemplate) => Ok(StateVmSourceType::WindowsTemplate),
         Ok(ProtoVmSourceType::Unspecified) | Err(_) => {
             Err(Status::invalid_argument("source type must be provided"))
         }
@@ -1752,6 +1754,7 @@ fn map_source_type(value: i32) -> Result<StateVmSourceType, Status> {
 fn map_guest_platform(value: i32) -> crate::state::GuestPlatform {
     match crate::proto::v1::GuestPlatform::try_from(value) {
         Ok(crate::proto::v1::GuestPlatform::Macos) => crate::state::GuestPlatform::Macos,
+        Ok(crate::proto::v1::GuestPlatform::Windows) => crate::state::GuestPlatform::Windows,
         _ => crate::state::GuestPlatform::Linux,
     }
 }
@@ -1760,6 +1763,7 @@ fn build_guest_platform(value: crate::state::GuestPlatform) -> i32 {
     match value {
         crate::state::GuestPlatform::Linux => crate::proto::v1::GuestPlatform::Linux as i32,
         crate::state::GuestPlatform::Macos => crate::proto::v1::GuestPlatform::Macos as i32,
+        crate::state::GuestPlatform::Windows => crate::proto::v1::GuestPlatform::Windows as i32,
     }
 }
 
@@ -1836,6 +1840,9 @@ fn map_capabilities(
                 Ok(crate::proto::v1::WorkspaceTransport::MacfuseFskit) => {
                     crate::state::WorkspaceTransport::MacfuseFskit
                 }
+                Ok(crate::proto::v1::WorkspaceTransport::Winfsp) => {
+                    crate::state::WorkspaceTransport::Winfsp
+                }
                 _ => crate::state::WorkspaceTransport::VirtioFs,
             },
             workspace_mode: match crate::proto::v1::WorkspaceMode::try_from(value.workspace_mode) {
@@ -1852,6 +1859,9 @@ fn map_capabilities(
                 }
                 Ok(crate::proto::v1::NetworkPolicyMode::NoNicIsolated) => {
                     crate::state::NetworkPolicyMode::NoNicIsolated
+                }
+                Ok(crate::proto::v1::NetworkPolicyMode::QemuUserNetworking) => {
+                    crate::state::NetworkPolicyMode::QemuUserNetworking
                 }
                 _ => crate::state::NetworkPolicyMode::TapTransparentProxy,
             },
@@ -1879,6 +1889,9 @@ fn build_capabilities(value: &crate::state::VmCapabilities) -> crate::proto::v1:
             crate::state::WorkspaceTransport::MacfuseFskit => {
                 crate::proto::v1::WorkspaceTransport::MacfuseFskit as i32
             }
+            crate::state::WorkspaceTransport::Winfsp => {
+                crate::proto::v1::WorkspaceTransport::Winfsp as i32
+            }
         },
         workspace_mode: match value.workspace_mode {
             crate::state::WorkspaceMode::OwnerAndObservers => {
@@ -1897,6 +1910,9 @@ fn build_capabilities(value: &crate::state::VmCapabilities) -> crate::proto::v1:
             }
             crate::state::NetworkPolicyMode::NoNicIsolated => {
                 crate::proto::v1::NetworkPolicyMode::NoNicIsolated as i32
+            }
+            crate::state::NetworkPolicyMode::QemuUserNetworking => {
+                crate::proto::v1::NetworkPolicyMode::QemuUserNetworking as i32
             }
         },
         durable_volume: value.durable_volume,

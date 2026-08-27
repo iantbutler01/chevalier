@@ -55,16 +55,12 @@ macOS installation and cannot be replaced with blank storage. The command
 rejects existing or cross-device destinations and never falls back to a full
 copy.
 
-`run` loads an installed bundle, optionally attaches one read-only provisioning
-directory, or combines the requested runtime `sharedDirectories` into one
-`VZMultipleDirectoryShare` using Apple's macOS automount tag. The guest sees
-runtime entries by name below `/Volumes/My Shared Files`; vmd validates that
-native `AppleVirtIOFS` mount and creates the stable guest-path aliases before it
-reports the VM ready. Provisioning and runtime shares are mutually exclusive in
-one request. Runtime directory shares must name absolute existing host
-directories and unique valid directory names. Vmd passes only active host
-RemoteFuseFs mount roots here; sharing the local-view backing tree would bypass
-the VFS callbacks and WAL.
+`run` loads an installed bundle and may attach one read-only provisioning
+directory for image maintenance. Runtime workspaces are mounted by the signed
+guest `chevalier-vfs-fuse` service: it owns the APFS materialized tree, durable
+WAL, gateway publisher, and macFUSE FSKit mount. Product readiness waits for the
+guest mount sentinel and publisher status rather than treating VZ machine state
+as workspace readiness.
 
 Set `viewerMode` to `window` in the run request for a local diagnostic window;
 `headless` and an omitted value create no `NSWindow` or

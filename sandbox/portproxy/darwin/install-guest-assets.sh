@@ -36,18 +36,25 @@ BIN_DIR="$RUNTIME_ROOT/bin"
 ETC_DIR="$RUNTIME_ROOT/etc"
 LOG_DIR="/Library/Logs/Chevalier"
 DAEMON_DIR="/Library/LaunchDaemons"
+SERVICE_USER="openbracket"
 
+if ! /usr/bin/id "$SERVICE_USER" >/dev/null 2>&1; then
+  echo "the guest must have an $SERVICE_USER account before installing control services" >&2
+  exit 67
+fi
 umask 077
 install -d -o root -g wheel -m 0755 "$RUNTIME_ROOT" "$BIN_DIR" "$LOG_DIR"
 install -d -o root -g wheel -m 0700 "$ETC_DIR"
+touch "$LOG_DIR/portproxy.log"
+chown root:wheel "$LOG_DIR/portproxy.log"
+chmod 0644 "$LOG_DIR/portproxy.log"
 install -o root -g wheel -m 0755 "$SOURCE_DIR/portproxy" "$BIN_DIR/portproxy"
 install -o root -g wheel -m 0755 \
   "$SOURCE_DIR/portproxy-darwin-vsock-bridge" \
   "$BIN_DIR/portproxy-darwin-vsock-bridge"
-install -o root -g wheel -m 0755 "$SOURCE_DIR/launch-portproxy.sh" "$BIN_DIR/launch-portproxy.sh"
-printf "CHEVALIER_PORTPROXY_AUTH_TOKEN='%s'\n" "$AUTH_TOKEN" >"$ETC_DIR/portproxy.env"
-chown root:wheel "$ETC_DIR/portproxy.env"
-chmod 0600 "$ETC_DIR/portproxy.env"
+printf '%s\n' "$AUTH_TOKEN" >"$ETC_DIR/portproxy.token"
+chown root:wheel "$ETC_DIR/portproxy.token"
+chmod 0400 "$ETC_DIR/portproxy.token"
 install -o root -g wheel -m 0644 \
   "$SOURCE_DIR/com.bracket.portproxy.plist" \
   "$DAEMON_DIR/com.bracket.portproxy.plist"
@@ -67,6 +74,8 @@ launchctl bootstrap system "$DAEMON_DIR/com.bracket.vfs-vsock-bridge.plist"
 launchctl kickstart -k system/com.bracket.portproxy
 launchctl kickstart -k system/com.bracket.portproxy-vsock-bridge
 launchctl kickstart -k system/com.bracket.vfs-vsock-bridge
+
+rm -f "$ETC_DIR/portproxy.env" "$BIN_DIR/launch-portproxy.sh"
 
 echo "Installed Darwin guest control services."
 echo "Check with: launchctl print system/com.bracket.portproxy"

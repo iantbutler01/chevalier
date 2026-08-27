@@ -73,18 +73,26 @@ type FuseResult<T> = std::result::Result<T, Errno>;
 
 /// Open flags returned to the kernel for a file handle.
 ///
-/// `FOPEN_DIRECT_IO` used to be forced here because separate VMs had separate
-/// page caches over the same remote object and there was no cross-kernel
-/// invalidation channel, so a cached page could outlive the bytes it described.
-/// A single owner reading and writing its own backing tree has no such sibling:
-/// the guest's page cache is coherent with the only writer there is, and forcing
-/// direct I/O only turned every read and write into an unbuffered round trip
-/// through the FUSE transport.
+/// `FOPEN_DIRECT_IO` used to be forced on every platform because separate VMs
+/// had separate page caches over the same remote object. A single owner reading
+/// and writing its own backing tree does not need that Linux penalty.
+///
+/// macFUSE's FSKit bridge is different: cached writes can remain only in FSKit's
+/// system cache after close while FUSE has already received the release and
+/// sealed the unchanged backing file. Direct I/O keeps the durable local tree
+/// and WAL authoritative for ordinary close-without-fsync writers.
 ///
 /// `FUSE_WRITEBACK_CACHE` stays off (see `requested_init_capabilities_for`): it
 /// changes write semantics and needs measurement, which is not this step's work.
 fn remote_file_open_flags() -> FopenFlags {
-    FopenFlags::empty()
+    #[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+    {
+        FopenFlags::FOPEN_DIRECT_IO
+    }
+    #[cfg(not(all(target_os = "macos", feature = "macos-fskit")))]
+    {
+        FopenFlags::empty()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1224,6 +1232,12 @@ impl RemoteFuseFs {
         let mut config = fuser::Config::default();
         config.mount_options = mount_options;
         if cfg!(target_os = "macos") {
+            // The authoritative tree and WAL live on the guest's APFS disk.
+            // Marking the mount local avoids a first-use network-volume TCC
+            // prompt that a headless command service cannot dismiss.
+            config
+                .mount_options
+                .push(MountOption::CUSTOM("local".to_string()));
             // FSKit issues mount-bootstrap requests as root even when the file
             // system process belongs to the interactive sandbox account.
             config.acl = fuser::SessionACL::RootAndOwner;
@@ -1897,8 +1911,8 @@ impl RemoteFuseFs {
         // FUSE_WRITEBACK_CACHE is deliberately still not requested. It changes
         // write semantics (the kernel becomes authoritative for i_size and
         // batches writeback behind the daemon's back) and needs measurement
-        // before it can be trusted; direct I/O is no longer forced, so the
-        // ordinary page cache already covers the read path it would help.
+        // before it can be trusted. Linux keeps the ordinary page cache;
+        // macFUSE FSKit uses direct I/O to keep close-time sealing correct.
         let _ = read_only;
         InitFlags::FUSE_AUTO_INVAL_DATA | directory_prefetch
     }
@@ -1909,16 +1923,26 @@ impl RemoteFuseFs {
 mod tests {
     use std::time::Duration;
 
+    #[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+    use fuser::FopenFlags;
     use fuser::{InitFlags, LockNamespace};
     use tokio::runtime::Builder;
 
     use super::super::client::RemoteVfsClient;
     use super::super::local_view::types::{LocalKind, LocalMetadata, LocalTimestamp};
+    #[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+    use super::remote_file_open_flags;
     use super::{
         ActiveAdvisoryLockFile, ActiveAdvisoryLocks, InodeTable, LockWaitCancellation, ROOT_INO,
         RemoteFuseFs, active_advisory_lock_identities, combine_flush_and_lock_cleanup,
         creation_mode, take_active_advisory_lock_file_id, take_active_posix_handle_locks,
     };
+
+    #[cfg(all(target_os = "macos", feature = "macos-fskit"))]
+    #[test]
+    fn macos_fskit_bypasses_the_system_cache() {
+        assert_eq!(remote_file_open_flags(), FopenFlags::FOPEN_DIRECT_IO);
+    }
 
     #[test]
     fn surface_kind_uses_scoped_path_not_mount_relative_path() {

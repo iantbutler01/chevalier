@@ -24,6 +24,7 @@ use tracing::{debug, error, warn};
 
 use crate::child_tracker::ChildTracker;
 use crate::daemon::{DaemonError, DaemonRegistry, OutputKind, build_command_builder};
+use crate::execution_identity::configure_command;
 use crate::pb::bracket::portproxy::v1::daemon_manager_server::DaemonManager;
 use crate::pb::bracket::portproxy::v1::port_proxy_server::PortProxy;
 use crate::pb::bracket::portproxy::v1::shell_exec_server::ShellExec;
@@ -222,6 +223,8 @@ impl ShellExec for ShellExecService {
             command.env(key, value);
         }
         configure_child_process_group(&mut command);
+        configure_command(&mut command, start.run_as_root)
+            .map_err(|err| Status::internal(format!("configure command identity: {err}")))?;
 
         let mut child = command
             .spawn()
@@ -480,7 +483,8 @@ impl ShellExec for ShellExecService {
             } else {
                 Some(start.cwd.clone())
             }
-        });
+        })
+        .map_err(|err| Status::internal(format!("configure shell identity: {err}")))?;
 
         let child = pair
             .slave
@@ -1609,6 +1613,7 @@ mod tests {
                     env: HashMap::new(),
                     timeout: Some(timeout_secs),
                     detach: false,
+                    run_as_root: false,
                 }),
             ),
         })
@@ -1704,6 +1709,7 @@ mod tests {
                     env: HashMap::new(),
                     timeout: Some(2),
                     detach: false,
+                    run_as_root: false,
                 }),
             ),
         })

@@ -19,6 +19,7 @@ const PROTOCOL_VERSION: u32 = 1;
 const REQUEST_SCHEMA_VERSION: u32 = 1;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const CONTROL_VSOCK_PORT: u32 = 13_338;
+const VFS_VSOCK_PORT: u32 = 13_339;
 const HELPER_ENV: &str = "CHEVALIER_SANDBOX_VZ_HELPER_BIN";
 const LEGACY_HELPER_ENV: &str = "BRACKET_SANDBOX_VZ_HELPER_BIN";
 const PORTPROXY_TOKEN_FILE_ENV: &str = "CHEVALIER_SANDBOX_MACOS_PORTPROXY_TOKEN_FILE";
@@ -279,7 +280,7 @@ pub async fn launch(
         .ok()
         .filter(|port| *port > 0)
         .ok_or_else(|| anyhow!("macOS VZ control relay requires a valid loopback port"))?;
-    let shared_directories = directory_shares(shared_mounts)?;
+    let guest_service_relays = vfs_guest_service_relays(shared_mounts)?;
     let bundle_path = path_string(&paths.bundle)?;
     let owner_control_socket_path = path_string(&paths.control_socket)?;
     let request = RunRequest {
@@ -291,11 +292,11 @@ pub async fn launch(
             .saturating_mul(1024 * 1024),
         provisioning_directory_path: None,
         provisioning_directory_read_only: None,
-        network_mode: "none",
+        network_mode: "natDevelopment",
         viewer_mode: "headless",
         loopback_relay_port: rpc_port,
-        guest_service_relays: Vec::new(),
-        shared_directories,
+        guest_service_relays,
+        shared_directories: Vec::new(),
         owner_control_socket_path: &owner_control_socket_path,
         runtime_generation: generation,
     };
@@ -477,36 +478,48 @@ fn path_string(path: &Path) -> Result<String> {
         .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))
 }
 
-fn directory_shares(shared_mounts: &[SharedMountSpec]) -> Result<Vec<SharedDirectory>> {
-    let mut names = std::collections::HashSet::new();
-    shared_mounts
-        .iter()
-        .map(|mount| {
-            if mount.host_path.trim().is_empty() {
-                bail!("macOS VZ shared mount {} has no host path", mount.mount_tag);
+fn vfs_guest_service_relays(shared_mounts: &[SharedMountSpec]) -> Result<Vec<GuestServiceRelay>> {
+    let mut host_loopback_port = None;
+    for mount in shared_mounts {
+        if !mount.is_fuse_backed() {
+            bail!(
+                "macOS VZ shared mount {} must use the guest-native VFS profile",
+                mount.mount_tag
+            );
+        }
+        let endpoint = reqwest::Url::parse(&mount.vfs_endpoint).with_context(|| {
+            format!(
+                "parse macOS VFS endpoint for shared mount {}",
+                mount.mount_tag
+            )
+        })?;
+        if endpoint.scheme() != "http"
+            || !matches!(endpoint.host_str(), Some("127.0.0.1" | "localhost"))
+        {
+            bail!(
+                "macOS VFS endpoint must use host loopback HTTP: {}",
+                mount.vfs_endpoint
+            );
+        }
+        let port = endpoint
+            .port_or_known_default()
+            .ok_or_else(|| anyhow!("macOS VFS endpoint has no port: {}", mount.vfs_endpoint))?;
+        match host_loopback_port {
+            Some(existing) if existing != port => {
+                bail!("all macOS VFS mounts must use one host gateway port ({existing} != {port})")
             }
-            if !Path::new(&mount.host_path).is_absolute() {
-                bail!(
-                    "macOS VZ shared mount {} host path must be absolute",
-                    mount.mount_tag
-                );
-            }
-            if mount.mount_tag.is_empty() || mount.mount_tag.as_bytes().len() > 35 {
-                bail!(
-                    "macOS VZ shared mount name must contain 1...35 UTF-8 bytes: {:?}",
-                    mount.mount_tag
-                );
-            }
-            if !names.insert(mount.mount_tag.as_str()) {
-                bail!("duplicate macOS VZ shared mount name {}", mount.mount_tag);
-            }
-            Ok(SharedDirectory {
-                host_path: mount.host_path.clone(),
-                name: mount.mount_tag.clone(),
-                read_only: mount.read_only,
-            })
+            Some(_) => {}
+            None => host_loopback_port = Some(port),
+        }
+    }
+    Ok(host_loopback_port
+        .map(|host_loopback_port| {
+            vec![GuestServiceRelay {
+                vsock_port: VFS_VSOCK_PORT,
+                host_loopback_port,
+            }]
         })
-        .collect()
+        .unwrap_or_default())
 }
 
 pub fn control_vsock_port() -> u32 {
@@ -533,18 +546,22 @@ mod tests {
     }
 
     #[test]
-    fn maps_host_mounts_to_distinct_directory_shares() {
-        let shares = directory_shares(&[mount("workspace"), mount("tools")]).unwrap();
-        assert_eq!(shares.len(), 2);
-        assert_eq!(shares[0].host_path, "/tmp/workspace");
-        assert_eq!(shares[0].name, "workspace");
-        assert!(!shares[0].read_only);
+    fn maps_guest_vfs_to_host_gateway_relay() {
+        let relays = vfs_guest_service_relays(&[mount("workspace")]).unwrap();
+        assert_eq!(relays.len(), 1);
+        assert_eq!(relays[0].vsock_port, VFS_VSOCK_PORT);
+        assert_eq!(relays[0].host_loopback_port, 63339);
     }
 
     #[test]
-    fn rejects_invalid_or_duplicate_directory_share_names() {
-        assert!(directory_shares(&[mount("")]).is_err());
-        assert!(directory_shares(&[mount("workspace"), mount("workspace")]).is_err());
+    fn rejects_non_loopback_or_mixed_gateway_relays() {
+        let mut remote = mount("workspace");
+        remote.vfs_endpoint = "https://example.com/vfs".to_string();
+        assert!(vfs_guest_service_relays(&[remote]).is_err());
+
+        let mut second = mount("tools");
+        second.vfs_endpoint = "http://127.0.0.1:63340/vfs".to_string();
+        assert!(vfs_guest_service_relays(&[mount("workspace"), second]).is_err());
     }
 
     #[test]

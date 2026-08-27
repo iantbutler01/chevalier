@@ -18,8 +18,9 @@ use chevalier_sandbox::{
     HostPciInventory as EngineHostPciInventory, OpenComputerBackendConfig, OpenComputerMountConfig,
     PciDeviceAction as EnginePciDeviceAction, ResourceLimits, Sandbox as EngineSandbox,
     SandboxConfig, SandboxError, SandboxProviderConfig, Session as EngineSession,
-    SessionInfo as EngineSessionInfo, SessionOptions, SharedMount, SharedMountAvailability,
-    SharedMountContinuity, ShellEvent, ShellInput, ShellOptions,
+    SessionInfo as EngineSessionInfo, SessionOptions, SessionSourceType as EngineSessionSourceType,
+    SharedMount, SharedMountAvailability, SharedMountContinuity, ShellEvent, ShellInput,
+    ShellOptions,
 };
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
@@ -308,6 +309,7 @@ pub struct SessionOpts {
     pub session_id: Option<String>,
     pub name: Option<String>,
     pub image: Option<String>,
+    pub source_type: Option<SessionSourceType>,
     pub architecture: Option<String>,
     pub metadata: Option<HashMap<String, String>>,
     pub auto_start: Option<bool>,
@@ -319,12 +321,29 @@ pub struct SessionOpts {
     pub volume_size_gb: Option<u32>,
 }
 
-impl From<SessionOpts> for SessionOptions {
-    fn from(o: SessionOpts) -> Self {
-        SessionOptions {
+#[napi(string_enum = "kebab-case")]
+pub enum SessionSourceType {
+    Docker,
+    Snapshot,
+    MacosTemplate,
+    WindowsTemplate,
+}
+
+impl TryFrom<SessionOpts> for SessionOptions {
+    type Error = SandboxError;
+
+    fn try_from(o: SessionOpts) -> Result<Self, Self::Error> {
+        let source_type = match o.source_type.unwrap_or(SessionSourceType::Docker) {
+            SessionSourceType::Docker => EngineSessionSourceType::Docker,
+            SessionSourceType::Snapshot => EngineSessionSourceType::Snapshot,
+            SessionSourceType::MacosTemplate => EngineSessionSourceType::MacosTemplate,
+            SessionSourceType::WindowsTemplate => EngineSessionSourceType::WindowsTemplate,
+        };
+        Ok(SessionOptions {
             session_id: o.session_id,
             name: o.name,
             image: o.image,
+            source_type,
             architecture: o.architecture,
             metadata: o.metadata.unwrap_or_default(),
             auto_start: o.auto_start.unwrap_or(true),
@@ -345,7 +364,7 @@ impl From<SessionOpts> for SessionOptions {
                 .and_then(|value| i32::try_from(value).ok())
                 .filter(|value| *value > 0),
             ..Default::default()
-        }
+        })
     }
 }
 
@@ -1075,7 +1094,11 @@ impl Sandbox {
     /// Create a new session (microVM).
     #[napi]
     pub async fn session(&self, options: Option<SessionOpts>) -> napi::Result<Session> {
-        let opts = options.map(Into::into).unwrap_or_default();
+        let opts = options
+            .map(SessionOptions::try_from)
+            .transpose()
+            .map_err(sb_err)?
+            .unwrap_or_default();
         let s = self.inner.session(opts).await.map_err(sb_err)?;
         Ok(Session { inner: s })
     }

@@ -1752,6 +1752,7 @@ async fn handle_exec_run_command(
                 env: payload.env,
                 detach: payload.detach,
                 timeout: payload.timeout_secs,
+                run_as_root: false,
             })),
         })
         .await

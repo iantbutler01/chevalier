@@ -48,6 +48,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Command;
@@ -87,6 +88,117 @@ pub struct StatusInfo {
 
 const DEFAULT_D2VM_IMAGE: &str = "linkacloud/d2vm:latest";
 const D2VM_CONTAINER_DIR: &str = "/workspace";
+const D2VM_BOOTSTRAP_CONTEXT: &str = ".chevalier-bootstrap-image";
+const D2VM_BOOTSTRAP_LOADER: &str = r#"#!/bin/sh
+set -eu
+
+mount_dir=/run/chevalier-bootstrap
+marker=/var/lib/chevalier/bootstrap.sha256
+mkdir -p "$mount_dir" "$(dirname "$marker")"
+
+device=""
+for _ in $(seq 1 120); do
+  device=$(blkid -L brkboot 2>/dev/null || blkid -L BRKBOOT 2>/dev/null || true)
+  if [ -n "$device" ] && [ -b "$device" ]; then
+    break
+  fi
+  sleep 0.25
+done
+if [ -z "$device" ] || [ ! -b "$device" ]; then
+  echo "chevalier bootstrap volume was not found" >&2
+  exit 1
+fi
+
+mount -o ro "$device" "$mount_dir"
+trap 'umount "$mount_dir" 2>/dev/null || true' EXIT
+script=$(find "$mount_dir" -maxdepth 1 -type f -iname init.sh -print -quit)
+if [ -z "$script" ]; then
+  echo "chevalier bootstrap script was not found" >&2
+  exit 1
+fi
+
+digest=$(sha256sum "$script" | awk '{print $1}')
+if [ -f "$marker" ] && [ "$(cat "$marker")" = "$digest" ]; then
+  exit 0
+fi
+
+/bin/bash "$script"
+printf '%s\n' "$digest" >"$marker"
+"#;
+const D2VM_BOOTSTRAP_SERVICE: &str = r#"[Unit]
+Description=Install Chevalier guest runtime
+After=local-fs.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/chevalier-bootstrap
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+"#;
+
+async fn build_d2vm_bootstrap_image(
+    docker_bin: &str,
+    host_dir: &Path,
+    source_image: &str,
+    platform: Option<&str>,
+    pull: bool,
+) -> Result<String> {
+    let context_dir = host_dir.join(D2VM_BOOTSTRAP_CONTEXT);
+    std::fs::create_dir_all(&context_dir)
+        .with_context(|| format!("create d2vm bootstrap context {}", context_dir.display()))?;
+    std::fs::write(
+        context_dir.join("Dockerfile"),
+        r#"ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+COPY --chmod=0755 chevalier-bootstrap /usr/local/sbin/chevalier-bootstrap
+COPY chevalier-bootstrap.service /etc/systemd/system/chevalier-bootstrap.service
+RUN mkdir -p /etc/systemd/system/multi-user.target.wants && \
+    ln -sfn /etc/systemd/system/chevalier-bootstrap.service /etc/systemd/system/multi-user.target.wants/chevalier-bootstrap.service
+"#,
+    )
+    .with_context(|| format!("write d2vm bootstrap Dockerfile in {}", context_dir.display()))?;
+    std::fs::write(
+        context_dir.join("chevalier-bootstrap"),
+        D2VM_BOOTSTRAP_LOADER,
+    )
+    .with_context(|| format!("write d2vm bootstrap loader in {}", context_dir.display()))?;
+    std::fs::write(
+        context_dir.join("chevalier-bootstrap.service"),
+        D2VM_BOOTSTRAP_SERVICE,
+    )
+    .with_context(|| format!("write d2vm bootstrap service in {}", context_dir.display()))?;
+
+    let fingerprint = format!(
+        "{source_image}\n{}\n{D2VM_BOOTSTRAP_LOADER}\n{D2VM_BOOTSTRAP_SERVICE}",
+        platform.unwrap_or_default()
+    );
+    let digest = format!("{:x}", Sha256::digest(fingerprint.as_bytes()));
+    let image = format!("chevalier-d2vm-bootstrap:{}", &digest[..24]);
+    let mut cmd = Command::new(docker_bin);
+    cmd.arg("build")
+        .arg("--build-arg")
+        .arg(format!("BASE_IMAGE={source_image}"))
+        .arg("--tag")
+        .arg(&image);
+    if pull {
+        cmd.arg("--pull");
+    }
+    if let Some(platform) = platform.filter(|value| !value.trim().is_empty()) {
+        cmd.arg("--platform").arg(platform);
+    }
+    cmd.arg(&context_dir);
+    let output = cmd.output().await.context("build d2vm bootstrap image")?;
+    if !output.status.success() {
+        bail!(
+            "build d2vm bootstrap image failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(image)
+}
 
 fn configured_d2vm_bin() -> Option<String> {
     std::env::var("CHEVALIER_SANDBOX_D2VM_BIN")
@@ -130,6 +242,14 @@ fn configured_d2vm_host_workdir() -> Option<PathBuf> {
         .filter(|path| !path.as_os_str().is_empty())
 }
 
+fn configured_d2vm_container_platform() -> Option<String> {
+    std::env::var("CHEVALIER_SANDBOX_D2VM_CONTAINER_PLATFORM")
+        .or_else(|_| std::env::var("BRACKET_SANDBOX_D2VM_CONTAINER_PLATFORM"))
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn parse_env_bool(raw: &str) -> bool {
     matches!(
         raw.trim().to_ascii_lowercase().as_str(),
@@ -137,12 +257,22 @@ fn parse_env_bool(raw: &str) -> bool {
     )
 }
 
-fn host_container_platform() -> Option<&'static str> {
+fn host_container_platform() -> Option<String> {
     match std::env::consts::ARCH {
-        "aarch64" | "arm64" => Some("linux/arm64"),
-        "x86_64" | "amd64" => Some("linux/amd64"),
+        "aarch64" | "arm64" => Some("linux/arm64".to_string()),
+        "x86_64" | "amd64" => Some("linux/amd64".to_string()),
         _ => None,
     }
+}
+
+fn d2vm_container_platform(image: &str) -> Option<String> {
+    configured_d2vm_container_platform().or_else(|| {
+        if image == DEFAULT_D2VM_IMAGE {
+            Some("linux/amd64".to_string())
+        } else {
+            host_container_platform()
+        }
+    })
 }
 
 pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> Result<()> {
@@ -158,11 +288,24 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
     } else {
         opts.output.clone()
     };
-    let converter_platform = host_container_platform();
+    let converter_platform = d2vm_container_platform(&d2vm_image);
     let disk_gb = if opts.disk_gb <= 0 { 10 } else { opts.disk_gb };
     let host_dir = host_dir
         .canonicalize()
         .with_context(|| format!("canonicalize {}", host_dir.display()))?;
+    let conversion_image = if opts.include_bootstrap && !include_bootstrap_arg {
+        build_d2vm_bootstrap_image(
+            docker_bin,
+            &host_dir,
+            &opts.image,
+            opts.platform.as_deref(),
+            opts.pull,
+        )
+        .await?
+    } else {
+        opts.image.clone()
+    };
+    let conversion_pull = opts.pull && conversion_image == opts.image;
     // When vmd itself runs in a container with the host Docker socket, `host_dir`
     // is a path in vmd's mount namespace. The sibling converter container needs
     // the corresponding Docker-host path so both containers see the same bind.
@@ -174,11 +317,11 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
         );
     }
     debug!(
-        image = %opts.image,
+        image = %conversion_image,
         output = %output_name,
         disk_gb,
         platform = ?opts.platform,
-        pull = opts.pull,
+        pull = conversion_pull,
         include_bootstrap = opts.include_bootstrap,
         include_bootstrap_arg,
         docker_api_version = ?docker_api_version,
@@ -195,12 +338,12 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
         cmd.current_dir(&host_dir)
             .arg("--verbose")
             .arg("convert")
-            .arg(&opts.image)
+            .arg(&conversion_image)
             .arg("--output")
             .arg(&output_name)
             .arg("--size")
             .arg(format!("{disk_gb}G"));
-        if opts.pull {
+        if conversion_pull {
             cmd.arg("--pull");
         }
         if let Some(platform) = &opts.platform {
@@ -236,10 +379,9 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
             ))
             .arg("-w")
             .arg(D2VM_CONTAINER_DIR)
-            // Force converter image to host architecture so qemu-img itself never runs under
-            // Rosetta/user-mode emulation on Apple Silicon.
             .args(
                 converter_platform
+                    .as_deref()
                     .map(|platform| vec!["--platform", platform])
                     .unwrap_or_default(),
             );
@@ -249,13 +391,13 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
         cmd.arg(&d2vm_image)
             .arg("--verbose")
             .arg("convert")
-            .arg(&opts.image)
+            .arg(&conversion_image)
             .arg("--output")
             .arg(&output_name)
             .arg("--size")
             .arg(format!("{disk_gb}G"));
 
-        if opts.pull {
+        if conversion_pull {
             cmd.arg("--pull");
         }
         if let Some(platform) = &opts.platform {
@@ -1513,6 +1655,17 @@ impl MonitorHandle {
         }
         Ok(())
     }
+
+    pub async fn blockdev_del(&self, node_name: &str) -> Result<()> {
+        self.execute(
+            "blockdev-del",
+            Some(json!({
+                "node-name": node_name,
+            })),
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 struct QmpConnection {
@@ -1978,7 +2131,7 @@ exit 2
             r#"#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "{log_path}"
-if [ "${{1:-}}" = "run" ]; then
+if [ "${{1:-}}" = "run" ] || [ "${{1:-}}" = "build" ]; then
   exit 0
 fi
 echo "unsupported args: $*" >&2
@@ -2010,6 +2163,8 @@ exit 2
             std::env::remove_var("BRACKET_SANDBOX_D2VM_DOCKER_API_VERSION");
             std::env::remove_var("CHEVALIER_SANDBOX_D2VM_HOST_WORKDIR");
             std::env::remove_var("BRACKET_SANDBOX_D2VM_HOST_WORKDIR");
+            std::env::remove_var("CHEVALIER_SANDBOX_D2VM_CONTAINER_PLATFORM");
+            std::env::remove_var("BRACKET_SANDBOX_D2VM_CONTAINER_PLATFORM");
             std::env::remove_var("DOCKER_API_VERSION");
         }
     }
@@ -2027,7 +2182,7 @@ exit 2
 
     #[tokio::test(flavor = "current_thread")]
     #[allow(clippy::await_holding_lock)]
-    async fn run_d2vm_uses_public_converter_without_private_bootstrap_flag_by_default() {
+    async fn run_d2vm_wraps_the_guest_image_with_the_public_converter_by_default() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         clear_d2vm_env();
         let (tmp, docker_bin, log_path) = create_fake_d2vm_docker();
@@ -2038,7 +2193,18 @@ exit 2
 
         let log = fs::read_to_string(log_path).expect("read fake docker log");
         assert!(log.contains("linkacloud/d2vm:latest"));
+        assert!(log.contains("build --build-arg BASE_IMAGE=ubuntu:22.04"));
+        assert!(log.contains("chevalier-d2vm-bootstrap:"));
+        assert_eq!(log.matches("--platform linux/amd64").count(), 3);
         assert!(!log.contains("--include-bootstrap"));
+        let loader = fs::read_to_string(
+            tmp.path()
+                .join(D2VM_BOOTSTRAP_CONTEXT)
+                .join("chevalier-bootstrap"),
+        )
+        .expect("read generated bootstrap loader");
+        assert!(loader.contains("blkid -L brkboot"));
+        assert!(loader.contains("/bin/bash \"$script\""));
         clear_d2vm_env();
     }
 
@@ -2058,6 +2224,7 @@ exit 2
 
         let log = fs::read_to_string(log_path).expect("read fake docker log");
         assert!(log.contains("--include-bootstrap"));
+        assert!(!log.contains("build --build-arg"));
         clear_d2vm_env();
     }
 

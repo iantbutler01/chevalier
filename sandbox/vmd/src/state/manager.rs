@@ -32,8 +32,11 @@ use crate::bootstrap;
 use crate::config::{self, Config};
 use crate::fuse;
 use crate::guest::macos_vz;
+use crate::guest::windows_qemu;
 use crate::guest_exec_probe::{
-    portproxy_auth_header_from_metadata, probe_guest_exec_ready_anyhow, run_guest_shell_exec,
+    portproxy_auth_header_from_metadata, prepare_guest_shutdown, probe_guest_exec_ready_anyhow,
+    probe_guest_exec_ready_for_platform, run_guest_exec_args, run_guest_shell_exec,
+    write_guest_file,
 };
 use crate::image::{self, BASE_IMAGE_EXT, BASE_IMAGE_SIZE_GB, PrebuiltImageStatus};
 use crate::network;
@@ -93,6 +96,9 @@ const META_NETWORK_POLICY_PROXY_UPSTREAM: &str = "chevalier.network_policy_proxy
 const META_NETWORK_EGRESS_SNAPSHOT: &str = "chevalier.network_egress";
 const META_PORTPROXY_AUTH_TOKEN: &str = "chevalier.portproxy_auth_token";
 const META_VZ_RUNTIME_GENERATION: &str = "chevalier.vz_runtime_generation";
+const META_WINDOWS_RUNTIME_GENERATION: &str = "chevalier.windows_runtime_generation";
+const META_WINDOWS_TEMPLATE_STATUS: &str = "chevalier.windows_template_status";
+const META_WINDOWS_TEMPLATE_PRODUCTION_READY: &str = "chevalier.windows_template_production_ready";
 const MAINTENANCE_DIR_NAME: &str = "_maintenance";
 const FORK_COMPACTION_QUEUE_DIR_NAME: &str = "fork_compaction_queue";
 const MAX_VM_VCPU: i32 = 8;
@@ -272,6 +278,7 @@ pub struct VmHealthProbeTarget {
     pub rpc_port: i32,
     pub portproxy_auth_token: Option<String>,
     pub started_at: DateTime<Utc>,
+    pub platform: GuestPlatform,
 }
 
 #[derive(Clone)]
@@ -1746,6 +1753,7 @@ impl Manager {
                     .get(META_PORTPROXY_AUTH_TOKEN)
                     .cloned(),
                 started_at,
+                platform: inner.metadata.guest_profile.platform,
             });
         }
         targets
@@ -1924,6 +1932,9 @@ impl Manager {
         if matches!(params.source.source_type, VmSourceType::MacosTemplate) {
             return self.create_macos_vz_vm(params, name, progress).await;
         }
+        if matches!(params.source.source_type, VmSourceType::WindowsTemplate) {
+            return self.create_windows_qemu_vm(params, name, progress).await;
+        }
 
         let mac = random_mac().map_err(ManagerError::Other)?;
         let requested_arch_str = normalize_arch(&params.architecture)?;
@@ -1965,6 +1976,7 @@ impl Manager {
                 }
             }
             VmSourceType::MacosTemplate => unreachable!("macOS creation dispatched above"),
+            VmSourceType::WindowsTemplate => unreachable!("Windows creation dispatched above"),
         };
 
         let arch = resolved_arch
@@ -2010,7 +2022,7 @@ impl Manager {
 
         let id = Uuid::new_v4().to_string();
         let vm_dir = PathBuf::from(&self.cfg.data_dir).join(&id);
-        fs::create_dir_all(&vm_dir)?;
+        create_private_vm_dir(&vm_dir)?;
 
         let mut meta = VmMetadata {
             id: id.clone(),
@@ -2106,6 +2118,7 @@ impl Manager {
                 }
             }
             VmSourceType::MacosTemplate => unreachable!("macOS creation dispatched above"),
+            VmSourceType::WindowsTemplate => unreachable!("Windows creation dispatched above"),
         };
         vm_guard = match create_result {
             Ok(vm_guard) => vm_guard,
@@ -2213,7 +2226,7 @@ impl Manager {
             macos_vz::load_template_descriptor(&template_path).map_err(ManagerError::Other)?;
         let id = Uuid::new_v4().to_string();
         let vm_dir = PathBuf::from(&self.cfg.data_dir).join(&id);
-        fs::create_dir_all(&vm_dir)?;
+        create_private_vm_dir(&vm_dir)?;
         let runtime = VmRuntime::new(&vm_dir);
         let paths = macos_vz::RuntimePaths::new(&vm_dir, &runtime.runtime_dir);
 
@@ -2246,9 +2259,9 @@ impl Manager {
             service_manager: "launchd".to_string(),
         };
         let capabilities = VmCapabilities {
-            workspace_transport: WorkspaceTransport::VirtioFs,
+            workspace_transport: WorkspaceTransport::MacfuseFskit,
             workspace_mode: WorkspaceMode::OwnerOnly,
-            network_policy_mode: NetworkPolicyMode::NoNicIsolated,
+            network_policy_mode: NetworkPolicyMode::QemuUserNetworking,
             durable_volume: false,
             docker: false,
             managed_services: false,
@@ -2355,6 +2368,232 @@ impl Manager {
                 CreateVmStage::StartVm,
                 100,
                 "macOS VZ guest started".to_string(),
+            );
+        } else {
+            emit_stage_progress(
+                &progress,
+                CreateVmStage::StartVm,
+                100,
+                "auto-start disabled".to_string(),
+            );
+        }
+        Ok(meta)
+    }
+
+    async fn create_windows_qemu_vm(
+        &self,
+        mut params: CreateVmParams,
+        name: String,
+        progress: Option<CreateVmProgressCallback>,
+    ) -> ManagerResult<VmMetadata> {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            return Err(ManagerError::Unsupported(
+                "Windows QEMU guests require a Linux/KVM or macOS/HVF host".to_string(),
+            ));
+        }
+        if params.guest_profile.platform != GuestPlatform::Windows {
+            return Err(ManagerError::Unsupported(
+                "Windows template creation requires an explicit Windows guest profile".to_string(),
+            ));
+        }
+        if !params.pci_device_ids.is_empty() {
+            return Err(ManagerError::Unsupported(
+                "PCI assignment is unavailable for Windows template guests".to_string(),
+            ));
+        }
+        if !params.storage_profile.trim().is_empty()
+            && params.storage_profile.trim() != "local-ephemeral"
+        {
+            return Err(ManagerError::Unsupported(
+                "durable Windows data volumes are not implemented".to_string(),
+            ));
+        }
+        if params.volume_owner_key.is_some() || params.volume_size_gb.is_some() {
+            return Err(ManagerError::Unsupported(
+                "durable Windows data volumes are not implemented".to_string(),
+            ));
+        }
+        if params.shared_mounts.len() != 1 || !params.shared_mounts[0].is_fuse_backed() {
+            return Err(ManagerError::Unsupported(
+                "the Windows WinFsp profile requires exactly one VFS-backed workspace mount"
+                    .to_string(),
+            ));
+        }
+
+        let template_path = PathBuf::from(params.source.reference.trim());
+        let template =
+            windows_qemu::load_template_descriptor(&template_path).map_err(ManagerError::Other)?;
+        let architecture = windows_qemu::admit_native_architecture(
+            &template.architecture,
+            &params.architecture,
+            &self.host_arch,
+        )
+        .map_err(|error| ManagerError::Unsupported(error.to_string()))?;
+        let template_disk_gb = template.virtual_size_bytes.div_ceil(1024_u64.pow(3)) as i32;
+        params.resources.disk_gb = params.resources.disk_gb.max(template_disk_gb);
+        enforce_resource_bounds(&params.resources, self.resource_bounds)?;
+
+        let id = Uuid::new_v4().to_string();
+        let vm_dir = PathBuf::from(&self.cfg.data_dir).join(&id);
+        create_private_vm_dir(&vm_dir)?;
+        let runtime = VmRuntime::new(&vm_dir);
+
+        let mut profile = params.guest_profile;
+        profile.platform = GuestPlatform::Windows;
+        profile.architecture = architecture.clone();
+        if profile.schema_version == 0 {
+            profile.schema_version = 1;
+        }
+        profile.template_id = template.profile.clone();
+        profile.template_digest = format!("sha256:{}", template.disk_sha256);
+        profile.machine_profile = match architecture.as_str() {
+            ARCH_AMD64 => "qemu-q35-uefi".to_string(),
+            ARCH_ARM64 => "qemu-virt-10.2-uefi".to_string(),
+            _ => unreachable!("native architecture admission already validated"),
+        };
+
+        let guest_runtime = GuestRuntime {
+            platform: GuestPlatform::Windows,
+            architecture: architecture.clone(),
+            home_dir: r"C:\Users\Administrator".to_string(),
+            workspace_root: r"W:\".to_string(),
+            workspace_alias: Some(r"C:\OpenBracket\workspace".to_string()),
+            temp_dir: r"C:\Windows\Temp".to_string(),
+            runtime_dir: r"C:\ProgramData\OpenBracket\runtime".to_string(),
+            environment_file_root: r"C:\ProgramData\OpenBracket\env".to_string(),
+            default_shell: r"C:\Program Files\PowerShell\7\pwsh.exe".to_string(),
+            service_manager: "scm".to_string(),
+        };
+        let capabilities = VmCapabilities {
+            workspace_transport: WorkspaceTransport::Winfsp,
+            workspace_mode: WorkspaceMode::OwnerOnly,
+            network_policy_mode: NetworkPolicyMode::QemuUserNetworking,
+            durable_volume: false,
+            docker: false,
+            managed_services: false,
+            pause_resume: true,
+            cold_checkpoint: false,
+            same_host_saved_state: false,
+            stopped_fork: false,
+            running_fork: false,
+            computer_use: false,
+            pci: false,
+            cross_node_restore: false,
+        };
+
+        let mut metadata = params.metadata;
+        metadata.insert(
+            META_STORAGE_PROFILE.to_string(),
+            "local-ephemeral".to_string(),
+        );
+        metadata.insert(
+            META_WINDOWS_TEMPLATE_STATUS.to_string(),
+            template.status.clone(),
+        );
+        metadata.insert(
+            META_WINDOWS_TEMPLATE_PRODUCTION_READY.to_string(),
+            template.production_ready.to_string(),
+        );
+        assign_new_portproxy_auth_token(&mut metadata);
+        if !template.production_ready {
+            warn!(
+                template = %template.profile,
+                status = %template.status,
+                "creating Windows VM from a diagnostic template"
+            );
+        }
+
+        let mut meta = VmMetadata {
+            id: id.clone(),
+            name,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            state: VmState::Creating,
+            architecture,
+            guest_profile: profile,
+            guest_runtime,
+            capabilities,
+            source: params.source,
+            resources: params.resources,
+            network: NetworkSpec {
+                mac: random_mac().map_err(ManagerError::Other)?,
+                proxy_port: 0,
+                rpc_port: 0,
+            },
+            metadata,
+            snapshots: Vec::new(),
+            shared_mounts: params.shared_mounts,
+            pci_devices: Vec::new(),
+            durable_volume: None,
+            boot_incoming_ram_path: String::new(),
+            started_at: None,
+        };
+        save_metadata(&vm_dir, &mut meta).map_err(ManagerError::Other)?;
+        let vm = Arc::new(Vm::new(meta.clone(), runtime, vm_dir.clone()));
+        if let Err(error) = self
+            .insert_creating_vm_with_capacity(id.clone(), vm.clone())
+            .await
+        {
+            let _ = remove_vm_dir_if_detached(&id, &vm_dir);
+            return Err(error);
+        }
+
+        emit_stage_progress(
+            &progress,
+            CreateVmStage::ConvertImage,
+            0,
+            "instantiating Windows QEMU template".to_string(),
+        );
+        if let Err(error) = windows_qemu::instantiate_template(
+            &template,
+            &vm_dir,
+            meta.resources.disk_gb,
+            &self.cfg.qemu_img_bin,
+        )
+        .await
+        {
+            self.vms.write().await.remove(&id);
+            let _ = remove_vm_dir_if_detached(&id, &vm_dir);
+            return Err(ManagerError::Other(error));
+        }
+        emit_stage_progress(
+            &progress,
+            CreateVmStage::ConvertImage,
+            100,
+            "Windows QEMU template instantiated".to_string(),
+        );
+
+        {
+            let mut inner = vm.lock().await;
+            inner.runtime.state = VmState::Stopped;
+            inner.metadata.state = VmState::Stopped;
+            save_metadata(&vm.dir, &mut inner.metadata).map_err(ManagerError::Other)?;
+            meta = inner.metadata.clone();
+        }
+        if let Some(session_id) = meta
+            .metadata
+            .get(META_SESSION_ID)
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.session_registry
+                .write()
+                .await
+                .insert(session_id.clone(), id.clone());
+        }
+
+        if params.auto_start {
+            emit_stage_progress(
+                &progress,
+                CreateVmStage::StartVm,
+                0,
+                "starting Windows QEMU guest".to_string(),
+            );
+            meta = self.start_vm(&id).await?;
+            emit_stage_progress(
+                &progress,
+                CreateVmStage::StartVm,
+                100,
+                "Windows QEMU guest started".to_string(),
             );
         } else {
             emit_stage_progress(
@@ -2560,6 +2799,11 @@ impl Manager {
             if is_macos_vz(&inner.metadata) {
                 return Err(ManagerError::Unsupported(
                     "macOS VZ guest fork is not implemented".to_string(),
+                ));
+            }
+            if is_windows_qemu(&inner.metadata) {
+                return Err(ManagerError::Unsupported(
+                    "Windows QEMU guest fork is not implemented".to_string(),
                 ));
             }
             if !inner.metadata.pci_devices.is_empty() {
@@ -3195,6 +3439,11 @@ impl Manager {
                 "macOS VZ guest snapshots are not implemented".to_string(),
             ));
         }
+        if is_windows_qemu(&vm.lock().await.metadata) {
+            return Err(ManagerError::Unsupported(
+                "Windows QEMU guest snapshots are not implemented".to_string(),
+            ));
+        }
         let pending = self.create_snapshot_qemu_phase(vm_id, params).await?;
         self.promote_staged_snapshot(vm_id, pending).await
     }
@@ -3610,37 +3859,18 @@ impl Manager {
             return Err(ManagerError::Other(error));
         }
 
-        let mut launch_mounts = shared_mounts;
-        let mut fuse_handles = Vec::new();
-        for mount in &mut launch_mounts {
-            if !mount.is_fuse_backed() {
-                continue;
-            }
-            let handle = match fuse::mount_vfs_fuse(&self.cfg, mount, vm.dir.as_path()).await {
-                Ok(handle) => handle,
-                Err(error) => {
-                    cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
-                    mark_vm_state(&vm, VmState::Error).await;
-                    return Err(ManagerError::Other(error));
-                }
-            };
-            mount.host_path = handle.mountpoint().to_string_lossy().into_owned();
-            fuse_handles.push(handle);
-        }
-
         let mut child = match macos_vz::launch(
             &helper,
             &paths,
             &resources,
             rpc_port,
-            &launch_mounts,
+            &shared_mounts,
             &generation,
         )
         .await
         {
             Ok(child) => child,
             Err(error) => {
-                cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
                 mark_vm_state(&vm, VmState::Error).await;
                 return Err(ManagerError::Other(error));
             }
@@ -3658,14 +3888,18 @@ impl Manager {
             Err(error) => {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
                 mark_vm_state(&vm, VmState::Error).await;
                 return Err(ManagerError::Other(error));
             }
         };
         let pid = response.pid.or(child_pid);
-        if let Err(error) =
-            prepare_macos_vz_shared_directories(rpc_port, &portproxy_metadata, &launch_mounts).await
+        if let Err(error) = prepare_macos_vz_guest_vfs(
+            rpc_port,
+            &portproxy_metadata,
+            &shared_mounts,
+            self.cfg.vfs_internal_service_token.as_deref(),
+        )
+        .await
         {
             let _ = macos_vz::request(
                 &paths.control_socket,
@@ -3675,7 +3909,6 @@ impl Manager {
             .await;
             let _ = child.kill().await;
             let _ = child.wait().await;
-            cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
             mark_vm_state(&vm, VmState::Error).await;
             return Err(ManagerError::Other(error));
         }
@@ -3684,7 +3917,6 @@ impl Manager {
             inner.runtime.state = VmState::Running;
             inner.runtime.started_at = Some(Utc::now());
             inner.runtime.command_pid = pid;
-            inner.runtime.fuse_handles = fuse_handles;
             inner.runtime.reset_health_tracking();
             inner.metadata.state = VmState::Running;
             inner.metadata.started_at = inner.runtime.started_at;
@@ -4269,6 +4501,14 @@ impl Manager {
             cleanup_stale_runtime_sidecars(id, vm_dir.as_path(), runtime_dir.as_path()).await;
         }
 
+        let windows_qemu_guest = is_windows_qemu(&meta_snapshot);
+        if windows_qemu_guest && requires_managed_tap_network(&cfg, &meta_snapshot) {
+            mark_vm_state(&vm, VmState::Error).await;
+            return Err(ManagerError::Unsupported(
+                "managed TAP networking is not ready for Windows guests; use loopback-bound QEMU user networking"
+                    .to_string(),
+            ));
+        }
         let use_managed_tap_network = requires_managed_tap_network(&cfg, &meta_snapshot);
         let (tap_spec, vm_proxy_upstream_addr) = if use_managed_tap_network {
             let mut reserved_proxy_ports = HashSet::from([
@@ -4308,32 +4548,71 @@ impl Manager {
                 .remove(META_NETWORK_POLICY_PROXY_UPSTREAM);
             (None, None)
         };
-        if let Err(err) = bootstrap::create_iso(
-            vm_dir.join("bootstrap.iso"),
-            bootstrap::Config {
-                instance_id: meta_snapshot.id.clone(),
-                hostname: meta_snapshot.name.clone(),
-                arch: meta_snapshot.architecture.clone(),
-                shared_mounts: meta_snapshot
-                    .shared_mounts
-                    .iter()
-                    .cloned()
-                    .map(map_bootstrap_shared_mount)
-                    .collect(),
-                network: tap_spec
-                    .as_ref()
-                    .map(|_| map_bootstrap_network(&meta_snapshot)),
-                http_proxy_url: None,
-                portproxy_auth_token: meta_snapshot
+        if !windows_qemu_guest {
+            if let Err(err) = bootstrap::create_iso(
+                vm_dir.join("bootstrap.iso"),
+                bootstrap::Config {
+                    instance_id: meta_snapshot.id.clone(),
+                    hostname: meta_snapshot.name.clone(),
+                    arch: meta_snapshot.architecture.clone(),
+                    shared_mounts: meta_snapshot
+                        .shared_mounts
+                        .iter()
+                        .cloned()
+                        .map(map_bootstrap_shared_mount)
+                        .collect(),
+                    network: tap_spec
+                        .as_ref()
+                        .map(|_| map_bootstrap_network(&meta_snapshot)),
+                    http_proxy_url: None,
+                    portproxy_auth_token: meta_snapshot
+                        .metadata
+                        .get(META_PORTPROXY_AUTH_TOKEN)
+                        .cloned(),
+                    durable_volume: meta_snapshot.durable_volume.is_some(),
+                },
+            ) {
+                let _ = network::unregister_vm_proxy_policy(id).await;
+                mark_vm_state(&vm, VmState::Error).await;
+                return Err(ManagerError::Other(err));
+            }
+        } else {
+            let generation = Uuid::new_v4().to_string();
+            let Some(vfs_service_token) = cfg
+                .vfs_internal_service_token
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            else {
+                mark_vm_state(&vm, VmState::Error).await;
+                return Err(ManagerError::Other(anyhow!(
+                    "Windows guest runtime requires CHEVALIER_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN"
+                )));
+            };
+            meta_snapshot.metadata.insert(
+                META_WINDOWS_RUNTIME_GENERATION.to_string(),
+                generation.clone(),
+            );
+            if let Err(error) = windows_qemu::create_runtime_config_iso(
+                &meta_snapshot,
+                vm_dir.as_path(),
+                &generation,
+                vfs_service_token,
+            ) {
+                mark_vm_state(&vm, VmState::Error).await;
+                return Err(ManagerError::Other(error));
+            }
+            let persist_result = {
+                let mut inner = vm.lock().await;
+                inner
                     .metadata
-                    .get(META_PORTPROXY_AUTH_TOKEN)
-                    .cloned(),
-                durable_volume: meta_snapshot.durable_volume.is_some(),
-            },
-        ) {
-            let _ = network::unregister_vm_proxy_policy(id).await;
-            mark_vm_state(&vm, VmState::Error).await;
-            return Err(ManagerError::Other(err));
+                    .metadata
+                    .insert(META_WINDOWS_RUNTIME_GENERATION.to_string(), generation);
+                save_metadata(&vm.dir, &mut inner.metadata)
+            };
+            if let Err(error) = persist_result {
+                mark_vm_state(&vm, VmState::Error).await;
+                return Err(ManagerError::Other(error));
+            }
         }
 
         // @dive: Spawn one virtiofsd subprocess per shared mount BEFORE launching
@@ -4349,7 +4628,7 @@ impl Manager {
         //        live migration, but keeps the dev workflow running on non-Linux hosts.
         let mut fuse_handles: Vec<fuse::FuseHandle> = Vec::new();
         for mount in &mut meta_snapshot.shared_mounts {
-            if mount.is_fuse_backed() {
+            if !windows_qemu_guest && mount.is_fuse_backed() {
                 let handle = match fuse::mount_vfs_fuse(&cfg, mount, vm_dir.as_path()).await {
                     Ok(handle) => handle,
                     Err(err) => {
@@ -4370,7 +4649,7 @@ impl Manager {
         let can_use_virtiofsd = cfg!(target_os = "linux")
             && !cfg.virtiofsd_bin.is_empty()
             && Path::new(&cfg.virtiofsd_bin).exists();
-        if can_use_virtiofsd {
+        if !windows_qemu_guest && can_use_virtiofsd {
             for (index, mount) in meta_snapshot.shared_mounts.iter().enumerate() {
                 let socket_path = runtime_dir.join(format!("virtiofsd-{index}.sock"));
                 let log_path = vm_dir.join(format!("virtiofsd-{index}.log"));
@@ -4395,7 +4674,7 @@ impl Manager {
                     }
                 }
             }
-        } else if !meta_snapshot.shared_mounts.is_empty() {
+        } else if !windows_qemu_guest && !meta_snapshot.shared_mounts.is_empty() {
             debug!(
                 vm_id = %id,
                 virtiofsd_bin = %cfg.virtiofsd_bin,
@@ -4695,6 +4974,35 @@ impl Manager {
             }
             return Err(err);
         }
+        if windows_qemu_guest {
+            if let Err(err) = wait_for_windows_guest_ready(&meta_snapshot).await {
+                if let Some(handle) = tap_network_handle.take() {
+                    handle.shutdown().await;
+                }
+                if vm_proxy_upstream_addr.is_some() {
+                    let _ = network::unregister_vm_proxy_policy(id).await;
+                }
+                cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
+                let err = abort_launch(vm.clone(), child, &log_path, err).await;
+                if let Some(cgroup) = qemu_cgroup.take() {
+                    cgroup.cleanup();
+                }
+                return Err(err);
+            }
+            if let Err(err) = detach_windows_runtime_config(&monitor, vm_dir.as_path()).await {
+                if let Some(handle) = tap_network_handle.take() {
+                    handle.shutdown().await;
+                }
+                if vm_proxy_upstream_addr.is_some() {
+                    let _ = network::unregister_vm_proxy_policy(id).await;
+                }
+                let err = abort_launch(vm.clone(), child, &log_path, err).await;
+                if let Some(cgroup) = qemu_cgroup.take() {
+                    cgroup.cleanup();
+                }
+                return Err(err);
+            }
+        }
 
         let child_pid = child.id();
         {
@@ -4838,6 +5146,27 @@ impl Manager {
                 );
                 return self.force_stop_vm(id).await;
             }
+        }
+        let windows_shutdown = {
+            let inner = vm.lock().await;
+            if is_windows_qemu(&inner.metadata) {
+                Some((
+                    format!("http://127.0.0.1:{}", inner.metadata.network.rpc_port),
+                    portproxy_auth_header_from_metadata(&inner.metadata.metadata)
+                        .map_err(ManagerError::Other)?,
+                ))
+            } else {
+                None
+            }
+        };
+        if let Some((endpoint, auth_header)) = windows_shutdown {
+            tokio::time::timeout(
+                Duration::from_secs(120),
+                prepare_guest_shutdown(&endpoint, auth_header.as_ref()),
+            )
+            .await
+            .context("timed out draining Windows guest runtime")?
+            .map_err(ManagerError::Other)?;
         }
         if let Err(err) = virt::system_powerdown(&monitor).await {
             warn!(
@@ -5756,6 +6085,26 @@ fn build_qemu_args(
     let running_on_macos = cfg!(target_os = "macos");
     let kvm_available = running_on_linux && kvm_is_usable();
 
+    if is_windows_qemu(meta) {
+        let netdev = match tap_network {
+            Some(tap_network) => format!(
+                "tap,id=net0,ifname={},script=no,downscript=no",
+                tap_network.tap_name
+            ),
+            None => qemu_user_netdev(meta)?,
+        };
+        return windows_qemu::build_qemu_args(
+            meta,
+            vm_dir,
+            qmp_path,
+            pid_path,
+            host_arch,
+            running_on_linux,
+            running_on_macos,
+            netdev,
+        );
+    }
+
     // @dive: virtio-fs (and qemu migration generally) requires shared-memory guest RAM
     //        backing so the host-side daemons can mmap guest pages. `memory-backend-memfd`
     //        creates an anonymous memfd-backed mapping marked `share=on`, which also
@@ -5998,6 +6347,103 @@ fn qemu_user_netdev(meta: &VmMetadata) -> Result<String> {
     ))
 }
 
+async fn wait_for_windows_guest_ready(meta: &VmMetadata) -> Result<()> {
+    let auth_header = portproxy_auth_header_from_metadata(&meta.metadata)?;
+    let endpoint = format!("http://127.0.0.1:{}", meta.network.rpc_port);
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let generation = meta
+        .metadata
+        .get(META_WINDOWS_RUNTIME_GENERATION)
+        .map(String::as_str)
+        .unwrap_or("unknown");
+    let sentinel = format!("W:\\.chevalier-ready-{generation}.tmp");
+    let script = format!(
+        "$ErrorActionPreference='Stop'; \
+         $stage='open'; \
+         try{{ \
+           $path='{sentinel}'; \
+           $bytes=[Text.Encoding]::UTF8.GetBytes('ready'); \
+           $file=[IO.File]::Open($path,[IO.FileMode]::Create,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None); \
+           $stage='write-flush'; \
+           try{{$file.Write($bytes,0,$bytes.Length);$file.Flush($true)}}finally{{$file.Dispose()}}; \
+           $stage='read'; \
+           if([IO.File]::ReadAllText($path)-ne'ready'){{throw 'readback mismatch'}} \
+         }}catch{{[Console]::Error.WriteLine(\"workspace sentinel failed at $stage`: $($_.Exception.Message)\");exit 22}}"
+    );
+    let mut last_logged_error = String::new();
+    loop {
+        let last_error = match probe_guest_exec_ready_for_platform(
+            &endpoint,
+            auth_header.as_ref(),
+            5,
+            GuestPlatform::Windows,
+        )
+        .await
+        {
+            Ok(()) => match run_guest_exec_args(
+                &endpoint,
+                auth_header.as_ref(),
+                vec![
+                    r"C:\Program Files\PowerShell\7\pwsh.exe".to_string(),
+                    "-NoLogo".to_string(),
+                    "-NoProfile".to_string(),
+                    "-NonInteractive".to_string(),
+                    "-Command".to_string(),
+                    script.clone(),
+                ],
+                None,
+                30,
+            )
+            .await
+            {
+                Ok(output) if output.exit_code == Some(0) => return Ok(()),
+                Ok(output) => format!(
+                    "authenticated workspace sentinel exited with status {:?}: {}",
+                    output.exit_code,
+                    output.stderr_lossy().trim()
+                ),
+                Err(error) => format!("run authenticated workspace sentinel: {error:#}"),
+            },
+            Err(error) => error.to_string(),
+        };
+        if last_error != last_logged_error {
+            warn!(vm_id = %meta.id, error = %last_error, "Windows guest readiness probe is not ready");
+            last_logged_error = last_error.clone();
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "Windows guest control and WinFsp workspace did not become ready within 600s: {last_error}"
+            );
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn detach_windows_runtime_config(monitor: &virt::MonitorHandle, vm_dir: &Path) -> Result<()> {
+    monitor
+        .device_del_wait(
+            windows_qemu::RUNTIME_CONFIG_DEVICE_ID,
+            Duration::from_secs(15),
+        )
+        .await
+        .context("detach Windows runtime seed device")?;
+    monitor
+        .blockdev_del(windows_qemu::RUNTIME_CONFIG_BLOCK_NODE)
+        .await
+        .context("detach Windows runtime seed format backend")?;
+    monitor
+        .blockdev_del(windows_qemu::RUNTIME_CONFIG_FILE_NODE)
+        .await
+        .context("detach Windows runtime seed file backend")?;
+    monitor
+        .device_del_wait(windows_qemu::RUNTIME_CONFIG_USB_ID, Duration::from_secs(15))
+        .await
+        .context("detach empty Windows runtime seed USB transport")?;
+    fs::remove_file(vm_dir.join(windows_qemu::RUNTIME_CONFIG_ISO_FILE_NAME))
+        .context("remove imported Windows runtime seed")?;
+    Ok(())
+}
+
 fn resolve_arm64_bios_path() -> Result<String> {
     for candidate in ARM64_BIOS_CANDIDATES {
         if Path::new(candidate).exists() {
@@ -6139,7 +6585,7 @@ fn normalize_shared_mounts(
                 "shared mount guest_path is required"
             )));
         }
-        if !guest_path.starts_with('/') {
+        if !is_absolute_guest_path(guest_path) {
             return Err(ManagerError::Other(anyhow!(
                 "shared mount guest_path must be absolute: {}",
                 guest_path
@@ -6197,6 +6643,17 @@ fn normalize_shared_mounts(
     }
 
     Ok(normalized)
+}
+
+fn is_absolute_guest_path(path: &str) -> bool {
+    if path.starts_with('/') {
+        return true;
+    }
+    let bytes = path.as_bytes();
+    bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || matches!(bytes[2], b'/' | b'\\'))
 }
 
 fn normalize_mount_availability(raw: SharedMountAvailability) -> SharedMountAvailability {
@@ -6423,6 +6880,11 @@ async fn cleanup_runtime_mounts(vm: &Arc<Vm>) -> Result<()> {
 fn is_macos_vz(metadata: &VmMetadata) -> bool {
     metadata.guest_profile.platform == GuestPlatform::Macos
         || matches!(metadata.source.source_type, VmSourceType::MacosTemplate)
+}
+
+fn is_windows_qemu(metadata: &VmMetadata) -> bool {
+    metadata.guest_profile.platform == GuestPlatform::Windows
+        || matches!(metadata.source.source_type, VmSourceType::WindowsTemplate)
 }
 
 async fn try_adopt_macos_vz_runtime(vm: &Arc<Vm>) -> ManagerResult<Option<VmMetadata>> {
@@ -6823,14 +7285,38 @@ async fn macos_vz_runtime_identity(
     ))
 }
 
-async fn prepare_macos_vz_shared_directories(
+async fn prepare_macos_vz_guest_vfs(
     rpc_port: i32,
     metadata: &HashMap<String, String>,
     shared_mounts: &[SharedMountSpec],
+    vfs_service_token: Option<&str>,
 ) -> Result<()> {
     if shared_mounts.is_empty() {
         return Ok(());
     }
+    if shared_mounts.len() != 1 {
+        bail!("macOS guest-native VFS currently requires exactly one shared mount");
+    }
+    let mount = &shared_mounts[0];
+    if !mount.is_fuse_backed() {
+        bail!(
+            "macOS shared mount {} must use the guest-native VFS profile",
+            mount.mount_tag
+        );
+    }
+    if mount.read_only {
+        bail!("macOS guest-native VFS does not support read-only mounts");
+    }
+    if mount.guest_path != "/Volumes/OpenBracketWorkspace" {
+        bail!("macOS guest-native VFS mount path must be /Volumes/OpenBracketWorkspace");
+    }
+    let vfs_service_token = vfs_service_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow!("macOS guest runtime requires CHEVALIER_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN")
+        })?;
+    let guest_endpoint = macos_guest_vfs_endpoint(mount)?;
     let port = u16::try_from(rpc_port)
         .ok()
         .filter(|port| *port > 0)
@@ -6842,63 +7328,104 @@ async fn prepare_macos_vz_shared_directories(
         match probe_guest_exec_ready_anyhow(&endpoint, auth_header.as_ref(), 5).await {
             Ok(()) => break,
             Err(error) if Instant::now() < deadline => {
-                debug!(endpoint = %endpoint, error = %error, "waiting for macOS guest portproxy before verifying VirtioFS automount");
+                debug!(endpoint = %endpoint, error = %error, "waiting for macOS guest portproxy before configuring guest-native VFS");
                 sleep(Duration::from_millis(250)).await;
             }
             Err(error) => {
-                return Err(
-                    error.context("macOS guest portproxy did not become ready for VirtioFS automount verification")
-                );
+                return Err(error
+                    .context("macOS guest portproxy did not become ready for VFS configuration"));
             }
         }
     }
 
-    for mount in shared_mounts {
-        let script = macos_vz_shared_directory_script(mount)?;
-        let output = run_guest_shell_exec(&endpoint, auth_header.as_ref(), &script, None, 20)
-            .await
-            .with_context(|| {
-                format!(
-                    "prepare macOS guest VirtioFS share {} at {}",
-                    mount.mount_tag, mount.guest_path
-                )
-            })?;
-        if output.exit_code != Some(0) {
-            bail!(
-                "prepare macOS guest VirtioFS share {} at {} failed with status {:?}: {}",
-                mount.mount_tag,
-                mount.guest_path,
-                output.exit_code,
-                output.stderr_lossy().trim()
-            );
-        }
+    const VFS_ETC: &str = "/Library/Application Support/Chevalier/vfs-etc";
+    write_guest_file(
+        &endpoint,
+        auth_header.as_ref(),
+        "/Library/Application Support/Chevalier/bin/launch-vfs.sh",
+        include_bytes!("../../darwin/launch-vfs.sh").to_vec(),
+        true,
+    )
+    .await?;
+    for (name, value) in [
+        ("vfs.token", vfs_service_token),
+        ("vfs.endpoint", guest_endpoint.as_str()),
+        ("vfs.scope", mount.vfs_scope_path.as_str()),
+    ] {
+        write_guest_file(
+            &endpoint,
+            auth_header.as_ref(),
+            &format!("{VFS_ETC}/{name}"),
+            format!("{value}\n").into_bytes(),
+            true,
+        )
+        .await?;
+    }
+
+    let output = run_guest_shell_exec(
+        &endpoint,
+        auth_header.as_ref(),
+        r#"set -eu
+etc='/Library/Application Support/Chevalier/vfs-etc'
+/usr/sbin/chown root:wheel '/Library/Application Support/Chevalier/bin/launch-vfs.sh'
+/bin/chmod 0755 '/Library/Application Support/Chevalier/bin/launch-vfs.sh'
+/usr/sbin/chown openbracket:staff "$etc/vfs.token" "$etc/vfs.endpoint" "$etc/vfs.scope"
+/bin/chmod 0600 "$etc/vfs.token" "$etc/vfs.endpoint" "$etc/vfs.scope"
+/usr/bin/install -d -o openbracket -g staff -m 0700 '/Users/Shared/OpenBracket/vfs-state'
+/bin/launchctl enable system/com.bracket.vfs-vsock-bridge
+if ! /bin/launchctl print system/com.bracket.vfs-vsock-bridge >/dev/null 2>&1; then
+  /bin/launchctl bootstrap system /Library/LaunchDaemons/com.bracket.vfs-vsock-bridge.plist
+fi
+/bin/launchctl kickstart -k system/com.bracket.vfs-vsock-bridge
+if ! /sbin/mount | /usr/bin/grep -F ' on /Volumes/OpenBracketWorkspace (' >/dev/null; then
+  /bin/launchctl enable system/com.bracket.chevalier-vfs
+  if ! /bin/launchctl print system/com.bracket.chevalier-vfs >/dev/null 2>&1; then
+    /bin/launchctl bootstrap system /Library/LaunchDaemons/com.bracket.chevalier-vfs.plist
+  fi
+  /bin/launchctl kickstart -k system/com.bracket.chevalier-vfs
+fi
+deadline=$(( $(/bin/date +%s) + 60 ))
+while ! /sbin/mount | /usr/bin/grep -F ' on /Volumes/OpenBracketWorkspace (' >/dev/null; do
+  if [ "$(/bin/date +%s)" -ge "$deadline" ]; then
+    /bin/launchctl print system/com.bracket.chevalier-vfs >&2 || true
+    /usr/bin/tail -n 80 '/Library/Logs/Chevalier/vfs.log' >&2 || true
+    exit 75
+  fi
+  /bin/sleep 1
+done
+:"#,
+        None,
+        75,
+    )
+    .await
+    .context("start and verify macOS guest-native VFS")?;
+    if output.exit_code != Some(0) {
+        bail!(
+            "prepare macOS guest-native VFS failed with status {:?}: {}",
+            output.exit_code,
+            output.stderr_lossy().trim()
+        );
     }
     Ok(())
 }
 
-fn macos_vz_shared_directory_script(mount: &SharedMountSpec) -> Result<String> {
-    let automount_root = shell_quote("/Volumes/My Shared Files")?;
-    let shared_directory = shell_quote(&format!("/Volumes/My Shared Files/{}", mount.mount_tag))?;
-    let target = shell_quote(&mount.guest_path)?;
-    let writable_probe = if mount.read_only {
-        String::new()
-    } else {
-        "sentinel=$(/usr/bin/mktemp \"$source/.openbracket-ready.XXXXXX\")\n/bin/rm -f \"$sentinel\"\n"
-            .to_string()
-    };
-    Ok(format!(
-        "set -eu\nautomount_root={automount_root}\nsource={shared_directory}\ntarget={target}\n/sbin/mount | /usr/bin/grep -F -- \" on $automount_root (AppleVirtIOFS\" >/dev/null\n[ -d \"$source\" ]\n/bin/ls -A \"$source\" >/dev/null\n{writable_probe}if /sbin/mount | /usr/bin/grep -F -- \" on $target (\" >/dev/null; then\n  exit 64\nfi\nif [ -L \"$target\" ]; then\n  [ \"$(/usr/bin/readlink \"$target\")\" = \"$source\" ]\nelif [ -e \"$target\" ]; then\n  [ -d \"$target\" ]\n  [ -z \"$(/bin/ls -A \"$target\")\" ]\n  /bin/rmdir \"$target\"\n  /bin/ln -s \"$source\" \"$target\"\nelse\n  /bin/mkdir -p \"$(/usr/bin/dirname \"$target\")\"\n  /bin/ln -s \"$source\" \"$target\"\nfi\n[ -d \"$target\" ]"
-    ))
-}
-
-fn shell_quote(value: &str) -> Result<String> {
-    if value
-        .chars()
-        .any(|character| matches!(character, '\0' | '\n' | '\r'))
+fn macos_guest_vfs_endpoint(mount: &SharedMountSpec) -> Result<String> {
+    let host_endpoint =
+        reqwest::Url::parse(&mount.vfs_endpoint).context("parse macOS host VFS endpoint")?;
+    if host_endpoint.scheme() != "http"
+        || !matches!(host_endpoint.host_str(), Some("127.0.0.1" | "localhost"))
     {
-        bail!("shell value contains a forbidden control character");
+        bail!(
+            "macOS host VFS endpoint must use loopback HTTP: {}",
+            mount.vfs_endpoint
+        );
     }
-    Ok(format!("'{}'", value.replace('\'', "'\\''")))
+    let mut guest_endpoint = format!("http://127.0.0.1:18080{}", host_endpoint.path());
+    if let Some(query) = host_endpoint.query() {
+        guest_endpoint.push('?');
+        guest_endpoint.push_str(query);
+    }
+    Ok(guest_endpoint)
 }
 
 fn spawn_vz_exit_task(
@@ -7295,6 +7822,14 @@ fn configure_qemu_process_identity(
             Ok(())
         });
     }
+    Ok(())
+}
+
+fn create_private_vm_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("create VM directory {}", path.display()))?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod VM directory {}", path.display()))?;
     Ok(())
 }
 
@@ -7925,7 +8460,7 @@ mod tests {
     use crate::state::GuestProfile;
 
     #[test]
-    fn macos_vz_share_readiness_uses_native_automount_and_stable_alias() {
+    fn macos_guest_vfs_endpoint_uses_guest_loopback_relay() {
         let mount = SharedMountSpec {
             host_path: "/tmp/active-host-fuse".to_string(),
             guest_path: "/Volumes/OpenBracketWorkspace".to_string(),
@@ -7938,19 +8473,14 @@ mod tests {
             vfs_scope_path: "scope".to_string(),
         };
 
-        let script = macos_vz_shared_directory_script(&mount).unwrap();
+        assert_eq!(
+            macos_guest_vfs_endpoint(&mount).unwrap(),
+            "http://127.0.0.1:18080/"
+        );
 
-        assert!(script.contains("/Volumes/My Shared Files/workspace"));
-        assert!(script.contains("AppleVirtIOFS"));
-        assert!(script.contains("/usr/bin/mktemp"));
-        assert!(script.contains("exit 64"));
-        assert!(script.contains("/bin/ln -s \"$source\" \"$target\""));
-        assert!(!script.contains("mount_virtiofs"));
-
-        let mut read_only_mount = mount;
-        read_only_mount.read_only = true;
-        let read_only_script = macos_vz_shared_directory_script(&read_only_mount).unwrap();
-        assert!(!read_only_script.contains("/usr/bin/mktemp"));
+        let mut remote = mount;
+        remote.vfs_endpoint = "https://example.com/vfs".to_string();
+        assert!(macos_guest_vfs_endpoint(&remote).is_err());
     }
 
     #[cfg(unix)]
@@ -10508,6 +11038,15 @@ mod tests {
         );
         assert_eq!(normalized[0].vfs_scope_path, "conversations/example/shared");
         assert!(normalized[0].is_fuse_backed());
+    }
+
+    #[test]
+    fn guest_path_admission_accepts_windows_roots_without_drive_relative_paths() {
+        assert!(is_absolute_guest_path("W:"));
+        assert!(is_absolute_guest_path(r"C:\OpenBracket\workspace"));
+        assert!(is_absolute_guest_path("/workspace"));
+        assert!(!is_absolute_guest_path("C:workspace"));
+        assert!(!is_absolute_guest_path("workspace"));
     }
 
     #[tokio::test]

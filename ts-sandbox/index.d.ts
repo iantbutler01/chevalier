@@ -230,6 +230,7 @@ export interface SessionOpts {
   sessionId?: string
   name?: string
   image?: string
+  sourceType?: SessionSourceType
   architecture?: string
   metadata?: Record<string, string>
   autoStart?: boolean
@@ -256,6 +257,13 @@ export interface SessionSnapshotJs {
 export interface SessionSnapshotOpts {
   label?: string
   description?: string
+}
+
+export declare const enum SessionSourceType {
+  Docker = 'docker',
+  Snapshot = 'snapshot',
+  MacosTemplate = 'macos-template',
+  WindowsTemplate = 'windows-template'
 }
 
 export interface SharedMountOpts {

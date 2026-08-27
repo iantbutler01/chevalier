@@ -69,7 +69,7 @@ use proto::vmd::v1::vmd_service_client::VmdServiceClient;
 use proto::vmd::v1::{
     AttachPciDeviceRequest, CreateSnapshotRequest, CreateVmRequest, DeleteDurableVolumeRequest,
     DeleteSnapshotRequest, DetachPciDeviceRequest, ForkVmRequest, GetVmBySessionRequest,
-    GetVmRequest, ListDurableVolumesRequest, ListHostPciDevicesRequest, ListSnapshotsRequest,
+    GetVmRequest, GuestPlatform, GuestProfile, ListDurableVolumesRequest, ListHostPciDevicesRequest, ListSnapshotsRequest,
     ListVMsRequest, Metadata, PreDownloadVmImageRequest, ResizeDurableVolumeRequest, ResourceSpec,
     RestoreSnapshotRequest, UpdateVmRequest, Vm, VmActionRequest, VmSource, VmSourceType,
 };
@@ -83,6 +83,8 @@ const DEFAULT_PORTPROXY_WRITE_FILE_RPC_TIMEOUT: Duration = Duration::from_secs(1
 /// control-plane timeout is intentionally short and cannot cover that lifecycle
 /// contract.
 const VMD_DELETE_TIMEOUT: Duration = Duration::from_secs(60);
+const VMD_VM_START_TIMEOUT: Duration = Duration::from_secs(600);
+const VMD_VM_STOP_TIMEOUT: Duration = Duration::from_secs(150);
 
 /// A graceful restart is a guest shutdown (vmd waits up to its 180 s graceful-stop
 /// budget) followed by a fresh boot. The ordinary control-plane request timeout is a
@@ -585,11 +587,21 @@ impl Default for SandboxConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SessionSourceType {
+    #[default]
+    Docker,
+    Snapshot,
+    MacosTemplate,
+    WindowsTemplate,
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionOptions {
     pub session_id: Option<String>,
     pub name: Option<String>,
     pub image: Option<String>,
+    pub source_type: SessionSourceType,
     pub architecture: Option<String>,
     pub metadata: HashMap<String, String>,
     pub auto_start: bool,
@@ -608,6 +620,7 @@ impl Default for SessionOptions {
             session_id: None,
             name: None,
             image: None,
+            source_type: SessionSourceType::Docker,
             architecture: None,
             metadata: HashMap::new(),
             auto_start: true,
@@ -1453,6 +1466,7 @@ struct GuestRpcAccess {
     endpoint: String,
     rpc_port: i32,
     auth_header: Option<MetadataValue<Ascii>>,
+    platform: GuestPlatform,
 }
 
 struct PortproxyClientAccess {
@@ -1731,21 +1745,24 @@ impl Session {
                 }
             };
 
-            let shell = opts
-                .shell
-                .clone()
-                .unwrap_or_else(|| self.sandbox.inner.cfg.default_shell.clone());
+            let args = guest_shell_args(
+                access.platform,
+                opts.shell.as_deref(),
+                self.sandbox.inner.cfg.default_shell.as_str(),
+                command,
+            );
 
             let (req_tx, req_rx) = mpsc::channel(64);
             let execution_id = Uuid::new_v4().to_string();
             req_tx
                 .send(ExecRequest {
                     request: Some(exec_request::Request::Start(ExecStart {
-                        args: vec![shell, "-lc".to_string(), command.to_string()],
+                        args,
                         env: opts.env.clone(),
                         detach: opts.detach,
                         timeout: opts.timeout_secs,
                         execution_id: execution_id.clone(),
+                        run_as_root: false,
                     })),
                 })
                 .await
@@ -3317,7 +3334,17 @@ impl Session {
         }
 
         let node_endpoint = self.current_node_endpoint().await;
-        let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
+        let request_timeout = match action {
+            SessionVmAction::Start | SessionVmAction::Restart => VMD_VM_START_TIMEOUT,
+            SessionVmAction::Stop => VMD_VM_STOP_TIMEOUT,
+            SessionVmAction::Pause | SessionVmAction::Resume => {
+                self.sandbox.inner.cfg.connect_timeout
+            }
+        };
+        let mut client = self
+            .sandbox
+            .vmd_client_for_endpoint_with_timeout(&node_endpoint, request_timeout)
+            .await?;
         let request = self.sandbox.request_with_auth(VmActionRequest {
             vm_id: self.vm_id.clone(),
         });
@@ -3679,6 +3706,11 @@ impl Sandbox {
     pub async fn session(&self, opts: SessionOptions) -> Result<Session> {
         let started = Instant::now();
         if let ControlBackend::Managed(control) = &self.inner.control_backend {
+            if opts.source_type != SessionSourceType::Docker {
+                return Err(SandboxError::InvalidConfig(
+                    "OpenComputer supports only Docker session sources".to_string(),
+                ));
+            }
             let requested_session_id = opts.session_id;
             let mut metadata = opts.metadata;
             metadata
@@ -3808,12 +3840,14 @@ impl Sandbox {
                     .await?;
             }
             let vm = self.ensure_vm_running(&vm.id, &node_endpoint).await?;
+            if vm_has_guest_rpc(&vm) {
             self.maybe_wait_for_session_guest_rpc(
                 &vm.id,
                 &node_endpoint,
                 ReadinessRecovery::RestartIfNotFreshlyStarted,
             )
             .await?;
+            }
             let next_fence = self
                 .bind_session_route(
                     &session_id,
@@ -3851,19 +3885,46 @@ impl Sandbox {
             .image
             .unwrap_or_else(|| self.inner.cfg.default_image.clone());
         let architecture = normalize_architecture_label(&opts.architecture.unwrap_or_else(|| {
-            self.inner
-                .cfg
-                .default_architecture
-                .clone()
-                .or_else(detect_host_architecture_label)
-                .unwrap_or_default()
+            match opts.source_type {
+                SessionSourceType::MacosTemplate => "arm64".to_string(),
+                SessionSourceType::WindowsTemplate => String::new(),
+                SessionSourceType::Docker | SessionSourceType::Snapshot => self
+                    .inner
+                    .cfg
+                    .default_architecture
+                    .clone()
+                    .or_else(detect_host_architecture_label)
+                    .unwrap_or_default(),
+            }
         }));
+        let (source_type, guest_profile) = match opts.source_type {
+            SessionSourceType::Docker => (VmSourceType::Docker as i32, None),
+            SessionSourceType::Snapshot => (VmSourceType::Snapshot as i32, None),
+            SessionSourceType::MacosTemplate => (
+                VmSourceType::MacosTemplate as i32,
+                Some(GuestProfile {
+                    platform: GuestPlatform::Macos as i32,
+                    architecture: architecture.clone(),
+                    schema_version: 1,
+                    ..Default::default()
+                }),
+            ),
+            SessionSourceType::WindowsTemplate => (
+                VmSourceType::WindowsTemplate as i32,
+                Some(GuestProfile {
+                    platform: GuestPlatform::Windows as i32,
+                    architecture: architecture.clone(),
+                    schema_version: 1,
+                    ..Default::default()
+                }),
+            ),
+        };
 
         let session_shared_mounts = opts.shared_mounts.clone();
         let request = CreateVmRequest {
             name,
             source: Some(VmSource {
-                r#type: VmSourceType::Docker as i32,
+                r#type: source_type,
                 reference: image.clone(),
             }),
             resources: Some(ResourceSpec {
@@ -3874,7 +3935,7 @@ impl Sandbox {
             metadata: Some(Metadata { entries: metadata }),
             auto_start: opts.auto_start,
             architecture: architecture.clone(),
-            guest_profile: None,
+            guest_profile,
             guest_runtime: None,
             capabilities: None,
             shared_mounts: opts
@@ -3954,7 +4015,7 @@ impl Sandbox {
             .await?;
 
         let running_state = proto::vmd::v1::VmState::Running as i32;
-        if auto_start || vm.state == running_state {
+        if (auto_start || vm.state == running_state) && vm_has_guest_rpc(&vm) {
             // @dive: This VM was created (and auto-started) by this very call. A missed
             //        readiness budget here means "still booting", never "stale sidecar".
             self.maybe_wait_for_session_guest_rpc(
@@ -4074,12 +4135,14 @@ impl Sandbox {
                 .await?;
         }
         let vm = self.ensure_vm_running(&vm.id, &node_endpoint).await?;
+        if vm_has_guest_rpc(&vm) {
         self.maybe_wait_for_session_guest_rpc(
             &vm.id,
             &node_endpoint,
             ReadinessRecovery::RestartIfNotFreshlyStarted,
         )
         .await?;
+        }
         let next_fence = self
             .bind_session_route(
                 session_id,
@@ -5821,6 +5884,7 @@ impl Sandbox {
             endpoint: rpc_endpoint(&self.inner.cfg.endpoint_overrides, endpoint, rpc_port)?,
             rpc_port,
             auth_header: portproxy_auth_header_from_metadata(&vm.metadata)?,
+            platform: vm_guest_platform(vm),
         })
     }
 
@@ -5842,7 +5906,9 @@ impl Sandbox {
             ready
                 .get(&cache_key)
                 .map(|cached| {
-                    cached.rpc_port == access.rpc_port && cached.endpoint == access.endpoint
+                    cached.rpc_port == access.rpc_port
+                        && cached.endpoint == access.endpoint
+                        && cached.platform == access.platform
                 })
                 .unwrap_or(false)
         };
@@ -5858,6 +5924,7 @@ impl Sandbox {
                 access.endpoint.as_str(),
                 self.inner.cfg.connect_timeout,
                 access.auth_header.as_ref(),
+                access.platform,
             )
             .await
             {
@@ -5980,6 +6047,7 @@ async fn probe_shell_exec_ready(
     endpoint: &str,
     establish_timeout: Duration,
     auth_header: Option<&MetadataValue<Ascii>>,
+    platform: GuestPlatform,
 ) -> bool {
     let Ok(probe_endpoint) = Endpoint::from_shared(endpoint.to_string()) else {
         return false;
@@ -5998,10 +6066,11 @@ async fn probe_shell_exec_ready(
         .send(ExecRequest {
             request: Some(exec_request::Request::Start(ExecStart {
                 execution_id: String::new(),
-                args: vec!["/bin/sh".to_string(), "-lc".to_string(), "true".to_string()],
+                args: guest_shell_args(platform, None, "/bin/sh", "true"),
                 env: HashMap::new(),
                 detach: false,
                 timeout: Some(5),
+                run_as_root: false,
             })),
         })
         .await
@@ -6285,6 +6354,51 @@ fn resolve_tier_b_eligibility(metadata: &HashMap<String, String>) -> bool {
 
 fn vm_tier_b_eligible(vm: &Vm) -> bool {
     resolve_tier_b_eligibility(&vm.metadata)
+}
+
+fn vm_has_guest_rpc(vm: &Vm) -> bool {
+    let _ = vm;
+    true
+}
+
+fn vm_guest_platform(vm: &Vm) -> GuestPlatform {
+    vm.guest_profile
+        .as_ref()
+        .and_then(|profile| GuestPlatform::try_from(profile.platform).ok())
+        .unwrap_or(GuestPlatform::Linux)
+}
+
+fn guest_shell_args(
+    platform: GuestPlatform,
+    requested_shell: Option<&str>,
+    default_shell: &str,
+    command: &str,
+) -> Vec<String> {
+    if platform == GuestPlatform::Windows {
+        if let Some(shell) = requested_shell.filter(|shell| {
+            shell.rsplit(['/', '\\']).next().is_some_and(|name| {
+                name.eq_ignore_ascii_case("bash") || name.eq_ignore_ascii_case("bash.exe")
+            })
+        }) {
+            return vec![shell.to_string(), "-lc".to_string(), command.to_string()];
+        }
+        return vec![
+            requested_shell
+                .unwrap_or(r"C:\Program Files\PowerShell\7\pwsh.exe")
+                .to_string(),
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            command.to_string(),
+        ];
+    }
+
+    vec![
+        requested_shell.unwrap_or(default_shell).to_string(),
+        "-lc".to_string(),
+        command.to_string(),
+    ]
 }
 
 fn map_host_pci_device(device: proto::vmd::v1::HostPciDevice) -> HostPciDevice {
@@ -6766,6 +6880,34 @@ mod tests {
     fn shell_single_quote_preserves_posix_paths() {
         assert_eq!(shell_single_quote("/tmp/a b"), "'/tmp/a b'");
         assert_eq!(shell_single_quote("/tmp/ian's"), "'/tmp/ian'\"'\"'s'");
+    }
+
+    #[test]
+    fn guest_shell_args_are_platform_native() {
+        assert_eq!(
+            guest_shell_args(GuestPlatform::Linux, None, "/bin/sh", "printf ok"),
+            vec!["/bin/sh", "-lc", "printf ok"]
+        );
+        assert_eq!(
+            guest_shell_args(GuestPlatform::Windows, None, "/bin/sh", "Write-Output ok"),
+            vec![
+                r"C:\Program Files\PowerShell\7\pwsh.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Write-Output ok",
+            ]
+        );
+        assert_eq!(
+            guest_shell_args(
+                GuestPlatform::Windows,
+                Some(r"C:\Program Files\Git\bin\bash.exe"),
+                "/bin/sh",
+                "printf ok",
+            ),
+            vec![r"C:\Program Files\Git\bin\bash.exe", "-lc", "printf ok"]
+        );
     }
 
     #[tokio::test]

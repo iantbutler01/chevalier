@@ -13,6 +13,11 @@ if ! id openbracket >/dev/null 2>&1; then
   echo "Setup Assistant must create the stable short-name account 'openbracket'" >&2
   exit 69
 fi
+if [ ! -f /var/db/.AppleSetupDone ] || \
+  /usr/bin/pgrep -f '/Setup Assistant.app/|/SetupAssistant.app/' >/dev/null 2>&1; then
+  echo "Setup Assistant must be fully completed before sealing guest assets" >&2
+  exit 69
+fi
 
 SOURCE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 MACFUSE_DMG="$SOURCE_DIR/macfuse-5.3.3.dmg"

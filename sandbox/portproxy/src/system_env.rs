@@ -35,6 +35,13 @@ pub fn build_exec_env(
     let mut merged = HashMap::new();
     merged.insert("PATH".to_string(), default_path.to_string());
     merged.insert("HOME".to_string(), default_home.to_string());
+    if let Ok(user) = env::var("CHEVALIER_PORTPROXY_EXEC_USER") {
+        let user = user.trim();
+        if !user.is_empty() {
+            merged.insert("USER".to_string(), user.to_string());
+            merged.insert("LOGNAME".to_string(), user.to_string());
+        }
+    }
     let managed_proxy_env = read_managed_proxy_env();
     merged.extend(overrides.clone());
     for key in MANAGED_PROXY_ENV_KEYS {
@@ -158,6 +165,26 @@ mod tests {
 
         unsafe {
             env::remove_var("CHEVALIER_PORTPROXY_MANAGED_ENV_FILE");
+        }
+    }
+
+    #[test]
+    fn build_exec_env_reports_the_configured_guest_user() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            env::set_var("CHEVALIER_PORTPROXY_EXEC_USER", "openbracket");
+        }
+
+        let merged = build_exec_env("/usr/bin", "/Users/openbracket", &HashMap::new());
+
+        assert_eq!(merged.get("USER").map(String::as_str), Some("openbracket"));
+        assert_eq!(
+            merged.get("LOGNAME").map(String::as_str),
+            Some("openbracket")
+        );
+
+        unsafe {
+            env::remove_var("CHEVALIER_PORTPROXY_EXEC_USER");
         }
     }
 

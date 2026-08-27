@@ -13,6 +13,7 @@ use tokio::sync::{Mutex, RwLock, broadcast, watch};
 use tracing::{error, info, warn};
 
 use crate::child_tracker::ChildTracker;
+use crate::execution_identity::{command_builder, configure_command};
 use crate::pb::bracket::portproxy::v1::{ExecDaemonRequest, ExecDaemonResponse};
 use crate::process_group::{configure_child_process_group, kill_process_group_or_child};
 use crate::system_env::{DEFAULT_EXEC_PATH, build_exec_env, default_exec_home};
@@ -80,6 +81,7 @@ impl DaemonRegistry {
             command.env(key, value);
         }
         configure_child_process_group(&mut command);
+        configure_command(&mut command, false)?;
 
         let mut child = command.spawn()?;
 
@@ -375,8 +377,8 @@ pub fn build_command_builder(
     args: &[String],
     env: &std::collections::HashMap<String, String>,
     cwd: Option<String>,
-) -> CommandBuilder {
-    let mut builder = CommandBuilder::new(shell);
+) -> std::io::Result<CommandBuilder> {
+    let mut builder = command_builder(shell)?;
     if !args.is_empty() {
         builder.args(args);
     }
@@ -387,7 +389,7 @@ pub fn build_command_builder(
     if let Some(dir) = cwd {
         builder.cwd(PathBuf::from(dir));
     }
-    builder
+    Ok(builder)
 }
 
 #[cfg(test)]
