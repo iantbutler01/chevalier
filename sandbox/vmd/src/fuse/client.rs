@@ -36,9 +36,12 @@ const FILE_READ_RETRY_TIMEOUT: Duration = Duration::from_secs(45);
 const METADATA_READ_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const FILE_READ_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Hard wall for one streamed write publication. Large writes bypass the
-/// client's normal 30s mutation timeout, but remain bounded so a wedged
-/// gateway cannot turn a close/fsync into the old multi-minute stall.
-const STREAM_WRITE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(300);
+/// client's normal 30s mutation timeout and receive the same size-aware budget
+/// as OpenBracket's gateway uploads: five minutes minimum, then enough time to
+/// make progress at 128 KiB/s. The request remains finite without aborting
+/// multi-gigabyte payloads that are actively streaming.
+const STREAM_WRITE_MIN_TIMEOUT_SECS: u64 = 300;
+const STREAM_WRITE_MIN_BYTES_PER_SECOND: u64 = 128 * 1024;
 const STREAM_UPLOAD_HEADER: &str = "x-chevalier-vfs-stream-upload";
 const EXPECTED_CONTENT_HASH_HEADER: &str = "x-chevalier-vfs-expected-content-sha256";
 const STREAM_READ_BUFFER_BYTES: usize = 1024 * 1024;
@@ -46,6 +49,14 @@ const ADVISORY_LOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const ADVISORY_LOCK_RENEWAL_BATCH_SIZE: usize = 4_096;
 const READ_RETRY_DELAY_MIN: Duration = Duration::from_millis(50);
 const READ_RETRY_DELAY_MAX: Duration = Duration::from_millis(500);
+
+fn stream_write_attempt_timeout(size_bytes: u64) -> Duration {
+    Duration::from_secs(
+        size_bytes
+            .div_ceil(STREAM_WRITE_MIN_BYTES_PER_SECOND)
+            .max(STREAM_WRITE_MIN_TIMEOUT_SECS),
+    )
+}
 /// Content-hash budget the mount asks every bulk metadata route (`/tree`,
 /// `/subtree-metadata`) to honour: hash a file at or under this size, skip it
 /// above.
@@ -836,7 +847,7 @@ impl RemoteVfsClient {
                 .header(STREAM_UPLOAD_HEADER, "1")
                 .header(EXPECTED_CONTENT_HASH_HEADER, content_hash)
                 .header(header::CONTENT_LENGTH, size_bytes)
-                .timeout(STREAM_WRITE_ATTEMPT_TIMEOUT);
+                .timeout(stream_write_attempt_timeout(size_bytes));
             request = with_mode_header(request, mode);
             request = with_precondition_headers(request, base_content_hash, expected_file_id);
             let body = reqwest::Body::wrap_stream(ReaderStream::with_capacity(
@@ -1475,6 +1486,26 @@ mod tests {
             .build()
             .unwrap();
         assert!(!request.headers().contains_key(CHEVALIER_VFS_MODE_HEADER));
+    }
+
+    #[test]
+    fn streamed_write_timeout_scales_with_payload_size() {
+        assert_eq!(
+            stream_write_attempt_timeout(1),
+            Duration::from_secs(STREAM_WRITE_MIN_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            stream_write_attempt_timeout(
+                STREAM_WRITE_MIN_BYTES_PER_SECOND * STREAM_WRITE_MIN_TIMEOUT_SECS
+            ),
+            Duration::from_secs(STREAM_WRITE_MIN_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            stream_write_attempt_timeout(
+                STREAM_WRITE_MIN_BYTES_PER_SECOND * (STREAM_WRITE_MIN_TIMEOUT_SECS + 1)
+            ),
+            Duration::from_secs(STREAM_WRITE_MIN_TIMEOUT_SECS + 1)
+        );
     }
 
     #[test]
