@@ -131,9 +131,14 @@ impl MountOwnership {
             sync_directory(options.layout.root())?;
             record
         } else {
-            let record: MountOwnerRecord = serde_json::from_str(existing)
+            let mut record: MountOwnerRecord = serde_json::from_str(existing)
                 .with_context(|| format!("decode mount owner record {}", path.display()))?;
             validate_owner_record(&record, options, &path)?;
+            if record.endpoint != options.endpoint {
+                record.endpoint = options.endpoint.clone();
+                persist_owner_record(&mut file, &path, &record)?;
+                sync_directory(options.layout.root())?;
+            }
             record
         };
 
@@ -166,23 +171,17 @@ fn validate_owner_record(
             path.display()
         );
     }
-    // A state directory belongs to exactly one scope on one endpoint under one
-    // tag. Adopting a foreign one would publish this mount's WAL into somebody
-    // else's namespace, so every mismatch fails closed.
+    // Scope and tag are the durable identity. The endpoint is routing metadata:
+    // it may change when the same gateway namespace moves between network
+    // addresses, while the ownership epoch and unpublished WAL remain intact.
+    // Adopting a foreign scope or tag would publish this mount's WAL into
+    // somebody else's namespace, so those mismatches still fail closed.
     if record.scope_path != options.scope_path {
         bail!(
             "mount state directory {} belongs to scope {:?}, not {:?}",
             path.display(),
             record.scope_path,
             options.scope_path
-        );
-    }
-    if record.endpoint != options.endpoint {
-        bail!(
-            "mount state directory {} belongs to endpoint {:?}, not {:?}",
-            path.display(),
-            record.endpoint,
-            options.endpoint
         );
     }
     if record.mount_tag != options.mount_tag {
@@ -1519,11 +1518,14 @@ pub(crate) fn default_state_dir_for_mountpoint(mountpoint: &Path) -> Result<Moun
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
 
     use super::{MountLocalView, MountLocalViewOptions};
     use crate::fuse::local_view::MountStateLayout;
-    use crate::fuse::local_view::types::{MountMutation, PayloadSource, PayloadStorage};
+    use crate::fuse::local_view::types::{
+        MountMutation, MountOwnerRecord, PayloadSource, PayloadStorage,
+    };
 
     fn options(root: &Path, tokio: &tokio::runtime::Handle) -> MountLocalViewOptions {
         MountLocalViewOptions {
@@ -1569,6 +1571,32 @@ mod tests {
             })
             .expect("sealed content payload");
         assert!(matches!(payload.storage, PayloadStorage::Segment { .. }));
+    }
+
+    #[test]
+    fn reopening_the_same_scope_rebinds_endpoint_without_replacing_ownership() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = MountStateLayout::new(temp.path());
+        let opened =
+            MountLocalView::open(options(temp.path(), runtime.handle())).expect("open local view");
+        drop(opened);
+        let original: MountOwnerRecord =
+            serde_json::from_slice(&fs::read(layout.owner_path()).expect("read original owner"))
+                .expect("decode original owner");
+
+        let mut rebound = options(temp.path(), runtime.handle());
+        rebound.endpoint = "http://192.168.0.34:8930".to_string();
+        let reopened = MountLocalView::open(rebound).expect("reopen with new route");
+        drop(reopened);
+        let current: MountOwnerRecord =
+            serde_json::from_slice(&fs::read(layout.owner_path()).expect("read rebound owner"))
+                .expect("decode rebound owner");
+
+        assert_eq!(current.epoch, original.epoch);
+        assert_eq!(current.scope_path, original.scope_path);
+        assert_eq!(current.mount_tag, original.mount_tag);
+        assert_eq!(current.endpoint, "http://192.168.0.34:8930");
     }
 
     #[test]
