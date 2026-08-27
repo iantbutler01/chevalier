@@ -715,6 +715,14 @@ impl VmdService for GrpcService {
                 disk_gb: resources.disk_gb,
             });
         }
+        if req.replace_shared_mounts.is_some_and(|replace| replace) {
+            params.shared_mounts = Some(
+                req.shared_mounts
+                    .into_iter()
+                    .map(shared_mount_spec)
+                    .collect(),
+            );
+        }
         let meta = self
             .manager
             .update_vm(&req.vm_id, params)
@@ -1246,6 +1254,42 @@ impl VmdService for GrpcService {
             .await
             .map_err(status_from_error)?;
         Ok(Response::new(()))
+    }
+}
+
+fn shared_mount_spec(mount: crate::proto::v1::SharedMount) -> SharedMountSpec {
+    let availability = match crate::proto::v1::SharedMountAvailability::try_from(mount.availability)
+        .unwrap_or(crate::proto::v1::SharedMountAvailability::Unspecified)
+    {
+        crate::proto::v1::SharedMountAvailability::SharedStorage => {
+            SharedMountAvailability::SharedStorage
+        }
+        _ => SharedMountAvailability::NodeLocal,
+    };
+    let continuity = match crate::proto::v1::SharedMountContinuity::try_from(mount.continuity)
+        .unwrap_or(crate::proto::v1::SharedMountContinuity::Unspecified)
+    {
+        crate::proto::v1::SharedMountContinuity::RestoreCrossNode => {
+            SharedMountContinuity::RestoreCrossNode
+        }
+        crate::proto::v1::SharedMountContinuity::RestartSameNode => {
+            SharedMountContinuity::RestartSameNode
+        }
+        crate::proto::v1::SharedMountContinuity::Unspecified => match availability {
+            SharedMountAvailability::SharedStorage => SharedMountContinuity::RestoreCrossNode,
+            SharedMountAvailability::NodeLocal => SharedMountContinuity::RestartSameNode,
+        },
+    };
+    SharedMountSpec {
+        availability,
+        continuity,
+        backend_profile: mount.backend_profile.trim().to_ascii_lowercase(),
+        host_path: mount.host_path,
+        guest_path: mount.guest_path,
+        mount_tag: mount.mount_tag,
+        read_only: mount.read_only,
+        vfs_endpoint: mount.vfs_endpoint,
+        vfs_scope_path: mount.vfs_scope_path,
     }
 }
 

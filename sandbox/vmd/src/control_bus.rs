@@ -3605,6 +3605,7 @@ async fn disable_tier_b_after_unsupported(
                 name: None,
                 metadata: Some(degraded_metadata),
                 resources: None,
+                shared_mounts: None,
             },
         )
         .await
@@ -3655,6 +3656,7 @@ async fn finalize_execution_restore_snapshot_marker(
                 name: None,
                 metadata: Some(updated_metadata),
                 resources: None,
+                shared_mounts: None,
             },
         )
         .await

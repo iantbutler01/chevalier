@@ -309,6 +309,7 @@ pub struct UpdateVmParams {
     pub name: Option<String>,
     pub metadata: Option<HashMap<String, String>>,
     pub resources: Option<ResourceSpec>,
+    pub shared_mounts: Option<Vec<SharedMountSpec>>,
 }
 
 #[derive(Debug, Clone, Default)]

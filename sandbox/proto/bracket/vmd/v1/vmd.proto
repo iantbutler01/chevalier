@@ -264,6 +264,8 @@ message UpdateVMRequest {
   google.protobuf.StringValue name = 2;
   Metadata metadata = 3;
   ResourceSpec resources = 4;
+  repeated SharedMount shared_mounts = 5;
+  google.protobuf.BoolValue replace_shared_mounts = 6;
 }
 
 message DeleteVMRequest {

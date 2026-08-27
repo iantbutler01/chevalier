@@ -220,6 +220,7 @@ pub struct SharedMountSignature {
     pub mount_tag: String,
     pub read_only: bool,
     pub backend_profile: String,
+    pub vfs_endpoint: String,
     pub vfs_scope_path: String,
 }
 
@@ -230,6 +231,7 @@ impl SharedMountSignature {
             mount_tag: mount.mount_tag.clone(),
             read_only: mount.read_only,
             backend_profile: normalize_backend_profile(&mount.backend_profile),
+            vfs_endpoint: mount.vfs_endpoint.trim_end_matches('/').to_string(),
             vfs_scope_path: mount.vfs_scope_path.trim_matches('/').to_string(),
         }
     }
@@ -240,6 +242,7 @@ impl SharedMountSignature {
             mount_tag: mount.mount_tag.clone(),
             read_only: mount.read_only,
             backend_profile: normalize_backend_profile(&mount.backend_profile),
+            vfs_endpoint: mount.vfs_endpoint.trim_end_matches('/').to_string(),
             vfs_scope_path: mount.vfs_scope_path.trim_matches('/').to_string(),
         }
     }
@@ -483,5 +486,9 @@ mod tests {
         vm.shared_mounts[0].vfs_scope_path = "projects/stale/shared".to_string();
         assert!(!vm_has_mount_contract(&vm, &expected, &matcher));
         assert!(!vm_has_required_mounts(&vm, &expected, &matcher));
+
+        vm.shared_mounts[0] = proto_mount(&expected[0]);
+        vm.shared_mounts[0].vfs_endpoint = "http://stale-api".to_string();
+        assert!(!vm_has_mount_contract(&vm, &expected, &matcher));
     }
 }

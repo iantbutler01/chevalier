@@ -2636,6 +2636,8 @@ impl Session {
                     memory_mb: memory_mb.unwrap_or(current_resources.memory_mb),
                     disk_gb: current_resources.disk_gb,
                 }),
+                shared_mounts: Vec::new(),
+                replace_shared_mounts: None,
             }))
             .await?
             .into_inner();
@@ -2643,6 +2645,63 @@ impl Session {
             .invalidate_ready_vm_rpc(&self.vm_id, &node_endpoint)
             .await;
         Ok(vm.state)
+    }
+
+    pub async fn reconfigure_shared_mounts(&self, shared_mounts: Vec<SharedMount>) -> Result<i32> {
+        if matches!(
+            &self.sandbox.inner.control_backend,
+            ControlBackend::OpenComputer(_)
+        ) {
+            return Err(SandboxError::Unsupported(
+                "shared mount reconfiguration is only available for vmd-backed sandboxes"
+                    .to_string(),
+            ));
+        }
+
+        let node_endpoint = self.resolve_session_endpoint().await?;
+        let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
+        let current = client
+            .get_vm(self.sandbox.request_with_auth(GetVmRequest {
+                vm_id: self.vm_id.clone(),
+            }))
+            .await?
+            .into_inner();
+        let matcher = vm::ManagedMountMatcher::new(
+            shared_mounts.iter().map(|mount| mount.mount_tag.as_str()),
+            std::iter::empty::<&str>(),
+        );
+        if vm::vm_has_mount_contract(&current, &shared_mounts, &matcher) {
+            return Ok(current.state);
+        }
+
+        let original_state = current.state;
+        let running_state = proto::vmd::v1::VmState::Running as i32;
+        let paused_state = proto::vmd::v1::VmState::Paused as i32;
+        if matches!(original_state, state if state == running_state || state == paused_state) {
+            self.stop().await?;
+        }
+        let vm = client
+            .update_vm(self.sandbox.request_with_auth(UpdateVmRequest {
+                vm_id: self.vm_id.clone(),
+                name: None,
+                metadata: None,
+                resources: None,
+                shared_mounts: shared_mounts.into_iter().map(proto_shared_mount).collect(),
+                replace_shared_mounts: Some(proto::google::protobuf::BoolValue { value: true }),
+            }))
+            .await?
+            .into_inner();
+        self.sandbox
+            .invalidate_ready_vm_rpc(&self.vm_id, &node_endpoint)
+            .await;
+        match original_state {
+            state if state == running_state => self.start().await,
+            state if state == paused_state => {
+                self.start().await?;
+                self.pause().await
+            }
+            _ => Ok(vm.state),
+        }
     }
 
     pub async fn list_pci_devices(&self) -> Result<HostPciInventory> {
@@ -3265,17 +3324,7 @@ impl Sandbox {
             shared_mounts: opts
                 .shared_mounts
                 .into_iter()
-                .map(|mount| proto::vmd::v1::SharedMount {
-                    host_path: mount.host_path,
-                    guest_path: mount.guest_path,
-                    mount_tag: mount.mount_tag,
-                    read_only: mount.read_only,
-                    availability: shared_mount_availability_proto(&mount.availability),
-                    continuity: shared_mount_continuity_proto(&mount.continuity),
-                    backend_profile: normalize_mount_backend_profile(&mount.backend_profile),
-                    vfs_endpoint: mount.vfs_endpoint,
-                    vfs_scope_path: mount.vfs_scope_path,
-                })
+                .map(proto_shared_mount)
                 .collect(),
             pci_device_ids: opts.pci_device_ids,
             storage_profile: opts.storage_profile,
@@ -5703,6 +5752,20 @@ fn required_shared_mount_profiles(shared_mounts: &[SharedMount]) -> Vec<String> 
     profiles.sort();
     profiles.dedup();
     profiles
+}
+
+fn proto_shared_mount(mount: SharedMount) -> proto::vmd::v1::SharedMount {
+    proto::vmd::v1::SharedMount {
+        host_path: mount.host_path,
+        guest_path: mount.guest_path,
+        mount_tag: mount.mount_tag,
+        read_only: mount.read_only,
+        availability: shared_mount_availability_proto(&mount.availability),
+        continuity: shared_mount_continuity_proto(&mount.continuity),
+        backend_profile: normalize_mount_backend_profile(&mount.backend_profile),
+        vfs_endpoint: mount.vfs_endpoint,
+        vfs_scope_path: mount.vfs_scope_path,
+    }
 }
 
 fn vm_required_shared_mount_profiles(vm: &Vm) -> Vec<String> {

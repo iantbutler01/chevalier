@@ -2074,6 +2074,20 @@ impl Manager {
                     enforce_resource_bounds(&resources, self.resource_bounds)?;
                     inner.metadata.resources = resources;
                 }
+                if let Some(shared_mounts) = params.shared_mounts {
+                    if matches!(
+                        inner.runtime.state,
+                        VmState::Creating | VmState::Running | VmState::Paused | VmState::Error
+                    ) {
+                        return Err(ManagerError::InvalidState);
+                    }
+                    let shared_mounts = normalize_shared_mounts(shared_mounts)?;
+                    ensure_mount_profiles_supported(
+                        &shared_mounts,
+                        &self.cfg.shared_mount_profiles,
+                    )?;
+                    inner.metadata.shared_mounts = shared_mounts;
+                }
                 save_metadata(&vm.dir, &mut inner.metadata).map_err(ManagerError::Other)?;
             }
             (inner.metadata.clone(), inner.runtime.state)
@@ -7838,7 +7852,7 @@ mod tests {
             max_fork_chain_depth: 8,
             fork_compaction_depth_threshold: 8,
             storage_profile: config::StorageProfile::LocalEphemeral,
-            shared_mount_profiles: vec!["local-path".to_string()],
+            shared_mount_profiles: vec!["local-path".to_string(), "gateway-vfs".to_string()],
             ha_mode: false,
             node_registry: None,
             control_bus: None,
@@ -7944,6 +7958,7 @@ mod tests {
                         "caller-supplied-token".to_string(),
                     )])),
                     resources: None,
+                    shared_mounts: None,
                 },
             )
             .await
@@ -8000,12 +8015,41 @@ mod tests {
                         memory_mb: 1024,
                         disk_gb: 10,
                     }),
+                    shared_mounts: None,
                 },
             )
             .await
             .expect("update stopped vm resources");
         assert_eq!(resized.resources.vcpu, 2);
         assert_eq!(resized.resources.memory_mb, 1024);
+
+        let remounted = manager
+            .update_vm(
+                &vm_id,
+                UpdateVmParams {
+                    name: None,
+                    metadata: None,
+                    resources: None,
+                    shared_mounts: Some(vec![SharedMountSpec {
+                        host_path: String::new(),
+                        guest_path: "/workspace".to_string(),
+                        mount_tag: "workspace".to_string(),
+                        read_only: false,
+                        availability: SharedMountAvailability::SharedStorage,
+                        continuity: SharedMountContinuity::RestoreCrossNode,
+                        backend_profile: "gateway-vfs".to_string(),
+                        vfs_endpoint: "http://192.168.0.34:8930/internal/chevalier/vfs/owner"
+                            .to_string(),
+                        vfs_scope_path: "workspace".to_string(),
+                    }]),
+                },
+            )
+            .await
+            .expect("replace stopped vm mounts");
+        assert_eq!(
+            remounted.shared_mounts[0].vfs_endpoint,
+            "http://192.168.0.34:8930/internal/chevalier/vfs/owner"
+        );
 
         manager
             .vms
@@ -8028,12 +8072,26 @@ mod tests {
                         memory_mb: 2048,
                         disk_gb: 10,
                     }),
+                    shared_mounts: None,
                 },
             )
             .await
             .expect("update running vm next-boot resources");
         assert_eq!(next_boot.resources.vcpu, 4);
         assert_eq!(next_boot.resources.memory_mb, 2048);
+
+        let mount_update = manager
+            .update_vm(
+                &vm_id,
+                UpdateVmParams {
+                    name: None,
+                    metadata: None,
+                    resources: None,
+                    shared_mounts: Some(Vec::new()),
+                },
+            )
+            .await;
+        assert!(matches!(mount_update, Err(ManagerError::InvalidState)));
     }
 
     #[test]

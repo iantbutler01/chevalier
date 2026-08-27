@@ -716,6 +716,23 @@ impl Session {
     }
 
     #[napi]
+    pub async fn reconfigure_shared_mounts(
+        &self,
+        shared_mounts: Vec<SharedMountOpts>,
+    ) -> napi::Result<String> {
+        self.inner
+            .reconfigure_shared_mounts(
+                shared_mounts
+                    .into_iter()
+                    .map(SharedMountOpts::into_shared_mount)
+                    .collect(),
+            )
+            .await
+            .map(vm_state_label)
+            .map_err(sb_err)
+    }
+
+    #[napi]
     pub async fn list_pci_devices(&self) -> napi::Result<HostPciInventoryJs> {
         self.inner
             .list_pci_devices()
