@@ -41,6 +41,7 @@ export declare class Sandbox {
 export declare class Session {
   get sessionId(): string
   get vmId(): string
+  get workspaceRoot(): string
   /** Start a command; returns a bidirectional `ExecHandle`. */
   exec(command: string, options?: ExecOpts | undefined | null): Promise<ExecHandle>
   /** Start an interactive PTY shell; returns a bidirectional `ShellHandle`. */
@@ -86,6 +87,10 @@ export declare class Session {
   forwardPort(guestPort: number): Promise<ForwardHandle>
   /** Return a provider-managed preview URL when the provider supports one. */
   providerPreviewUrl(guestPort: number): Promise<string>
+  /** Open this VM's desktop. QEMU guests return a VNC target; macOS VZ opens a native viewer window. */
+  openDesktop(): Promise<SessionDesktopTargetJs>
+  /** Close a provider-owned desktop window without stopping the VM. */
+  closeDesktop(): Promise<void>
   /** Close the session handle without deleting the VM. */
   close(): Promise<void>
   /** Delete the backing VM/sandbox and purge provider resources. */
@@ -208,6 +213,13 @@ export interface SandboxConnectOptions {
 
 export interface SessionCheckpointJs {
   id: string
+}
+
+export interface SessionDesktopTargetJs {
+  kind: string
+  host?: string
+  port?: number
+  viewOnly: boolean
 }
 
 /** One entry returned by `Session.listDir`. */

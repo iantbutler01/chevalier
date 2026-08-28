@@ -128,15 +128,18 @@ download_verified \
   "4f13070cc9241fa342deab4ebfac360565030580ff77b6e5f1951a64627621e5da4abfd30e1e46ca8bae2bb7dd4ff98141aff424142c9629a5876a61283962e5"
 
 driver_root="$artifact_dir/answer-cd/\$WinPEDriver\$"
-if [[ ! -f "$driver_root/viostor/w11/ARM64/viostor.inf" || ! -f "$driver_root/NetKVM/w11/ARM64/netkvm.inf" ]]; then
+display_driver_root="$artifact_dir/viogpudo/w11/ARM64"
+if [[ ! -f "$driver_root/viostor/w11/ARM64/viostor.inf" || ! -f "$driver_root/NetKVM/w11/ARM64/netkvm.inf" || ! -f "$display_driver_root/viogpudo.inf" ]]; then
   if ! command -v 7z >/dev/null 2>&1; then
     echo "7z is required to extract the boot-critical virtio-win driver" >&2
     exit 1
   fi
   driver_temp=$(mktemp -d "$artifact_dir/.winpe-drivers.XXXXXX")
-  7z x -y -o"$driver_temp" "$virtio_iso" "viostor/w11/ARM64/*" "NetKVM/w11/ARM64/*" >/dev/null
+  7z x -y -o"$driver_temp" "$virtio_iso" "viostor/w11/ARM64/*" "NetKVM/w11/ARM64/*" "viogpudo/w11/ARM64/*" >/dev/null
   rm -rf "$driver_root"
+  rm -rf "$artifact_dir/viogpudo"
   mkdir -p "$driver_root"
   mv "$driver_temp/viostor" "$driver_temp/NetKVM" "$driver_root/"
+  mv "$driver_temp/viogpudo" "$artifact_dir/"
   rmdir "$driver_temp"
 fi

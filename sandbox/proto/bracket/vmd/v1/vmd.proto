@@ -136,6 +136,19 @@ message NetworkSpec {
   PortProxyPorts portproxy_ports = 4;
 }
 
+enum DesktopKind {
+  DESKTOP_KIND_UNSPECIFIED = 0;
+  DESKTOP_KIND_VNC = 1;
+  DESKTOP_KIND_NATIVE_WINDOW = 2;
+}
+
+message DesktopEndpoint {
+  DesktopKind kind = 1;
+  string host = 2;
+  int32 port = 3;
+  bool view_only = 4;
+}
+
 enum SharedMountAvailability {
   SHARED_MOUNT_AVAILABILITY_UNSPECIFIED = 0;
   SHARED_MOUNT_AVAILABILITY_NODE_LOCAL = 1;
@@ -222,6 +235,7 @@ message VM {
   GuestProfile guest_profile = 16;
   GuestRuntime guest_runtime = 17;
   VMCapabilities capabilities = 18;
+  DesktopEndpoint desktop = 19;
 }
 
 message ListVMsRequest {
@@ -440,6 +454,8 @@ service VMDService {
   rpc PauseVM(VMActionRequest) returns (VM);
   rpc ResumeVM(VMActionRequest) returns (VM);
   rpc ForceStopVM(VMActionRequest) returns (VM);
+  rpc ShowVMDesktop(VMActionRequest) returns (VM);
+  rpc HideVMDesktop(VMActionRequest) returns (VM);
 
   rpc ListHostPciDevices(ListHostPciDevicesRequest) returns (ListHostPciDevicesResponse);
   rpc AttachPciDevice(AttachPciDeviceRequest) returns (PciDeviceActionResponse);

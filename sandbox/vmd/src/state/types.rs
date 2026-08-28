@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -477,7 +478,27 @@ pub struct Vm {
     inner: Arc<tokio::sync::Mutex<VmInner>>,
     launch: tokio::sync::Mutex<()>,
     runtime_teardown: tokio::sync::Mutex<()>,
+    delete_requested: AtomicBool,
     pub dir: PathBuf,
+}
+
+pub struct VmDeleteGuard<'a> {
+    vm: &'a Vm,
+    completed: bool,
+}
+
+impl VmDeleteGuard<'_> {
+    pub fn complete(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for VmDeleteGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.vm.delete_requested.store(false, Ordering::Release);
+        }
+    }
 }
 
 impl Vm {
@@ -486,6 +507,7 @@ impl Vm {
             inner: Arc::new(tokio::sync::Mutex::new(VmInner { metadata, runtime })),
             launch: tokio::sync::Mutex::new(()),
             runtime_teardown: tokio::sync::Mutex::new(()),
+            delete_requested: AtomicBool::new(false),
             dir,
         }
     }
@@ -515,6 +537,20 @@ impl Vm {
 
     pub async fn lock_runtime_teardown(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.runtime_teardown.lock().await
+    }
+
+    pub fn begin_delete(&self) -> Option<VmDeleteGuard<'_>> {
+        self.delete_requested
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| VmDeleteGuard {
+                vm: self,
+                completed: false,
+            })
+    }
+
+    pub fn delete_requested(&self) -> bool {
+        self.delete_requested.load(Ordering::Acquire)
     }
 
     pub fn disk_path(&self) -> PathBuf {
@@ -721,5 +757,41 @@ mod tests {
             serde_json::to_value(VmSourceType::MacosTemplate).unwrap(),
             json!("macos-template")
         );
+    }
+
+    #[test]
+    fn vm_delete_guard_clears_failed_attempt_and_latches_completed_delete() {
+        let metadata: VmMetadata = serde_json::from_value(json!({
+            "id": "vm-delete-guard",
+            "name": "delete-guard",
+            "created_at": "2026-08-27T00:00:00.000Z",
+            "updated_at": "2026-08-27T00:00:00.000Z",
+            "state": "stopped",
+            "source": {
+                "type": "docker",
+                "reference": "docker.io/library/alpine:latest"
+            },
+            "resources": {
+                "vcpu": 2,
+                "memory_mb": 2048,
+                "disk_gb": 20
+            },
+            "network": {
+                "mac": "02:00:00:00:00:02"
+            }
+        }))
+        .expect("test metadata should deserialize");
+        let vm_dir = PathBuf::from("/tmp/vm-delete-guard");
+        let vm = Vm::new(metadata, VmRuntime::new(&vm_dir), vm_dir);
+
+        let failed_attempt = vm.begin_delete().expect("first delete should start");
+        assert!(vm.delete_requested());
+        assert!(vm.begin_delete().is_none());
+        drop(failed_attempt);
+        assert!(!vm.delete_requested());
+
+        let completed_attempt = vm.begin_delete().expect("retry should start");
+        completed_attempt.complete();
+        assert!(vm.delete_requested());
     }
 }

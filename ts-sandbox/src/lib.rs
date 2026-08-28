@@ -18,9 +18,10 @@ use chevalier_sandbox::{
     HostPciInventory as EngineHostPciInventory, OpenComputerBackendConfig, OpenComputerMountConfig,
     PciDeviceAction as EnginePciDeviceAction, ResourceLimits, Sandbox as EngineSandbox,
     SandboxConfig, SandboxError, SandboxProviderConfig, Session as EngineSession,
-    SessionInfo as EngineSessionInfo, SessionOptions, SessionSourceType as EngineSessionSourceType,
-    SharedMount, SharedMountAvailability, SharedMountContinuity, ShellEvent, ShellInput,
-    ShellOptions,
+    SessionDesktopKind as EngineSessionDesktopKind,
+    SessionDesktopTarget as EngineSessionDesktopTarget, SessionInfo as EngineSessionInfo,
+    SessionOptions, SessionSourceType as EngineSessionSourceType, SharedMount,
+    SharedMountAvailability, SharedMountContinuity, ShellEvent, ShellInput, ShellOptions,
 };
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
@@ -460,6 +461,28 @@ pub struct SessionInfoJs {
     pub fork_id: Option<String>,
 }
 
+#[napi(object)]
+pub struct SessionDesktopTargetJs {
+    pub kind: String,
+    pub host: Option<String>,
+    pub port: Option<u32>,
+    pub view_only: bool,
+}
+
+impl From<EngineSessionDesktopTarget> for SessionDesktopTargetJs {
+    fn from(target: EngineSessionDesktopTarget) -> Self {
+        Self {
+            kind: match target.kind {
+                EngineSessionDesktopKind::Vnc => "vnc".to_string(),
+                EngineSessionDesktopKind::NativeWindow => "native-window".to_string(),
+            },
+            host: target.host,
+            port: target.port.map(u32::from),
+            view_only: target.view_only,
+        }
+    }
+}
+
 impl From<EngineSessionInfo> for SessionInfoJs {
     fn from(info: EngineSessionInfo) -> Self {
         Self {
@@ -612,6 +635,10 @@ impl Session {
     #[napi(getter)]
     pub fn vm_id(&self) -> String {
         self.inner.vm_id().to_string()
+    }
+    #[napi(getter)]
+    pub fn workspace_root(&self) -> String {
+        self.inner.workspace_root().to_string()
     }
 
     /// Start a command; returns a bidirectional `ExecHandle`.
@@ -892,6 +919,22 @@ impl Session {
             .provider_preview_url(guest_port)
             .await
             .map_err(sb_err)
+    }
+
+    /// Open this VM's desktop. QEMU guests return a VNC target; macOS VZ opens a native viewer window.
+    #[napi]
+    pub async fn open_desktop(&self) -> napi::Result<SessionDesktopTargetJs> {
+        self.inner
+            .open_desktop()
+            .await
+            .map(SessionDesktopTargetJs::from)
+            .map_err(sb_err)
+    }
+
+    /// Close a provider-owned desktop window without stopping the VM.
+    #[napi]
+    pub async fn close_desktop(&self) -> napi::Result<()> {
+        self.inner.close_desktop().await.map_err(sb_err)
     }
 
     /// Close the session handle without deleting the VM.

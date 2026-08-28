@@ -151,6 +151,7 @@ source "qemu" "windows_11_arm64" {
     "${path.root}/${var.artifact_directory}/chevalier-vfs-winfsp-arm64.exe",
     "${path.root}/${var.artifact_directory}/chevalier-guest-agent-arm64.exe",
     "${path.root}/${var.artifact_directory}/chevalier-guest-services.SHA256SUMS",
+    "${path.root}/${var.artifact_directory}/viogpudo/*",
     "${path.root}/${var.artifact_directory}/answer-cd/*",
   ]
 

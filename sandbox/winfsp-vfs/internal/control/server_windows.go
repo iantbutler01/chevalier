@@ -60,6 +60,16 @@ func (r *Runtime) Run(ctx context.Context) error {
 		writeGuestStatus("failed", err)
 		return err
 	}
+	writeGuestStatus("finishing-windows-setup", nil)
+	if err := runtimeconfig.FinalizeFirstBoot(ctx); err != nil {
+		if errors.Is(err, runtimeconfig.ErrFirstBootRestartScheduled) {
+			writeGuestStatus("restarting-for-windows-setup", nil)
+			<-ctx.Done()
+			return nil
+		}
+		writeGuestStatus("failed", err)
+		return err
+	}
 	writeGuestStatus("initializing-state-volume", nil)
 	if err := initializeStateVolume(ctx); err != nil {
 		writeGuestStatus("failed", err)

@@ -23,6 +23,7 @@ pub struct VmRuntime {
     pub started_at: Option<DateTime<Utc>>,
     pub monitor: Option<MonitorHandle>,
     pub command_pid: Option<u32>,
+    pub desktop_port: Option<u16>,
     pub exit_status: Arc<Mutex<Option<Error>>>,
     pub suspending: bool,
     /// Per-shared-mount virtiofsd children spawned alongside the qemu process. These
@@ -47,6 +48,7 @@ impl VmRuntime {
             started_at: None,
             monitor: None,
             command_pid: None,
+            desktop_port: None,
             exit_status: Arc::new(Mutex::new(None)),
             suspending: false,
             virtiofsd_handles: Vec::new(),

@@ -7,6 +7,7 @@ $powerShell = Join-Path $artifactRoot "PowerShell-7.6.5-win-arm64.msi"
 $visualCppRuntime = Join-Path $artifactRoot "vc_redist.arm64-14.51.36247.exe"
 $ripgrep = Join-Path $artifactRoot "ripgrep-15.2.0-aarch64-pc-windows-msvc.zip"
 $git = Join-Path $artifactRoot "Git-2.55.0.4-64-bit.exe"
+$displayDriver = Join-Path $artifactRoot "viogpudo\w11\ARM64\viogpudo.inf"
 $installServices = Join-Path $artifactRoot "install-runtime-services.ps1"
 
 function Assert-Sha256 {
@@ -42,6 +43,10 @@ Assert-Sha256 -Path $git -Expected "0CBC0B34A74B3AFF3ACE0910328549155A770E228331
 
 Invoke-Installer -FilePath msiexec.exe -ArgumentList "/i `"$winFsp`" /qn /norestart INSTALLLEVEL=1000"
 Invoke-Installer -FilePath $virtioTools -ArgumentList "/quiet /norestart"
+& pnputil.exe /add-driver $displayDriver /install
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to stage the ARM64 VirtIO GPU display driver"
+}
 Invoke-Installer -FilePath msiexec.exe -ArgumentList "/i `"$powerShell`" /qn /norestart ADD_PATH=1"
 Invoke-Installer -FilePath $visualCppRuntime -ArgumentList "/install /quiet /norestart"
 Invoke-Installer -FilePath $git -ArgumentList "/VERYSILENT /NORESTART /NOCANCEL /SP-"

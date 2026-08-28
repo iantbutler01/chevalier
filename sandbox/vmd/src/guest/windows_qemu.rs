@@ -223,6 +223,13 @@ pub fn create_runtime_config_iso(
     }
     let endpoint = guest_visible_vfs_endpoint(&mount.vfs_endpoint)?;
     let bootstrap_password = format!("Aa1!{}", Uuid::new_v4().simple());
+    let computer_name = windows_computer_name(&meta.id)?;
+    let unattended = runtime_unattend_xml(
+        &meta.architecture,
+        &computer_name,
+        "OpenBracket",
+        &bootstrap_password,
+    )?;
     let config = serde_json::to_vec_pretty(&serde_json::json!({
         "schemaVersion": 1,
         "vmId": meta.id,
@@ -258,35 +265,92 @@ pub fn create_runtime_config_iso(
                 "BOOT.TKN".to_string(),
                 format!("{bootstrap_password}\n").into_bytes(),
             ),
-            (
-                "FIRSTBT.PS1".to_string(),
-                first_boot_script().as_bytes().to_vec(),
-            ),
+            ("AUTOUNATTEND.XML".to_string(), unattended.into_bytes()),
         ],
     )
 }
 
-fn first_boot_script() -> &'static str {
-    r#"$ErrorActionPreference = "Stop"
-$media = Split-Path -Parent $PSCommandPath
-$config = Get-Content -Raw -LiteralPath (Join-Path $media "RUNTIME.JSN") | ConvertFrom-Json
-$passwordText = [IO.File]::ReadAllText((Join-Path $media "BOOT.TKN")).Trim()
-if (-not $passwordText) { throw "The first-boot password is empty" }
-$compactId = $config.vmId -replace '[^A-Fa-f0-9]', ''
-if ($compactId.Length -lt 12) { throw "The VM ID cannot form a computer name" }
-$computerName = "OB-" + $compactId.Substring(0, 12).ToUpperInvariant()
-if ($env:COMPUTERNAME -ne $computerName) { Rename-Computer -NewName $computerName -Force }
-$securePassword = ConvertTo-SecureString $passwordText -AsPlainText -Force
-$account = Get-LocalUser -Name "OpenBracketBootstrap" -ErrorAction SilentlyContinue
-if ($account) {
-    Set-LocalUser -Name "OpenBracketBootstrap" -Password $securePassword
-    Enable-LocalUser -Name "OpenBracketBootstrap"
-} else {
-    $account = New-LocalUser -Name "OpenBracketBootstrap" -Password $securePassword -AccountNeverExpires -PasswordNeverExpires -Description "Ephemeral OpenBracket first-boot account"
+fn windows_computer_name(vm_id: &str) -> Result<String> {
+    let compact = vm_id
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .collect::<String>();
+    if compact.len() < 12 {
+        bail!("Windows VM ID cannot form a computer name");
+    }
+    Ok(format!("OB-{}", compact[..12].to_ascii_uppercase()))
 }
-$administrators = Get-LocalGroup -SID "S-1-5-32-544"
-Add-LocalGroupMember -Group $administrators -Member $account -ErrorAction SilentlyContinue
+
+fn runtime_unattend_xml(
+    architecture: &str,
+    computer_name: &str,
+    username: &str,
+    password: &str,
+) -> Result<String> {
+    let architecture = normalize_architecture(architecture)?;
+    let processor_architecture = match architecture.as_str() {
+        AMD64 => "amd64",
+        ARM64 => "arm64",
+        _ => unreachable!("Windows architecture was normalized"),
+    };
+    let computer_name = xml_escape(computer_name);
+    let username = xml_escape(username);
+    let password = xml_escape(password);
+    Ok(format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="{processor_architecture}" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <ComputerName>{computer_name}</ComputerName>
+      <TimeZone>UTC</TimeZone>
+    </component>
+  </settings>
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="{processor_architecture}" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <InputLocale>0409:00000409</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>en-US</UserLocale>
+    </component>
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="{processor_architecture}" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+      </OOBE>
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Password><Value>{password}</Value><PlainText>true</PlainText></Password>
+            <Description>OpenBracket desktop user</Description>
+            <DisplayName>{username}</DisplayName>
+            <Group>Users</Group>
+            <Name>{username}</Name>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+      <AutoLogon>
+        <Password><Value>{password}</Value><PlainText>true</PlainText></Password>
+        <Enabled>true</Enabled>
+        <LogonCount>1</LogonCount>
+        <Username>{username}</Username>
+      </AutoLogon>
+    </component>
+  </settings>
+</unattend>
 "#
+    ))
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 fn guest_visible_vfs_endpoint(raw: &str) -> Result<String> {
@@ -426,6 +490,10 @@ pub fn build_qemu_args(
         "usb-tablet".to_string(),
         "-device".to_string(),
         "ramfb".to_string(),
+        "-device".to_string(),
+        "virtio-gpu-pci".to_string(),
+        "-vnc".to_string(),
+        "127.0.0.1:0,to=99,share=ignore".to_string(),
         "-display".to_string(),
         "none".to_string(),
         "-serial".to_string(),
@@ -720,9 +788,10 @@ mod tests {
         let iso = fs::read(temp.path().join(RUNTIME_CONFIG_ISO_FILE_NAME)).unwrap();
         let text = String::from_utf8_lossy(&iso);
         assert!(text.contains("BOOT.TKN;1"));
-        assert!(text.contains("FIRSTBT.PS1;1"));
-        assert!(text.contains("OpenBracketBootstrap"));
-        assert!(text.contains("Rename-Computer"));
+        assert!(text.contains("AUTOUNATTEND.XML;1"));
+        assert!(text.contains("OpenBracket"));
+        assert!(text.contains("<Group>Users</Group>"));
+        assert!(text.contains("<LogonCount>1</LogonCount>"));
         assert!(text.contains("control-secret"));
         assert!(text.contains("vfs-secret"));
     }
@@ -751,6 +820,8 @@ mod tests {
         );
         assert!(args.iter().any(|arg| arg.contains(EFI_VARS_FILE_NAME)));
         assert!(!args.iter().any(|arg| arg.contains("bootstrap.iso")));
+        assert!(args.contains(&"virtio-gpu-pci".to_string()));
+        assert!(args.contains(&"127.0.0.1:0,to=99,share=ignore".to_string()));
 
         let mut high_memory = fixture_metadata(ARM64);
         high_memory.resources.memory_mb = 4096;
@@ -789,5 +860,7 @@ mod tests {
             args.contains(&"virtio-blk-pci,drive=windows-state,serial=openbracket-vfs".to_string())
         );
         assert!(args.iter().any(|arg| arg.contains("hv_time")));
+        assert!(args.contains(&"virtio-gpu-pci".to_string()));
+        assert!(args.contains(&"127.0.0.1:0,to=99,share=ignore".to_string()));
     }
 }

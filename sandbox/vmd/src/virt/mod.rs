@@ -86,6 +86,12 @@ pub struct StatusInfo {
     pub status: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VncInfo {
+    pub host: String,
+    pub port: u16,
+}
+
 const DEFAULT_D2VM_IMAGE: &str = "linkacloud/d2vm:latest";
 const D2VM_CONTAINER_DIR: &str = "/workspace";
 const D2VM_BOOTSTRAP_CONTEXT: &str = ".chevalier-bootstrap-image";
@@ -1579,6 +1585,34 @@ impl MonitorHandle {
         })
     }
 
+    pub async fn query_vnc(&self) -> Result<VncInfo> {
+        let mut conn = establish_connection(&self.path).await?;
+        let value = execute_raw(&mut conn, "query-vnc", None).await?;
+        let enabled = value
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !enabled {
+            bail!("QEMU VNC console is disabled");
+        }
+        let host = value
+            .get("host")
+            .and_then(Value::as_str)
+            .filter(|host| !host.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("QEMU VNC response omitted host"))?;
+        let service = value
+            .get("service")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("QEMU VNC response omitted service"))?;
+        let port = service
+            .parse::<u16>()
+            .with_context(|| format!("parse QEMU VNC service `{service}`"))?;
+        Ok(VncInfo {
+            host: host.to_string(),
+            port,
+        })
+    }
+
     async fn execute(&self, command: &str, args: Option<Value>) -> Result<Value> {
         let mut conn = establish_connection(&self.path).await?;
         execute_raw(&mut conn, command, args).await
@@ -1877,6 +1911,37 @@ mod tests {
             .await
             .expect("resize durable block device");
         server.await.expect("qmp mock should finish");
+    }
+
+    #[tokio::test]
+    async fn query_vnc_returns_the_bound_loopback_port() {
+        let temp = tempfile::tempdir().expect("create qmp tempdir");
+        let socket = temp.path().join("qmp.sock");
+        let listener = UnixListener::bind(&socket).expect("bind qmp socket");
+        let server = tokio::spawn(serve_qmp_script(
+            listener,
+            vec![(
+                "query-vnc",
+                json!({
+                    "enabled": true,
+                    "host": "127.0.0.1",
+                    "service": "5907",
+                    "family": "ipv4",
+                    "auth": "none",
+                    "clients": [],
+                }),
+            )],
+        ));
+
+        let monitor = MonitorHandle { path: socket };
+        assert_eq!(
+            monitor.query_vnc().await.expect("query VNC"),
+            VncInfo {
+                host: "127.0.0.1".to_string(),
+                port: 5907,
+            }
+        );
+        server.await.expect("QMP server should finish");
     }
 
     #[tokio::test]

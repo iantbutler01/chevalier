@@ -23,6 +23,12 @@ if ((Get-BitLockerVolume -MountPoint "C:").ProtectionStatus -ne "Off") {
 if (-not (Test-Path "C:\ProgramData\Chevalier\image-manifest.json")) {
     throw "The image manifest is missing"
 }
+$displayDriver = Get-WindowsDriver -Online | Where-Object {
+    $_.ProviderName -eq "Red Hat, Inc." -and $_.ClassName -eq "Display"
+}
+if (-not $displayDriver) {
+    throw "The ARM64 VirtIO GPU display driver is not staged"
+}
 foreach ($serviceName in "ChevalierVFS", "ChevalierGuest") {
     if (-not (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) {
         throw "$serviceName is not installed"

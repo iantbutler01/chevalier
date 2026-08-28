@@ -105,6 +105,7 @@ const MAX_VM_VCPU: i32 = 8;
 const MAX_VM_MEMORY_MB: i32 = 16 * 1024;
 const MAX_VM_DISK_GB: i32 = 100;
 const VM_RUNNING_TIMEOUT: Duration = Duration::from_secs(60);
+const WINDOWS_FIRST_BOOT_READY_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const INCOMING_RESTORE_TOTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const INCOMING_RESTORE_STALL_TIMEOUT: Duration = Duration::from_secs(90);
 // @dive: Bumped v1 -> v2 when the amd64 KVM `-cpu` line gained `+invtsc,migratable=off`.
@@ -2665,6 +2666,7 @@ impl Manager {
         } {
             return self.delete_macos_vz_vm(vm, id).await;
         }
+        let delete_guard = vm.begin_delete().ok_or(ManagerError::InvalidState)?;
         let (fork_base_path, session_id) = {
             let inner = vm.lock().await;
             (
@@ -2681,9 +2683,14 @@ impl Manager {
         // mounts are live, their publishers are running, and the qemu exit
         // reaper that follows only gets the short guarded bound.
         drain_vm_publication(&vm, "delete-vm", fuse::DEFAULT_VFS_DRAIN_TIMEOUT).await;
-        if matches!(state, VmState::Running | VmState::Paused) {
+        if matches!(
+            state,
+            VmState::Running | VmState::Paused | VmState::Creating
+        ) {
             self.force_stop_vm(id).await?;
         }
+        let _launch_settled = vm.lock_runtime_teardown().await;
+        wait_for_qemu_launch_to_settle(&vm, id, Duration::from_secs(30)).await?;
         {
             let inner = vm.lock().await;
             if matches!(inner.runtime.state, VmState::Running | VmState::Paused) {
@@ -2739,6 +2746,7 @@ impl Manager {
         self.release_pci_leases(id, &assignments).await;
         self.cleanup_fork_base_if_unreferenced(fork_base_path).await;
         self.garbage_collect_orphaned_fork_roots().await;
+        delete_guard.complete();
         Ok(())
     }
 
@@ -3439,6 +3447,7 @@ impl Manager {
                 "macOS VZ guest snapshots are not implemented".to_string(),
             ));
         }
+        let _launch = vm.lock_runtime_teardown().await;
         if is_windows_qemu(&vm.lock().await.metadata) {
             return Err(ManagerError::Unsupported(
                 "Windows QEMU guest snapshots are not implemented".to_string(),
@@ -3740,12 +3749,17 @@ impl Manager {
         if booting_from_incoming {
             // A deferred incoming qemu is not registered until restore completes. Keep
             // that launch caller-owned so cancellation drops its kill-on-drop child.
-            return Self::start_vm_inner(cfg, host_arch, vm, id).await;
+            let _launch = vm.lock_runtime_teardown().await;
+            return Self::start_vm_inner(cfg, host_arch, vm.clone(), id).await;
         }
 
         // Ordinary launches retain their established owned-task behavior so caller
         // cancellation cannot interrupt sidecar and runtime registration cleanup.
-        match tokio::spawn(async move { Self::start_vm_inner(cfg, host_arch, vm, id).await }).await
+        match tokio::spawn(async move {
+            let _launch = vm.lock_runtime_teardown().await;
+            Self::start_vm_inner(cfg, host_arch, vm.clone(), id).await
+        })
+        .await
         {
             Ok(result) => result,
             Err(err) => Err(ManagerError::Other(anyhow!(
@@ -4276,6 +4290,10 @@ impl Manager {
         let _launch = vm.lock_launch().await;
         let id = id.as_str();
 
+        if vm.delete_requested() {
+            return Err(ManagerError::InvalidState);
+        }
+
         let (
             binary,
             meta_snapshot,
@@ -4429,6 +4447,7 @@ impl Manager {
 
             inner.runtime.monitor = None;
             inner.runtime.command_pid = None;
+            inner.runtime.desktop_port = None;
             inner.runtime.started_at = None;
             {
                 let mut exit = inner
@@ -4729,6 +4748,21 @@ impl Manager {
             "starting qemu process"
         );
 
+        if vm.delete_requested() {
+            if let Some(handle) = tap_network_handle.take() {
+                handle.shutdown().await;
+            }
+            if vm_proxy_upstream_addr.is_some() {
+                let _ = network::unregister_vm_proxy_policy(id).await;
+            }
+            for handle in &virtiofsd_handles {
+                virt::terminate_virtiofsd(handle);
+            }
+            cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
+            mark_vm_state(&vm, VmState::Error).await;
+            return Err(ManagerError::InvalidState);
+        }
+
         let mut cmd = Command::new(&binary);
         cmd.args(&args);
         cmd.current_dir(&vm_dir);
@@ -4867,27 +4901,26 @@ impl Manager {
         cmd.stderr(std::process::Stdio::from(stderr_file));
 
         let booting_from_incoming = !meta_snapshot.boot_incoming_ram_path.is_empty();
-        let mut child =
-            match spawn_launch_child(&mut cmd, &format!("qemu {binary}"), booting_from_incoming) {
-                Ok(child) => child,
-                Err(err) => {
-                    if let Some(cgroup) = qemu_cgroup.take() {
-                        cgroup.cleanup();
-                    }
-                    if let Some(handle) = tap_network_handle.take() {
-                        handle.shutdown().await;
-                    }
-                    if vm_proxy_upstream_addr.is_some() {
-                        let _ = network::unregister_vm_proxy_policy(id).await;
-                    }
-                    for handle in &virtiofsd_handles {
-                        virt::terminate_virtiofsd(handle);
-                    }
-                    cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
-                    mark_vm_state(&vm, VmState::Error).await;
-                    return Err(ManagerError::Other(err));
+        let mut child = match spawn_launch_child(&mut cmd, &format!("qemu {binary}"), true) {
+            Ok(child) => child,
+            Err(err) => {
+                if let Some(cgroup) = qemu_cgroup.take() {
+                    cgroup.cleanup();
                 }
-            };
+                if let Some(handle) = tap_network_handle.take() {
+                    handle.shutdown().await;
+                }
+                if vm_proxy_upstream_addr.is_some() {
+                    let _ = network::unregister_vm_proxy_policy(id).await;
+                }
+                for handle in &virtiofsd_handles {
+                    virt::terminate_virtiofsd(handle);
+                }
+                cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
+                mark_vm_state(&vm, VmState::Error).await;
+                return Err(ManagerError::Other(err));
+            }
+        };
 
         let monitor =
             match virt::wait_for_monitor(qmp_path.as_path(), Duration::from_secs(20)).await {
@@ -4974,8 +5007,56 @@ impl Manager {
             }
             return Err(err);
         }
+        let desktop_port = if windows_qemu_guest {
+            match monitor.query_vnc().await {
+                Ok(info) if matches!(info.host.as_str(), "127.0.0.1" | "localhost" | "::1") => {
+                    Some(info.port)
+                }
+                Ok(info) => {
+                    let err = anyhow!(
+                        "Windows QEMU VNC must bind loopback, but QEMU reported {}:{}",
+                        info.host,
+                        info.port
+                    );
+                    if let Some(handle) = tap_network_handle.take() {
+                        handle.shutdown().await;
+                    }
+                    if vm_proxy_upstream_addr.is_some() {
+                        let _ = network::unregister_vm_proxy_policy(id).await;
+                    }
+                    cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
+                    let err = abort_launch(vm.clone(), child, &log_path, err).await;
+                    if let Some(cgroup) = qemu_cgroup.take() {
+                        cgroup.cleanup();
+                    }
+                    return Err(err);
+                }
+                Err(err) => {
+                    if let Some(handle) = tap_network_handle.take() {
+                        handle.shutdown().await;
+                    }
+                    if vm_proxy_upstream_addr.is_some() {
+                        let _ = network::unregister_vm_proxy_policy(id).await;
+                    }
+                    cleanup_unpublished_fuse_handles(id, &fuse_handles).await;
+                    let err = abort_launch(
+                        vm.clone(),
+                        child,
+                        &log_path,
+                        err.context("discover Windows QEMU VNC console"),
+                    )
+                    .await;
+                    if let Some(cgroup) = qemu_cgroup.take() {
+                        cgroup.cleanup();
+                    }
+                    return Err(err);
+                }
+            }
+        } else {
+            None
+        };
         if windows_qemu_guest {
-            if let Err(err) = wait_for_windows_guest_ready(&meta_snapshot).await {
+            if let Err(err) = wait_for_windows_guest_ready(&meta_snapshot, &vm).await {
                 if let Some(handle) = tap_network_handle.take() {
                     handle.shutdown().await;
                 }
@@ -5012,6 +5093,7 @@ impl Manager {
             inner.runtime.started_at = Some(Utc::now());
             inner.runtime.reset_health_tracking();
             inner.runtime.command_pid = child_pid;
+            inner.runtime.desktop_port = desktop_port;
             inner.runtime.virtiofsd_handles = virtiofsd_handles;
             inner.runtime.fuse_handles = fuse_handles;
             inner.runtime.tap_network = tap_network_handle.take();
@@ -5279,6 +5361,50 @@ impl Manager {
             }
         }
 
+        Ok(vm.lock().await.metadata.clone())
+    }
+
+    pub async fn show_vm_desktop(&self, id: &str) -> ManagerResult<VmMetadata> {
+        self.control_macos_vz_desktop(id, macos_vz::OwnerOperation::ShowViewer)
+            .await
+    }
+
+    pub async fn hide_vm_desktop(&self, id: &str) -> ManagerResult<VmMetadata> {
+        self.control_macos_vz_desktop(id, macos_vz::OwnerOperation::HideViewer)
+            .await
+    }
+
+    async fn control_macos_vz_desktop(
+        &self,
+        id: &str,
+        operation: macos_vz::OwnerOperation,
+    ) -> ManagerResult<VmMetadata> {
+        let vm = self.vm_by_id(id).await?;
+        let _teardown = vm.lock_runtime_teardown().await;
+        {
+            let inner = vm.lock().await;
+            if !is_macos_vz(&inner.metadata) {
+                return Err(ManagerError::Unsupported(
+                    "native desktop windows are only available for macOS VZ guests".to_string(),
+                ));
+            }
+            if !matches!(inner.runtime.state, VmState::Running | VmState::Paused) {
+                return Err(ManagerError::Unsupported(
+                    "macOS desktop requires a running or paused VM".to_string(),
+                ));
+            }
+        }
+        let (paths, generation) = macos_vz_runtime_identity(&vm).await?;
+        let response = macos_vz::request(&paths.control_socket, &generation, operation)
+            .await
+            .map_err(ManagerError::Other)?;
+        if !response.ok {
+            return Err(ManagerError::Other(anyhow!(
+                "macOS VZ owner rejected {}: {}",
+                operation.as_str(),
+                response.error.as_deref().unwrap_or("unknown error")
+            )));
+        }
         Ok(vm.lock().await.metadata.clone())
     }
 
@@ -6347,10 +6473,10 @@ fn qemu_user_netdev(meta: &VmMetadata) -> Result<String> {
     ))
 }
 
-async fn wait_for_windows_guest_ready(meta: &VmMetadata) -> Result<()> {
+async fn wait_for_windows_guest_ready(meta: &VmMetadata, vm: &Arc<Vm>) -> Result<()> {
     let auth_header = portproxy_auth_header_from_metadata(&meta.metadata)?;
     let endpoint = format!("http://127.0.0.1:{}", meta.network.rpc_port);
-    let deadline = Instant::now() + Duration::from_secs(600);
+    let deadline = Instant::now() + WINDOWS_FIRST_BOOT_READY_TIMEOUT;
     let generation = meta
         .metadata
         .get(META_WINDOWS_RUNTIME_GENERATION)
@@ -6372,6 +6498,9 @@ async fn wait_for_windows_guest_ready(meta: &VmMetadata) -> Result<()> {
     );
     let mut last_logged_error = String::new();
     loop {
+        if vm.delete_requested() {
+            bail!("Windows guest launch was cancelled because the VM is being deleted");
+        }
         let last_error = match probe_guest_exec_ready_for_platform(
             &endpoint,
             auth_header.as_ref(),
@@ -6412,10 +6541,55 @@ async fn wait_for_windows_guest_ready(meta: &VmMetadata) -> Result<()> {
         }
         if Instant::now() >= deadline {
             bail!(
-                "Windows guest control and WinFsp workspace did not become ready within 600s: {last_error}"
+                "Windows guest control and WinFsp workspace did not become ready within {}s: {last_error}",
+                WINDOWS_FIRST_BOOT_READY_TIMEOUT.as_secs()
             );
         }
         sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn wait_for_qemu_launch_to_settle(
+    vm: &Arc<Vm>,
+    id: &str,
+    timeout: Duration,
+) -> ManagerResult<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let (state, vm_dir, qmp_path, pid_path) = {
+            let inner = vm.lock().await;
+            (
+                inner.runtime.state,
+                vm.dir.clone(),
+                inner.runtime.qmp_path.clone(),
+                inner.runtime.pid_path.clone(),
+            )
+        };
+        let live_pid = read_pid_file(&pid_path).filter(|pid| pid_exists(*pid));
+        if live_pid.is_some() || state == VmState::Creating {
+            let _ = reclaim_local_runtime_ownership(
+                id,
+                vm_dir.as_path(),
+                qmp_path.as_path(),
+                pid_path.as_path(),
+            )
+            .await
+            .map_err(ManagerError::Other)?;
+        }
+        let settled = {
+            let inner = vm.lock().await;
+            inner.runtime.state != VmState::Creating
+                && read_pid_file(&inner.runtime.pid_path).is_none_or(|pid| !pid_exists(pid))
+        };
+        if settled {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(ManagerError::Other(anyhow!(
+                "timed out waiting for in-flight QEMU launch to stop before deleting VM {id}"
+            )));
+        }
+        sleep(Duration::from_millis(100)).await;
     }
 }
 

@@ -68,7 +68,7 @@ use proto::bracket::portproxy::v1::{
 use proto::vmd::v1::vmd_service_client::VmdServiceClient;
 use proto::vmd::v1::{
     AttachPciDeviceRequest, CreateSnapshotRequest, CreateVmRequest, DeleteDurableVolumeRequest,
-    DeleteSnapshotRequest, DetachPciDeviceRequest, ForkVmRequest, GetVmBySessionRequest,
+    DeleteSnapshotRequest, DesktopKind, DetachPciDeviceRequest, ForkVmRequest, GetVmBySessionRequest,
     GetVmRequest, GuestPlatform, GuestProfile, ListDurableVolumesRequest, ListHostPciDevicesRequest, ListSnapshotsRequest,
     ListVMsRequest, Metadata, PreDownloadVmImageRequest, ResizeDurableVolumeRequest, ResourceSpec,
     RestoreSnapshotRequest, UpdateVmRequest, Vm, VmActionRequest, VmSource, VmSourceType,
@@ -1033,6 +1033,20 @@ pub struct SessionInfo {
     pub fork_id: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionDesktopKind {
+    Vnc,
+    NativeWindow,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionDesktopTarget {
+    pub kind: SessionDesktopKind,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub view_only: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct DurableVolumeInfo {
     pub owner_key: String,
@@ -1438,6 +1452,7 @@ pub struct Session {
     sandbox: Sandbox,
     session_id: String,
     vm_id: String,
+    workspace_root: String,
     node_endpoint: Arc<Mutex<String>>,
     ownership_fence: Arc<Mutex<Option<String>>>,
     shared_mounts: Arc<Vec<SharedMount>>,
@@ -1546,10 +1561,17 @@ impl Session {
         ownership_fence: Option<String>,
         shared_mounts: Vec<SharedMount>,
     ) -> Self {
+        let workspace_root = shared_mounts
+            .first()
+            .map(|mount| mount.guest_path.trim())
+            .filter(|path| !path.is_empty())
+            .unwrap_or("/workspace")
+            .to_string();
         Self {
             sandbox,
             session_id,
             vm_id,
+            workspace_root,
             node_endpoint: Arc::new(Mutex::new(node_endpoint)),
             ownership_fence: Arc::new(Mutex::new(ownership_fence)),
             shared_mounts: Arc::new(shared_mounts),
@@ -1562,6 +1584,10 @@ impl Session {
 
     pub fn vm_id(&self) -> &str {
         &self.vm_id
+    }
+
+    pub fn workspace_root(&self) -> &str {
+        &self.workspace_root
     }
 
     // @dive: Exposes the currently resolved owner endpoint so higher-level integrations can
@@ -3160,6 +3186,101 @@ impl Session {
         ))
     }
 
+    pub async fn open_desktop(&self) -> Result<SessionDesktopTarget> {
+        if matches!(
+            &self.sandbox.inner.control_backend,
+            ControlBackend::OpenComputer(_)
+        ) {
+            return Err(SandboxError::Unsupported(
+                "VM desktops are only available for vmd-backed sandboxes".to_string(),
+            ));
+        }
+
+        let node_endpoint = self.current_node_endpoint().await;
+        let vm = self
+            .sandbox
+            .ensure_vm_running(&self.vm_id, &node_endpoint)
+            .await?;
+        let desktop = vm.desktop.ok_or_else(|| {
+            SandboxError::Unsupported("this guest does not expose a desktop console".to_string())
+        })?;
+        match DesktopKind::try_from(desktop.kind).unwrap_or(DesktopKind::Unspecified) {
+            DesktopKind::NativeWindow => {
+                let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
+                client
+                    .show_vm_desktop(self.sandbox.request_with_auth(VmActionRequest {
+                        vm_id: self.vm_id.clone(),
+                    }))
+                    .await?;
+                Ok(SessionDesktopTarget {
+                    kind: SessionDesktopKind::NativeWindow,
+                    host: None,
+                    port: None,
+                    view_only: false,
+                })
+            }
+            DesktopKind::Vnc => {
+                let port = u16::try_from(desktop.port).map_err(|_| {
+                    SandboxError::InvalidResponse(format!(
+                        "VM reported invalid desktop port: {}",
+                        desktop.port
+                    ))
+                })?;
+                if port == 0 {
+                    return Err(SandboxError::InvalidResponse(
+                        "VM reported zero desktop port".to_string(),
+                    ));
+                }
+                let host = endpoint_host(&node_endpoint)?;
+                if !matches!(host.as_str(), "127.0.0.1" | "::1") {
+                    return Err(SandboxError::Unsupported(
+                        "remote-node QEMU desktop relay is not implemented; the VNC console remains node-loopback-only"
+                            .to_string(),
+                    ));
+                }
+                Ok(SessionDesktopTarget {
+                    kind: SessionDesktopKind::Vnc,
+                    host: Some(host),
+                    port: Some(port),
+                    view_only: desktop.view_only,
+                })
+            }
+            DesktopKind::Unspecified => Err(SandboxError::InvalidResponse(
+                "VM reported an unspecified desktop kind".to_string(),
+            )),
+        }
+    }
+
+    pub async fn close_desktop(&self) -> Result<()> {
+        if matches!(
+            &self.sandbox.inner.control_backend,
+            ControlBackend::OpenComputer(_)
+        ) {
+            return Ok(());
+        }
+        let node_endpoint = self.current_node_endpoint().await;
+        let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
+        let vm = client
+            .get_vm(self.sandbox.request_with_auth(GetVmRequest {
+                vm_id: self.vm_id.clone(),
+            }))
+            .await?
+            .into_inner();
+        if vm
+            .guest_profile
+            .as_ref()
+            .and_then(|profile| GuestPlatform::try_from(profile.platform).ok())
+            == Some(GuestPlatform::Macos)
+        {
+            client
+                .hide_vm_desktop(self.sandbox.request_with_auth(VmActionRequest {
+                    vm_id: self.vm_id.clone(),
+                }))
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn state(&self) -> Result<i32> {
         if let ControlBackend::Managed(control) = &self.sandbox.inner.control_backend {
             return control.state(&self.vm_id).await;
@@ -3599,6 +3720,7 @@ impl Session {
         let child = Session {
             sandbox: self.sandbox.clone(),
             session_id: child_session_id.clone(),
+            workspace_root: vm_workspace_root(&child_vm),
             vm_id: child_vm.id,
             node_endpoint: Arc::new(Mutex::new(node_endpoint)),
             ownership_fence: Arc::new(Mutex::new(child_fence)),
@@ -3864,6 +3986,7 @@ impl Sandbox {
             let session = Session {
                 sandbox: self.clone(),
                 session_id,
+                workspace_root: vm_workspace_root(&vm),
                 vm_id: vm.id,
                 node_endpoint: Arc::new(Mutex::new(node_endpoint)),
                 ownership_fence: Arc::new(Mutex::new(next_fence)),
@@ -4029,6 +4152,7 @@ impl Sandbox {
         let session = Session {
             sandbox: self.clone(),
             session_id,
+            workspace_root: vm_workspace_root(&vm),
             vm_id: vm.id,
             node_endpoint: Arc::new(Mutex::new(node_endpoint)),
             ownership_fence: Arc::new(Mutex::new(next_fence)),
@@ -4160,6 +4284,7 @@ impl Sandbox {
         let session = Session {
             sandbox: self.clone(),
             session_id: session_id.to_string(),
+            workspace_root: vm_workspace_root(&vm),
             vm_id: vm.id,
             node_endpoint: Arc::new(Mutex::new(node_endpoint)),
             ownership_fence: Arc::new(Mutex::new(next_fence)),
@@ -4187,6 +4312,7 @@ impl Sandbox {
         let session = Session {
             sandbox: self.clone(),
             session_id: session_id.to_string(),
+            workspace_root: vm_workspace_root(&vm),
             vm_id: vm.id,
             node_endpoint: Arc::new(Mutex::new(node_endpoint)),
             ownership_fence: Arc::new(Mutex::new(current_fence)),
@@ -6366,6 +6492,15 @@ fn vm_guest_platform(vm: &Vm) -> GuestPlatform {
         .as_ref()
         .and_then(|profile| GuestPlatform::try_from(profile.platform).ok())
         .unwrap_or(GuestPlatform::Linux)
+}
+
+fn vm_workspace_root(vm: &Vm) -> String {
+    vm.guest_runtime
+        .as_ref()
+        .map(|runtime| runtime.workspace_root.trim())
+        .filter(|path| !path.is_empty())
+        .unwrap_or("/workspace")
+        .to_string()
 }
 
 fn guest_shell_args(

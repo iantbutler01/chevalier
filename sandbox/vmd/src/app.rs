@@ -34,7 +34,7 @@ use crate::pci::{
 use crate::proto::v1::{
     AttachPciDeviceRequest, CreateSnapshotRequest, CreateVmPhase, CreateVmProgress,
     CreateVmRequest, CreateVmStreamResponse, DeleteDurableVolumeRequest, DeleteSnapshotRequest,
-    DeleteVmRequest, DetachPciDeviceRequest, DurableVolume, DurableVolumeAttachment, ForkVmRequest,
+    DeleteVmRequest, DesktopEndpoint, DesktopKind, DetachPciDeviceRequest, DurableVolume, DurableVolumeAttachment, ForkVmRequest,
     ForkVmResponse, GetSnapshotRequest, GetVmBySessionRequest, GetVmRequest, HealthRequest,
     HealthResponse, HostPciDevice, HostPciDeviceState, HostPciFunction, InfoRequest, InfoResponse,
     ListDurableVolumesRequest, ListDurableVolumesResponse, ListHostPciDevicesRequest,
@@ -891,6 +891,18 @@ impl VmdService for GrpcService {
             .await
     }
 
+    async fn show_vm_desktop(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
+        self.authorize(&request, AccessLevel::Write).await?;
+        self.vm_action(request.into_inner(), Action::ShowDesktop)
+            .await
+    }
+
+    async fn hide_vm_desktop(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
+        self.authorize(&request, AccessLevel::Write).await?;
+        self.vm_action(request.into_inner(), Action::HideDesktop)
+            .await
+    }
+
     async fn list_host_pci_devices(
         &self,
         request: Request<ListHostPciDevicesRequest>,
@@ -1377,6 +1389,8 @@ enum Action {
     Pause,
     Resume,
     ForceStop,
+    ShowDesktop,
+    HideDesktop,
 }
 
 impl Action {
@@ -1431,7 +1445,7 @@ impl GrpcService {
                     Action::Stop => manager.stop_vm(&task_vm_id).await,
                     Action::Restart => manager.restart_vm(&task_vm_id).await,
                     Action::ForceStop => manager.force_stop_vm(&task_vm_id).await,
-                    Action::Start | Action::Pause | Action::Resume => unreachable!(),
+                    Action::ShowDesktop | Action::HideDesktop | Action::Start | Action::Pause | Action::Resume => unreachable!(),
                 };
                 match &result {
                     Ok(meta) => info!(
@@ -1457,6 +1471,8 @@ impl GrpcService {
                 Action::Start => manager.start_vm(&vm_id).await,
                 Action::Pause => manager.pause_vm(&vm_id).await,
                 Action::Resume => manager.resume_vm(&vm_id).await,
+                Action::ShowDesktop => manager.show_vm_desktop(&vm_id).await,
+                Action::HideDesktop => manager.hide_vm_desktop(&vm_id).await,
                 Action::Stop | Action::Restart | Action::ForceStop => unreachable!(),
             }
         };
@@ -1692,6 +1708,28 @@ fn build_vm(
         guest_profile: Some(build_guest_profile(&meta.guest_profile)),
         guest_runtime: Some(build_guest_runtime(&meta.guest_runtime)),
         capabilities: Some(build_capabilities(&meta.capabilities)),
+        desktop: runtime.and_then(|runtime| {
+            if !matches!(runtime.state, VmState::Running | VmState::Paused) {
+                return None;
+            }
+            match meta.guest_profile.platform {
+                crate::state::GuestPlatform::Macos => Some(DesktopEndpoint {
+                    kind: DesktopKind::NativeWindow as i32,
+                    host: String::new(),
+                    port: 0,
+                    view_only: false,
+                }),
+                crate::state::GuestPlatform::Windows => {
+                    runtime.desktop_port.map(|port| DesktopEndpoint {
+                        kind: DesktopKind::Vnc as i32,
+                        host: "127.0.0.1".to_string(),
+                        port: i32::from(port),
+                        view_only: false,
+                    })
+                }
+                crate::state::GuestPlatform::Linux => None,
+            }
+        }),
     };
 
     if let Some(runtime) = runtime {
