@@ -899,7 +899,7 @@ impl MountWal {
         remote_revision: u64,
         tree_generation: u64,
     ) -> Result<()> {
-        {
+        let reclaim_candidates = {
             let mut state = self.append_lock()?;
             if through_sequence < state.acknowledged_sequence {
                 bail!(
@@ -933,14 +933,17 @@ impl MountWal {
             )?;
             state.acknowledged_sequence = through_sequence;
             state.remote_revision = remote_revision;
-            prune_resolved(&mut state, through_sequence);
-            state.compaction_pending = true;
-        }
+            prune_resolved(&mut state, through_sequence)
+        };
         // The acknowledgement record must be durable before the checkpoint that
         // asserts it, and the checkpoint must be durable before compaction can
         // treat anything below it as unreachable.
         self.sync_local()?;
-        self.checkpoint(tree_generation)
+        self.checkpoint(tree_generation)?;
+        let mut state = self.append_lock()?;
+        state.reclaim_candidates.extend(reclaim_candidates);
+        state.compaction_pending = true;
+        Ok(())
     }
 
     // -- recovery ------------------------------------------------------------
@@ -1863,7 +1866,7 @@ fn truncate_torn_tail(path: &Path, offset: u64, layout: &MountStateLayout) -> Re
 /// Drop every resolved sequence at or below the cursor. Pruning is what makes
 /// the in-memory index proportional to the unacknowledged backlog rather than to
 /// the lifetime of the mount, and it is what makes log compaction legal.
-fn prune_resolved(state: &mut AppendState, through_sequence: u64) {
+fn prune_resolved(state: &mut AppendState, through_sequence: u64) -> BTreeSet<String> {
     let retain = through_sequence.saturating_add(1);
     let kept_committed = state.committed.split_off(&retain);
     let removed_committed = std::mem::replace(&mut state.committed, kept_committed);
@@ -1880,6 +1883,11 @@ fn prune_resolved(state: &mut AppendState, through_sequence: u64) {
         }
     }
     state.first_unpruned_sequence = retain;
+    removed_prepared
+        .values()
+        .filter_map(|record| record.event.payload.as_ref())
+        .map(|payload| payload.storage.file().to_string())
+        .collect()
 }
 
 /// A committed mutation's effect on the content dirty set. Applied both when a
@@ -2599,6 +2607,41 @@ mod tests {
                 .committed_unacknowledged
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn acknowledged_payload_is_reclaimed_without_restart() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = MountStateLayout::new(temp.path());
+        let wal = open(temp.path());
+        let event = wal
+            .prepare(
+                MountMutation::ReplaceFile {
+                    path: "repo/file.txt".to_string(),
+                    mode: 0o644,
+                    expected_file_id: None,
+                    base_content_hash: None,
+                },
+                PayloadSource::Bytes(b"published generation"),
+                MountPreImage::empty(),
+            )
+            .expect("prepare payload");
+        let payload_name = event
+            .event
+            .payload
+            .as_ref()
+            .expect("payload")
+            .storage
+            .file()
+            .to_string();
+        wal.commit(event, None).expect("commit payload");
+        wal.acknowledge(1, 1, 1).expect("acknowledge payload");
+
+        let payload_path = layout.payload_dir().join(payload_name);
+        assert!(payload_path.exists(), "compaction has not run yet");
+        let outcome = wal.compact().expect("compact acknowledged payload");
+        assert_eq!(outcome.removed_payload_files, 1);
+        assert!(!payload_path.exists(), "acknowledged payload was reclaimed");
     }
 
     #[test]
