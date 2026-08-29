@@ -1193,7 +1193,9 @@ impl Manager {
         let vms = self.vm_refs().await;
         let mut snapshots = Vec::with_capacity(vms.len());
         for vm in vms {
-            let inner = vm.lock().await;
+            let Ok(inner) = vm.try_lock() else {
+                continue;
+            };
             snapshots.push(inner.metadata.clone());
         }
 
@@ -6927,6 +6929,64 @@ mod tests {
             boot_incoming_ram_path: String::new(),
             started_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn vm_inventory_does_not_wait_for_busy_vm_runtime() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let manager = Manager::new(Config {
+            listen_address: "127.0.0.1:0".to_string(),
+            data_dir: tmp.path().join("vmd").to_string_lossy().to_string(),
+            ..Config::default()
+        })
+        .await
+        .expect("create manager");
+
+        let busy_id = "busy-inventory-vm".to_string();
+        let busy_dir = tmp.path().join("vmd").join(&busy_id);
+        fs::create_dir_all(&busy_dir).expect("create busy VM dir");
+        let busy_vm = Arc::new(Vm::new(
+            qemu_test_metadata(&busy_id),
+            VmRuntime::new(&busy_dir),
+            busy_dir,
+        ));
+
+        let visible_id = "visible-inventory-vm".to_string();
+        let visible_dir = tmp.path().join("vmd").join(&visible_id);
+        fs::create_dir_all(&visible_dir).expect("create visible VM dir");
+        let visible_vm = Arc::new(Vm::new(
+            qemu_test_metadata(&visible_id),
+            VmRuntime::new(&visible_dir),
+            visible_dir,
+        ));
+
+        {
+            let mut vms = manager.vms.write().await;
+            vms.insert(busy_id.clone(), Arc::clone(&busy_vm));
+            vms.insert(visible_id.clone(), visible_vm);
+        }
+
+        let busy_guard = busy_vm.lock().await;
+        let listed = tokio::time::timeout(Duration::from_millis(200), manager.list())
+            .await
+            .expect("inventory must not wait for a busy VM runtime");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|metadata| metadata.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![visible_id.as_str()]
+        );
+        drop(busy_guard);
+
+        let mut listed = manager
+            .list()
+            .await
+            .into_iter()
+            .map(|metadata| metadata.id)
+            .collect::<Vec<_>>();
+        listed.sort();
+        assert_eq!(listed, vec![busy_id, visible_id]);
     }
 
     #[cfg(unix)]
