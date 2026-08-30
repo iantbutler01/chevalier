@@ -379,6 +379,8 @@ impl AnthropicClient {
             output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
             cached_tokens: usage["cache_read_input_tokens"].as_u64().unwrap_or(0),
             cache_write_input_tokens: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+            reasoning_tokens: None,
+            provider_cost_dollars: None,
         }
     }
 

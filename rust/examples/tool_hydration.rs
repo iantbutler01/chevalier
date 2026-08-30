@@ -36,10 +36,12 @@ fn run_params(
         temperature,
         top_p,
         max_tokens,
+        reasoning_effort: None,
         model: model.map(|s| s.to_string()),
         api_key: api_key.map(|s| s.to_string()),
         timeout: None,
         retry_config: None,
+        previous_response_id: None,
     }
 }
 

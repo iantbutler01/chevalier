@@ -425,6 +425,8 @@ fn test_stream_chunk_types() {
         output_tokens: 50,
         cached_tokens: 0,
         cache_write_input_tokens: 0,
+        reasoning_tokens: None,
+        provider_cost_dollars: None,
     };
     let tool_partial = StreamChunk::ToolCallPartial(serde_json::json!({
         "partial": true

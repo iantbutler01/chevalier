@@ -418,6 +418,8 @@ pub enum StreamChunk {
         output_tokens: u64,
         cached_tokens: u64,
         cache_write_input_tokens: u64,
+        reasoning_tokens: Option<u64>,
+        provider_cost_dollars: Option<f64>,
     },
 
     /// Provider rate-limit window usage.

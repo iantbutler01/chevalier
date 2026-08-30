@@ -247,6 +247,11 @@ impl OAIClient {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
             cache_write_input_tokens: 0,
+            reasoning_tokens: usage
+                .get("completion_tokens_details")
+                .and_then(|d| d.get("reasoning_tokens"))
+                .and_then(|v| v.as_u64()),
+            provider_cost_dollars: usage.get("cost").and_then(|v| v.as_f64()),
         }
     }
 

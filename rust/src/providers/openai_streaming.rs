@@ -117,6 +117,26 @@ pub fn parse_openai_chunk(
 ) -> Vec<StreamChunk> {
     let mut chunks = Vec::new();
 
+    // OpenRouter may attach usage to its final choice-bearing chunk rather than
+    // sending a separate chunk with no choices.
+    if let Some(usage) = chunk_json.get("usage") {
+        chunks.push(StreamChunk::Usage {
+            input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
+            output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
+            cached_tokens: usage
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            cache_write_input_tokens: 0,
+            reasoning_tokens: usage
+                .get("completion_tokens_details")
+                .and_then(|d| d.get("reasoning_tokens"))
+                .and_then(|v| v.as_u64()),
+            provider_cost_dollars: usage.get("cost").and_then(|v| v.as_f64()),
+        });
+    }
+
     // Extract delta from choices[0]
     let delta = match chunk_json
         .get("choices")
@@ -124,22 +144,7 @@ pub fn parse_openai_chunk(
         .and_then(|c| c.get("delta"))
     {
         Some(d) => d,
-        None => {
-            // Check for usage in final chunk
-            if let Some(usage) = chunk_json.get("usage") {
-                chunks.push(StreamChunk::Usage {
-                    input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
-                    output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
-                    cached_tokens: usage
-                        .get("prompt_tokens_details")
-                        .and_then(|d| d.get("cached_tokens"))
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    cache_write_input_tokens: 0,
-                });
-            }
-            return chunks;
-        }
+        None => return chunks,
     };
 
     // Handle content
@@ -515,7 +520,9 @@ mod tests {
                 "completion_tokens": 50,
                 "prompt_tokens_details": {
                     "cached_tokens": 25
-                }
+                },
+                "completion_tokens_details": { "reasoning_tokens": 12 },
+                "cost": 0.00125
             }
         });
 
@@ -528,14 +535,37 @@ mod tests {
                 input_tokens,
                 output_tokens,
                 cached_tokens,
+                reasoning_tokens,
+                provider_cost_dollars,
                 ..
             } => {
                 assert_eq!(*input_tokens, 100);
                 assert_eq!(*output_tokens, 50);
                 assert_eq!(*cached_tokens, 25);
+                assert_eq!(*reasoning_tokens, Some(12));
+                assert_eq!(*provider_cost_dollars, Some(0.00125));
             }
             _ => panic!("Expected Usage chunk"),
         }
+    }
+
+    #[test]
+    fn test_parse_usage_on_final_choice_chunk() {
+        let chunk = serde_json::json!({
+            "choices": [{ "delta": {}, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 100, "completion_tokens": 50, "cost": 0.00125 }
+        });
+        let mut acc = OpenAIToolAccumulator::new();
+        let chunks = parse_openai_chunk(&chunk, &mut acc, false);
+
+        assert!(matches!(
+            chunks.as_slice(),
+            [StreamChunk::Usage {
+                input_tokens: 100,
+                output_tokens: 50,
+                ..
+            }]
+        ));
     }
 
     #[test]

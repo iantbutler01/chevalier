@@ -157,6 +157,8 @@ impl ToolCallAccumulator {
             output_tokens: self.usage.output_tokens,
             cached_tokens: self.usage.cached_tokens,
             cache_write_input_tokens: self.usage.cache_write_input_tokens,
+            reasoning_tokens: None,
+            provider_cost_dollars: None,
         }
     }
 }
@@ -582,6 +584,7 @@ mod tests {
                 output_tokens,
                 cached_tokens,
                 cache_write_input_tokens,
+                ..
             } => {
                 assert_eq!(*input_tokens, 1200);
                 assert_eq!(*output_tokens, 0);
@@ -607,6 +610,7 @@ mod tests {
                 output_tokens,
                 cached_tokens,
                 cache_write_input_tokens,
+                ..
             } => {
                 assert_eq!(*input_tokens, 1200);
                 assert_eq!(*output_tokens, 42);
