@@ -285,6 +285,7 @@ impl TracingInferenceClient {
                     output_tokens,
                     cached_tokens,
                     cache_write_input_tokens,
+                    ..
                 }) = &chunk
                 {
                     // Calculate and record cost
@@ -500,6 +501,8 @@ mod tests {
                         output_tokens: 50,
                         cached_tokens: 0,
                         cache_write_input_tokens: 0,
+                        reasoning_tokens: None,
+                        provider_cost_dollars: None,
                     },
                     None,
                     None,

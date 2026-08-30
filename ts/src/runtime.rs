@@ -84,6 +84,7 @@ impl RunOptions {
             temperature: self.temperature.map(|v| v as f32),
             top_p: self.top_p.map(|v| v as f32),
             max_tokens: self.max_tokens,
+            reasoning_effort: None,
             model: self.model,
             api_key: self.api_key,
             timeout: self.timeout_ms.map(|ms| Duration::from_millis(ms as u64)),

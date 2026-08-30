@@ -241,11 +241,15 @@ async fn stream_chunk_to_runtime_events(
             output_tokens,
             cached_tokens,
             cache_write_input_tokens,
+            reasoning_tokens,
+            provider_cost_dollars,
         } => Ok(vec![ResponseStreamEvent::Usage(TokenUsage {
             input_tokens,
             output_tokens,
             cached_tokens,
             cache_write_input_tokens,
+            reasoning_tokens,
+            provider_cost_dollars,
         })]),
         StreamChunk::RateLimits(rate_limits) => {
             Ok(vec![ResponseStreamEvent::RateLimits(rate_limits)])
@@ -691,6 +695,7 @@ pub async fn call_llm(
     temperature: Option<f32>,
     top_p: Option<f32>,
     max_tokens: Option<u32>,
+    reasoning_effort: Option<String>,
     timeout: Option<std::time::Duration>,
     retry_config: Option<crate::retry::RetryConfig>,
     previous_response_id: Option<String>,
@@ -743,7 +748,7 @@ pub async fn call_llm(
         top_p,
         tools: tool_schemas,
         native_tools: true, // Always true - we only support native tools
-        reasoning_effort: None,
+        reasoning_effort,
         thinking_budget: None,
         output_schema: fixed_output_schema,
         output_type_name,
@@ -788,6 +793,7 @@ pub async fn call_llm_stream(
     temperature: Option<f32>,
     top_p: Option<f32>,
     max_tokens: Option<u32>,
+    reasoning_effort: Option<String>,
     timeout: Option<std::time::Duration>,
     retry_config: Option<crate::retry::RetryConfig>,
     previous_response_id: Option<String>,
@@ -841,7 +847,7 @@ pub async fn call_llm_stream(
         top_p,
         tools: tool_schemas,
         native_tools: true, // Always true - we only support native tools
-        reasoning_effort: None,
+        reasoning_effort,
         thinking_budget: None,
         output_schema: fixed_output_schema,
         output_type_name,

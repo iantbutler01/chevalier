@@ -587,12 +587,16 @@ impl InferenceClient for OpenAICodexResponsesClient {
                     output_tokens,
                     cached_tokens,
                     cache_write_input_tokens,
+                    reasoning_tokens,
+                    provider_cost_dollars,
                 } => {
                     usage = TokenUsage {
                         input_tokens,
                         output_tokens,
                         cached_tokens,
                         cache_write_input_tokens,
+                        reasoning_tokens,
+                        provider_cost_dollars,
                     };
                 }
             }

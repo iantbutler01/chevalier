@@ -442,6 +442,8 @@ fn parse_google_stream_value(
             output_tokens: output,
             cached_tokens: cached,
             cache_write_input_tokens: 0,
+            reasoning_tokens: usage.get("thoughtsTokenCount").and_then(|v| v.as_u64()),
+            provider_cost_dollars: None,
         }));
     }
 
@@ -1194,6 +1196,8 @@ impl GoogleGenAIClient {
                 .as_u64()
                 .unwrap_or(0),
             cache_write_input_tokens: 0,
+            reasoning_tokens: usage_metadata["thoughtsTokenCount"].as_u64(),
+            provider_cost_dollars: None,
         }
     }
 
