@@ -140,6 +140,7 @@ enum DesktopKind {
   DESKTOP_KIND_UNSPECIFIED = 0;
   DESKTOP_KIND_VNC = 1;
   DESKTOP_KIND_NATIVE_WINDOW = 2;
+  DESKTOP_KIND_GUEST_VNC = 3;
 }
 
 message DesktopEndpoint {
@@ -147,6 +148,7 @@ message DesktopEndpoint {
   string host = 2;
   int32 port = 3;
   bool view_only = 4;
+  string password = 5;
 }
 
 enum SharedMountAvailability {
@@ -456,6 +458,8 @@ service VMDService {
   rpc ForceStopVM(VMActionRequest) returns (VM);
   rpc ShowVMDesktop(VMActionRequest) returns (VM);
   rpc HideVMDesktop(VMActionRequest) returns (VM);
+  rpc OpenVMDesktop(VMActionRequest) returns (DesktopEndpoint);
+  rpc CloseVMDesktop(VMActionRequest) returns (VM);
 
   rpc ListHostPciDevices(ListHostPciDevicesRequest) returns (ListHostPciDevicesResponse);
   rpc AttachPciDevice(AttachPciDeviceRequest) returns (PciDeviceActionResponse);

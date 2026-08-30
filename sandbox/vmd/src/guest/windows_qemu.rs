@@ -16,9 +16,8 @@ use crate::virt;
 pub const EFI_CODE_FILE_NAME: &str = "windows-efi-code.fd";
 pub const EFI_VARS_FILE_NAME: &str = "windows-efi-vars.fd";
 pub const STATE_DISK_FILE_NAME: &str = "windows-vfs-state.qcow2";
-pub const RUNTIME_CONFIG_ISO_FILE_NAME: &str = "windows-runtime.iso";
+pub const RUNTIME_CONFIG_DISK_FILE_NAME: &str = "windows-runtime.img";
 pub const RUNTIME_CONFIG_DEVICE_ID: &str = "windows-runtime-config-device";
-pub const RUNTIME_CONFIG_USB_ID: &str = "windows-runtime-config-usb";
 pub const RUNTIME_CONFIG_BLOCK_NODE: &str = "windows-runtime-config";
 pub const RUNTIME_CONFIG_FILE_NODE: &str = "windows-runtime-config-file";
 
@@ -65,7 +64,15 @@ pub fn load_template_descriptor(source: &Path) -> Result<TemplateDescriptor> {
         let parent = source
             .parent()
             .context("Windows template manifest has no parent directory")?;
-        (parent.to_path_buf(), source.to_path_buf())
+        let manifest_path = if source
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("qcow2"))
+        {
+            parent.join("image-manifest.json")
+        } else {
+            source.to_path_buf()
+        };
+        (parent.to_path_buf(), manifest_path)
     };
     let bundle_dir = fs::canonicalize(&bundle_dir)
         .with_context(|| format!("resolve Windows template bundle {}", bundle_dir.display()))?;
@@ -199,7 +206,7 @@ pub async fn instantiate_template(
     Ok(())
 }
 
-pub fn create_runtime_config_iso(
+pub fn create_runtime_config_disk(
     meta: &VmMetadata,
     vm_dir: &Path,
     generation: &str,
@@ -222,14 +229,7 @@ pub fn create_runtime_config_iso(
         bail!("Windows guest requires a VFS service token");
     }
     let endpoint = guest_visible_vfs_endpoint(&mount.vfs_endpoint)?;
-    let bootstrap_password = format!("Aa1!{}", Uuid::new_v4().simple());
-    let computer_name = windows_computer_name(&meta.id)?;
-    let unattended = runtime_unattend_xml(
-        &meta.architecture,
-        &computer_name,
-        "OpenBracket",
-        &bootstrap_password,
-    )?;
+    let bootstrap_password = format!("Aa1{}", Uuid::new_v4().simple());
     let config = serde_json::to_vec_pretty(&serde_json::json!({
         "schemaVersion": 1,
         "vmId": meta.id,
@@ -248,9 +248,9 @@ pub fn create_runtime_config_iso(
             "drainTimeout": "90s"
         }
     }))?;
-    bootstrap::create_data_iso(
-        vm_dir.join(RUNTIME_CONFIG_ISO_FILE_NAME),
-        "BRKCFG",
+    bootstrap::create_data_fat(
+        vm_dir.join(RUNTIME_CONFIG_DISK_FILE_NAME),
+        *b"BRKCFG     ",
         vec![
             ("RUNTIME.JSN".to_string(), config),
             (
@@ -265,92 +265,8 @@ pub fn create_runtime_config_iso(
                 "BOOT.TKN".to_string(),
                 format!("{bootstrap_password}\n").into_bytes(),
             ),
-            ("AUTOUNATTEND.XML".to_string(), unattended.into_bytes()),
         ],
     )
-}
-
-fn windows_computer_name(vm_id: &str) -> Result<String> {
-    let compact = vm_id
-        .chars()
-        .filter(|character| character.is_ascii_hexdigit())
-        .collect::<String>();
-    if compact.len() < 12 {
-        bail!("Windows VM ID cannot form a computer name");
-    }
-    Ok(format!("OB-{}", compact[..12].to_ascii_uppercase()))
-}
-
-fn runtime_unattend_xml(
-    architecture: &str,
-    computer_name: &str,
-    username: &str,
-    password: &str,
-) -> Result<String> {
-    let architecture = normalize_architecture(architecture)?;
-    let processor_architecture = match architecture.as_str() {
-        AMD64 => "amd64",
-        ARM64 => "arm64",
-        _ => unreachable!("Windows architecture was normalized"),
-    };
-    let computer_name = xml_escape(computer_name);
-    let username = xml_escape(username);
-    let password = xml_escape(password);
-    Ok(format!(
-        r#"<?xml version="1.0" encoding="utf-8"?>
-<unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
-  <settings pass="specialize">
-    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="{processor_architecture}" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <ComputerName>{computer_name}</ComputerName>
-      <TimeZone>UTC</TimeZone>
-    </component>
-  </settings>
-  <settings pass="oobeSystem">
-    <component name="Microsoft-Windows-International-Core" processorArchitecture="{processor_architecture}" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <InputLocale>0409:00000409</InputLocale>
-      <SystemLocale>en-US</SystemLocale>
-      <UILanguage>en-US</UILanguage>
-      <UserLocale>en-US</UserLocale>
-    </component>
-    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="{processor_architecture}" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <OOBE>
-        <HideEULAPage>true</HideEULAPage>
-        <HideLocalAccountScreen>true</HideLocalAccountScreen>
-        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
-        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
-        <ProtectYourPC>3</ProtectYourPC>
-      </OOBE>
-      <UserAccounts>
-        <LocalAccounts>
-          <LocalAccount wcm:action="add">
-            <Password><Value>{password}</Value><PlainText>true</PlainText></Password>
-            <Description>OpenBracket desktop user</Description>
-            <DisplayName>{username}</DisplayName>
-            <Group>Users</Group>
-            <Name>{username}</Name>
-          </LocalAccount>
-        </LocalAccounts>
-      </UserAccounts>
-      <AutoLogon>
-        <Password><Value>{password}</Value><PlainText>true</PlainText></Password>
-        <Enabled>true</Enabled>
-        <LogonCount>1</LogonCount>
-        <Username>{username}</Username>
-      </AutoLogon>
-    </component>
-  </settings>
-</unattend>
-"#
-    ))
-}
-
-fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
 }
 
 fn guest_visible_vfs_endpoint(raw: &str) -> Result<String> {
@@ -381,36 +297,36 @@ pub fn build_qemu_args(
 ) -> Result<Vec<String>> {
     let architecture =
         admit_native_architecture(&meta.architecture, &meta.architecture, host_architecture)?;
-    let arm_machine = |accelerator: &str| {
-        if meta.resources.memory_mb <= 3072 {
-            format!("virt-10.2,highmem=off,accel={accelerator}")
-        } else {
-            format!("virt-10.2,highmem=on,accel={accelerator}")
-        }
-    };
+    if architecture == ARM64 && meta.resources.memory_mb > 3072 {
+        bail!(
+            "Windows ARM64 profile qemu-virt-10.2-uefi supports at most 3072 MiB; requested {} MiB",
+            meta.resources.memory_mb
+        );
+    }
+    let arm_machine = |accelerator: &str| format!("virt-10.2,highmem=off,accel={accelerator}");
     let (machine, cpu, root_device, state_device) = match architecture.as_str() {
         AMD64 if running_on_linux => (
             "q35,smm=on,accel=kvm".to_string(),
             "host,+invtsc,hv_relaxed,hv_vapic,hv_spinlocks=0x1fff,hv_time,migratable=off",
-            "virtio-blk-pci,drive=windows-root",
+            "virtio-blk-pci,drive=windows-root,bootindex=1",
             "virtio-blk-pci,drive=windows-state,serial=openbracket-vfs",
         ),
         AMD64 if running_on_macos => (
             "q35,smm=on,accel=hvf".to_string(),
             "host,hv_relaxed,hv_vapic,hv_spinlocks=0x1fff,hv_time",
-            "virtio-blk-pci,drive=windows-root",
+            "virtio-blk-pci,drive=windows-root,bootindex=1",
             "virtio-blk-pci,drive=windows-state,serial=openbracket-vfs",
         ),
         ARM64 if running_on_linux => (
             arm_machine("kvm"),
             "host",
-            "nvme,drive=windows-root,serial=openbracket-root",
+            "nvme,drive=windows-root,serial=openbracket-root,bootindex=1",
             "nvme,drive=windows-state,serial=openbracket-vfs",
         ),
         ARM64 if running_on_macos => (
             arm_machine("hvf"),
             "host",
-            "nvme,drive=windows-root,serial=openbracket-root",
+            "nvme,drive=windows-root,serial=openbracket-root,bootindex=1",
             "nvme,drive=windows-state,serial=openbracket-vfs",
         ),
         _ => bail!("native Windows QEMU guests require a Linux/KVM or macOS/HVF host"),
@@ -420,7 +336,7 @@ pub fn build_qemu_args(
     let efi_code_path = vm_dir.join(EFI_CODE_FILE_NAME);
     let efi_vars_path = vm_dir.join(EFI_VARS_FILE_NAME);
     let state_disk_path = vm_dir.join(STATE_DISK_FILE_NAME);
-    let runtime_config_path = vm_dir.join(RUNTIME_CONFIG_ISO_FILE_NAME);
+    let runtime_config_path = vm_dir.join(RUNTIME_CONFIG_DISK_FILE_NAME);
     for (label, path) in [
         ("Windows disk", &disk_path),
         ("Windows EFI code", &efi_code_path),
@@ -442,6 +358,8 @@ pub fn build_qemu_args(
         meta.resources.vcpu.to_string(),
         "-m".to_string(),
         meta.resources.memory_mb.to_string(),
+        "-boot".to_string(),
+        "strict=on".to_string(),
         "-drive".to_string(),
         format!(
             "if=pflash,format=raw,readonly=on,file={}",
@@ -471,18 +389,14 @@ pub fn build_qemu_args(
         "qemu-xhci".to_string(),
         "-blockdev".to_string(),
         format!(
-            "driver=file,filename={},node-name={RUNTIME_CONFIG_FILE_NODE},read-only=on",
+            "driver=file,filename={},node-name={RUNTIME_CONFIG_FILE_NODE}",
             runtime_config_path.display()
         ),
         "-blockdev".to_string(),
-        format!(
-            "driver=raw,file={RUNTIME_CONFIG_FILE_NODE},node-name={RUNTIME_CONFIG_BLOCK_NODE},read-only=on"
-        ),
-        "-device".to_string(),
-        format!("usb-bot,id={RUNTIME_CONFIG_USB_ID}"),
+        format!("driver=raw,file={RUNTIME_CONFIG_FILE_NODE},node-name={RUNTIME_CONFIG_BLOCK_NODE}"),
         "-device".to_string(),
         format!(
-            "scsi-cd,bus={RUNTIME_CONFIG_USB_ID}.0,drive={RUNTIME_CONFIG_BLOCK_NODE},id={RUNTIME_CONFIG_DEVICE_ID}"
+            "usb-storage,drive={RUNTIME_CONFIG_BLOCK_NODE},id={RUNTIME_CONFIG_DEVICE_ID},removable=on,serial=openbracket-runtime,bootindex=10"
         ),
         "-device".to_string(),
         "usb-kbd".to_string(),
@@ -678,7 +592,7 @@ mod tests {
         fs::write(root.join(EFI_CODE_FILE_NAME), b"code").unwrap();
         fs::write(root.join(EFI_VARS_FILE_NAME), b"vars").unwrap();
         fs::write(root.join(STATE_DISK_FILE_NAME), b"state").unwrap();
-        fs::write(root.join(RUNTIME_CONFIG_ISO_FILE_NAME), b"config").unwrap();
+        fs::write(root.join(RUNTIME_CONFIG_DISK_FILE_NAME), b"config").unwrap();
     }
 
     #[test]
@@ -706,6 +620,9 @@ mod tests {
         )
         .unwrap();
         let descriptor = load_template_descriptor(arm.path()).unwrap();
+        assert_eq!(descriptor.architecture, ARM64);
+        assert_eq!(descriptor.profile, "windows-arm");
+        let descriptor = load_template_descriptor(&arm.path().join("image.qcow2")).unwrap();
         assert_eq!(descriptor.architecture, ARM64);
         assert_eq!(descriptor.profile, "windows-arm");
 
@@ -765,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_iso_contains_first_boot_program_and_ephemeral_credentials() {
+    fn runtime_disk_contains_only_per_vm_configuration_and_credentials() {
         let temp = TempDir::new().unwrap();
         let mut metadata = fixture_metadata(ARM64);
         metadata.metadata.insert(
@@ -784,16 +701,38 @@ mod tests {
             vfs_scope_path: "workspace/test".to_string(),
         });
 
-        create_runtime_config_iso(&metadata, temp.path(), "generation-1", "vfs-secret").unwrap();
-        let iso = fs::read(temp.path().join(RUNTIME_CONFIG_ISO_FILE_NAME)).unwrap();
-        let text = String::from_utf8_lossy(&iso);
-        assert!(text.contains("BOOT.TKN;1"));
-        assert!(text.contains("AUTOUNATTEND.XML;1"));
-        assert!(text.contains("OpenBracket"));
-        assert!(text.contains("<Group>Users</Group>"));
-        assert!(text.contains("<LogonCount>1</LogonCount>"));
-        assert!(text.contains("control-secret"));
-        assert!(text.contains("vfs-secret"));
+        create_runtime_config_disk(&metadata, temp.path(), "generation-1", "vfs-secret").unwrap();
+        let mut image = File::options()
+            .read(true)
+            .write(true)
+            .open(temp.path().join(RUNTIME_CONFIG_DISK_FILE_NAME))
+            .unwrap();
+        let mut mbr = [0_u8; 512];
+        image.read_exact(&mut mbr).unwrap();
+        assert_eq!(&mbr[510..512], &[0x55, 0xaa]);
+        assert_eq!(mbr[450], 0x0c);
+        let partition_start = u32::from_le_bytes(mbr[454..458].try_into().unwrap()) as u64 * 512;
+        let disk_size = image.metadata().unwrap().len();
+        let partition = fscommon::StreamSlice::new(image, partition_start, disk_size).unwrap();
+        let filesystem = fatfs::FileSystem::new(partition, fatfs::FsOptions::new()).unwrap();
+        let root = filesystem.root_dir();
+        for name in ["RUNTIME.JSN", "CTRL.TKN", "VFS.TKN", "BOOT.TKN"] {
+            root.open_file(name).unwrap();
+        }
+        let mut control_token = String::new();
+        root.open_file("CTRL.TKN")
+            .unwrap()
+            .read_to_string(&mut control_token)
+            .unwrap();
+        let mut vfs_token = String::new();
+        root.open_file("VFS.TKN")
+            .unwrap()
+            .read_to_string(&mut vfs_token)
+            .unwrap();
+        drop(root);
+        filesystem.unmount().unwrap();
+        assert_eq!(control_token, "control-secret\n");
+        assert_eq!(vfs_token, "vfs-secret\n");
     }
 
     #[test]
@@ -812,12 +751,22 @@ mod tests {
         )
         .unwrap();
         assert!(args.contains(&"virt-10.2,highmem=off,accel=hvf".to_string()));
-        assert!(args.contains(&"nvme,drive=windows-root,serial=openbracket-root".to_string()));
+        assert!(args.windows(2).any(|pair| pair == ["-boot", "strict=on"]));
+        assert!(
+            args.contains(
+                &"nvme,drive=windows-root,serial=openbracket-root,bootindex=1".to_string()
+            )
+        );
         assert!(args.contains(&"nvme,drive=windows-state,serial=openbracket-vfs".to_string()));
         assert!(
             args.iter()
-                .any(|argument| argument.contains(RUNTIME_CONFIG_ISO_FILE_NAME))
+                .any(|argument| argument.contains(RUNTIME_CONFIG_DISK_FILE_NAME))
         );
+        assert!(args.iter().any(|argument| {
+            argument.contains("usb-storage")
+                && argument.contains("removable=on")
+                && argument.contains("bootindex=10")
+        }));
         assert!(args.iter().any(|arg| arg.contains(EFI_VARS_FILE_NAME)));
         assert!(!args.iter().any(|arg| arg.contains("bootstrap.iso")));
         assert!(args.contains(&"virtio-gpu-pci".to_string()));
@@ -825,7 +774,7 @@ mod tests {
 
         let mut high_memory = fixture_metadata(ARM64);
         high_memory.resources.memory_mb = 4096;
-        let args = build_qemu_args(
+        let error = build_qemu_args(
             &high_memory,
             temp.path(),
             &temp.path().join("qmp.sock"),
@@ -835,8 +784,8 @@ mod tests {
             true,
             "user,id=net0".to_string(),
         )
-        .unwrap();
-        assert!(args.contains(&"virt-10.2,highmem=on,accel=hvf".to_string()));
+        .unwrap_err();
+        assert!(error.to_string().contains("supports at most 3072 MiB"));
     }
 
     #[test]
@@ -855,7 +804,7 @@ mod tests {
         )
         .unwrap();
         assert!(args.contains(&"q35,smm=on,accel=kvm".to_string()));
-        assert!(args.contains(&"virtio-blk-pci,drive=windows-root".to_string()));
+        assert!(args.contains(&"virtio-blk-pci,drive=windows-root,bootindex=1".to_string()));
         assert!(
             args.contains(&"virtio-blk-pci,drive=windows-state,serial=openbracket-vfs".to_string())
         );

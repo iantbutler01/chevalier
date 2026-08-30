@@ -77,8 +77,8 @@ try {
   const vmDirectory = join(vmdDataDirectory, session.vmId);
   await stat(join(vmDirectory, "windows-vfs-state.qcow2"));
   try {
-    await access(join(vmDirectory, "windows-runtime.iso"));
-    throw new Error("runtime secret ISO remained attached after guest readiness");
+    await access(join(vmDirectory, "windows-runtime.img"));
+    throw new Error("runtime secret disk remained attached after guest readiness");
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
@@ -89,11 +89,8 @@ try {
   await run(
     session,
     [
-      "if (Get-LocalUser -Name OpenBracketBootstrap -ErrorAction SilentlyContinue) { throw 'bootstrap account remains' }",
-      "$answers = @('C:\\Windows\\Panther\\unattend.xml', 'C:\\Windows\\Panther\\Autounattend.xml', 'C:\\Windows\\Panther\\Unattend\\unattend.xml')",
-      "if ($answers | Where-Object { Test-Path -LiteralPath $_ }) { throw 'cached first-boot answer remains' }",
       "foreach ($name in @('ChevalierGuest', 'ChevalierVFS')) { if ((Get-Service -Name $name).Status -ne 'Running') { throw \"$name is not running\" } }",
-      "$status = Get-Content -Raw C:\\ProgramData\\Chevalier\\runtime\\guest-status.json | ConvertFrom-Json",
+      "$status = Get-Content -Raw C:\\ProgramData\\Chevalier\\guest-status.json | ConvertFrom-Json",
       "if ($status.phase -ne 'ready' -or $status.error) { throw 'guest status is not ready' }",
     ].join("; "),
   );
@@ -133,6 +130,47 @@ try {
   if (!(await run(session, write)).includes("command-and-winfsp-ok")) {
     throw new Error("authenticated command execution did not return its receipt");
   }
+
+  const networkReceipt = (
+    await run(
+      session,
+      "$response = Invoke-WebRequest -UseBasicParsing -Uri 'https://www.microsoft.com/robots.txt' -TimeoutSec 30; \"$($response.StatusCode):$($response.RawContentLength)\"",
+      60,
+    )
+  ).trim();
+  if (!/^200:[1-9][0-9]*$/.test(networkReceipt)) {
+    throw new Error(`unexpected outbound network receipt ${JSON.stringify(networkReceipt)}`);
+  }
+
+  const firstBootDeadline = Date.now() + 10 * 60_000;
+  for (;;) {
+    const firstBoot = JSON.parse(
+      await run(
+        session,
+        "Get-Content -Raw C:\\ProgramData\\Chevalier\\first-boot-status.json",
+      ),
+    );
+    if (firstBoot.phase === "failed") {
+      throw new Error(`Windows first boot failed: ${firstBoot.error ?? "unknown error"}`);
+    }
+    if (firstBoot.phase === "complete") break;
+    if (Date.now() >= firstBootDeadline) {
+      throw new Error(`Windows desktop did not complete first boot; last phase was ${firstBoot.phase}`);
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 1_000));
+  }
+  await run(
+    session,
+    [
+      "$desktopSessions = (& query.exe user 2>&1 | Out-String)",
+      "if ($desktopSessions -notmatch '(?im)^\\s*>?\\s*OpenBracket\\s+') { throw 'OpenBracket desktop session is not active' }",
+      "if (Get-LocalUser -Name OpenBracketBootstrap -ErrorAction SilentlyContinue) { throw 'bootstrap account remains' }",
+      "$answers = @('C:\\Windows\\Panther\\unattend.xml', 'C:\\Windows\\Panther\\Autounattend.xml', 'C:\\Windows\\Panther\\Unattend\\unattend.xml')",
+      "if ($answers | Where-Object { Test-Path -LiteralPath $_ }) { throw 'cached first-boot answer remains' }",
+      "$winlogon = 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon'",
+      "foreach ($name in @('AutoAdminLogon', 'AutoLogonCount', 'DefaultDomainName', 'DefaultPassword', 'DefaultUserName')) { if ((Get-ItemProperty -LiteralPath $winlogon -Name $name -ErrorAction SilentlyContinue).$name) { throw \"Winlogon credential remains: $name\" } }",
+    ].join("; "),
+  );
 
   await run(
     session,
@@ -196,8 +234,9 @@ try {
           gitHead: head,
           checks: [
             "runtime-secrets-absent-from-base",
-            "runtime-iso-detached-before-ready",
+    "runtime-disk-detached-before-ready",
             "authenticated-command-execution",
+            "outbound-https",
             "native-file-rpc",
             "winfsp-create-write-flush-read-delete-basic-info",
             "git-init-add-commit-fsck",

@@ -63,6 +63,8 @@ http = "1.1.0"
 indicatif = "0.17.9"
 tokio-util = { version = "0.7", features = ["io"] }
 base64 = "0.22.1"
+fatfs = "0.3.6"
+fscommon = "0.1.1"
 
 [build-dependencies]
 protoc-bin-vendored = "3.2.0"

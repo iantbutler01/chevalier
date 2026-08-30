@@ -9,16 +9,19 @@ import (
 )
 
 const (
-	SchemaVersion       = 1
-	DefaultInstalledDir = `C:\ProgramData\Chevalier\runtime`
-	DefaultConfigPath   = DefaultInstalledDir + `\runtime.json`
-	DefaultControlToken = DefaultInstalledDir + `\control.token`
-	DefaultVFSToken     = DefaultInstalledDir + `\vfs.token`
-	DefaultGuestStatus  = DefaultInstalledDir + `\guest-status.json`
-	DefaultStateRoot    = `C:\ProgramData\Chevalier\state-volume\workspace`
-	DefaultStatusPath   = DefaultStateRoot + `\status.json`
-	DefaultMountpoint   = `W:`
-	DefaultListen       = `0.0.0.0:13338`
+	SchemaVersion           = 1
+	DefaultInstalledDir     = `C:\ProgramData\Chevalier\runtime`
+	DefaultConfigPath       = DefaultInstalledDir + `\runtime.json`
+	DefaultControlToken     = DefaultInstalledDir + `\control.token`
+	DefaultVFSToken         = DefaultInstalledDir + `\vfs.token`
+	DefaultDesktopToken     = DefaultInstalledDir + `\desktop.token`
+	DefaultFirstBootRestart = DefaultInstalledDir + `\desktop-restart.requested`
+	DefaultGuestStatus      = `C:\ProgramData\Chevalier\guest-status.json`
+	DefaultFirstBootStatus  = `C:\ProgramData\Chevalier\first-boot-status.json`
+	DefaultStateRoot        = `C:\ProgramData\Chevalier\state-volume\workspace`
+	DefaultStatusPath       = DefaultStateRoot + `\status.json`
+	DefaultMountpoint       = `W:`
+	DefaultListen           = `0.0.0.0:13338`
 )
 
 type Config struct {
@@ -90,4 +93,14 @@ func (c Config) Validate() error {
 
 func isWindowsAbsolute(path string) bool {
 	return len(path) >= 3 && path[1] == ':' && (path[2] == '\\' || path[2] == '/')
+}
+
+func hasDesktopSession(output string, username string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(strings.TrimPrefix(strings.TrimSpace(line), ">"))
+		if len(fields) > 0 && strings.EqualFold(fields[0], username) {
+			return true
+		}
+	}
+	return false
 }

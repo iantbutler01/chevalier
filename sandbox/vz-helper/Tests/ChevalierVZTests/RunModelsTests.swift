@@ -50,6 +50,7 @@ import Virtualization
       networkMode: .natDevelopment,
       viewerMode: .window,
       loopbackRelayPort: 13_338,
+      guestIngressRelayPort: 13_337,
       guestServiceRelays: [
         GuestServiceRelayRequest(vsockPort: 13_339, hostLoopbackPort: 63_339)
       ])
@@ -60,6 +61,7 @@ import Virtualization
     #expect(request.networkMode == .natDevelopment)
     #expect(request.effectiveViewerMode == .window)
     #expect(request.loopbackRelayPort == 13_338)
+    #expect(request.guestIngressRelayPort == 13_337)
     #expect(request.guestServiceRelays?.first?.vsockPort == 13_339)
   }
 
@@ -135,6 +137,7 @@ import Virtualization
 
     let request = try JSONDecoder().decode(RunRequest.self, from: data)
     #expect(request.loopbackRelayPort == nil)
+    #expect(request.guestIngressRelayPort == nil)
     #expect(request.guestServiceRelays == nil)
     #expect(request.networkMode == nil)
     #expect(request.viewerMode == nil)
@@ -194,6 +197,46 @@ import Virtualization
         "guestServiceRelays hostLoopbackPort must be greater than zero")
     ) {
       try zeroHost.validateShape()
+    }
+  }
+
+  @Test func rejectsInvalidGuestIngressRelayPorts() {
+    let zero = RunRequest(
+      schemaVersion: 1,
+      bundlePath: "/tmp/template.bundle",
+      cpuCount: 4,
+      memoryBytes: 4 * 1024 * 1024 * 1024,
+      provisioningDirectoryPath: nil,
+      provisioningDirectoryReadOnly: nil,
+      networkMode: nil,
+      viewerMode: nil,
+      loopbackRelayPort: nil,
+      guestIngressRelayPort: 0,
+      guestServiceRelays: nil)
+    #expect(
+      throws: RunError.invalidRequest(
+        "guestIngressRelayPort must be greater than zero when present")
+    ) {
+      try zero.validateShape()
+    }
+
+    let collision = RunRequest(
+      schemaVersion: 1,
+      bundlePath: "/tmp/template.bundle",
+      cpuCount: 4,
+      memoryBytes: 4 * 1024 * 1024 * 1024,
+      provisioningDirectoryPath: nil,
+      provisioningDirectoryReadOnly: nil,
+      networkMode: nil,
+      viewerMode: nil,
+      loopbackRelayPort: 13_338,
+      guestIngressRelayPort: 13_338,
+      guestServiceRelays: nil)
+    #expect(
+      throws: RunError.invalidRequest(
+        "guestIngressRelayPort must not collide with loopbackRelayPort")
+    ) {
+      try collision.validateShape()
     }
   }
 

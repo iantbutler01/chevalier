@@ -1,4 +1,4 @@
-# Windows ARM64 QEMU image builder
+# Native-architecture Windows QEMU image builder
 
 This directory builds the pinned
 `windows-11-iot-enterprise-ltsc-2024-arm64-guest-winfsp-v2` base image
@@ -8,23 +8,28 @@ actual WinFsp MEMFS probe, removes build access, and seals the disk with
 Sysprep.
 
 The completed services image contains the native `ChevalierVFS` and
-`ChevalierGuest` binaries and their SCM registrations. At first boot,
-`ChevalierGuest` imports one-use runtime media containing fresh VM identity,
-scope, endpoint, and bearer values, initializes the separate NTFS state disk,
-starts the `W:` mount, deletes the bootstrap account and cached answer files,
+`ChevalierGuest` binaries, their SCM registrations, and a static secretless
+answer at `C:\Windows\Panther\Unattend\Unattend.xml`. Windows Setup consumes
+that answer during normal `specialize` and `oobeSystem` passes, and
+`SetupComplete.cmd` installs the baked services. At first boot,
+`ChevalierGuest` imports fresh VM identity, scope, endpoint, credentials, and
+bearers from a one-use FAT runtime disk, initializes the separate NTFS state
+disk, starts the `W:` mount, removes one-use autologon data and cached answers,
 and reports authenticated readiness. No local development key, runtime bearer,
-scope, VM identity, or reusable bootstrap password is sealed into the base.
+scope, VM identity, or reusable desktop password is sealed into the base.
 
 ## Current evidence
 
 The accepted services image is
-`output/windows-11-iot-enterprise-ltsc-2024-arm64-services`. Its qcow2 is
-8,973,254,656 bytes with SHA-256
-`9a82bc6fd2e56b27fceeaf6df78f8b12e4d1bc6d8c35f326045b11618175a661`.
-The 2026-08-24 no-injection acceptance run started that image through vmd,
-detached and deleted the one-use runtime ISO before readiness, and proved:
+`output/windows-11-iot-enterprise-ltsc-2024-arm64-services-v12`. Its qcow2 is
+9,019,392,000 bytes with SHA-256
+`7f474327146e87b1ea2e523999b156725385f609ff0949ea9777d30d7027a54c`.
+The 2026-08-30 untouched-clone acceptance run started that image through vmd,
+let Windows consume the embedded answer and install the baked services,
+detached and deleted the one-use runtime disk before readiness, and proved:
 
 - authenticated argv execution and bounded native file RPCs;
+- an active desktop session and outbound public HTTPS;
 - WinFsp create, write, `FlushFileBuffers`, read, forced delete, and basic-info
   changes on `W:`;
 - Git init, add, commit, and strict/full fsck on the real mount;
@@ -35,9 +40,6 @@ detached and deleted the one-use runtime ISO before readiness, and proved:
 is `sealed-local-acceptance` and remains `productionReady:false` until the
 power-cut WAL recovery, fresh identity matrix, and persistent runtime TPM gates
 pass.
-
-The earlier image-builder evidence follows because it proves how the sealed
-substrate itself was constructed.
 
 The 2026-08-17 clean build completed from ISO to Packer artifact in 8 minutes 21
 seconds. The ignored output directory contains a 64 GiB-virtual qcow2 and build
@@ -52,8 +54,8 @@ EFI variables:
   `productionReady: false`.
 
 A read-only disk audit found the Sysprep success tag and no receipt credential,
-answer file (including Windows' cached original), build script, stage file, or
-build-error residue. A disposable
+build script, stage file, or build-error residue. The embedded runtime answer
+contains no secret and is removed after a clone consumes it. A disposable
 qcow2 overlay using fresh EFI variables then booted Windows Boot Manager,
 specialized successfully, generated a new CAPI machine GUID, advanced OOBE to
 `IMAGE_STATE_COMPLETE`, and honored a graceful ACPI shutdown. The ARM ramfb was
@@ -134,7 +136,11 @@ selected pending reboot, and a real native `memfs-a64.exe` mount/read/write/
 delete cycle at `W:`.
 
 The service gate additionally verifies the product WinFsp and authenticated
-control services using fresh per-VM credentials and a separate state disk.
+control services using fresh per-VM credentials, a one-use runtime disk, and a
+separate state disk. Both guest services cross-compile for ARM64 and AMD64;
+vmd has native ARM64/HVF and AMD64/KVM-or-HVF launch shapes and rejects TCG.
+The real sealed-image acceptance is ARM64 because this host is ARM64; the
+equivalent AMD64 image and live matrix require an x86-64 host.
 Production promotion still requires:
 
 - a gateway-enforced mount-generation authority fence;

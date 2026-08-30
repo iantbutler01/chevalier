@@ -1039,11 +1039,20 @@ pub enum SessionDesktopKind {
     NativeWindow,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionDesktopAuthentication {
+    None,
+    Password,
+    Account,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionDesktopTarget {
     pub kind: SessionDesktopKind,
     pub host: Option<String>,
     pub port: Option<u16>,
+    pub password: Option<String>,
+    pub authentication: SessionDesktopAuthentication,
     pub view_only: bool,
 }
 
@@ -1456,6 +1465,7 @@ pub struct Session {
     node_endpoint: Arc<Mutex<String>>,
     ownership_fence: Arc<Mutex<Option<String>>>,
     shared_mounts: Arc<Vec<SharedMount>>,
+    desktop_forward: Arc<Mutex<Option<ForwardHandle>>>,
 }
 
 /// What the facade may do when a running VM misses its guest RPC readiness budget.
@@ -1575,6 +1585,7 @@ impl Session {
             node_endpoint: Arc::new(Mutex::new(node_endpoint)),
             ownership_fence: Arc::new(Mutex::new(ownership_fence)),
             shared_mounts: Arc::new(shared_mounts),
+            desktop_forward: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -3197,16 +3208,18 @@ impl Session {
         }
 
         let node_endpoint = self.current_node_endpoint().await;
-        let vm = self
-            .sandbox
+        self.sandbox
             .ensure_vm_running(&self.vm_id, &node_endpoint)
             .await?;
-        let desktop = vm.desktop.ok_or_else(|| {
-            SandboxError::Unsupported("this guest does not expose a desktop console".to_string())
-        })?;
+        let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
+        let desktop = client
+            .open_vm_desktop(self.sandbox.request_with_auth(VmActionRequest {
+                vm_id: self.vm_id.clone(),
+            }))
+            .await?
+            .into_inner();
         match DesktopKind::try_from(desktop.kind).unwrap_or(DesktopKind::Unspecified) {
             DesktopKind::NativeWindow => {
-                let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
                 client
                     .show_vm_desktop(self.sandbox.request_with_auth(VmActionRequest {
                         vm_id: self.vm_id.clone(),
@@ -3216,6 +3229,8 @@ impl Session {
                     kind: SessionDesktopKind::NativeWindow,
                     host: None,
                     port: None,
+                    password: None,
+                    authentication: SessionDesktopAuthentication::None,
                     view_only: false,
                 })
             }
@@ -3238,12 +3253,59 @@ impl Session {
                             .to_string(),
                     ));
                 }
+                let password = (!desktop.password.is_empty()).then_some(desktop.password);
                 Ok(SessionDesktopTarget {
                     kind: SessionDesktopKind::Vnc,
                     host: Some(host),
                     port: Some(port),
+                    authentication: if password.is_some() {
+                        SessionDesktopAuthentication::Password
+                    } else {
+                        SessionDesktopAuthentication::None
+                    },
+                    password,
                     view_only: desktop.view_only,
                 })
+            }
+            DesktopKind::GuestVnc => {
+                let port = u16::try_from(desktop.port).map_err(|_| {
+                    SandboxError::InvalidResponse(format!(
+                        "VM reported invalid guest desktop port: {}",
+                        desktop.port
+                    ))
+                })?;
+                if port == 0 {
+                    return Err(SandboxError::InvalidResponse(
+                        "VM reported zero guest desktop port".to_string(),
+                    ));
+                }
+
+                let mut active_forward = self.desktop_forward.lock().await;
+                if let Some(previous) = active_forward.take() {
+                    previous.close().await?;
+                }
+                match self.forward_port(port).await {
+                    Ok(forward) => {
+                        let host_port = forward.host_port;
+                        *active_forward = Some(forward);
+                        Ok(SessionDesktopTarget {
+                            kind: SessionDesktopKind::Vnc,
+                            host: Some("127.0.0.1".to_string()),
+                            port: Some(host_port),
+                            password: (!desktop.password.is_empty()).then_some(desktop.password),
+                            authentication: SessionDesktopAuthentication::Account,
+                            view_only: desktop.view_only,
+                        })
+                    }
+                    Err(error) => {
+                        let _ = client
+                            .close_vm_desktop(self.sandbox.request_with_auth(VmActionRequest {
+                                vm_id: self.vm_id.clone(),
+                            }))
+                            .await;
+                        Err(error)
+                    }
+                }
             }
             DesktopKind::Unspecified => Err(SandboxError::InvalidResponse(
                 "VM reported an unspecified desktop kind".to_string(),
@@ -3259,25 +3321,16 @@ impl Session {
             return Ok(());
         }
         let node_endpoint = self.current_node_endpoint().await;
+        if let Some(forward) = self.desktop_forward.lock().await.take() {
+            forward.close().await?;
+        }
         let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
-        let vm = client
-            .get_vm(self.sandbox.request_with_auth(GetVmRequest {
+        client
+            .close_vm_desktop(self.sandbox.request_with_auth(VmActionRequest {
                 vm_id: self.vm_id.clone(),
             }))
             .await?
             .into_inner();
-        if vm
-            .guest_profile
-            .as_ref()
-            .and_then(|profile| GuestPlatform::try_from(profile.platform).ok())
-            == Some(GuestPlatform::Macos)
-        {
-            client
-                .hide_vm_desktop(self.sandbox.request_with_auth(VmActionRequest {
-                    vm_id: self.vm_id.clone(),
-                }))
-                .await?;
-        }
         Ok(())
     }
 
@@ -3725,6 +3778,7 @@ impl Session {
             node_endpoint: Arc::new(Mutex::new(node_endpoint)),
             ownership_fence: Arc::new(Mutex::new(child_fence)),
             shared_mounts: self.shared_mounts.clone(),
+            desktop_forward: Arc::new(Mutex::new(None)),
         };
 
         Ok(ForkResult {
@@ -3991,6 +4045,7 @@ impl Sandbox {
                 node_endpoint: Arc::new(Mutex::new(node_endpoint)),
                 ownership_fence: Arc::new(Mutex::new(next_fence)),
                 shared_mounts: Arc::new(Vec::new()),
+                desktop_forward: Arc::new(Mutex::new(None)),
             };
             log_slo_observation("session.attach", started.elapsed(), "ok");
             return Ok(session);
@@ -4157,6 +4212,7 @@ impl Sandbox {
             node_endpoint: Arc::new(Mutex::new(node_endpoint)),
             ownership_fence: Arc::new(Mutex::new(next_fence)),
             shared_mounts: Arc::new(session_shared_mounts),
+            desktop_forward: Arc::new(Mutex::new(None)),
         };
 
         if warm_pool_hit {
@@ -4289,6 +4345,7 @@ impl Sandbox {
             node_endpoint: Arc::new(Mutex::new(node_endpoint)),
             ownership_fence: Arc::new(Mutex::new(next_fence)),
             shared_mounts: Arc::new(Vec::new()),
+            desktop_forward: Arc::new(Mutex::new(None)),
         };
         log_slo_observation("session.attach", started.elapsed(), "ok");
         Ok(session)
@@ -4317,6 +4374,7 @@ impl Sandbox {
             node_endpoint: Arc::new(Mutex::new(node_endpoint)),
             ownership_fence: Arc::new(Mutex::new(current_fence)),
             shared_mounts: Arc::new(Vec::new()),
+            desktop_forward: Arc::new(Mutex::new(None)),
         };
         log_slo_observation("session.attach.passive", started.elapsed(), "ok");
         Ok(session)

@@ -105,6 +105,7 @@ const MAX_VM_VCPU: i32 = 8;
 const MAX_VM_MEMORY_MB: i32 = 16 * 1024;
 const MAX_VM_DISK_GB: i32 = 100;
 const VM_RUNNING_TIMEOUT: Duration = Duration::from_secs(60);
+const MACOS_GUEST_READY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const WINDOWS_FIRST_BOOT_READY_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const INCOMING_RESTORE_TOTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const INCOMING_RESTORE_STALL_TIMEOUT: Duration = Duration::from_secs(90);
@@ -128,6 +129,21 @@ struct VmResourceBounds {
     max_vcpu: i32,
     max_memory_mb: i32,
     max_disk_gb: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VmDesktopKind {
+    Vnc,
+    GuestVnc,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmDesktopTarget {
+    pub kind: VmDesktopKind,
+    pub host: String,
+    pub port: u16,
+    pub password: String,
+    pub view_only: bool,
 }
 
 impl Default for VmResourceBounds {
@@ -2281,10 +2297,7 @@ impl Manager {
             META_STORAGE_PROFILE.to_string(),
             "local-ephemeral".to_string(),
         );
-        metadata.insert(
-            META_PORTPROXY_AUTH_TOKEN.to_string(),
-            macos_vz::portproxy_auth_token().map_err(ManagerError::Other)?,
-        );
+        assign_new_portproxy_auth_token(&mut metadata);
         let mut meta = VmMetadata {
             id: id.clone(),
             name,
@@ -3832,12 +3845,13 @@ impl Manager {
             )));
         }
 
-        let (resources, shared_mounts, rpc_port, generation, portproxy_metadata) = {
+        let (resources, shared_mounts, rpc_port, proxy_port, generation, portproxy_metadata) = {
             let mut inner = vm.lock().await;
             let mut reserved = HashSet::new();
             let rpc_port = allocate_host_port(inner.metadata.network.rpc_port, &mut reserved)?;
+            let proxy_port = allocate_host_port(inner.metadata.network.proxy_port, &mut reserved)?;
             inner.metadata.network.rpc_port = rpc_port;
-            inner.metadata.network.proxy_port = rpc_port;
+            inner.metadata.network.proxy_port = proxy_port;
             let generation = macos_vz::runtime_generation();
             inner
                 .metadata
@@ -3853,6 +3867,7 @@ impl Manager {
                 inner.metadata.resources.clone(),
                 inner.metadata.shared_mounts.clone(),
                 rpc_port,
+                proxy_port,
                 generation,
                 inner.metadata.metadata.clone(),
             )
@@ -3878,6 +3893,7 @@ impl Manager {
             &paths,
             &resources,
             rpc_port,
+            proxy_port,
             &shared_mounts,
             &generation,
         )
@@ -3907,14 +3923,33 @@ impl Manager {
             }
         };
         let pid = response.pid.or(child_pid);
-        if let Err(error) = prepare_macos_vz_guest_vfs(
-            rpc_port,
-            &portproxy_metadata,
-            &shared_mounts,
-            self.cfg.vfs_internal_service_token.as_deref(),
-        )
-        .await
-        {
+        let guest_preparation = async {
+            let portproxy_auth_token = portproxy_metadata
+                .get(META_PORTPROXY_AUTH_TOKEN)
+                .map(String::as_str)
+                .filter(|token| !token.is_empty())
+                .ok_or_else(|| anyhow!("macOS VM is missing its per-VM portproxy token"))?;
+            configure_macos_vz_guest_runtime(
+                &paths,
+                &generation,
+                macos_vz::GuestRuntimeConfiguration {
+                    schema_version: 1,
+                    portproxy_auth_token: Some(portproxy_auth_token.to_string()),
+                    vnc_legacy_enabled: None,
+                    vnc_password: None,
+                },
+            )
+            .await?;
+            prepare_macos_vz_guest_vfs(
+                rpc_port,
+                &portproxy_metadata,
+                &shared_mounts,
+                self.cfg.vfs_internal_service_token.as_deref(),
+            )
+            .await
+        }
+        .await;
+        if let Err(error) = guest_preparation {
             let _ = macos_vz::request(
                 &paths.control_socket,
                 &generation,
@@ -3937,7 +3972,7 @@ impl Manager {
             save_metadata(&vm.dir, &mut inner.metadata).map_err(ManagerError::Other)?;
         }
         spawn_vz_exit_task(vm.clone(), child, paths, pid, generation);
-        info!(vm_id = %id, pid = ?pid, rpc_port, "macOS VZ guest started");
+        info!(vm_id = %id, pid = ?pid, rpc_port, proxy_port, "macOS VZ guest started");
         Ok(vm.lock().await.metadata.clone())
     }
 
@@ -4611,7 +4646,7 @@ impl Manager {
                 META_WINDOWS_RUNTIME_GENERATION.to_string(),
                 generation.clone(),
             );
-            if let Err(error) = windows_qemu::create_runtime_config_iso(
+            if let Err(error) = windows_qemu::create_runtime_config_disk(
                 &meta_snapshot,
                 vm_dir.as_path(),
                 &generation,
@@ -5372,6 +5407,91 @@ impl Manager {
     pub async fn hide_vm_desktop(&self, id: &str) -> ManagerResult<VmMetadata> {
         self.control_macos_vz_desktop(id, macos_vz::OwnerOperation::HideViewer)
             .await
+    }
+
+    pub async fn open_vm_desktop(&self, id: &str) -> ManagerResult<VmDesktopTarget> {
+        let vm = self.vm_by_id(id).await?;
+        let platform = vm.lock().await.metadata.guest_profile.platform.clone();
+        match platform {
+            GuestPlatform::Windows => {
+                let inner = vm.lock().await;
+                if !matches!(inner.runtime.state, VmState::Running | VmState::Paused) {
+                    return Err(ManagerError::Unsupported(
+                        "Windows desktop requires a running or paused VM".to_string(),
+                    ));
+                }
+                let port = inner.runtime.desktop_port.ok_or_else(|| {
+                    ManagerError::Other(anyhow!("Windows QEMU VNC endpoint is unavailable"))
+                })?;
+                Ok(VmDesktopTarget {
+                    kind: VmDesktopKind::Vnc,
+                    host: "127.0.0.1".to_string(),
+                    port,
+                    password: String::new(),
+                    view_only: false,
+                })
+            }
+            GuestPlatform::Macos => {
+                let _teardown = vm.lock_runtime_teardown().await;
+                {
+                    let inner = vm.lock().await;
+                    if inner.runtime.state != VmState::Running {
+                        return Err(ManagerError::Unsupported(
+                            "macOS Screen Sharing requires a running VM".to_string(),
+                        ));
+                    }
+                }
+                let (paths, generation) = macos_vz_runtime_identity(&vm).await?;
+                configure_macos_vz_guest_runtime(
+                    &paths,
+                    &generation,
+                    macos_vz::GuestRuntimeConfiguration {
+                        schema_version: 1,
+                        portproxy_auth_token: None,
+                        vnc_legacy_enabled: Some(false),
+                        vnc_password: None,
+                    },
+                )
+                .await
+                .map_err(ManagerError::Other)?;
+                Ok(VmDesktopTarget {
+                    kind: VmDesktopKind::GuestVnc,
+                    host: String::new(),
+                    port: 5900,
+                    password: String::new(),
+                    view_only: false,
+                })
+            }
+            GuestPlatform::Linux => Err(ManagerError::Unsupported(
+                "this guest does not expose a desktop console".to_string(),
+            )),
+        }
+    }
+
+    pub async fn close_vm_desktop(&self, id: &str) -> ManagerResult<VmMetadata> {
+        let vm = self.vm_by_id(id).await?;
+        let platform = vm.lock().await.metadata.guest_profile.platform.clone();
+        if platform != GuestPlatform::Macos {
+            return Ok(vm.lock().await.metadata.clone());
+        }
+        let _teardown = vm.lock_runtime_teardown().await;
+        if vm.lock().await.runtime.state != VmState::Running {
+            return Ok(vm.lock().await.metadata.clone());
+        }
+        let (paths, generation) = macos_vz_runtime_identity(&vm).await?;
+        configure_macos_vz_guest_runtime(
+            &paths,
+            &generation,
+            macos_vz::GuestRuntimeConfiguration {
+                schema_version: 1,
+                portproxy_auth_token: None,
+                vnc_legacy_enabled: Some(false),
+                vnc_password: None,
+            },
+        )
+        .await
+        .map_err(ManagerError::Other)?;
+        Ok(vm.lock().await.metadata.clone())
     }
 
     async fn control_macos_vz_desktop(
@@ -6609,11 +6729,7 @@ async fn detach_windows_runtime_config(monitor: &virt::MonitorHandle, vm_dir: &P
         .blockdev_del(windows_qemu::RUNTIME_CONFIG_FILE_NODE)
         .await
         .context("detach Windows runtime seed file backend")?;
-    monitor
-        .device_del_wait(windows_qemu::RUNTIME_CONFIG_USB_ID, Duration::from_secs(15))
-        .await
-        .context("detach empty Windows runtime seed USB transport")?;
-    fs::remove_file(vm_dir.join(windows_qemu::RUNTIME_CONFIG_ISO_FILE_NAME))
+    fs::remove_file(vm_dir.join(windows_qemu::RUNTIME_CONFIG_DISK_FILE_NAME))
         .context("remove imported Windows runtime seed")?;
     Ok(())
 }
@@ -7459,6 +7575,31 @@ async fn macos_vz_runtime_identity(
     ))
 }
 
+async fn configure_macos_vz_guest_runtime(
+    paths: &macos_vz::RuntimePaths,
+    generation: &str,
+    configuration: macos_vz::GuestRuntimeConfiguration,
+) -> Result<()> {
+    let deadline = Instant::now() + MACOS_GUEST_READY_TIMEOUT;
+    loop {
+        match macos_vz::configure_guest(&paths.control_socket, generation, &configuration).await {
+            Ok(response) if response.ok => return Ok(()),
+            Ok(response) if Instant::now() >= deadline => {
+                bail!(
+                    "macOS guest runtime configuration was rejected: {}",
+                    response.error.as_deref().unwrap_or("unknown error")
+                );
+            }
+            Ok(_) => {}
+            Err(error) if Instant::now() >= deadline => {
+                return Err(error.context("configure macOS guest runtime"));
+            }
+            Err(_) => {}
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
 async fn prepare_macos_vz_guest_vfs(
     rpc_port: i32,
     metadata: &HashMap<String, String>,
@@ -7497,7 +7638,7 @@ async fn prepare_macos_vz_guest_vfs(
         .ok_or_else(|| anyhow!("macOS VZ guest has no valid portproxy relay port"))?;
     let endpoint = format!("http://127.0.0.1:{port}");
     let auth_header = portproxy_auth_header_from_metadata(metadata)?;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + MACOS_GUEST_READY_TIMEOUT;
     loop {
         match probe_guest_exec_ready_anyhow(&endpoint, auth_header.as_ref(), 5).await {
             Ok(()) => break,

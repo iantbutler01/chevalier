@@ -5,15 +5,6 @@
       <ComputerName>*</ComputerName>
       <TimeZone>UTC</TimeZone>
     </component>
-    <component name="Microsoft-Windows-Deployment" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
-      <RunSynchronous>
-        <RunSynchronousCommand wcm:action="add">
-          <Order>1</Order>
-          <Description>Apply the per-VM OpenBracket first-boot identity</Description>
-          <Path>cmd.exe /d /c "for %D in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do @if exist %D:\FIRSTBT.PS1 powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File %D:\FIRSTBT.PS1"</Path>
-        </RunSynchronousCommand>
-      </RunSynchronous>
-    </component>
   </settings>
   <settings pass="oobeSystem">
     <component name="Microsoft-Windows-International-Core" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
@@ -29,6 +20,8 @@
         <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
         <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
         <ProtectYourPC>3</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
       </OOBE>
     </component>
   </settings>

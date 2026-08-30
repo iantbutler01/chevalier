@@ -8,7 +8,7 @@ import Testing
   #expect(
     OwnerControlOperation.allCases.map(\.rawValue) == [
       "status", "requestStop", "forceStop", "pause", "resume", "showViewer", "hideViewer",
-      "shutdownHelper",
+      "configureGuest", "shutdownHelper",
     ])
 }
 
@@ -21,6 +21,23 @@ import Testing
   let frame = try OwnerControlProtocol.encodeFrame(request)
   let decoded = try OwnerControlProtocol.decodeFrame(OwnerControlRequest.self, from: frame)
   #expect(decoded == request)
+
+  let configuration = GuestRuntimeConfiguration(
+    schemaVersion: 1,
+    portproxyAuthToken: "0123456789abcdef0123456789abcdef",
+    vncLegacyEnabled: true,
+    vncPassword: "A1b2C3d4")
+  let configureRequest = OwnerControlRequest(
+    protocolVersion: 1,
+    id: "request-2",
+    operation: .configureGuest,
+    expectedGeneration: "generation-7",
+    guestConfiguration: configuration)
+  let configureFrame = try OwnerControlProtocol.encodeFrame(configureRequest)
+  let decodedConfiguration = try OwnerControlProtocol.decodeFrame(
+    OwnerControlRequest.self,
+    from: configureFrame)
+  #expect(decodedConfiguration == configureRequest)
 
   let oversizedHeader = Data([0x00, 0x01, 0x00, 0x01])
   #expect(throws: OwnerControlError.invalidFrameLength(65_537)) {
@@ -44,6 +61,7 @@ import Testing
   #expect(OwnerControlOperationPolicy.rejection(for: .pause, snapshot: running) == nil)
   #expect(OwnerControlOperationPolicy.rejection(for: .resume, snapshot: running) != nil)
   #expect(OwnerControlOperationPolicy.rejection(for: .showViewer, snapshot: running) == nil)
+  #expect(OwnerControlOperationPolicy.rejection(for: .configureGuest, snapshot: running) == nil)
   #expect(OwnerControlOperationPolicy.rejection(for: .shutdownHelper, snapshot: running) != nil)
 
   let stopped = OwnerRuntimeSnapshot(
@@ -54,6 +72,7 @@ import Testing
     canResume: false)
   #expect(OwnerControlOperationPolicy.rejection(for: .shutdownHelper, snapshot: stopped) == nil)
   #expect(OwnerControlOperationPolicy.rejection(for: .showViewer, snapshot: stopped) != nil)
+  #expect(OwnerControlOperationPolicy.rejection(for: .configureGuest, snapshot: stopped) != nil)
 }
 
 @Test func runRequestRequiresGenerationForOwnerSocket() throws {

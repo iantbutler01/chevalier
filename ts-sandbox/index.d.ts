@@ -219,6 +219,8 @@ export interface SessionDesktopTargetJs {
   kind: string
   host?: string
   port?: number
+  password?: string
+  authentication: string
   viewOnly: boolean
 }
 

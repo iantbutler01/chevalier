@@ -5,9 +5,9 @@ script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 image_dir=$(cd -- "$script_dir/.." && pwd)
 gold=${OPENBRACKET_WINDOWS_GOLD:-"$image_dir/output/windows-11-iot-enterprise-ltsc-2024-arm64/windows-11-iot-enterprise-ltsc-2024-arm64.qcow2"}
 output=${1:-"$image_dir/output/windows-11-iot-enterprise-ltsc-2024-arm64-services"}
-firmware_code="$image_dir/artifacts/edk2-aarch64-secure-code.fd"
-firmware_vars="$image_dir/artifacts/edk2-arm-secure-vars-64m.fd"
-windows_iso="$image_dir/artifacts/windows-11-iot-enterprise-ltsc-2024-arm64-eval.iso"
+firmware_code=${OPENBRACKET_ARM_EFI_CODE:-"$image_dir/artifacts/edk2-aarch64-secure-code.fd"}
+firmware_vars=${OPENBRACKET_ARM_EFI_VARS:-"$image_dir/artifacts/edk2-arm-secure-vars-64m.fd"}
+windows_iso=${OPENBRACKET_WINDOWS_INSTALL_ISO:-"$image_dir/artifacts/windows-11-iot-enterprise-ltsc-2024-arm64-eval.iso"}
 test_root=$(mktemp -d /private/tmp/openbracket-windows-services.XXXXXX)
 qemu_pid=
 success=0
@@ -39,7 +39,7 @@ cp "$image_dir/artifacts/chevalier-guest-services.SHA256SUMS" "$media/"
 cp "$script_dir/initialize-state.ps1" "$media/"
 cp "$script_dir/install-runtime-services.ps1" "$media/"
 cp "$script_dir/SetupComplete-services.cmd" "$media/"
-cp "$script_dir/unattend-runtime-arm64.xml" "$media/"
+cp "$script_dir/unattend-runtime-arm64.xml" "$media/Unattend-runtime.xml"
 cp "$script_dir/stage-runtime-services.cmd" "$media/"
 cp "$script_dir/Autounattend-stage-services.xml" "$media/Autounattend.xml"
 vfs_hash=$(awk '$2 == "chevalier-vfs-winfsp-arm64.exe" { print $1 }' "$image_dir/artifacts/chevalier-guest-services.SHA256SUMS")

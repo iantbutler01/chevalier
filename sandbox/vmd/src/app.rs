@@ -45,7 +45,9 @@ use crate::proto::v1::{
     VmState as ProtoVmState, create_vm_stream_response,
     vmd_service_server::{VmdService, VmdServiceServer},
 };
-use crate::state::manager::{CreateVmProgressCallback, CreateVmProgressEvent, CreateVmStage};
+use crate::state::manager::{
+    CreateVmProgressCallback, CreateVmProgressEvent, CreateVmStage, VmDesktopKind,
+};
 use crate::state::{
     CreateVmParams, ForkVmParams, Manager, ManagerError, SharedMountAvailability,
     SharedMountContinuity, SharedMountSpec, SnapshotMetadata, SnapshotParams, UpdateVmParams,
@@ -903,6 +905,49 @@ impl VmdService for GrpcService {
             .await
     }
 
+    async fn open_vm_desktop(
+        &self,
+        request: Request<VmActionRequest>,
+    ) -> GrpcResult<DesktopEndpoint> {
+        self.authorize(&request, AccessLevel::Write).await?;
+        let request = request.into_inner();
+        Uuid::parse_str(&request.vm_id)
+            .map_err(|_| Status::invalid_argument("vm_id must be a UUID"))?;
+        let desktop = self
+            .manager
+            .open_vm_desktop(&request.vm_id)
+            .await
+            .map_err(status_from_error)?;
+        Ok(Response::new(DesktopEndpoint {
+            kind: match desktop.kind {
+                VmDesktopKind::Vnc => DesktopKind::Vnc as i32,
+                VmDesktopKind::GuestVnc => DesktopKind::GuestVnc as i32,
+            },
+            host: desktop.host,
+            port: i32::from(desktop.port),
+            view_only: desktop.view_only,
+            password: desktop.password,
+        }))
+    }
+
+    async fn close_vm_desktop(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
+        self.authorize(&request, AccessLevel::Write).await?;
+        let request = request.into_inner();
+        Uuid::parse_str(&request.vm_id)
+            .map_err(|_| Status::invalid_argument("vm_id must be a UUID"))?;
+        let metadata = self
+            .manager
+            .close_vm_desktop(&request.vm_id)
+            .await
+            .map_err(status_from_error)?;
+        let (_, runtime) = self
+            .manager
+            .get_with_runtime(&request.vm_id)
+            .await
+            .map_err(status_from_error)?;
+        Ok(Response::new(build_vm(&metadata, Some(&runtime), true)))
+    }
+
     async fn list_host_pci_devices(
         &self,
         request: Request<ListHostPciDevicesRequest>,
@@ -1714,10 +1759,11 @@ fn build_vm(
             }
             match meta.guest_profile.platform {
                 crate::state::GuestPlatform::Macos => Some(DesktopEndpoint {
-                    kind: DesktopKind::NativeWindow as i32,
+                    kind: DesktopKind::GuestVnc as i32,
                     host: String::new(),
-                    port: 0,
+                    port: 5900,
                     view_only: false,
+                    password: String::new(),
                 }),
                 crate::state::GuestPlatform::Windows => {
                     runtime.desktop_port.map(|port| DesktopEndpoint {
@@ -1725,6 +1771,7 @@ fn build_vm(
                         host: "127.0.0.1".to_string(),
                         port: i32::from(port),
                         view_only: false,
+                        password: String::new(),
                     })
                 }
                 crate::state::GuestPlatform::Linux => None,

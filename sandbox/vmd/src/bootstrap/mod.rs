@@ -1,8 +1,8 @@
 // @dive-file: Builds bootstrap ISO images that seed guest init scripts and bundled portproxy binaries.
 // @dive-rel: Consumed by VM launch paths in vmd state manager to initialize guest runtime services.
 // @dive-rel: Depends on assets::portproxy binary selection for architecture-specific guest payloads.
-use std::fs;
-use std::io::{Seek, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -100,6 +100,78 @@ pub fn create_data_iso<P: AsRef<Path>>(
         .map(|(name, data)| IsoEntry::new(&name, data))
         .collect::<Vec<_>>();
     write_iso(path.as_ref(), volume_id, &entries)
+}
+
+pub fn create_data_fat<P: AsRef<Path>>(
+    path: P,
+    volume_label: [u8; 11],
+    files: Vec<(String, Vec<u8>)>,
+) -> Result<()> {
+    const DISK_SIZE: u64 = 64 * 1024 * 1024;
+    const BYTES_PER_SECTOR: u64 = 512;
+    const PARTITION_START_SECTOR: u32 = 2048;
+    const PARTITION_START: u64 = PARTITION_START_SECTOR as u64 * BYTES_PER_SECTOR;
+    const PARTITION_SECTORS: u32 = (DISK_SIZE / BYTES_PER_SECTOR) as u32 - PARTITION_START_SECTOR;
+
+    if let Some(parent) = path.as_ref().parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("data FAT: ensure directory {}", parent.display()))?;
+        }
+    }
+    let mut image = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(path.as_ref())
+        .with_context(|| format!("data FAT: create {}", path.as_ref().display()))?;
+    image
+        .set_len(DISK_SIZE)
+        .context("data FAT: allocate image")?;
+    let mut mbr = [0_u8; 512];
+    let partition_entry = &mut mbr[446..462];
+    partition_entry[0] = 0x00;
+    partition_entry[1..4].copy_from_slice(&[0x00, 0x02, 0x00]);
+    partition_entry[4] = 0x0c;
+    partition_entry[5..8].copy_from_slice(&[0xfe, 0xff, 0xff]);
+    partition_entry[8..12].copy_from_slice(&PARTITION_START_SECTOR.to_le_bytes());
+    partition_entry[12..16].copy_from_slice(&PARTITION_SECTORS.to_le_bytes());
+    mbr[510..512].copy_from_slice(&[0x55, 0xaa]);
+    image.write_all(&mbr).context("data FAT: write MBR")?;
+    let mut partition = fscommon::StreamSlice::new(image, PARTITION_START, DISK_SIZE)
+        .context("data FAT: open partition")?;
+    fatfs::format_volume(
+        &mut partition,
+        fatfs::FormatVolumeOptions::new().volume_label(volume_label),
+    )
+    .context("data FAT: format image")?;
+    partition
+        .seek(SeekFrom::Start(0))
+        .context("data FAT: rewind partition")?;
+    let filesystem = fatfs::FileSystem::new(partition, fatfs::FsOptions::new())
+        .context("data FAT: open formatted image")?;
+    {
+        let root = filesystem.root_dir();
+        for (name, data) in files {
+            let mut file = root
+                .create_file(&name)
+                .with_context(|| format!("data FAT: create {name}"))?;
+            file.write_all(&data)
+                .with_context(|| format!("data FAT: write {name}"))?;
+            file.flush()
+                .with_context(|| format!("data FAT: flush {name}"))?;
+        }
+    }
+    filesystem.unmount().context("data FAT: unmount image")?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path.as_ref())
+        .with_context(|| format!("data FAT: reopen {}", path.as_ref().display()))?
+        .sync_all()
+        .context("data FAT: sync image")?;
+    Ok(())
 }
 
 fn build_init_script(

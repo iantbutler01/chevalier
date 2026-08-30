@@ -41,6 +41,7 @@ struct RunRequest: Codable, Equatable {
   let networkMode: RunNetworkMode?
   let viewerMode: RunViewerMode?
   let loopbackRelayPort: UInt16?
+  let guestIngressRelayPort: UInt16?
   let guestServiceRelays: [GuestServiceRelayRequest]?
   let sharedDirectories: [SharedDirectoryRequest]?
   let ownerControlSocketPath: String?
@@ -56,6 +57,7 @@ struct RunRequest: Codable, Equatable {
     networkMode: RunNetworkMode?,
     viewerMode: RunViewerMode?,
     loopbackRelayPort: UInt16?,
+    guestIngressRelayPort: UInt16? = nil,
     guestServiceRelays: [GuestServiceRelayRequest]?,
     sharedDirectories: [SharedDirectoryRequest]? = nil,
     ownerControlSocketPath: String? = nil,
@@ -70,6 +72,7 @@ struct RunRequest: Codable, Equatable {
     self.networkMode = networkMode
     self.viewerMode = viewerMode
     self.loopbackRelayPort = loopbackRelayPort
+    self.guestIngressRelayPort = guestIngressRelayPort
     self.guestServiceRelays = guestServiceRelays
     self.sharedDirectories = sharedDirectories
     self.ownerControlSocketPath = ownerControlSocketPath
@@ -110,6 +113,13 @@ struct RunRequest: Codable, Equatable {
     }
     if loopbackRelayPort == 0 {
       throw RunError.invalidRequest("loopbackRelayPort must be greater than zero when present")
+    }
+    if guestIngressRelayPort == 0 {
+      throw RunError.invalidRequest("guestIngressRelayPort must be greater than zero when present")
+    }
+    if let loopbackRelayPort, loopbackRelayPort == guestIngressRelayPort {
+      throw RunError.invalidRequest(
+        "guestIngressRelayPort must not collide with loopbackRelayPort")
     }
     if let ownerControlSocketPath {
       guard !ownerControlSocketPath.isEmpty else {

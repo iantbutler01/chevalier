@@ -45,6 +45,102 @@ final class GuestControlSocketListener: NSObject, VZVirtioSocketListenerDelegate
   }
 }
 
+private enum GuestRuntimeConfigurationTransport {
+  static func exchange(
+    _ request: Data,
+    _ descriptor: Int32
+  ) throws -> GuestRuntimeConfigurationResponse {
+    try configureTimeouts(descriptor)
+    try writeAll(request, to: descriptor)
+    let header = try readExactly(4, from: descriptor)
+    let length = header.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+    guard length > 0, length <= OwnerControlProtocol.maximumFrameBytes else {
+      throw OwnerControlError.invalidFrameLength(Int(length))
+    }
+    let payload = try readExactly(Int(length), from: descriptor)
+    return try JSONDecoder().decode(GuestRuntimeConfigurationResponse.self, from: payload)
+  }
+
+  private static func configureTimeouts(_ descriptor: Int32) throws {
+    var timeout = timeval(tv_sec: 10, tv_usec: 0)
+    for option in [SO_RCVTIMEO, SO_SNDTIMEO] {
+      guard
+        setsockopt(
+          descriptor,
+          SOL_SOCKET,
+          option,
+          &timeout,
+          socklen_t(MemoryLayout<timeval>.size)) == 0
+      else {
+        throw OwnerControlError.io(
+          "configure guest runtime socket: \(String(cString: strerror(errno)))")
+      }
+    }
+  }
+
+  private static func readExactly(_ count: Int, from descriptor: Int32) throws -> Data {
+    var data = Data(count: count)
+    try data.withUnsafeMutableBytes { bytes in
+      var offset = 0
+      while offset < count {
+        let result = Darwin.read(
+          descriptor,
+          bytes.baseAddress!.advanced(by: offset),
+          count - offset)
+        if result == 0 { throw OwnerControlError.truncatedFrame }
+        if result < 0 {
+          if errno == EINTR { continue }
+          if errno == EAGAIN || errno == EWOULDBLOCK {
+            try waitForReadiness(descriptor, events: Int16(POLLIN))
+            continue
+          }
+          throw OwnerControlError.io(
+            "read guest runtime response: \(String(cString: strerror(errno)))")
+        }
+        offset += result
+      }
+    }
+    return data
+  }
+
+  private static func writeAll(_ data: Data, to descriptor: Int32) throws {
+    try data.withUnsafeBytes { bytes in
+      var offset = 0
+      while offset < bytes.count {
+        let result = Darwin.write(
+          descriptor,
+          bytes.baseAddress!.advanced(by: offset),
+          bytes.count - offset)
+        if result < 0 {
+          if errno == EINTR { continue }
+          if errno == EAGAIN || errno == EWOULDBLOCK {
+            try waitForReadiness(descriptor, events: Int16(POLLOUT))
+            continue
+          }
+          throw OwnerControlError.io(
+            "write guest runtime request: \(String(cString: strerror(errno)))")
+        }
+        offset += result
+      }
+    }
+  }
+
+  private static func waitForReadiness(_ descriptor: Int32, events: Int16) throws {
+    var pollDescriptor = pollfd(fd: descriptor, events: events, revents: 0)
+    while true {
+      let result = Darwin.poll(&pollDescriptor, 1, 10_000)
+      if result > 0 { return }
+      if result == 0 {
+        throw OwnerControlError.io("guest runtime socket timed out")
+      }
+      if errno != EINTR {
+        throw OwnerControlError.io(
+          "wait for guest runtime socket: \(String(cString: strerror(errno)))")
+      }
+    }
+  }
+}
+
 @MainActor
 final class MacOSVirtualMachineApplication: NSObject, NSWindowDelegate,
   @preconcurrency VZVirtualMachineDelegate
@@ -55,6 +151,7 @@ final class MacOSVirtualMachineApplication: NSObject, NSWindowDelegate,
   private let socketListener: VZVirtioSocketListener
   private let socketDelegate: GuestControlSocketListener
   private let loopbackRelay: LoopbackTCPRelay?
+  private let guestIngressRelay: GuestIngressRelay?
   private let guestServiceSocketListeners: [VZVirtioSocketListener]
   private let guestServiceRelays: [GuestServiceRelay]
   private let runtimeGeneration: String?
@@ -80,6 +177,9 @@ final class MacOSVirtualMachineApplication: NSObject, NSWindowDelegate,
       throw RunError.missingVirtioSocketDevice
     }
     let loopbackRelay = try request.loopbackRelayPort.map(LoopbackTCPRelay.init(port:))
+    let guestIngressRelay = try request.guestIngressRelayPort.map {
+      try GuestIngressRelay(port: $0, socketDevice: socketDevice)
+    }
     let socketListener = VZVirtioSocketListener()
     let socketDelegate = GuestControlSocketListener(relay: loopbackRelay)
     socketListener.delegate = socketDelegate
@@ -104,6 +204,7 @@ final class MacOSVirtualMachineApplication: NSObject, NSWindowDelegate,
     self.socketListener = socketListener
     self.socketDelegate = socketDelegate
     self.loopbackRelay = loopbackRelay
+    self.guestIngressRelay = guestIngressRelay
     self.guestServiceSocketListeners = guestServiceSocketListeners
     self.guestServiceRelays = guestServiceRelays
     self.runtimeGeneration = request.runtimeGeneration
@@ -132,9 +233,10 @@ final class MacOSVirtualMachineApplication: NSObject, NSWindowDelegate,
   }
 
   func run() async throws {
-    application.setActivationPolicy(.accessory)
+    application.setActivationPolicy(initialViewerMode == .window ? .regular : .accessory)
     if initialViewerMode == .window {
       showViewer()
+      application.activate(ignoringOtherApps: true)
     }
     NSLog("chevalier-vz: viewer mode=%@", initialViewerMode.rawValue)
     NSLog(
@@ -149,6 +251,7 @@ final class MacOSVirtualMachineApplication: NSObject, NSWindowDelegate,
         GuestServiceRelay.maximumConcurrentSessions)
     }
     ownerControlServer?.start()
+    guestIngressRelay?.start()
     if let ownerControlServer {
       NSLog(
         "chevalier-vz: owner control listening path=%@ generation=%@",
@@ -299,6 +402,11 @@ final class MacOSVirtualMachineApplication: NSObject, NSWindowDelegate,
         showViewer()
       case .hideViewer:
         hideViewer()
+      case .configureGuest:
+        guard let configuration = request.guestConfiguration else {
+          throw RunError.invalidRequest("configureGuest requires guestConfiguration")
+        }
+        try await configureGuest(configuration)
       case .shutdownHelper:
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak application] in
           application?.terminate(nil)
@@ -355,6 +463,31 @@ final class MacOSVirtualMachineApplication: NSObject, NSWindowDelegate,
   private func resumeVirtualMachine() async throws {
     try await withCheckedThrowingContinuation { continuation in
       virtualMachine.resume { continuation.resume(with: $0) }
+    }
+  }
+
+  private func configureGuest(_ configuration: GuestRuntimeConfiguration) async throws {
+    guard let socketDevice = virtualMachine.socketDevices.first as? VZVirtioSocketDevice else {
+      throw RunError.missingVirtioSocketDevice
+    }
+    let connection = try await socketDevice.connect(toPort: 13_340)
+    defer { connection.close() }
+    let frame = try OwnerControlProtocol.encodeFrame(configuration)
+    let response = try await withCheckedThrowingContinuation {
+      (continuation: CheckedContinuation<GuestRuntimeConfigurationResponse, Error>) in
+      let descriptor = connection.fileDescriptor
+      DispatchQueue.global(qos: .userInitiated).async {
+        continuation.resume(
+          with: Result { try GuestRuntimeConfigurationTransport.exchange(frame, descriptor) })
+      }
+    }
+    guard response.schemaVersion == 1 else {
+      throw RunError.invalidRequest(
+        "guest runtime configuration protocol mismatch: \(response.schemaVersion)")
+    }
+    guard response.ok else {
+      throw RunError.invalidRequest(
+        response.error ?? "guest runtime configuration was rejected")
     }
   }
 

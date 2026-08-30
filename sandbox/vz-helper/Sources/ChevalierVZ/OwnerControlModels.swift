@@ -8,7 +8,21 @@ enum OwnerControlOperation: String, Codable, CaseIterable {
   case resume
   case showViewer
   case hideViewer
+  case configureGuest
   case shutdownHelper
+}
+
+struct GuestRuntimeConfiguration: Codable, Equatable {
+  let schemaVersion: Int
+  let portproxyAuthToken: String?
+  let vncLegacyEnabled: Bool?
+  let vncPassword: String?
+}
+
+struct GuestRuntimeConfigurationResponse: Codable, Equatable {
+  let schemaVersion: Int
+  let ok: Bool
+  let error: String?
 }
 
 struct OwnerControlRequest: Codable, Equatable {
@@ -16,6 +30,21 @@ struct OwnerControlRequest: Codable, Equatable {
   let id: String
   let operation: OwnerControlOperation
   let expectedGeneration: String?
+  let guestConfiguration: GuestRuntimeConfiguration?
+
+  init(
+    protocolVersion: Int,
+    id: String,
+    operation: OwnerControlOperation,
+    expectedGeneration: String?,
+    guestConfiguration: GuestRuntimeConfiguration? = nil
+  ) {
+    self.protocolVersion = protocolVersion
+    self.id = id
+    self.operation = operation
+    self.expectedGeneration = expectedGeneration
+    self.guestConfiguration = guestConfiguration
+  }
 }
 
 struct OwnerControlResponse: Codable, Equatable {
@@ -121,6 +150,8 @@ enum OwnerControlOperationPolicy {
     case .showViewer:
       ["starting", "running", "paused"].contains(snapshot.state)
         ? nil : "viewer is unavailable in state \(snapshot.state)"
+    case .configureGuest:
+      snapshot.state == "running" ? nil : "guest configuration requires a running VM"
     case .shutdownHelper:
       ["stopped", "error"].contains(snapshot.state)
         ? nil : "helper shutdown requires stopped or error state, got \(snapshot.state)"

@@ -29,3 +29,13 @@ func TestConfigValidate(t *testing.T) {
 		t.Fatal("invalid listen address accepted")
 	}
 }
+
+func TestHasDesktopSessionMatchesQueryUserRowsCaseInsensitively(t *testing.T) {
+	output := " USERNAME              SESSIONNAME        ID  STATE   IDLE TIME  LOGON TIME\r\n openbracket           console             1  Active      none   8/30/2026 5:36 PM\r\n"
+	if !hasDesktopSession(output, "OpenBracket") {
+		t.Fatal("expected OpenBracket console session")
+	}
+	if hasDesktopSession(output, "OtherUser") {
+		t.Fatal("unexpected session match")
+	}
+}

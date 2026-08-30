@@ -19,6 +19,7 @@ use chevalier_sandbox::{
     PciDeviceAction as EnginePciDeviceAction, ResourceLimits, Sandbox as EngineSandbox,
     SandboxConfig, SandboxError, SandboxProviderConfig, Session as EngineSession,
     SessionDesktopKind as EngineSessionDesktopKind,
+    SessionDesktopAuthentication as EngineSessionDesktopAuthentication,
     SessionDesktopTarget as EngineSessionDesktopTarget, SessionInfo as EngineSessionInfo,
     SessionOptions, SessionSourceType as EngineSessionSourceType, SharedMount,
     SharedMountAvailability, SharedMountContinuity, ShellEvent, ShellInput, ShellOptions,
@@ -466,6 +467,8 @@ pub struct SessionDesktopTargetJs {
     pub kind: String,
     pub host: Option<String>,
     pub port: Option<u32>,
+    pub password: Option<String>,
+    pub authentication: String,
     pub view_only: bool,
 }
 
@@ -478,6 +481,12 @@ impl From<EngineSessionDesktopTarget> for SessionDesktopTargetJs {
             },
             host: target.host,
             port: target.port.map(u32::from),
+            password: target.password,
+            authentication: match target.authentication {
+                EngineSessionDesktopAuthentication::None => "none".to_string(),
+                EngineSessionDesktopAuthentication::Password => "password".to_string(),
+                EngineSessionDesktopAuthentication::Account => "account".to_string(),
+            },
             view_only: target.view_only,
         }
     }

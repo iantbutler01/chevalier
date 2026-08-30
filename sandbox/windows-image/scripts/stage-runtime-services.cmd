@@ -15,7 +15,14 @@ copy /y "%MEDIA%\chevalier-guest-services.SHA256SUMS" "%DEST%\chevalier-guest-se
 copy /y "%MEDIA%\image-manifest.json" "%TARGET%\ProgramData\Chevalier\image-manifest.json" || exit /b 25
 if not exist "%TARGET%\Windows\Setup\Scripts" mkdir "%TARGET%\Windows\Setup\Scripts"
 copy /y "%MEDIA%\SetupComplete-services.cmd" "%TARGET%\Windows\Setup\Scripts\SetupComplete.cmd" || exit /b 26
-copy /y "%MEDIA%\unattend-runtime-arm64.xml" "%TARGET%\Windows\Panther\unattend.xml" || exit /b 27
+if not exist "%TARGET%\Windows\Panther\Unattend" mkdir "%TARGET%\Windows\Panther\Unattend"
+del /q "%TARGET%\Windows\Panther\unattend.xml" 2>nul
+del /q "%TARGET%\Windows\Panther\Autounattend.xml" 2>nul
+del /q "%TARGET%\Windows\Panther\unattend-original.xml" 2>nul
+copy /y "%MEDIA%\Unattend-runtime.xml" "%TARGET%\Windows\Panther\Unattend\Unattend.xml" || exit /b 27
+reg load HKLM\OB_SYSTEM "%TARGET%\Windows\System32\Config\SYSTEM" || exit /b 28
+reg add HKLM\OB_SYSTEM\Setup /v UnattendFile /t REG_SZ /d "C:\Windows\Panther\Unattend\Unattend.xml" /f || exit /b 29
+reg unload HKLM\OB_SYSTEM || exit /b 30
 echo staged>"%DEST%\offline-staged.txt"
 wpeutil shutdown
 exit /b 0

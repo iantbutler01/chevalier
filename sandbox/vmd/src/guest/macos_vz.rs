@@ -22,7 +22,7 @@ const CONTROL_VSOCK_PORT: u32 = 13_338;
 const VFS_VSOCK_PORT: u32 = 13_339;
 const HELPER_ENV: &str = "CHEVALIER_SANDBOX_VZ_HELPER_BIN";
 const LEGACY_HELPER_ENV: &str = "BRACKET_SANDBOX_VZ_HELPER_BIN";
-const PORTPROXY_TOKEN_FILE_ENV: &str = "CHEVALIER_SANDBOX_MACOS_PORTPROXY_TOKEN_FILE";
+pub const RUNTIME_CONFIG_VSOCK_PORT: u32 = 13_340;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnerOperation {
@@ -33,6 +33,7 @@ pub enum OwnerOperation {
     Resume,
     ShowViewer,
     HideViewer,
+    ConfigureGuest,
     ShutdownHelper,
 }
 
@@ -46,6 +47,7 @@ impl OwnerOperation {
             Self::Resume => "resume",
             Self::ShowViewer => "showViewer",
             Self::HideViewer => "hideViewer",
+            Self::ConfigureGuest => "configureGuest",
             Self::ShutdownHelper => "shutdownHelper",
         }
     }
@@ -70,6 +72,17 @@ struct OwnerRequest<'a> {
     id: String,
     operation: &'a str,
     expected_generation: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guest_configuration: Option<&'a GuestRuntimeConfiguration>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestRuntimeConfiguration {
+    pub schema_version: u32,
+    pub portproxy_auth_token: Option<String>,
+    pub vnc_legacy_enabled: Option<bool>,
+    pub vnc_password: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -113,6 +126,7 @@ struct RunRequest<'a> {
     network_mode: &'static str,
     viewer_mode: &'static str,
     loopback_relay_port: u16,
+    guest_ingress_relay_port: u16,
     guest_service_relays: Vec<GuestServiceRelay>,
     shared_directories: Vec<SharedDirectory>,
     owner_control_socket_path: &'a str,
@@ -166,24 +180,6 @@ pub fn helper_binary() -> Result<String> {
         .ok_or_else(|| {
             anyhow!("macOS VZ source requires {HELPER_ENV} to name the signed chevalier-vz helper")
         })
-}
-
-pub fn portproxy_auth_token() -> Result<String> {
-    let path = env::var(PORTPROXY_TOKEN_FILE_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow!("macOS VZ source requires {PORTPROXY_TOKEN_FILE_ENV} for the provisioned guest")
-        })?;
-    let token = fs::read_to_string(&path)
-        .with_context(|| format!("read macOS guest portproxy token file {path}"))?
-        .trim()
-        .to_string();
-    if token.is_empty() {
-        bail!("macOS guest portproxy token file is empty: {path}");
-    }
-    Ok(token)
 }
 
 pub fn load_template_descriptor(bundle: &Path) -> Result<(TemplateDescriptor, String)> {
@@ -270,6 +266,7 @@ pub async fn launch(
     paths: &RuntimePaths,
     resources: &ResourceSpec,
     rpc_port: i32,
+    proxy_port: i32,
     shared_mounts: &[SharedMountSpec],
     generation: &str,
 ) -> Result<Child> {
@@ -280,6 +277,13 @@ pub async fn launch(
         .ok()
         .filter(|port| *port > 0)
         .ok_or_else(|| anyhow!("macOS VZ control relay requires a valid loopback port"))?;
+    let proxy_port = u16::try_from(proxy_port)
+        .ok()
+        .filter(|port| *port > 0)
+        .ok_or_else(|| anyhow!("macOS VZ guest ingress requires a valid loopback port"))?;
+    if proxy_port == rpc_port {
+        bail!("macOS VZ guest ingress and control relay ports must be distinct");
+    }
     let guest_service_relays = vfs_guest_service_relays(shared_mounts)?;
     let bundle_path = path_string(&paths.bundle)?;
     let owner_control_socket_path = path_string(&paths.control_socket)?;
@@ -295,6 +299,7 @@ pub async fn launch(
         network_mode: "natDevelopment",
         viewer_mode: "headless",
         loopback_relay_port: rpc_port,
+        guest_ingress_relay_port: proxy_port,
         guest_service_relays,
         shared_directories: Vec::new(),
         owner_control_socket_path: &owner_control_socket_path,
@@ -393,7 +398,31 @@ pub async fn request(
         id: Uuid::new_v4().to_string(),
         operation: operation.as_str(),
         expected_generation: generation,
+        guest_configuration: None,
     };
+    send_owner_request(socket, generation, request).await
+}
+
+pub async fn configure_guest(
+    socket: &Path,
+    generation: &str,
+    configuration: &GuestRuntimeConfiguration,
+) -> Result<OwnerResponse> {
+    let request = OwnerRequest {
+        protocol_version: PROTOCOL_VERSION,
+        id: Uuid::new_v4().to_string(),
+        operation: OwnerOperation::ConfigureGuest.as_str(),
+        expected_generation: generation,
+        guest_configuration: Some(configuration),
+    };
+    send_owner_request(socket, generation, request).await
+}
+
+async fn send_owner_request(
+    socket: &Path,
+    generation: &str,
+    request: OwnerRequest<'_>,
+) -> Result<OwnerResponse> {
     let payload = serde_json::to_vec(&request)?;
     if payload.len() > MAX_FRAME_BYTES {
         bail!("macOS VZ owner request exceeds maximum frame size");

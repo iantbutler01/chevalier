@@ -11,7 +11,11 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
+mod guest_ingress;
+mod runtime_config;
+
 const DEFAULT_VSOCK_PORT: u32 = 13_338;
+const DEFAULT_GUEST_INGRESS_VSOCK_PORT: u32 = 13_341;
 const DEFAULT_TCP_ADDRESS: &str = "127.0.0.1:13338";
 const DEFAULT_RETRY_MILLIS: u64 = 1_000;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -23,6 +27,8 @@ struct Config {
     listen_address: Option<String>,
     retry_millis: u64,
     once: bool,
+    runtime_config_agent: bool,
+    guest_ingress_agent: bool,
 }
 
 impl Default for Config {
@@ -33,6 +39,8 @@ impl Default for Config {
             listen_address: None,
             retry_millis: DEFAULT_RETRY_MILLIS,
             once: false,
+            runtime_config_agent: false,
+            guest_ingress_agent: false,
         }
     }
 }
@@ -64,6 +72,22 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Check(config) => {
+            if config.guest_ingress_agent {
+                println!(
+                    "guest_ingress_agent=true vsock_port={} maximum_sessions={}",
+                    config.vsock_port,
+                    guest_ingress::MAXIMUM_CONCURRENT_SESSIONS
+                );
+                return ExitCode::SUCCESS;
+            }
+            if config.runtime_config_agent {
+                println!(
+                    "runtime_config_agent=true vsock_cid={} vsock_port={}",
+                    libc::VMADDR_CID_HOST,
+                    config.vsock_port
+                );
+                return ExitCode::SUCCESS;
+            }
             let tcp_mode = config
                 .listen_address
                 .as_deref()
@@ -93,6 +117,8 @@ fn usage() -> &'static str {
        --vsock-port <port>       Host VZ listener port (default: 13338)\n\
        --tcp-address <host:port> Guest-local portproxy endpoint (default: 127.0.0.1:13338)\n\
        --listen-address <addr>   Listen for guest clients and relay each to host vsock\n\
+       --runtime-config-agent    Apply host-only guest runtime configuration\n\
+       --guest-ingress-agent     Relay host-initiated streams into guest loopback\n\
        --retry-millis <ms>       Reconnect delay (default: 1000)\n\
        --once                    Exit after the first connection ends or fails\n\
        --check-config            Validate and print configuration without connecting\n\
@@ -104,6 +130,7 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command, St
     let mut config = Config::default();
     let mut check = false;
     let mut tcp_address_set = false;
+    let mut vsock_port_set = false;
     let mut arguments = arguments.into_iter();
 
     while let Some(argument) = arguments.next() {
@@ -113,6 +140,7 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command, St
                     .next()
                     .ok_or_else(|| "missing value for --vsock-port".to_owned())?;
                 config.vsock_port = parse_port("--vsock-port", &value)?;
+                vsock_port_set = true;
             }
             "--tcp-address" => {
                 if config.listen_address.is_some() {
@@ -151,6 +179,8 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command, St
                 }
             }
             "--once" => config.once = true,
+            "--runtime-config-agent" => config.runtime_config_agent = true,
+            "--guest-ingress-agent" => config.guest_ingress_agent = true,
             "--check-config" => check = true,
             "--version" => return Ok(Command::Version),
             "--help" | "-h" => return Ok(Command::Help),
@@ -158,6 +188,19 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command, St
         }
     }
 
+    if config.runtime_config_agent && config.guest_ingress_agent {
+        return Err(
+            "--runtime-config-agent and --guest-ingress-agent are mutually exclusive".to_owned(),
+        );
+    }
+    if config.guest_ingress_agent && !vsock_port_set {
+        config.vsock_port = DEFAULT_GUEST_INGRESS_VSOCK_PORT;
+    }
+    if (config.runtime_config_agent || config.guest_ingress_agent)
+        && (tcp_address_set || config.listen_address.is_some() || config.once)
+    {
+        return Err("agent modes cannot be combined with TCP relay options or --once".to_owned());
+    }
     if check {
         Ok(Command::Check(config))
     } else {
@@ -189,6 +232,12 @@ fn validate_tcp_address(value: &str) -> Result<(), String> {
 }
 
 fn run(config: Config) -> ExitCode {
+    if config.guest_ingress_agent {
+        return guest_ingress::run_agent(config.vsock_port);
+    }
+    if config.runtime_config_agent {
+        return runtime_config::run_agent(config.vsock_port);
+    }
     if config.listen_address.is_some() {
         return run_listener(config);
     }
@@ -307,7 +356,7 @@ fn connect_host_vsock(port: u32) -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(raw) })
 }
 
-fn relay(tcp: TcpStream, vsock: File) -> io::Result<()> {
+pub(crate) fn relay(tcp: TcpStream, vsock: File) -> io::Result<()> {
     let mut tcp_reader = tcp.try_clone()?;
     let mut tcp_writer = tcp;
     let mut vsock_reader = vsock.try_clone()?;
@@ -436,6 +485,54 @@ mod tests {
 
         assert_eq!(config.vsock_port, 13_339);
         assert_eq!(config.listen_address.as_deref(), Some("127.0.0.1:18080"));
+    }
+
+    #[test]
+    fn parses_runtime_configuration_agent_mode() {
+        let Command::Run(config) = parse_args(strings(&[
+            "--runtime-config-agent",
+            "--vsock-port",
+            "13340",
+        ]))
+        .unwrap() else {
+            panic!("expected run command");
+        };
+
+        assert!(config.runtime_config_agent);
+        assert_eq!(config.vsock_port, 13_340);
+        assert!(
+            parse_args(strings(&[
+                "--runtime-config-agent",
+                "--listen-address",
+                "127.0.0.1:18080",
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_guest_ingress_agent_mode() {
+        let Command::Run(config) = parse_args(strings(&["--guest-ingress-agent"])).unwrap() else {
+            panic!("expected run command");
+        };
+
+        assert!(config.guest_ingress_agent);
+        assert_eq!(config.vsock_port, 13_341);
+        assert!(
+            parse_args(strings(&[
+                "--guest-ingress-agent",
+                "--listen-address",
+                "127.0.0.1:18080",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_args(strings(&[
+                "--guest-ingress-agent",
+                "--runtime-config-agent",
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

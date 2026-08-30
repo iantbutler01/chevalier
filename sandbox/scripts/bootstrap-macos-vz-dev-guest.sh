@@ -65,13 +65,23 @@ if [ "$(macfuse_version)" != "5.3.3" ]; then
   exit 69
 fi
 
+BOOTSTRAP_SECRET_DIR=$(/usr/bin/mktemp -d /private/tmp/chevalier-bootstrap.XXXXXX)
+trap '/bin/rm -rf "$BOOTSTRAP_SECRET_DIR"' EXIT INT TERM
+/usr/bin/openssl rand -hex 32 >"$BOOTSTRAP_SECRET_DIR/portproxy.token"
+/usr/bin/openssl rand -hex 32 >"$BOOTSTRAP_SECRET_DIR/vfs.token"
+/bin/chmod 0600 "$BOOTSTRAP_SECRET_DIR/portproxy.token" "$BOOTSTRAP_SECRET_DIR/vfs.token"
+
 "$SOURCE_DIR/install-guest-assets.sh" \
-  --auth-token-file "$SOURCE_DIR/portproxy.token"
+  --auth-token-file "$BOOTSTRAP_SECRET_DIR/portproxy.token"
 "$SOURCE_DIR/install-vfs-guest.sh" \
-  --vfs-token-file "$SOURCE_DIR/vfs.token" \
+  --vfs-token-file "$BOOTSTRAP_SECRET_DIR/vfs.token" \
   --endpoint http://127.0.0.1:18080/internal/chevalier/vfs/macos-vz-dev \
   --scope macos-dev/workspace
 
+/bin/rm -rf "$BOOTSTRAP_SECRET_DIR"
+trap - EXIT INT TERM
+
 echo "Development guest assets installed."
 echo "If the VFS log reports that approval is required, approve macFUSE in System Settings."
+echo "Enable Screen Sharing once in System Settings; leave legacy VNC access disabled."
 echo "Then check: sudo launchctl print system/com.bracket.chevalier-vfs"

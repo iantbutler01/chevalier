@@ -60,16 +60,16 @@ func (r *Runtime) Run(ctx context.Context) error {
 		writeGuestStatus("failed", err)
 		return err
 	}
-	writeGuestStatus("finishing-windows-setup", nil)
-	if err := runtimeconfig.FinalizeFirstBoot(ctx); err != nil {
-		if errors.Is(err, runtimeconfig.ErrFirstBootRestartScheduled) {
-			writeGuestStatus("restarting-for-windows-setup", nil)
-			<-ctx.Done()
-			return nil
+	writeRuntimeStatus(runtimeconfig.DefaultFirstBootStatus, "waiting-for-desktop", nil)
+	go func() {
+		if err := runtimeconfig.FinalizeFirstBoot(ctx); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				writeRuntimeStatus(runtimeconfig.DefaultFirstBootStatus, "failed", err)
+			}
+			return
 		}
-		writeGuestStatus("failed", err)
-		return err
-	}
+		writeRuntimeStatus(runtimeconfig.DefaultFirstBootStatus, "complete", nil)
+	}()
 	writeGuestStatus("initializing-state-volume", nil)
 	if err := initializeStateVolume(ctx); err != nil {
 		writeGuestStatus("failed", err)
@@ -132,6 +132,10 @@ func (r *Runtime) Run(ctx context.Context) error {
 }
 
 func writeGuestStatus(phase string, runtimeError error) {
+	writeRuntimeStatus(runtimeconfig.DefaultGuestStatus, phase, runtimeError)
+}
+
+func writeRuntimeStatus(path string, phase string, runtimeError error) {
 	status := struct {
 		SchemaVersion int    `json:"schemaVersion"`
 		Phase         string `json:"phase"`
@@ -149,10 +153,10 @@ func writeGuestStatus(phase string, runtimeError error) {
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(runtimeconfig.DefaultInstalledDir, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return
 	}
-	_ = runtimeconfig.WriteFileAtomic(runtimeconfig.DefaultGuestStatus, encoded)
+	_ = runtimeconfig.WriteFileAtomic(path, encoded)
 }
 
 func ensureControlFirewall(ctx context.Context, listenAddress string) error {
