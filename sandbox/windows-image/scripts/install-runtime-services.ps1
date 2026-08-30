@@ -7,9 +7,14 @@ $ErrorActionPreference = "Stop"
 
 $chevalierRoot = "C:\Program Files\Chevalier"
 $runtimeConfig = "C:\ProgramData\Chevalier\runtime\runtime.json"
+$architecture = switch ($env:PROCESSOR_ARCHITECTURE) {
+    "ARM64" { "arm64" }
+    "AMD64" { "amd64" }
+    default { throw "Unsupported Windows runtime architecture: $env:PROCESSOR_ARCHITECTURE" }
+}
 $artifacts = @{
-    "chevalier-vfs-winfsp.exe" = "chevalier-vfs-winfsp-arm64.exe"
-    "chevalier-guest-agent.exe" = "chevalier-guest-agent-arm64.exe"
+    "chevalier-vfs-winfsp.exe" = "chevalier-vfs-winfsp-$architecture.exe"
+    "chevalier-guest-agent.exe" = "chevalier-guest-agent-$architecture.exe"
     "initialize-state.ps1" = "initialize-state.ps1"
 }
 

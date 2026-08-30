@@ -61,15 +61,13 @@ func (r *Runtime) Run(ctx context.Context) error {
 		return err
 	}
 	writeRuntimeStatus(runtimeconfig.DefaultFirstBootStatus, "waiting-for-desktop", nil)
-	go func() {
-		if err := runtimeconfig.FinalizeFirstBoot(ctx); err != nil {
-			if !errors.Is(err, context.Canceled) {
-				writeRuntimeStatus(runtimeconfig.DefaultFirstBootStatus, "failed", err)
-			}
-			return
+	if err := runtimeconfig.FinalizeFirstBoot(ctx); err != nil {
+		if !errors.Is(err, context.Canceled) {
+			writeRuntimeStatus(runtimeconfig.DefaultFirstBootStatus, "failed", err)
 		}
-		writeRuntimeStatus(runtimeconfig.DefaultFirstBootStatus, "complete", nil)
-	}()
+		return err
+	}
+	writeRuntimeStatus(runtimeconfig.DefaultFirstBootStatus, "complete", nil)
 	writeGuestStatus("initializing-state-volume", nil)
 	if err := initializeStateVolume(ctx); err != nil {
 		writeGuestStatus("failed", err)

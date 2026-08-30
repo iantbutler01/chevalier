@@ -1,11 +1,9 @@
 # Native-architecture Windows QEMU image builder
 
-This directory builds the pinned
-`windows-11-iot-enterprise-ltsc-2024-arm64-guest-winfsp-v2` base image
-from Microsoft installation media. Packer drives unattended Windows Setup on
-Apple Silicon through QEMU/HVF, installs the ARM64 guest substrate, runs an
-actual WinFsp MEMFS probe, removes build access, and seals the disk with
-Sysprep.
+This directory builds native ARM64/HVF and AMD64/KVM Windows base images from
+pinned Microsoft installation media. Packer drives unattended Windows Setup,
+installs the matching guest substrate, runs an actual native WinFsp MEMFS
+probe, removes build access, and seals the disk with Sysprep.
 
 The completed services image contains the native `ChevalierVFS` and
 `ChevalierGuest` binaries, their SCM registrations, and a static secretless
@@ -40,6 +38,17 @@ detached and deleted the one-use runtime disk before readiness, and proved:
 is `sealed-local-acceptance` and remains `productionReady:false` until the
 power-cut WAL recovery, fresh identity matrix, and persistent runtime TPM gates
 pass.
+
+The accepted AMD64/KVM image is
+`output/windows-11-enterprise-25h2-amd64-production`. Its qcow2 is
+9,890,430,976 bytes with SHA-256
+`f8f832521864d17ec87e9e2a62b4357804606450da64150488bc0574d650c234`.
+The clean build completed in 20 minutes 4 seconds. An untouched two-clone run
+passed command/file control, outbound HTTPS, WinFsp I/O, Git lock/rename and
+branch/merge/stash/gc/fsck, gateway outage, offline WAL recovery after forced
+VFS-service death, publication drain, cold restart, and distinct hostname,
+MachineGuid, and machine SID. Its manifest has only
+`persistent-runtime-tpm` left in `notProved`.
 
 The 2026-08-17 clean build completed from ISO to Packer artifact in 8 minutes 21
 seconds. The ignored output directory contains a 64 GiB-virtual qcow2 and build
@@ -76,6 +85,12 @@ visual desktop/display acceptance result.
 - PowerShell `7.6.5` ARM64, Visual C++ runtime `14.51.36247.0` ARM64,
   ripgrep `15.2.0` ARM64, and Git for Windows `2.55.0.windows.4` x64, each
   pinned to the digest in `fetch-artifacts.sh`.
+- Windows 11 Enterprise 25H2 Evaluation x64, SHA-256
+  `a61adeab895ef5a4db436e0a7011c92a2ff17bb0357f58b13bbc4062e535e7b9`;
+- PowerShell `7.6.5` x64, Visual C++ runtime `14.51.36247.0` x64, and ripgrep
+  `15.2.0` x64, each pinned in `fetch-artifacts.sh`; and
+- Microsoft-enrolled OVMF code/variables pinned to the exact hashes recorded
+  in `fetch-artifacts.sh`.
 
 Git runs through Windows on ARM's x64 emulation until Git for Windows ships a
 native ARM64 distribution. Microsoft's published hash PDF currently prints a
@@ -83,7 +98,7 @@ malformed 65-character digest for the evaluation ARM64 object, so this builder
 pins the exact Microsoft CDN object and measured hash and fails closed on any
 byte change.
 
-## Build on Apple Silicon
+## Build
 
 Prerequisites are QEMU, Packer, `7z`, and pinned ARM secure EDK2 firmware. The
 default firmware source is UTM's signed bundle; UTM is not the builder or VM
@@ -93,11 +108,28 @@ runtime. Override `OPENBRACKET_ARM_EFI_CODE` and
 ```bash
 cd sandbox/windows-image
 ./scripts/fetch-artifacts.sh
-packer init .
-packer fmt -check .
-PKR_VAR_build_password="$(openssl rand -base64 24)" packer validate .
-PKR_VAR_build_password="$(openssl rand -base64 24)" packer build -force .
+./scripts/build-guest-services.sh
+packer init windows.pkr.hcl
+packer fmt -check windows.pkr.hcl
+PKR_VAR_build_password="$(openssl rand -base64 24)" packer validate windows.pkr.hcl
+PKR_VAR_build_password="$(openssl rand -base64 24)" packer build -force windows.pkr.hcl
 ./scripts/seal-output.sh
+```
+
+On x86-64 Linux with KVM, QEMU, and Microsoft-enrolled OVMF:
+
+```bash
+cd sandbox/windows-image
+OPENBRACKET_WINDOWS_ARCHITECTURE=amd64 ./scripts/fetch-artifacts.sh
+./scripts/build-guest-services.sh
+packer init windows-amd64.pkr.hcl
+packer fmt -check windows-amd64.pkr.hcl
+PKR_VAR_build_password="$(openssl rand -hex 24)" \
+  packer validate windows-amd64.pkr.hcl
+PKR_VAR_build_password="$(openssl rand -hex 24)" \
+  packer build windows-amd64.pkr.hcl
+OPENBRACKET_WINDOWS_ARCHITECTURE=amd64 \
+  ./scripts/seal-output.sh output/windows-11-enterprise-25h2-amd64
 ```
 
 Use a new password for validation and build, and never print or reuse it. The
@@ -130,17 +162,16 @@ bound to ephemeral or shared TPM state.
 
 ## What verification proves
 
-The build gate verifies native ARM64 Windows under a hypervisor, signed WinFsp
-ARM64 files, Git, PowerShell, and ripgrep execution, BitLocker disabled, no
-selected pending reboot, and a real native `memfs-a64.exe` mount/read/write/
-delete cycle at `W:`.
+The build gate verifies native-architecture Windows under a hypervisor, signed
+WinFsp files, Git, PowerShell, and ripgrep execution, BitLocker disabled, no
+selected pending reboot, and a real native MEMFS mount/read/write/delete cycle
+at `W:`.
 
 The service gate additionally verifies the product WinFsp and authenticated
 control services using fresh per-VM credentials, a one-use runtime disk, and a
 separate state disk. Both guest services cross-compile for ARM64 and AMD64;
 vmd has native ARM64/HVF and AMD64/KVM-or-HVF launch shapes and rejects TCG.
-The real sealed-image acceptance is ARM64 because this host is ARM64; the
-equivalent AMD64 image and live matrix require an x86-64 host.
+Both sealed-image architectures have native-host live acceptance evidence.
 Production promotion still requires:
 
 - a gateway-enforced mount-generation authority fence;

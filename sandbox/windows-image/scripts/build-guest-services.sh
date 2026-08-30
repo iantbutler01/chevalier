@@ -5,7 +5,7 @@ script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 image_dir=$(cd -- "$script_dir/.." && pwd)
 module_dir=$(cd -- "$image_dir/../winfsp-vfs" && pwd)
 artifact_dir="$image_dir/artifacts"
-build_cache=$(mktemp -d /private/tmp/openbracket-windows-services.XXXXXX)
+build_cache=$(mktemp -d "${TMPDIR:-/tmp}/openbracket-windows-services.XXXXXX")
 trap 'rm -rf "$build_cache"' EXIT
 
 mkdir -p "$artifact_dir"
@@ -22,9 +22,18 @@ for architecture in arm64 amd64; do
 done
 
 cd "$artifact_dir"
-shasum -a 256 \
-  chevalier-vfs-winfsp-arm64.exe \
-  chevalier-guest-agent-arm64.exe \
-  chevalier-vfs-winfsp-amd64.exe \
-  chevalier-guest-agent-amd64.exe \
-  >chevalier-guest-services.SHA256SUMS
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum \
+    chevalier-vfs-winfsp-arm64.exe \
+    chevalier-guest-agent-arm64.exe \
+    chevalier-vfs-winfsp-amd64.exe \
+    chevalier-guest-agent-amd64.exe \
+    >chevalier-guest-services.SHA256SUMS
+else
+  shasum -a 256 \
+    chevalier-vfs-winfsp-arm64.exe \
+    chevalier-guest-agent-arm64.exe \
+    chevalier-vfs-winfsp-amd64.exe \
+    chevalier-guest-agent-amd64.exe \
+    >chevalier-guest-services.SHA256SUMS
+fi

@@ -197,7 +197,7 @@ func (s *Session) Rename(source, target string) error {
 	if err != nil {
 		return err
 	}
-	to, localTarget, err := s.resolve(target)
+	to, localTarget, err := s.resolveNew(target)
 	if err != nil {
 		return err
 	}
@@ -209,6 +209,8 @@ func (s *Session) Rename(source, target string) error {
 }
 
 func (s *Session) Stat(name string) (os.FileInfo, error) {
+	s.operationMu.Lock()
+	defer s.operationMu.Unlock()
 	_, local, err := s.resolve(name)
 	if err != nil {
 		return nil, err
@@ -252,10 +254,48 @@ func (s *Session) append(event journal.Event, payloadPath string) (journal.Event
 }
 
 func (s *Session) resolve(name string) (string, string, error) {
+	return s.resolveWithFinal(name, true)
+}
+
+func (s *Session) resolveNew(name string) (string, string, error) {
+	return s.resolveWithFinal(name, false)
+}
+
+func (s *Session) resolveWithFinal(name string, canonicalizeFinal bool) (string, string, error) {
 	relative, err := journal.ValidateRelativePath(name)
 	if err != nil {
 		return "", "", err
 	}
+	components := strings.Split(relative, "/")
+	current := s.treeRoot
+	for index, component := range components {
+		if component == "" || (!canonicalizeFinal && index == len(components)-1) {
+			current = filepath.Join(current, component)
+			continue
+		}
+		entries, readErr := os.ReadDir(current)
+		if readErr != nil {
+			if os.IsNotExist(readErr) {
+				current = filepath.Join(current, component)
+				continue
+			}
+			return "", "", readErr
+		}
+		matched := ""
+		for _, entry := range entries {
+			if strings.EqualFold(entry.Name(), component) {
+				if matched != "" && matched != entry.Name() {
+					return "", "", fmt.Errorf("case-colliding VFS entries %q and %q", matched, entry.Name())
+				}
+				matched = entry.Name()
+			}
+		}
+		if matched != "" {
+			components[index] = matched
+		}
+		current = filepath.Join(current, components[index])
+	}
+	relative = strings.Join(components, "/")
 	local := s.treeRoot
 	if relative != "" {
 		local = filepath.Join(append([]string{s.treeRoot}, strings.Split(relative, "/")...)...)
@@ -312,9 +352,12 @@ func (s *Session) hydrateDirectory(ctx context.Context, relative string) error {
 		if relative != "" {
 			child = relative + "/" + entry.Name
 		}
-		_, local, err := s.resolve(child)
+		canonicalChild, local, err := s.resolve(child)
 		if err != nil {
 			return err
+		}
+		if canonicalChild != child {
+			return fmt.Errorf("case-colliding VFS entries %q and %q", canonicalChild, child)
 		}
 		switch entry.Kind {
 		case "directory":
@@ -329,7 +372,15 @@ func (s *Session) hydrateDirectory(ctx context.Context, relative string) error {
 			if err != nil {
 				return fmt.Errorf("hydrate file %q: %w", child, err)
 			}
-			if err := os.WriteFile(local, body, 0o600); err != nil {
+			file, err := os.OpenFile(local, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+			if err != nil {
+				return fmt.Errorf("create hydrated file %q: %w", child, err)
+			}
+			if _, err := file.Write(body); err != nil {
+				file.Close()
+				return fmt.Errorf("write hydrated file %q: %w", child, err)
+			}
+			if err := file.Close(); err != nil {
 				return fmt.Errorf("materialize file %q: %w", child, err)
 			}
 		default:

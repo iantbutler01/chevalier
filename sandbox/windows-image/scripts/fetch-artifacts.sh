@@ -4,9 +4,11 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 artifact_dir=$(cd -- "$script_dir/.." && pwd)/artifacts
 mkdir -p "$artifact_dir"
-
-firmware_code=${OPENBRACKET_ARM_EFI_CODE:-/Applications/UTM.app/Contents/Resources/qemu/edk2-aarch64-secure-code.fd}
-firmware_vars=${OPENBRACKET_ARM_EFI_VARS:-/Applications/UTM.app/Contents/Resources/qemu/edk2-arm-secure-vars.fd}
+architecture=${OPENBRACKET_WINDOWS_ARCHITECTURE:-arm64}
+if [[ $architecture != arm64 && $architecture != amd64 ]]; then
+  echo "OPENBRACKET_WINDOWS_ARCHITECTURE must be arm64 or amd64" >&2
+  exit 1
+fi
 
 checksum_file() {
   local algorithm=$1
@@ -58,30 +60,53 @@ require_checksum() {
   fi
 }
 
-require_checksum \
-  "$firmware_code" \
-  "c85a57de1ac39e550a6529bd66a4214eb1d8c14dcda7e22dedf72566a769fbc7"
-require_checksum \
-  "$firmware_vars" \
-  "e16c802acef4b55ad6a9a21908ba0c3fdec59abec7b9cecb084a8e9261c75f06"
-
-firmware_code_copy="$artifact_dir/edk2-aarch64-secure-code.fd"
-if [[ ! -f "$firmware_code_copy" ]] || \
-  [[ "$(checksum_file sha256 "$firmware_code_copy")" != "c85a57de1ac39e550a6529bd66a4214eb1d8c14dcda7e22dedf72566a769fbc7" ]]; then
-  cp "$firmware_code" "$firmware_code_copy"
-fi
-require_checksum \
-  "$firmware_code_copy" \
-  "c85a57de1ac39e550a6529bd66a4214eb1d8c14dcda7e22dedf72566a769fbc7"
-
-firmware_vars_64m="$artifact_dir/edk2-arm-secure-vars-64m.fd"
-if [[ ! -f "$firmware_vars_64m" ]] || \
-  [[ "$(checksum_file sha256 "$firmware_vars_64m")" != "d1cb54a9a527243eac1373559bbfcd0c627ae629079b39b45633f183e1cab9f9" ]]; then
-  cp "$firmware_vars" "$firmware_vars_64m"
-  truncate -s 67108864 "$firmware_vars_64m"
+if [[ $architecture == arm64 ]]; then
+  firmware_code=${OPENBRACKET_ARM_EFI_CODE:-/Applications/UTM.app/Contents/Resources/qemu/edk2-aarch64-secure-code.fd}
+  firmware_vars=${OPENBRACKET_ARM_EFI_VARS:-/Applications/UTM.app/Contents/Resources/qemu/edk2-arm-secure-vars.fd}
   require_checksum \
-    "$firmware_vars_64m" \
-    "d1cb54a9a527243eac1373559bbfcd0c627ae629079b39b45633f183e1cab9f9"
+    "$firmware_code" \
+    "c85a57de1ac39e550a6529bd66a4214eb1d8c14dcda7e22dedf72566a769fbc7"
+  require_checksum \
+    "$firmware_vars" \
+    "e16c802acef4b55ad6a9a21908ba0c3fdec59abec7b9cecb084a8e9261c75f06"
+
+  firmware_code_copy="$artifact_dir/edk2-aarch64-secure-code.fd"
+  if [[ ! -f $firmware_code_copy ]] || \
+    [[ "$(checksum_file sha256 "$firmware_code_copy")" != "c85a57de1ac39e550a6529bd66a4214eb1d8c14dcda7e22dedf72566a769fbc7" ]]; then
+    cp "$firmware_code" "$firmware_code_copy"
+  fi
+  require_checksum \
+    "$firmware_code_copy" \
+    "c85a57de1ac39e550a6529bd66a4214eb1d8c14dcda7e22dedf72566a769fbc7"
+
+  firmware_vars_64m="$artifact_dir/edk2-arm-secure-vars-64m.fd"
+  if [[ ! -f $firmware_vars_64m ]] || \
+    [[ "$(checksum_file sha256 "$firmware_vars_64m")" != "d1cb54a9a527243eac1373559bbfcd0c627ae629079b39b45633f183e1cab9f9" ]]; then
+    cp "$firmware_vars" "$firmware_vars_64m"
+    truncate -s 67108864 "$firmware_vars_64m"
+    require_checksum \
+      "$firmware_vars_64m" \
+      "d1cb54a9a527243eac1373559bbfcd0c627ae629079b39b45633f183e1cab9f9"
+  fi
+else
+  firmware_code=${OPENBRACKET_AMD64_EFI_CODE:-/usr/share/OVMF/OVMF_CODE_4M.secboot.fd}
+  firmware_vars=${OPENBRACKET_AMD64_EFI_VARS:-/usr/share/OVMF/OVMF_VARS_4M.ms.fd}
+  require_checksum \
+    "$firmware_code" \
+    "f3407578de01c200a158953ad7bedf6bf493744a3ad25ba06791df49b96e3846"
+  require_checksum \
+    "$firmware_vars" \
+    "630d46eeaf15f7c2abb7ce7ec8d5eef9ba7910ff1ab81998a384c99458a4d317"
+  cp "$firmware_code" "$artifact_dir/edk2-x86_64-secure-code.fd.partial"
+  mv "$artifact_dir/edk2-x86_64-secure-code.fd.partial" "$artifact_dir/edk2-x86_64-secure-code.fd"
+  cp "$firmware_vars" "$artifact_dir/edk2-x86_64-ms-vars.fd.partial"
+  mv "$artifact_dir/edk2-x86_64-ms-vars.fd.partial" "$artifact_dir/edk2-x86_64-ms-vars.fd"
+  require_checksum \
+    "$artifact_dir/edk2-x86_64-secure-code.fd" \
+    "f3407578de01c200a158953ad7bedf6bf493744a3ad25ba06791df49b96e3846"
+  require_checksum \
+    "$artifact_dir/edk2-x86_64-ms-vars.fd" \
+    "630d46eeaf15f7c2abb7ce7ec8d5eef9ba7910ff1ab81998a384c99458a4d317"
 fi
 
 download_verified \
@@ -90,23 +115,49 @@ download_verified \
   "$artifact_dir/winfsp-2.2.26215.msi" \
   "2ecb5c89405488a95bbd8a01875e02c48534fd37bbdfd84488f7590464d65944"
 
-download_verified \
-  sha256 \
-  "https://github.com/PowerShell/PowerShell/releases/download/v7.6.5/PowerShell-7.6.5-win-arm64.msi" \
-  "$artifact_dir/PowerShell-7.6.5-win-arm64.msi" \
-  "a1633b48b8e45c7767902efc972bff235b3594c192ad575af4a4e8eb2ea3bd5a"
+if [[ $architecture == arm64 ]]; then
+  download_verified \
+    sha256 \
+    "https://github.com/PowerShell/PowerShell/releases/download/v7.6.5/PowerShell-7.6.5-win-arm64.msi" \
+    "$artifact_dir/PowerShell-7.6.5-win-arm64.msi" \
+    "a1633b48b8e45c7767902efc972bff235b3594c192ad575af4a4e8eb2ea3bd5a"
 
-download_verified \
-  sha256 \
-  "https://aka.ms/vc14/vc_redist.arm64.exe" \
-  "$artifact_dir/vc_redist.arm64-14.51.36247.exe" \
-  "b70ef586669a620a0a30a1156969c05c6a3831dc8f8bc992da75779d2a92f944"
+  download_verified \
+    sha256 \
+    "https://aka.ms/vc14/vc_redist.arm64.exe" \
+    "$artifact_dir/vc_redist.arm64-14.51.36247.exe" \
+    "b70ef586669a620a0a30a1156969c05c6a3831dc8f8bc992da75779d2a92f944"
 
-download_verified \
-  sha256 \
-  "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-pc-windows-msvc.zip" \
-  "$artifact_dir/ripgrep-15.2.0-aarch64-pc-windows-msvc.zip" \
-  "e4abca10c3a64ebea742667dd7009449d49403db5460dd6873e389fa2945360f"
+  download_verified \
+    sha256 \
+    "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-pc-windows-msvc.zip" \
+    "$artifact_dir/ripgrep-15.2.0-aarch64-pc-windows-msvc.zip" \
+    "e4abca10c3a64ebea742667dd7009449d49403db5460dd6873e389fa2945360f"
+else
+  download_verified \
+    sha256 \
+    "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENTENTERPRISEEVAL_OEMRET_x64FRE_en-us.iso" \
+    "$artifact_dir/windows-11-enterprise-25h2-amd64-eval.iso" \
+    "a61adeab895ef5a4db436e0a7011c92a2ff17bb0357f58b13bbc4062e535e7b9"
+
+  download_verified \
+    sha256 \
+    "https://github.com/PowerShell/PowerShell/releases/download/v7.6.5/PowerShell-7.6.5-win-x64.msi" \
+    "$artifact_dir/PowerShell-7.6.5-win-x64.msi" \
+    "3a87c24e044ec792047d734c841917ee4323a535e25f645ae6c33141a35fca8d"
+
+  download_verified \
+    sha256 \
+    "https://aka.ms/vc14/vc_redist.x64.exe" \
+    "$artifact_dir/vc_redist.x64-14.51.36247.exe" \
+    "843068991daaa1f73ad9f6239bce4d0f6a07a51f18c37ea2a867e9beca71295c"
+
+  download_verified \
+    sha256 \
+    "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-pc-windows-msvc.zip" \
+    "$artifact_dir/ripgrep-15.2.0-x86_64-pc-windows-msvc.zip" \
+    "71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5"
+fi
 
 download_verified \
   sha256 \
@@ -127,19 +178,32 @@ download_verified \
   "$virtio_iso" \
   "4f13070cc9241fa342deab4ebfac360565030580ff77b6e5f1951a64627621e5da4abfd30e1e46ca8bae2bb7dd4ff98141aff424142c9629a5876a61283962e5"
 
-driver_root="$artifact_dir/answer-cd/\$WinPEDriver\$"
-display_driver_root="$artifact_dir/viogpudo/w11/ARM64"
-if [[ ! -f "$driver_root/viostor/w11/ARM64/viostor.inf" || ! -f "$driver_root/NetKVM/w11/ARM64/netkvm.inf" || ! -f "$display_driver_root/viogpudo.inf" ]]; then
+if [[ $architecture == arm64 ]]; then
+  driver_root="$artifact_dir/answer-cd/\$WinPEDriver\$"
+  driver_architecture=ARM64
+  display_driver_root="$artifact_dir/viogpudo/w11/ARM64"
+else
+  driver_root="$artifact_dir/answer-cd-amd64/\$WinPEDriver\$"
+  driver_architecture=amd64
+  display_driver_root=
+fi
+if [[ ! -f "$driver_root/viostor/w11/$driver_architecture/viostor.inf" || ! -f "$driver_root/NetKVM/w11/$driver_architecture/netkvm.inf" || ( $architecture == arm64 && ! -f "$display_driver_root/viogpudo.inf" ) ]]; then
   if ! command -v 7z >/dev/null 2>&1; then
     echo "7z is required to extract the boot-critical virtio-win driver" >&2
     exit 1
   fi
   driver_temp=$(mktemp -d "$artifact_dir/.winpe-drivers.XXXXXX")
-  7z x -y -o"$driver_temp" "$virtio_iso" "viostor/w11/ARM64/*" "NetKVM/w11/ARM64/*" "viogpudo/w11/ARM64/*" >/dev/null
+  extraction_paths=("viostor/w11/$driver_architecture/*" "NetKVM/w11/$driver_architecture/*")
+  if [[ $architecture == arm64 ]]; then
+    extraction_paths+=("viogpudo/w11/ARM64/*")
+  fi
+  7z x -y -o"$driver_temp" "$virtio_iso" "${extraction_paths[@]}" >/dev/null
   rm -rf "$driver_root"
-  rm -rf "$artifact_dir/viogpudo"
   mkdir -p "$driver_root"
   mv "$driver_temp/viostor" "$driver_temp/NetKVM" "$driver_root/"
-  mv "$driver_temp/viogpudo" "$artifact_dir/"
+  if [[ $architecture == arm64 ]]; then
+    rm -rf "$artifact_dir/viogpudo"
+    mv "$driver_temp/viogpudo" "$artifact_dir/"
+  fi
   rmdir "$driver_temp"
 fi

@@ -3,33 +3,86 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 builder_dir=$(cd -- "$script_dir/.." && pwd)
-output_dir=${1:-"$builder_dir/output/windows-11-iot-enterprise-ltsc-2024-arm64"}
-image="$output_dir/windows-11-iot-enterprise-ltsc-2024-arm64.qcow2"
+architecture=${OPENBRACKET_WINDOWS_ARCHITECTURE:-arm64}
+case "$architecture" in
+  arm64)
+    default_output="$builder_dir/output/windows-11-iot-enterprise-ltsc-2024-arm64"
+    image_name=windows-11-iot-enterprise-ltsc-2024-arm64.qcow2
+    profile=windows-11-iot-enterprise-ltsc-2024-arm64-guest-winfsp-v2
+    accelerator=hvf
+    firmware_code_source=${OPENBRACKET_ARM_EFI_CODE:-"$builder_dir/artifacts/edk2-aarch64-secure-code.fd"}
+    windows_iso_sha256=3dcdba9c9c0aa0430d4332b60c9afcb3cd613d648a49cbba2d4ef7b5978f32e8
+    architecture_proofs='["native-arm64", "hvf", "nvme-root", "virtio-net"]'
+    ;;
+  amd64)
+    default_output="$builder_dir/output/windows-11-enterprise-25h2-amd64"
+    image_name=windows-11-enterprise-25h2-amd64.qcow2
+    profile=windows-11-enterprise-25h2-amd64-guest-winfsp-v2
+    accelerator=kvm
+    firmware_code_source=${OPENBRACKET_AMD64_EFI_CODE:-"$builder_dir/artifacts/edk2-x86_64-secure-code.fd"}
+    windows_iso_sha256=a61adeab895ef5a4db436e0a7011c92a2ff17bb0357f58b13bbc4062e535e7b9
+    architecture_proofs='["native-amd64", "kvm", "virtio-blk-root", "virtio-net"]'
+    ;;
+  *)
+    echo "OPENBRACKET_WINDOWS_ARCHITECTURE must be arm64 or amd64" >&2
+    exit 1
+    ;;
+esac
+output_dir=${1:-"$default_output"}
+image="$output_dir/$image_name"
 efi_vars="$output_dir/efivars.fd"
-firmware_code_source=${OPENBRACKET_ARM_EFI_CODE:-"$builder_dir/artifacts/edk2-aarch64-secure-code.fd"}
 firmware_code="$output_dir/efi-code.fd"
 manifest="$output_dir/image-manifest.json"
+service_checksums="$builder_dir/artifacts/chevalier-guest-services.SHA256SUMS"
 
 test -f "$image"
 test -f "$efi_vars"
 test -f "$firmware_code_source"
+test -f "$service_checksums"
 cp "$firmware_code_source" "$firmware_code.partial"
 mv "$firmware_code.partial" "$firmware_code"
 qemu-img check "$image"
 
-image_sha256=$(shasum -a 256 "$image" | awk '{print $1}')
-efi_vars_sha256=$(shasum -a 256 "$efi_vars" | awk '{print $1}')
-firmware_code_sha256=$(shasum -a 256 "$firmware_code" | awk '{print $1}')
+hash_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+file_size() {
+  if [[ $(uname -s) == Darwin ]]; then
+    stat -f '%z' "$1"
+  else
+    stat -c '%s' "$1"
+  fi
+}
+
+image_sha256=$(hash_sha256 "$image")
+efi_vars_sha256=$(hash_sha256 "$efi_vars")
+firmware_code_sha256=$(hash_sha256 "$firmware_code")
 virtual_size=$(qemu-img info --output=json "$image" | jq -er '."virtual-size"')
-image_size=$(stat -f '%z' "$image" 2>/dev/null || stat -c '%s' "$image")
-efi_vars_size=$(stat -f '%z' "$efi_vars" 2>/dev/null || stat -c '%s' "$efi_vars")
-firmware_code_size=$(stat -f '%z' "$firmware_code" 2>/dev/null || stat -c '%s' "$firmware_code")
+image_size=$(file_size "$image")
+efi_vars_size=$(file_size "$efi_vars")
+firmware_code_size=$(file_size "$firmware_code")
+vfs_sha256=$(awk -v name="chevalier-vfs-winfsp-$architecture.exe" '$2 == name { print $1 }' "$service_checksums")
+guest_control_sha256=$(awk -v name="chevalier-guest-agent-$architecture.exe" '$2 == name { print $1 }' "$service_checksums")
+test -n "$vfs_sha256"
+test -n "$guest_control_sha256"
 
 jq -n \
-  --arg profile windows-11-iot-enterprise-ltsc-2024-arm64-guest-winfsp-v2 \
+  --arg profile "$profile" \
+  --arg architecture "$architecture" \
+  --arg accelerator "$accelerator" \
+  --arg imageName "$image_name" \
+  --arg windowsIsoSha256 "$windows_iso_sha256" \
+  --argjson architectureProofs "$architecture_proofs" \
   --arg imageSha256 "$image_sha256" \
   --arg efiVarsSha256 "$efi_vars_sha256" \
   --arg firmwareCodeSha256 "$firmware_code_sha256" \
+  --arg vfsSha256 "$vfs_sha256" \
+  --arg guestControlSha256 "$guest_control_sha256" \
   --argjson virtualSize "$virtual_size" \
   --argjson imageSize "$image_size" \
   --argjson efiVarsSize "$efi_vars_size" \
@@ -39,14 +92,20 @@ jq -n \
     status: "sealed-local-diagnostic",
     productionReady: false,
     profile: $profile,
-    architecture: "arm64",
-    accelerator: "hvf",
+    architecture: $architecture,
+    accelerator: $accelerator,
     workspaceTransport: "guest-winfsp",
-    windowsIsoSha256: "3dcdba9c9c0aa0430d4332b60c9afcb3cd613d648a49cbba2d4ef7b5978f32e8",
+    runtimeServices: {
+      registration: "sysprep-first-boot-setup-complete",
+      containsRuntimeSecrets: false,
+      vfsSha256: $vfsSha256,
+      guestControlSha256: $guestControlSha256
+    },
+    windowsIsoSha256: $windowsIsoSha256,
     virtioWinVersion: "0.1.285",
     winFspVersion: "2.2.26215",
     image: {
-      file: "windows-11-iot-enterprise-ltsc-2024-arm64.qcow2",
+      file: $imageName,
       sha256: $imageSha256,
       virtualSizeBytes: $virtualSize,
       fileSizeBytes: $imageSize
@@ -62,20 +121,16 @@ jq -n \
       sha256: $firmwareCodeSha256,
       fileSizeBytes: $firmwareCodeSize
     },
-    proved: [
+    proved: ($architectureProofs + [
       "unattended-install",
-      "native-arm64",
-      "hvf",
-      "nvme-root",
-      "virtio-net",
-      "winfsp-arm64-memfs",
+      "winfsp-native-memfs",
       "chevalier-runtime-service-payload-staged",
       "runtime-secret-free-base",
       "authenticated-guest-verification",
       "build-channel-cleanup",
       "sysprep-shutdown",
       "offline-image-check"
-    ],
+    ]),
     notProved: [
       "first-boot-service-registration",
       "chevalier-services-live-vm",
@@ -90,5 +145,9 @@ mv "$manifest.partial" "$manifest"
 
 (
   cd "$output_dir"
-  shasum -a 256 windows-11-iot-enterprise-ltsc-2024-arm64.qcow2 efi-code.fd efivars.fd >SHA256SUMS
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$image_name" efi-code.fd efivars.fd >SHA256SUMS
+  else
+    shasum -a 256 "$image_name" efi-code.fd efivars.fd >SHA256SUMS
+  fi
 )

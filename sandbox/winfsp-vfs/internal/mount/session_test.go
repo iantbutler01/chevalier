@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -237,6 +238,69 @@ func TestOpenFileReportsMissingParentAsNotExist(t *testing.T) {
 	_, err = session.Stat("missing/child.txt")
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Stat() error = %v, want os.ErrNotExist", err)
+	}
+}
+
+func TestSessionUsesCanonicalBackingCaseForJournalPaths(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/owner/tree" {
+			json.NewEncoder(response).Encode([]map[string]any{})
+			return
+		}
+		http.NotFound(response, request)
+	}))
+	defer server.Close()
+	client, err := gateway.New(server.URL+"/owner", "token", "scope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := Open(context.Background(), filepath.Join(t.TempDir(), "state"), client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Mkdir("repo", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file, err := session.OpenFile("REPO/config.lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file.relative != "repo/config.lock" {
+		t.Fatalf("open path = %q, want repo/config.lock", file.relative)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Rename("REPO/config.lock", "Repo/Config"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(session.treeRoot, "repo", "Config")); err != nil {
+		t.Fatalf("case-preserving rename target: %v", err)
+	}
+}
+
+func TestSessionRejectsCaseCollisionsDuringHydration(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/owner/tree":
+			json.NewEncoder(response).Encode([]map[string]any{
+				{"name": "Readme.md", "kind": "file", "size_bytes": 3},
+				{"name": "README.md", "kind": "file", "size_bytes": 3},
+			})
+		case "/owner/file/raw":
+			response.Write([]byte("doc"))
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+	client, err := gateway.New(server.URL+"/owner", "token", "scope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = Open(context.Background(), filepath.Join(t.TempDir(), "state"), client)
+	if err == nil || !strings.Contains(err.Error(), "case-colliding VFS entries") {
+		t.Fatalf("Open() error = %v, want case collision", err)
 	}
 }
 

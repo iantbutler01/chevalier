@@ -7,8 +7,8 @@ if not defined TARGET exit /b 10
 if exist "%TARGET%\ProgramData\Chevalier\runtime\runtime.json" exit /b 11
 set "DEST=%TARGET%\ProgramData\Chevalier\runtime-services-staged"
 if not exist "%DEST%" mkdir "%DEST%"
-copy /y "%MEDIA%\chevalier-vfs-winfsp-arm64.exe" "%DEST%\chevalier-vfs-winfsp-arm64.exe" || exit /b 20
-copy /y "%MEDIA%\chevalier-guest-agent-arm64.exe" "%DEST%\chevalier-guest-agent-arm64.exe" || exit /b 21
+for %%F in (chevalier-vfs-winfsp-arm64.exe chevalier-vfs-winfsp-amd64.exe) do if exist "%MEDIA%\%%F" copy /y "%MEDIA%\%%F" "%DEST%\%%F" || exit /b 20
+for %%F in (chevalier-guest-agent-arm64.exe chevalier-guest-agent-amd64.exe) do if exist "%MEDIA%\%%F" copy /y "%MEDIA%\%%F" "%DEST%\%%F" || exit /b 21
 copy /y "%MEDIA%\initialize-state.ps1" "%DEST%\initialize-state.ps1" || exit /b 22
 copy /y "%MEDIA%\install-runtime-services.ps1" "%DEST%\install-runtime-services.ps1" || exit /b 23
 copy /y "%MEDIA%\chevalier-guest-services.SHA256SUMS" "%DEST%\chevalier-guest-services.SHA256SUMS" || exit /b 24

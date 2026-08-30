@@ -1,8 +1,11 @@
 $ErrorActionPreference = "Stop"
 
-if ($env:PROCESSOR_ARCHITECTURE -ne "ARM64") {
-    throw "The image is not native ARM64 Windows"
+$architecture = switch ($env:PROCESSOR_ARCHITECTURE) {
+    "ARM64" { "arm64" }
+    "AMD64" { "amd64" }
+    default { throw "Unsupported Windows verification architecture: $env:PROCESSOR_ARCHITECTURE" }
 }
+$winFspSuffix = if ($architecture -eq "arm64") { "a64" } else { "x64" }
 if (-not (Get-CimInstance Win32_ComputerSystem).HypervisorPresent) {
     throw "Windows does not report a hypervisor"
 }
@@ -10,12 +13,12 @@ $virtioFsService = Get-Service -Name VirtioFsSvc -ErrorAction SilentlyContinue
 if ($virtioFsService -and $virtioFsService.StartType -ne "Disabled") {
     throw "VirtioFsSvc must remain disabled for the guest-native VFS profile"
 }
-if (-not (Test-Path "C:\Program Files (x86)\WinFsp\bin\fsptool-a64.exe")) {
-    throw "WinFsp ARM64 runtime is not installed"
+if (-not (Test-Path "C:\Program Files (x86)\WinFsp\bin\fsptool-$winFspSuffix.exe")) {
+    throw "WinFsp $architecture runtime is not installed"
 }
-$winFspDriver = "C:\Program Files (x86)\WinFsp\bin\winfsp-a64.dll"
+$winFspDriver = "C:\Program Files (x86)\WinFsp\bin\winfsp-$winFspSuffix.dll"
 if ((Get-AuthenticodeSignature -FilePath $winFspDriver).Status -ne "Valid") {
-    throw "WinFsp ARM64 runtime signature is invalid"
+    throw "WinFsp $architecture runtime signature is invalid"
 }
 if ((Get-BitLockerVolume -MountPoint "C:").ProtectionStatus -ne "Off") {
     throw "BitLocker must remain disabled in the generalized image"
@@ -23,11 +26,13 @@ if ((Get-BitLockerVolume -MountPoint "C:").ProtectionStatus -ne "Off") {
 if (-not (Test-Path "C:\ProgramData\Chevalier\image-manifest.json")) {
     throw "The image manifest is missing"
 }
-$displayDriver = Get-WindowsDriver -Online | Where-Object {
-    $_.ProviderName -eq "Red Hat, Inc." -and $_.ClassName -eq "Display"
-}
-if (-not $displayDriver) {
-    throw "The ARM64 VirtIO GPU display driver is not staged"
+if ($architecture -eq "arm64") {
+    $displayDriver = Get-WindowsDriver -Online | Where-Object {
+        $_.ProviderName -eq "Red Hat, Inc." -and $_.ClassName -eq "Display"
+    }
+    if (-not $displayDriver) {
+        throw "The ARM64 VirtIO GPU display driver is not staged"
+    }
 }
 foreach ($serviceName in "ChevalierVFS", "ChevalierGuest") {
     if (-not (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) {
@@ -65,16 +70,16 @@ if ($LASTEXITCODE -ne 0) {
 }
 & "C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo -NoProfile -Command '$PSVersionTable.PSVersion.ToString()' | Out-Null
 if ($LASTEXITCODE -ne 0) {
-    throw "Native ARM64 PowerShell is unavailable"
+    throw "Native $architecture PowerShell is unavailable"
 }
 & "C:\Program Files\OpenBracket\bin\rg.exe" --version | Out-Null
 if ($LASTEXITCODE -ne 0) {
-    throw "Native ARM64 ripgrep is unavailable"
+    throw "Native $architecture ripgrep is unavailable"
 }
 
-$memfs = "C:\Program Files (x86)\WinFsp\bin\memfs-a64.exe"
+$memfs = "C:\Program Files (x86)\WinFsp\bin\memfs-$winFspSuffix.exe"
 if (-not (Test-Path $memfs)) {
-    throw "WinFsp ARM64 MEMFS probe is unavailable"
+    throw "WinFsp $architecture MEMFS probe is unavailable"
 }
 $memfsProcess = Start-Process -FilePath $memfs -ArgumentList "-i", "-F", "NTFS", "-m", "W:" -PassThru
 try {
@@ -87,12 +92,12 @@ try {
         Start-Sleep -Milliseconds 100
     }
     if (-not $mounted) {
-        throw "WinFsp ARM64 MEMFS did not mount at W:"
+        throw "WinFsp $architecture MEMFS did not mount at W:"
     }
-    $probe = "W:\openbracket-winfsp-arm64.txt"
-    [System.IO.File]::WriteAllText($probe, "native-arm64-winfsp")
-    if ([System.IO.File]::ReadAllText($probe) -ne "native-arm64-winfsp") {
-        throw "WinFsp ARM64 MEMFS readback failed"
+    $probe = "W:\openbracket-winfsp-$architecture.txt"
+    [System.IO.File]::WriteAllText($probe, "native-$architecture-winfsp")
+    if ([System.IO.File]::ReadAllText($probe) -ne "native-$architecture-winfsp") {
+        throw "WinFsp $architecture MEMFS readback failed"
     }
     Remove-Item -Force $probe
 } finally {

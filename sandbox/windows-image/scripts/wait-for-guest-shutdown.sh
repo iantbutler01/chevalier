@@ -8,7 +8,7 @@ receipt_token=${OPENBRACKET_RECEIPT_TOKEN:?OPENBRACKET_RECEIPT_TOKEN is required
 timeout_seconds=${OPENBRACKET_WAIT_TIMEOUT_SECONDS:-7200}
 deadline=$((SECONDS + timeout_seconds))
 seen=0
-receipt_status=$(mktemp /private/tmp/openbracket-windows-arm64-receipt-status.XXXXXX)
+receipt_status=$(mktemp "${TMPDIR:-/tmp}/openbracket-windows-receipt-status.XXXXXX")
 rm -f "$receipt_status"
 
 OPENBRACKET_RECEIPT_PORT="$receipt_port" \
@@ -31,13 +31,13 @@ for attempt in {1..100}; do
     break
   fi
   if ! kill -0 "$receipt_server_pid" >/dev/null 2>&1; then
-    echo "the authenticated Windows ARM receipt server failed to start" >&2
+    echo "the authenticated Windows receipt server failed to start" >&2
     exit 1
   fi
   sleep 0.05
 done
 if ! nc -z 127.0.0.1 "$receipt_port" >/dev/null 2>&1; then
-  echo "the authenticated Windows ARM receipt server did not become ready" >&2
+  echo "the authenticated Windows receipt server did not become ready" >&2
   exit 1
 fi
 
@@ -47,23 +47,23 @@ qemu_owns_image() {
     if ps -p "$pid" -o command= | grep -Fq -- "$image_path"; then
       return 0
     fi
-  done < <(pgrep -f 'qemu-system-aarch64' || true)
+  done < <(pgrep -f 'qemu-system-(aarch64|x86_64)' || true)
   return 1
 }
 
 verify_receipt() {
   if [[ ! -f $receipt_status ]]; then
-    echo "the Windows ARM guest stopped without a verified image receipt" >&2
+    echo "the Windows guest stopped without a verified image receipt" >&2
     return 1
   fi
   local status
   status=$(<"$receipt_status")
   if [[ $status == failure ]]; then
-    echo "the Windows ARM guest reported an image verification failure" >&2
+    echo "the Windows guest reported an image verification failure" >&2
     return 1
   fi
   if [[ $status != verified && $status != success ]]; then
-    echo "the Windows ARM guest wrote an invalid image receipt" >&2
+    echo "the Windows guest wrote an invalid image receipt" >&2
     return 1
   fi
 }
@@ -81,5 +81,5 @@ while ((SECONDS < deadline)); do
   sleep 1
 done
 
-echo "timed out waiting for the Windows ARM guest to verify, generalize, and stop" >&2
+echo "timed out waiting for the Windows guest to verify, generalize, and stop" >&2
 exit 1

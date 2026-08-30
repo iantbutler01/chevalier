@@ -9,6 +9,16 @@ $artifactRoot = "C:\Windows\Temp\OpenBracketImage"
 $stateRoot = "C:\ProgramData\Chevalier"
 New-Item -ItemType Directory -Force -Path $artifactRoot, $stateRoot | Out-Null
 
+$architecture = switch ($env:PROCESSOR_ARCHITECTURE) {
+    "ARM64" { "arm64" }
+    "AMD64" { "amd64" }
+    default { throw "Unsupported Windows build architecture: $env:PROCESSOR_ARCHITECTURE" }
+}
+$powerShellInstaller = if ($architecture -eq "arm64") { "PowerShell-7.6.5-win-arm64.msi" } else { "PowerShell-7.6.5-win-x64.msi" }
+$visualCppInstaller = if ($architecture -eq "arm64") { "vc_redist.arm64-14.51.36247.exe" } else { "vc_redist.x64-14.51.36247.exe" }
+$ripgrepArchive = if ($architecture -eq "arm64") { "ripgrep-15.2.0-aarch64-pc-windows-msvc.zip" } else { "ripgrep-15.2.0-x86_64-pc-windows-msvc.zip" }
+$runtimeUnattend = "unattend-runtime-$architecture.xml"
+
 foreach ($receiptFile in "build-receipt-token.txt", "build-receipt-url.txt") {
     $receiptSource = Join-Path $source $receiptFile
     if (-not (Test-Path $receiptSource)) {
@@ -20,12 +30,12 @@ foreach ($receiptFile in "build-receipt-token.txt", "build-receipt-url.txt") {
 $files = @(
     "winfsp-2.2.26215.msi",
     "virtio-win-guest-tools-0.1.285.exe",
-    "PowerShell-7.6.5-win-arm64.msi",
-    "vc_redist.arm64-14.51.36247.exe",
-    "ripgrep-15.2.0-aarch64-pc-windows-msvc.zip",
+    $powerShellInstaller,
+    $visualCppInstaller,
+    $ripgrepArchive,
     "Git-2.55.0.4-64-bit.exe",
-    "chevalier-vfs-winfsp-arm64.exe",
-    "chevalier-guest-agent-arm64.exe",
+    "chevalier-vfs-winfsp-$architecture.exe",
+    "chevalier-guest-agent-$architecture.exe",
     "chevalier-guest-services.SHA256SUMS",
     "initialize-state.ps1",
     "install-runtime-services.ps1",
@@ -33,7 +43,9 @@ $files = @(
     "verify.ps1",
     "install-seal-scripts.ps1",
     "finalize-image.ps1",
-    "complete-image.ps1"
+    "complete-image.ps1",
+    "SetupComplete-services.cmd",
+    $runtimeUnattend
 )
 foreach ($file in $files) {
     $sourcePath = Join-Path $source $file

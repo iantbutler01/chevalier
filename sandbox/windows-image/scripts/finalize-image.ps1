@@ -5,6 +5,12 @@ $urlPath = "C:\ProgramData\Chevalier\build-receipt-url.txt"
 $stagePath = "C:\ProgramData\Chevalier\image-build-stage.txt"
 $token = [System.IO.File]::ReadAllText($tokenPath).Trim()
 $url = [System.IO.File]::ReadAllText($urlPath).Trim()
+$artifactRoot = "C:\Windows\Temp\OpenBracketImage"
+$architecture = switch ($env:PROCESSOR_ARCHITECTURE) {
+    "ARM64" { "arm64" }
+    "AMD64" { "amd64" }
+    default { throw "Unsupported Windows seal architecture: $env:PROCESSOR_ARCHITECTURE" }
+}
 
 function Send-SealReceipt {
     param(
@@ -19,7 +25,24 @@ function Send-SealReceipt {
     Invoke-WebRequest -UseBasicParsing -Uri $url -Method Post -Headers @{ Authorization = "Bearer $token" } -ContentType "application/json" -Body $payload -TimeoutSec 15 | Out-Null
 }
 
-Remove-Item -Recurse -Force "C:\Windows\Temp\OpenBracketImage" -ErrorAction SilentlyContinue
+$stagedServices = "C:\ProgramData\Chevalier\runtime-services-staged"
+New-Item -ItemType Directory -Force -Path $stagedServices | Out-Null
+foreach ($file in @(
+    "chevalier-vfs-winfsp-$architecture.exe",
+    "chevalier-guest-agent-$architecture.exe",
+    "chevalier-guest-services.SHA256SUMS",
+    "initialize-state.ps1",
+    "install-runtime-services.ps1"
+)) {
+    Copy-Item -Force -Path (Join-Path $artifactRoot $file) -Destination (Join-Path $stagedServices $file)
+}
+$setupScripts = "C:\Windows\Setup\Scripts"
+New-Item -ItemType Directory -Force -Path $setupScripts | Out-Null
+Copy-Item -Force -Path (Join-Path $artifactRoot "SetupComplete-services.cmd") -Destination (Join-Path $setupScripts "SetupComplete.cmd")
+$runtimeUnattend = "C:\ProgramData\Chevalier\unattend-runtime.xml"
+Copy-Item -Force -Path (Join-Path $artifactRoot "unattend-runtime-$architecture.xml") -Destination $runtimeUnattend
+
+Remove-Item -Recurse -Force $artifactRoot -ErrorAction SilentlyContinue
 Remove-Item -Force "C:\ProgramData\Chevalier\complete-image.ps1" -ErrorAction SilentlyContinue
 Remove-Item -Force "C:\ProgramData\Chevalier\image-build.log" -ErrorAction SilentlyContinue
 Remove-Item -Force "C:\ProgramData\Chevalier\image-build.error.txt" -ErrorAction SilentlyContinue
@@ -98,7 +121,7 @@ try {
     Remove-Item -Force $tokenPath, $urlPath, $stagePath
     Remove-Item -Force $currentScript -ErrorAction SilentlyContinue
 
-    $sysprep = Start-Process -FilePath "$env:WINDIR\System32\Sysprep\Sysprep.exe" -ArgumentList "/generalize", "/oobe", "/shutdown", "/quiet" -Wait -PassThru
+    $sysprep = Start-Process -FilePath "$env:WINDIR\System32\Sysprep\Sysprep.exe" -ArgumentList "/generalize", "/oobe", "/shutdown", "/quiet", "/unattend:$runtimeUnattend" -Wait -PassThru
     if ($sysprep.ExitCode -ne 0) {
         throw "Sysprep generalization failed with code $($sysprep.ExitCode)"
     }
