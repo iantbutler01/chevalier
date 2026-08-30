@@ -358,6 +358,7 @@ pub fn stream_event_to_python(
         EngineResponseStreamEvent::RateLimits(rate_limits) => {
             Ok(Py::new(py, RateLimitsStreamEvent { rate_limits })?.into_any())
         }
+        EngineResponseStreamEvent::ResponseId(_) => Ok(py.None()),
         EngineResponseStreamEvent::Complete(response) => {
             Ok(Py::new(py, CompleteStreamEvent { response })?.into_any())
         }

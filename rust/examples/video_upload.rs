@@ -152,10 +152,12 @@ async fn analyze_video(
             temperature: None,
             top_p: None,
             max_tokens: None,
+            reasoning_effort: None,
             model: None,   // use default from agentic macro
             api_key: None, // use default from env
             timeout: None,
             retry_config: None,
+            previous_response_id: None,
         })
         .await?;
 

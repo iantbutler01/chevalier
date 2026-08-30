@@ -262,6 +262,8 @@ impl InferenceClient for BedrockClient {
                 cache_write_input_tokens: response_json["usage"]["cache_creation_input_tokens"]
                     .as_u64()
                     .unwrap_or(0),
+                reasoning_tokens: None,
+                provider_cost_dollars: None,
             };
 
             // If tools were provided, return full response for tool extraction

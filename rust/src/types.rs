@@ -513,6 +513,14 @@ pub struct TokenUsage {
     /// Cache write / cache creation tokens (for Anthropic caching)
     #[serde(default)]
     pub cache_write_input_tokens: u64,
+
+    /// Reasoning tokens reported separately by providers that expose them.
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
+
+    /// Provider-reported request cost in US dollars (for example OpenRouter usage.cost).
+    #[serde(default)]
+    pub provider_cost_dollars: Option<f64>,
 }
 
 impl TokenUsage {
@@ -523,6 +531,8 @@ impl TokenUsage {
             output_tokens,
             cached_tokens,
             cache_write_input_tokens: 0,
+            reasoning_tokens: None,
+            provider_cost_dollars: None,
         }
     }
 

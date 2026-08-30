@@ -69,12 +69,14 @@ impl RunOptions {
             temperature: self.temperature.map(|value| value as f32),
             top_p: self.top_p.map(|value| value as f32),
             max_tokens: self.max_tokens,
+            reasoning_effort: None,
             model: self.model,
             api_key: self.api_key,
             timeout: self
                 .timeout_ms
                 .map(|milliseconds| Duration::from_millis(milliseconds as u64)),
             retry_config: None,
+            previous_response_id: None,
         }
     }
 }
@@ -166,6 +168,7 @@ fn provider_config(config: ProviderConfigInput) -> Option<ProviderConfig> {
             CodexSubscriptionProviderConfig {
                 token: codex.token,
                 account_id: codex.account_id,
+                prompt_cache_key: None,
                 base_url: codex.base_url,
                 transport: codex
                     .transport

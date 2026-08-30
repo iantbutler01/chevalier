@@ -330,6 +330,11 @@ pub fn parse_openai_responses_event(
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0),
                     cache_write_input_tokens: 0,
+                    reasoning_tokens: usage
+                        .get("output_tokens_details")
+                        .and_then(|d| d.get("reasoning_tokens"))
+                        .and_then(|v| v.as_u64()),
+                    provider_cost_dollars: usage.get("cost").and_then(|v| v.as_f64()),
                 });
             }
             if !accumulator.has_emitted_reasoning()
@@ -525,7 +530,9 @@ mod tests {
             "response": {
                 "usage": {
                     "input_tokens": 10,
-                    "output_tokens": 5
+                    "output_tokens": 5,
+                    "output_tokens_details": { "reasoning_tokens": 3 },
+                    "cost": 0.0004
                 }
             }
         });
@@ -536,10 +543,14 @@ mod tests {
             StreamChunk::Usage {
                 input_tokens,
                 output_tokens,
+                reasoning_tokens,
+                provider_cost_dollars,
                 ..
             } => {
                 assert_eq!(*input_tokens, 10);
                 assert_eq!(*output_tokens, 5);
+                assert_eq!(*reasoning_tokens, Some(3));
+                assert_eq!(*provider_cost_dollars, Some(0.0004));
             }
             _ => panic!("Expected Usage chunk"),
         }
