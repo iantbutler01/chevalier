@@ -24,6 +24,7 @@ use crate::config::{self, Config};
 pub const BASE_IMAGE_EXT: &str = ".qcow2";
 pub const BASE_IMAGE_SIZE_GB: i32 = 10;
 pub const DEFAULT_VM_REGISTRY_URL: &str = "https://vm-images.openbracket.dev";
+const DEFAULT_PREBUILT_IMAGE_NAMESPACE: &str = "ghcr.io/bracketdevelopers/";
 const MAX_DOWNLOAD_ATTEMPTS: usize = 5;
 const DOWNLOAD_LOCK_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
 const DOWNLOAD_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -67,6 +68,23 @@ pub fn vm_registry_base_url() -> String {
     }
 }
 
+fn prebuilt_registry_base_url(reference: &str) -> Option<String> {
+    let configured = env::var("BRACKET_VM_REGISTRY_URL").ok();
+    prebuilt_registry_base_url_for(reference, configured.as_deref())
+}
+
+fn prebuilt_registry_base_url_for(reference: &str, configured: Option<&str>) -> Option<String> {
+    match configured {
+        Some(value) if !value.trim().is_empty() => {
+            Some(value.trim().trim_end_matches('/').to_string())
+        }
+        _ if reference.starts_with(DEFAULT_PREBUILT_IMAGE_NAMESPACE) => {
+            Some(DEFAULT_VM_REGISTRY_URL.to_string())
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DownloadProgress {
     pub downloaded_bytes: u64,
@@ -77,6 +95,12 @@ pub struct DownloadProgress {
 pub enum PrebuiltImageStatus {
     Downloaded { bytes: u64 },
     NotFound,
+}
+
+enum ExpectedImageDigest {
+    Available(String),
+    Missing,
+    Invalid,
 }
 
 struct DownloadLock {
@@ -118,11 +142,25 @@ where
         .parent()
         .context("determine directory for base image download")?;
 
+    let Some(registry_base_url) = prebuilt_registry_base_url(reference) else {
+        debug!(
+            %reference,
+            "image is outside the default prebuilt namespace; falling back to local conversion"
+        );
+        return Ok(PrebuiltImageStatus::NotFound);
+    };
     let file_name = base_image_file_name(reference, arch);
-    let url = format!("{}/{}", vm_registry_base_url(), file_name);
+    let url = format!("{registry_base_url}/{file_name}");
     let client = Client::new();
     debug!(%url, path = %target.display(), "attempting to download prebuilt VM image");
-    let expected_digest = fetch_expected_image_digest(&client, &url).await?;
+    let expected_digest = match fetch_expected_image_digest(&client, &url).await? {
+        ExpectedImageDigest::Available(digest) => Some(digest),
+        ExpectedImageDigest::Missing => None,
+        ExpectedImageDigest::Invalid => {
+            warn!(%url, "prebuilt VM image has an invalid digest sidecar; falling back to local conversion");
+            return Ok(PrebuiltImageStatus::NotFound);
+        }
+    };
 
     let tmp_name = format!(
         "{}.part",
@@ -332,7 +370,10 @@ where
     )))
 }
 
-async fn fetch_expected_image_digest(client: &Client, image_url: &str) -> Result<Option<String>> {
+async fn fetch_expected_image_digest(
+    client: &Client,
+    image_url: &str,
+) -> Result<ExpectedImageDigest> {
     let digest_url = format!("{image_url}.sha256");
     let response = match client.get(&digest_url).send().await {
         Ok(response) => response,
@@ -342,7 +383,7 @@ async fn fetch_expected_image_digest(client: &Client, image_url: &str) -> Result
                 error = %err,
                 "unable to fetch VM image digest sidecar"
             );
-            return Ok(None);
+            return Ok(ExpectedImageDigest::Missing);
         }
     };
 
@@ -352,18 +393,26 @@ async fn fetch_expected_image_digest(client: &Client, image_url: &str) -> Result
                 .text()
                 .await
                 .with_context(|| format!("read VM image digest sidecar {digest_url}"))?;
-            Ok(Some(parse_sha256_digest(&body).with_context(|| {
-                format!("parse VM image digest sidecar {digest_url}")
-            })?))
+            match parse_sha256_digest(&body) {
+                Ok(digest) => Ok(ExpectedImageDigest::Available(digest)),
+                Err(err) => {
+                    warn!(
+                        %digest_url,
+                        error = %err,
+                        "VM image registry returned an invalid digest sidecar"
+                    );
+                    Ok(ExpectedImageDigest::Invalid)
+                }
+            }
         }
-        StatusCode::NOT_FOUND => Ok(None),
+        StatusCode::NOT_FOUND => Ok(ExpectedImageDigest::Missing),
         status => {
             debug!(
                 %digest_url,
                 status = ?status,
                 "VM image registry returned unexpected digest sidecar status"
             );
-            Ok(None)
+            Ok(ExpectedImageDigest::Missing)
         }
     }
 }
@@ -482,6 +531,10 @@ async fn remove_stale_download_lock(lock_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     #[test]
     fn parse_sha256_digest_accepts_plain_or_sha256sum_format() {
@@ -502,11 +555,52 @@ mod tests {
         assert!(parse_sha256_digest("abc123 image.qcow2").is_err());
     }
 
+    #[tokio::test]
+    async fn malformed_digest_sidecar_rejects_prebuilt_image() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.expect("read request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot-a-sha",
+                )
+                .await
+                .expect("write response");
+        });
+
+        let client = Client::new();
+        let image_url = format!("http://{address}/image.qcow2");
+        let status = fetch_expected_image_digest(&client, &image_url)
+            .await
+            .expect("digest request");
+
+        assert!(matches!(status, ExpectedImageDigest::Invalid));
+        server.await.expect("test server task");
+    }
+
     #[test]
     fn digest_sidecar_path_appends_sha256_to_full_file_name() {
         assert_eq!(
             digest_sidecar_path(Path::new("/tmp/base.qcow2")),
             PathBuf::from("/tmp/base.qcow2.sha256")
+        );
+    }
+
+    #[test]
+    fn default_registry_does_not_receive_private_image_references() {
+        assert!(
+            prebuilt_registry_base_url_for("127.0.0.1:5000/openbracket/sandbox:latest", None)
+                .is_none()
+        );
+        assert_eq!(
+            prebuilt_registry_base_url_for("ghcr.io/bracketdevelopers/uv-builder:main", None)
+                .as_deref(),
+            Some(DEFAULT_VM_REGISTRY_URL)
         );
     }
 }
