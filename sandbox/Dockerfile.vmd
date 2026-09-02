@@ -1,4 +1,20 @@
-ARG D2VM_SOURCE_IMAGE=us-west1-docker.pkg.dev/grounded-being-490907-r4/chevalier/d2vm:ghcr-private-amd64
+# syntax=docker/dockerfile:1.7
+# Chevalier VMD image — the Nym computer substrate as a container.
+#
+# Build context is the chevalier REPO ROOT (not sandbox/): the vmd crate depends
+# on the sibling workspace crate ../../hash, so the context must contain both
+# `hash/` and `sandbox/`. Root .dockerignore allowlists exactly what's needed.
+#
+#   docker build -f sandbox/Dockerfile.vmd -t chevalier-vmd:dev .
+#
+# Runtime contract (see OtherYou infra/docker-compose.yml `vmd` service):
+#   --privileged, /dev/kvm + /dev/fuse, host docker.sock (d2vm image builds),
+#   state on /var/lib/chevalier/vms, listens on 0.0.0.0:18072.
+#
+# @dive-rel: Same bill of materials as the OVH systemd deployment (vmd + patched
+# @dive-rel: virtiofsd 1.13 + envoy + coredns + d2vm + portproxy guest bins).
+
+ARG D2VM_SOURCE_IMAGE=linkacloud/d2vm:latest
 ARG ENVOY_IMAGE=envoyproxy/envoy:v1.33.0
 ARG COREDNS_IMAGE=coredns/coredns:1.12.1
 
@@ -16,15 +32,29 @@ RUN apt-get update \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
+# Preserve the on-disk layout so vmd's `path = "../../hash"` dependency and the
+# workspace [patch] entries (patches/fuser-0.17.0) resolve exactly as they do in
+# a checkout. Building from the workspace root means sandbox/Cargo.lock — the
+# lockfile local `cargo build -p vmd` uses — governs the image too.
 WORKDIR /src
-COPY vmd ./vmd
-COPY crates ./crates
-COPY proto ./proto
-COPY patches/fuser-0.17.0 ./patches/fuser-0.17.0
-COPY portproxy/bin ./portproxy/bin
+COPY hash ./hash
+COPY sandbox/Cargo.toml sandbox/Cargo.lock ./sandbox/
+COPY sandbox/vmd ./sandbox/vmd
+COPY sandbox/crates ./sandbox/crates
+COPY sandbox/proto ./sandbox/proto
+COPY sandbox/portproxy ./sandbox/portproxy
+COPY sandbox/patches/fuser-0.17.0 ./sandbox/patches/fuser-0.17.0
 
-WORKDIR /src/vmd
-RUN cargo build --release --bin vmd
+WORKDIR /src/sandbox
+# Cache mounts keep the registry and the ~400-crate target dir across builds so
+# a source edit is an incremental rebuild, not a from-scratch release build.
+# Cache mounts are not part of the image; copy the artifacts out in-step.
+RUN --mount=type=cache,id=vmd-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=vmd-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=vmd-target,target=/src/sandbox/target \
+    cargo build --release -p vmd --bin vmd --bin vmdctl \
+    && mkdir -p /out \
+    && cp target/release/vmd target/release/vmdctl /out/
 
 # @dive-rel: virtiofsd 1.13+ is required for vhost-user migration cooperation (the
 # @dive-rel: VHOST_USER_PROTOCOL_F_LOG_SHMFD feature bit and `--migration-mode=find-paths`).
@@ -40,9 +70,10 @@ RUN apt-get update \
     patch \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
-COPY patches/virtiofsd-1.13.0-lock-forwarding.patch /src/patches/virtiofsd-1.13.0-lock-forwarding.patch
-COPY scripts/build-patched-virtiofsd.sh /src/scripts/build-patched-virtiofsd.sh
-RUN VIRTIOFSD_INSTALL_ROOT=/usr/local \
+COPY sandbox/patches/virtiofsd-1.13.0-lock-forwarding.patch /src/patches/virtiofsd-1.13.0-lock-forwarding.patch
+COPY sandbox/scripts/build-patched-virtiofsd.sh /src/scripts/build-patched-virtiofsd.sh
+RUN --mount=type=cache,id=vfsd-cargo-registry,target=/usr/local/cargo/registry \
+    VIRTIOFSD_INSTALL_ROOT=/usr/local \
     VIRTIOFSD_SKIP_TESTS=1 \
     /src/scripts/build-patched-virtiofsd.sh
 
@@ -54,7 +85,7 @@ RUN apt-get update \
     curl \
     gawk \
     && rm -rf /var/lib/apt/lists/*
-COPY vmd/assets/threat-domains.seed.hosts /tmp/threat-domains.seed.hosts
+COPY sandbox/vmd/assets/threat-domains.seed.hosts /tmp/threat-domains.seed.hosts
 RUN set -eux; \
     curl -fsSL https://urlhaus.abuse.ch/downloads/hostfile/ -o /tmp/urlhaus.hosts || cp /tmp/threat-domains.seed.hosts /tmp/urlhaus.hosts; \
     curl -fsSL https://isc.sans.edu/feeds/suspiciousdomains_High.txt -o /tmp/sans-high.txt || cp /tmp/threat-domains.seed.hosts /tmp/sans-high.txt; \
@@ -118,17 +149,19 @@ RUN if getent group qemu >/dev/null; then \
     fi
 
 COPY --from=d2vm /usr/local/bin/d2vm /usr/local/bin/d2vm
-COPY --from=builder /src/vmd/target/release/vmd /usr/local/bin/vmd
+COPY --from=builder /out/vmd /usr/local/bin/vmd
+COPY --from=builder /out/vmdctl /usr/local/bin/vmdctl
 COPY --from=envoy-bin /usr/local/bin/envoy /usr/local/bin/envoy
 COPY --from=coredns-bin /coredns /usr/local/bin/coredns
 COPY --from=threat-feed-builder /tmp/threat-domains.hosts /opt/chevalier/network/threat-domains.hosts
 # Overwrite the Ubuntu-shipped virtiofsd 1.10 with our source-built 1.13.0 that
 # supports `--migration-mode` / VHOST_USER_PROTOCOL_F_LOG_SHMFD.
 COPY --from=vfsd-builder /usr/local/bin/virtiofsd /usr/libexec/virtiofsd
-COPY portproxy/bin/portproxy-linux-amd64 /opt/chevalier/portproxy/bin/portproxy-linux-amd64
-COPY portproxy/bin/portproxy-linux-arm64 /opt/chevalier/portproxy/bin/portproxy-linux-arm64
+COPY sandbox/portproxy/bin/portproxy-linux-amd64 /opt/chevalier/portproxy/bin/portproxy-linux-amd64
+COPY sandbox/portproxy/bin/portproxy-linux-arm64 /opt/chevalier/portproxy/bin/portproxy-linux-arm64
 
 RUN chmod +x /usr/local/bin/vmd \
+    /usr/local/bin/vmdctl \
     /usr/local/bin/envoy \
     /usr/local/bin/coredns \
     /usr/libexec/virtiofsd \
@@ -136,4 +169,8 @@ RUN chmod +x /usr/local/bin/vmd \
     /opt/chevalier/portproxy/bin/portproxy-linux-arm64 \
     && chmod 0644 /opt/chevalier/network/threat-domains.hosts
 
+ENV PROXY_BIN=/opt/chevalier/portproxy/bin
+VOLUME ["/var/lib/chevalier/vms"]
+EXPOSE 18072
 ENTRYPOINT ["vmd"]
+CMD ["--listen", "0.0.0.0:18072", "--data-dir", "/var/lib/chevalier/vms"]
