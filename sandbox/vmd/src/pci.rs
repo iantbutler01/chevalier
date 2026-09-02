@@ -749,7 +749,11 @@ pub async fn prepare_assignment(
     }
     .await;
     if let Err(error) = setup {
-        let rollback = release_assignment(config, &assignment).await;
+        let rollback = if policy.managed {
+            release_assignment(config, &assignment).await
+        } else {
+            run_hook(&policy.release_command, "release", &policy.id).await
+        };
         return match rollback {
             Ok(()) => Err(error),
             Err(rollback_error) => Err(anyhow::Error::new(PciRollbackError {
@@ -907,6 +911,46 @@ mod tests {
         let error =
             validate_iommu_group(&config, normalized_device).expect_err("extra endpoint must fail");
         assert!(error.to_string().contains("0000:80:02.0"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unmanaged_prepare_failure_does_not_unbind_host_driver() {
+        let temp = tempfile::tempdir().expect("create fake sysfs");
+        let sysfs_root = temp.path().join("sys");
+        let group_path = sysfs_root.join("kernel/iommu_groups/13");
+        fs::create_dir_all(group_path.join("devices")).expect("create fake IOMMU group");
+        add_group_member(&sysfs_root, &group_path, "0000:81:00.0", "0x030000");
+
+        let driver_path = sysfs_root.join("bus/pci/drivers/nvidia");
+        fs::create_dir_all(&driver_path).expect("create fake NVIDIA driver");
+        symlink(
+            &driver_path,
+            sysfs_root.join("bus/pci/devices/0000:81:00.0/driver"),
+        )
+        .expect("bind fake NVIDIA driver");
+
+        let config = PciConfig::for_test(
+            "token",
+            vec![policy("gpu-a", &["81:00.0"])],
+            sysfs_root.clone(),
+            temp.path().join("dev"),
+        )
+        .expect("build PCI config");
+
+        let error = prepare_assignment(&config, "gpu-a", 1000, 1000)
+            .await
+            .expect_err("unmanaged host-bound device must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("bound to `nvidia`, not vfio-pci")
+        );
+        assert_eq!(
+            driver_name(&sysfs_root.join("bus/pci/devices/0000:81:00.0")),
+            "nvidia"
+        );
+        assert!(!driver_path.join("unbind").exists());
     }
 
     #[cfg(unix)]

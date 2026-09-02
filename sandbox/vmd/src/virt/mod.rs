@@ -6,6 +6,43 @@
 use std::ffi::CString;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+
+fn virtiofsd_args(
+    virtiofsd_bin: &str,
+    spawn: &VirtiofsdSpawn,
+    cache_mode: &str,
+    sandbox_mode: &str,
+) -> Vec<String> {
+    // Ubuntu 22.04 ships the legacy C daemon at this path. Its filesystem semantics
+    // are compatible, but its CLI predates the Rust daemon's long options.
+    if virtiofsd_bin.ends_with("/usr/lib/qemu/virtiofsd") {
+        return vec![
+            format!("--socket-path={}", spawn.socket_path.display()),
+            "-f".to_string(),
+            "-o".to_string(),
+            format!("source={}", spawn.source_path.display()),
+            "-o".to_string(),
+            format!("cache={cache_mode}"),
+            // Ubuntu 22.04's legacy C daemon has a stale seccomp allowlist: its
+            // optional worker pool calls sched_getaffinity under real build I/O
+            // and is killed by SIGSYS. Keep its supported default pool size of
+            // zero; modern Rust virtiofsd keeps the 64-thread pool below.
+            "-o".to_string(),
+            "log_level=warn".to_string(),
+        ];
+    }
+
+    vec![
+        format!("--socket-path={}", spawn.socket_path.display()),
+        format!("--shared-dir={}", spawn.source_path.display()),
+        format!("--cache={cache_mode}"),
+        format!("--sandbox={sandbox_mode}"),
+        "--thread-pool-size=64".to_string(),
+        "--log-level=warn".to_string(),
+        // Required for vhost-user migration cooperation in Rust virtiofsd >= 1.12.
+        "--migration-mode=find-paths".to_string(),
+    ]
+}
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -1194,14 +1231,6 @@ pub async fn spawn_virtiofsd(
     let _ = std::fs::remove_file(&pid_path);
 
     let mut cmd = Command::new(virtiofsd_bin);
-    cmd.arg(format!(
-        "--socket-path={}",
-        spawn.socket_path.to_string_lossy()
-    ));
-    cmd.arg(format!(
-        "--shared-dir={}",
-        spawn.source_path.to_string_lossy()
-    ));
     // The host source is itself a remote FUSE mount, so in principle another VM
     // could publish through a separate FUSE/virtiofsd pair and this daemon would
     // not learn of it. That was the reason for `never`.
@@ -1224,24 +1253,13 @@ pub async fn spawn_virtiofsd(
         .map(|value| value.trim().to_string())
         .filter(|value| matches!(value.as_str(), "never" | "auto" | "always"))
         .unwrap_or_else(|| "auto".to_string());
-    cmd.arg(format!("--cache={cache_mode}"));
     let sandbox_mode = configured_virtiofsd_sandbox_mode();
-    cmd.arg(format!("--sandbox={sandbox_mode}"));
-    // Blocking SETLKW/flock requests must not monopolize the sole vhost-user
-    // request loop. The patched daemon forwards them to the host FUSE mount,
-    // where RemoteFuseFs applies the bounded distributed-lock wait.
-    cmd.arg("--thread-pool-size=64");
-    cmd.arg("--log-level=warn");
-    // @dive: `--migration-mode=find-paths` is required for vhost-user migration
-    //        cooperation. Without it, virtiofsd doesn't advertise the
-    //        `VHOST_USER_PROTOCOL_F_LOG_SHMFD` feature bit, and qemu rejects every
-    //        `migrate` call with "Migration disabled: vhost-user backend lacks
-    //        VHOST_USER_PROTOCOL_F_LOG_SHMFD feature". Added in virtiofsd 1.12.0,
-    //        stabilized in 1.13.0. The `find-paths` mode reconstructs open-file paths
-    //        from file handles during migrate, as opposed to `file-handles` which
-    //        serializes kernel file handles — `find-paths` is more portable across
-    //        filesystems (ext4/xfs/btrfs/etc).
-    cmd.arg("--migration-mode=find-paths");
+    cmd.args(virtiofsd_args(
+        virtiofsd_bin,
+        spawn,
+        &cache_mode,
+        &sandbox_mode,
+    ));
     // @dive: Read-only enforcement runs on two layers: (1) the host filesystem at the
     //        VFS export root is already mounted ro, and (2) bootstrap/init.sh appends
     //        `,ro` to the guest `mount -t virtiofs` options when the SharedMountSpec
@@ -1591,6 +1609,50 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn test_virtiofsd_spawn() -> VirtiofsdSpawn {
+        VirtiofsdSpawn {
+            source_path: PathBuf::from("/workspace/apps"),
+            socket_path: PathBuf::from("/tmp/virtiofsd.sock"),
+            tag: "apps".to_string(),
+            read_only: false,
+        }
+    }
+
+    #[test]
+    fn virtiofsd_args_support_ubuntu_legacy_daemon() {
+        assert_eq!(
+            virtiofsd_args(
+                "/usr/lib/qemu/virtiofsd",
+                &test_virtiofsd_spawn(),
+                "auto",
+                "chroot",
+            ),
+            vec![
+                "--socket-path=/tmp/virtiofsd.sock",
+                "-f",
+                "-o",
+                "source=/workspace/apps",
+                "-o",
+                "cache=auto",
+                "-o",
+                "log_level=warn",
+            ]
+        );
+    }
+
+    #[test]
+    fn virtiofsd_args_preserve_rust_daemon_migration_contract() {
+        let args = virtiofsd_args(
+            "/usr/libexec/virtiofsd",
+            &test_virtiofsd_spawn(),
+            "auto",
+            "chroot",
+        );
+        assert!(args.contains(&"--shared-dir=/workspace/apps".to_string()));
+        assert!(args.contains(&"--migration-mode=find-paths".to_string()));
+        assert!(!args.contains(&"-o".to_string()));
+    }
 
     async fn serve_qmp_script(listener: UnixListener, script: Vec<(&'static str, Value)>) {
         for (expected_command, response) in script {

@@ -1311,6 +1311,7 @@ async fn convert_container_image_to_qcow(
         })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
     Start,
     Stop,
@@ -1320,21 +1321,88 @@ enum Action {
     ForceStop,
 }
 
+impl Action {
+    fn as_str(self) -> &'static str {
+        match self {
+            Action::Start => "start",
+            Action::Stop => "stop",
+            Action::Restart => "restart",
+            Action::Pause => "pause",
+            Action::Resume => "resume",
+            Action::ForceStop => "force_stop",
+        }
+    }
+
+    /// Stop-class actions drive the guest through a graceful shutdown that can take
+    /// minutes. They must run to completion even if the requesting client gives up:
+    /// abandoning them mid-flight leaves a guest powering off while vmd still
+    /// projects it as Running, or a restart that stopped but never started.
+    fn is_detached(self) -> bool {
+        matches!(self, Action::Stop | Action::Restart | Action::ForceStop)
+    }
+}
+
+/// Run a lifecycle operation on its own task so that dropping the calling future
+/// (tonic drops handler futures when the client disconnects or times out) cannot
+/// cancel it. Dropping a `JoinHandle` detaches the task rather than aborting it.
+async fn run_detached<T, F>(work: F) -> Result<T, ManagerError>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T, ManagerError>> + Send + 'static,
+{
+    tokio::spawn(work)
+        .await
+        .map_err(|err| ManagerError::Other(anyhow!("lifecycle task failed: {err}")))?
+}
+
 impl GrpcService {
     async fn vm_action(&self, req: VmActionRequest, action: Action) -> GrpcResult<Vm> {
         let vm_id = req.vm_id.clone();
         if vm_id.is_empty() {
             return Err(Status::invalid_argument("vm_id is required"));
         }
-        let meta = match action {
-            Action::Start => self.manager.start_vm(&vm_id).await,
-            Action::Stop => self.manager.stop_vm(&vm_id).await,
-            Action::Restart => self.manager.restart_vm(&vm_id).await,
-            Action::Pause => self.manager.pause_vm(&vm_id).await,
-            Action::Resume => self.manager.resume_vm(&vm_id).await,
-            Action::ForceStop => self.manager.force_stop_vm(&vm_id).await,
-        }
-        .map_err(status_from_error)?;
+        let manager = Arc::clone(&self.manager);
+        let result = if action.is_detached() {
+            info!(vm_id = %vm_id, action = action.as_str(), "vm lifecycle action requested");
+            let task_vm_id = vm_id.clone();
+            // Completion is logged inside the detached task so the outcome is recorded
+            // even when the requesting client has already disconnected.
+            run_detached(async move {
+                let started = std::time::Instant::now();
+                let result = match action {
+                    Action::Stop => manager.stop_vm(&task_vm_id).await,
+                    Action::Restart => manager.restart_vm(&task_vm_id).await,
+                    Action::ForceStop => manager.force_stop_vm(&task_vm_id).await,
+                    Action::Start | Action::Pause | Action::Resume => unreachable!(),
+                };
+                match &result {
+                    Ok(meta) => info!(
+                        vm_id = %task_vm_id,
+                        action = action.as_str(),
+                        state = ?meta.state,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "vm lifecycle action completed"
+                    ),
+                    Err(err) => error!(
+                        vm_id = %task_vm_id,
+                        action = action.as_str(),
+                        error = %err,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "vm lifecycle action failed"
+                    ),
+                }
+                result
+            })
+            .await
+        } else {
+            match action {
+                Action::Start => manager.start_vm(&vm_id).await,
+                Action::Pause => manager.pause_vm(&vm_id).await,
+                Action::Resume => manager.resume_vm(&vm_id).await,
+                Action::Stop | Action::Restart | Action::ForceStop => unreachable!(),
+            }
+        };
+        let meta = result.map_err(status_from_error)?;
         let (detail, runtime) = self
             .manager
             .get_with_runtime(&meta.id)
@@ -1738,5 +1806,58 @@ mod tests {
         assert!(authorize_pci_metadata(None, request.metadata()).is_err());
         assert!(authorize_pci_metadata(Some("different"), request.metadata()).is_err());
         assert!(authorize_pci_metadata(Some("pci-secret"), request.metadata()).is_ok());
+    }
+
+    #[test]
+    fn stop_class_actions_are_detached() {
+        assert!(Action::Stop.is_detached());
+        assert!(Action::Restart.is_detached());
+        assert!(Action::ForceStop.is_detached());
+        assert!(!Action::Start.is_detached());
+        assert!(!Action::Pause.is_detached());
+        assert!(!Action::Resume.is_detached());
+    }
+
+    #[tokio::test]
+    async fn detached_lifecycle_work_survives_caller_cancellation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Model a restart: a slow stop phase followed by a start phase. The gRPC
+        // handler future is dropped (client timeout) during the stop phase; the
+        // start phase must still run.
+        let started_again = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&started_again);
+        let handler = run_detached(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await; // graceful stop
+            flag.store(true, Ordering::SeqCst); // start_vm
+            Ok::<(), ManagerError>(())
+        });
+
+        // The caller gives up long before the stop phase finishes.
+        let abandoned = tokio::time::timeout(Duration::from_millis(20), handler).await;
+        assert!(abandoned.is_err(), "caller should have timed out");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            started_again.load(Ordering::SeqCst),
+            "detached lifecycle work must complete after the caller is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_future_is_cancelled_with_its_caller() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Control: the same work awaited inline is cancelled by the timeout, which is
+        // exactly the failure mode `run_detached` exists to prevent.
+        let started_again = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&started_again);
+        let inline = async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            flag.store(true, Ordering::SeqCst);
+        };
+        let _ = tokio::time::timeout(Duration::from_millis(20), inline).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!started_again.load(Ordering::SeqCst));
     }
 }

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
-use tokio::io;
+use tokio::io::{self, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
@@ -23,6 +23,7 @@ const TPROXY_ROUTE_TABLE: &str = "100";
 const GUEST_PROXY_PORT: u16 = 13337;
 const GUEST_RPC_PORT: u16 = 13338;
 const TAP_FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const TAP_FORWARD_HALF_CLOSE_LINGER: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct VmTapNetworkSpec {
@@ -445,6 +446,35 @@ fn install_capture_rules(spec: &VmTapNetworkSpec) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tap_forward_drops_guest_that_never_closes_after_client_disconnects() {
+        let guest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let guest_address = guest_listener.local_addr().unwrap();
+        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_address = client_listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(client_address).await.unwrap();
+        let (mut inbound, _) = client_listener.accept().await.unwrap();
+        let mut outbound = TcpStream::connect(guest_address).await.unwrap();
+        let (guest, _) = guest_listener.accept().await.unwrap();
+        drop(client);
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            copy_bidirectional_with_linger(&mut inbound, &mut outbound, Duration::from_millis(10)),
+        )
+        .await
+        .expect("forward linger elapsed")
+        .unwrap();
+
+        drop(guest);
+    }
+}
+
 fn cleanup_vm_tap_network(spec: &VmTapNetworkSpec) -> Result<()> {
     let tap = spec.tap_name.as_str();
     let gateway_ip = spec.gateway_ip.to_string();
@@ -666,9 +696,43 @@ async fn forward_connection(mut inbound: TcpStream, target: SocketAddr) -> Resul
                 )
             })?
             .with_context(|| format!("connect tap forward target {target}"))?;
-    io::copy_bidirectional(&mut inbound, &mut outbound)
+    copy_bidirectional_with_linger(&mut inbound, &mut outbound, TAP_FORWARD_HALF_CLOSE_LINGER)
         .await
         .with_context(|| format!("copy tap forward stream to {target}"))?;
+    Ok(())
+}
+
+async fn copy_bidirectional_with_linger(
+    inbound: &mut TcpStream,
+    outbound: &mut TcpStream,
+    linger: Duration,
+) -> io::Result<()> {
+    let (mut inbound_read, mut inbound_write) = inbound.split();
+    let (mut outbound_read, mut outbound_write) = outbound.split();
+    let client_to_guest = async {
+        io::copy(&mut inbound_read, &mut outbound_write).await?;
+        outbound_write.shutdown().await
+    };
+    let guest_to_client = async {
+        io::copy(&mut outbound_read, &mut inbound_write).await?;
+        inbound_write.shutdown().await
+    };
+    tokio::pin!(client_to_guest, guest_to_client);
+
+    tokio::select! {
+        result = &mut client_to_guest => {
+            result?;
+            if let Ok(result) = tokio::time::timeout(linger, &mut guest_to_client).await {
+                result?;
+            }
+        }
+        result = &mut guest_to_client => {
+            result?;
+            if let Ok(result) = tokio::time::timeout(linger, &mut client_to_guest).await {
+                result?;
+            }
+        }
+    }
     Ok(())
 }
 
