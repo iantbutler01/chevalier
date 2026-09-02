@@ -669,7 +669,7 @@ try {
   );
   first = await createSession("a");
 
-  await check(1, "one-VM virtiofs topology, POSIX barriers, and HTTP coherence", async () => {
+  await check(1, "one-VM virtiofs topology, concurrent I/O survival, POSIX barriers, and HTTP coherence", async () => {
     const guest = await execGuest(
       first,
       `python3 - <<'PY'
@@ -756,6 +756,60 @@ assert open(session_shrink, "rb").read() == b"x" * 47 + b"\\n"
 print("ONE_VM_TOPOLOGY_AND_OPS_OK")
 PY`,
     );
+    // Regression for Ubuntu 22.04's legacy C virtiofsd. Configuring its optional
+    // worker pool caused a stale seccomp filter to kill the helper only after
+    // concurrent filesystem activity; startup and single-file probes still passed.
+    // Keep this as real guest I/O so a future CLI/configuration oscillation fails
+    // this gate by timeout instead of leaving application builds hung indefinitely.
+    const concurrentIo = await execGuest(
+      first,
+      `python3 - <<'PY'
+import concurrent.futures
+import os
+
+root = "/workspace/virtiofs-helper-survival"
+os.mkdir(root)
+
+def churn(worker):
+    worker_root = f"{root}/{worker}"
+    os.mkdir(worker_root)
+    for iteration in range(16):
+        payload = (f"worker={worker};iteration={iteration};".encode() * 4096)[:65536]
+        staging = f"{worker_root}/staging-{iteration}"
+        final = f"{worker_root}/final-{iteration}"
+        fd = os.open(staging, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        try:
+            assert os.write(fd, payload) == len(payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(staging, final)
+        fd = os.open(final, os.O_RDONLY)
+        try:
+            assert os.read(fd, len(payload)) == payload
+        finally:
+            os.close(fd)
+        os.unlink(final)
+    os.rmdir(worker_root)
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+    list(pool.map(churn, range(16)))
+
+dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+os.fsync(dirfd)
+os.close(dirfd)
+print("CONCURRENT_VIRTIOFS_IO_OK")
+PY`,
+      180,
+    );
+    const postLoadProbe = await execGuest(
+      first,
+      `printf '%s' 'helper-alive' >/workspace/virtiofs-helper-survival/post-load &&
+       test "$(cat /workspace/virtiofs-helper-survival/post-load)" = helper-alive &&
+       rm -rf /workspace/virtiofs-helper-survival &&
+       printf '%s\n' POST_LOAD_VIRTIOFS_PROBE_OK`,
+      30,
+    );
     const remotePath = `${scopePath}/coherent-renamed`;
     const response = await withTimeout(
       fetch(`${ownerEndpoint}/file/raw?path=${encodeURIComponent(remotePath)}`, {
@@ -798,10 +852,12 @@ PY`,
     return {
       pass:
         guest.code === 0 &&
+        concurrentIo.code === 0 &&
+        postLoadProbe.code === 0 &&
         response.ok &&
         bytes === "abcdXYZhi" &&
         hostVisible.code === 0,
-      detail: `${commandResultText(guest)}\nhttp=${response.status} bytes=${JSON.stringify(bytes)}\n${commandResultText(hostVisible)}`,
+      detail: `${commandResultText(guest)}\n${commandResultText(concurrentIo)}\n${commandResultText(postLoadProbe)}\nhttp=${response.status} bytes=${JSON.stringify(bytes)}\n${commandResultText(hostVisible)}`,
     };
   });
 

@@ -152,6 +152,16 @@ impl McpServer {
         self
     }
 
+    /// Attach runtime-rendered UI for opaque child resource paths.
+    #[cfg(feature = "mcp-apps")]
+    pub fn with_ui_prefix_resolver<R>(mut self, resource: UiResource, resolver: R) -> Self
+    where
+        R: chevalier_mcp::apps::UiResourceResolver,
+    {
+        self.builder = self.builder.with_ui_prefix_resolver(resource, resolver);
+        self
+    }
+
     /// Set the visibility of the most recently registered tool.
     ///
     /// Controls who can call the tool per SEP-1865:

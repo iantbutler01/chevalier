@@ -483,6 +483,13 @@ mod tests {
 
         assert!(vm_has_mount_contract(&vm, &expected, &matcher));
 
+        vm.shared_mounts[0].vfs_endpoint = "http://stale-api".to_string();
+        assert!(!vm_has_mount_contract(&vm, &expected, &matcher));
+        assert!(!vm_has_required_mounts(&vm, &expected, &matcher));
+
+        vm.shared_mounts[0].vfs_endpoint = "http://api/".to_string();
+        assert!(vm_has_mount_contract(&vm, &expected, &matcher));
+
         vm.shared_mounts[0].vfs_scope_path = "projects/stale/shared".to_string();
         assert!(!vm_has_mount_contract(&vm, &expected, &matcher));
         assert!(!vm_has_required_mounts(&vm, &expected, &matcher));

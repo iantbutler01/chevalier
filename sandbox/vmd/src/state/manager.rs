@@ -127,6 +127,61 @@ impl Default for VmResourceBounds {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn device_access_group(
+    mode: u32,
+    owner_uid: u32,
+    owner_gid: u32,
+    uid: u32,
+    primary_gid: u32,
+) -> Option<u32> {
+    if (owner_uid == uid && mode & 0o600 == 0o600)
+        || mode & 0o006 == 0o006
+        || (owner_gid == primary_gid && mode & 0o060 == 0o060)
+    {
+        return Some(primary_gid);
+    }
+    (mode & 0o060 == 0o060).then_some(owner_gid)
+}
+
+#[cfg(target_os = "linux")]
+fn device_group_for_identity(metadata: &fs::Metadata, uid: u32, primary_gid: u32) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+
+    device_access_group(
+        metadata.mode(),
+        metadata.uid(),
+        metadata.gid(),
+        uid,
+        primary_gid,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn kvm_is_usable() -> bool {
+    use std::os::fd::AsRawFd;
+
+    let Ok(kvm) = OpenOptions::new().read(true).write(true).open("/dev/kvm") else {
+        return false;
+    };
+    let vm_fd = unsafe { libc::ioctl(kvm.as_raw_fd(), 0xae01, 0) };
+    if vm_fd < 0 {
+        return false;
+    }
+    unsafe { libc::close(vm_fd) };
+
+    let metadata = match fs::metadata("/dev/kvm") {
+        Ok(metadata) => metadata,
+        Err(_) => return false,
+    };
+    device_group_for_identity(&metadata, 1000, 1000).is_some()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kvm_is_usable() -> bool {
+    false
+}
+
 impl VmResourceBounds {
     fn from_env() -> Result<Self> {
         Ok(Self {
@@ -4871,8 +4926,9 @@ fn select_amd64_machine_cpu(
     host_arch: &str,
     running_on_linux: bool,
     running_on_macos: bool,
+    kvm_available: bool,
 ) -> (&'static str, &'static str) {
-    if host_arch == ARCH_AMD64 && running_on_linux {
+    if host_arch == ARCH_AMD64 && running_on_linux && kvm_available {
         ("q35,accel=kvm:tcg", "host,+invtsc,migratable=off")
     } else if host_arch == ARCH_AMD64 && running_on_macos {
         ("q35,accel=hvf:tcg", "host")
@@ -4898,6 +4954,7 @@ fn build_qemu_args(
 
     let running_on_linux = cfg!(target_os = "linux");
     let running_on_macos = cfg!(target_os = "macos");
+    let kvm_available = running_on_linux && kvm_is_usable();
 
     // @dive: virtio-fs (and qemu migration generally) requires shared-memory guest RAM
     //        backing so the host-side daemons can mmap guest pages. `memory-backend-memfd`
@@ -4918,8 +4975,12 @@ fn build_qemu_args(
 
     let (machine, cpu, bios) = match guest_arch {
         ARCH_AMD64 => {
-            let (machine_base, cpu) =
-                select_amd64_machine_cpu(host_arch, running_on_linux, running_on_macos);
+            let (machine_base, cpu) = select_amd64_machine_cpu(
+                host_arch,
+                running_on_linux,
+                running_on_macos,
+                kvm_available,
+            );
             (
                 format!("{machine_base}{memory_backend_suffix}"),
                 cpu.to_string(),
@@ -5864,9 +5925,19 @@ fn configure_qemu_process_identity(
 
     let uid = cfg.qemu_process.run_as_uid;
     let gid = cfg.qemu_process.run_as_gid;
+    #[cfg(target_os = "linux")]
+    let device_gid = fs::metadata("/dev/kvm")
+        .ok()
+        .and_then(|metadata| device_group_for_identity(&metadata, uid, gid));
     unsafe {
         cmd.pre_exec(move || {
-            let groups = [gid as libc::gid_t];
+            let mut groups = vec![gid as libc::gid_t];
+            #[cfg(target_os = "linux")]
+            if let Some(device_gid) = device_gid
+                && device_gid != gid
+            {
+                groups.push(device_gid as libc::gid_t);
+            }
             #[cfg(target_os = "linux")]
             let ngroups = groups.len();
             #[cfg(not(target_os = "linux"))]
@@ -8198,7 +8269,7 @@ mod tests {
     }
 
     #[test]
-    fn build_qemu_args_falls_back_to_virtfs_when_virtiofsd_unavailable() {
+    fn build_qemu_args_falls_back_to_xattr_free_virtfs_when_virtiofsd_unavailable() {
         // @dive: Dev hosts (notably macOS) cannot run virtiofsd, so vmd passes an empty
         //        handle slice and the builder must fall back to legacy `-virtfs`
         //        shared-mount emission. Also: no memfd backend on this path (the qemu
@@ -8230,7 +8301,7 @@ mod tests {
                 host_path: "/tmp/runtimefs".to_string(),
                 guest_path: "/workspace".to_string(),
                 mount_tag: "runtimefs".to_string(),
-                read_only: true,
+                read_only: false,
                 availability: SharedMountAvailability::SharedStorage,
                 continuity: SharedMountContinuity::RestoreCrossNode,
                 backend_profile: "shared-posix".to_string(),
@@ -8265,13 +8336,11 @@ mod tests {
             "fallback path must not reference the memfd backend on the machine line"
         );
 
-        // Legacy -virtfs device with the same mount tag and readonly flag.
+        // Writable legacy 9p mounts must remain xattr-free: mapped-xattr makes
+        // app-runtime writes fail on hosts whose backing filesystem lacks xattrs.
         assert!(args.iter().any(|arg| arg == "-virtfs"));
-        assert!(args.iter().any(|arg| {
-            arg.contains("path=/tmp/runtimefs")
-                && arg.contains("mount_tag=runtimefs")
-                && arg.contains("readonly=on")
-        }));
+        assert!(args.iter().any(|arg| arg
+            == "local,id=share0,path=/tmp/runtimefs,security_model=none,multidevs=remap,mount_tag=runtimefs"));
     }
 
     #[test]
@@ -8412,7 +8481,7 @@ mod tests {
     fn select_amd64_machine_cpu_exposes_invariant_tsc_on_kvm() {
         // Linux/KVM (production bismuth) must expose the invariant TSC so guests
         // keep a stable clocksource; invtsc requires migratable=off to be exposed.
-        let (machine, cpu) = select_amd64_machine_cpu(ARCH_AMD64, true, false);
+        let (machine, cpu) = select_amd64_machine_cpu(ARCH_AMD64, true, false, true);
         assert_eq!(machine, "q35,accel=kvm:tcg");
         assert_eq!(cpu, "host,+invtsc,migratable=off");
     }
@@ -8421,14 +8490,27 @@ mod tests {
     fn select_amd64_machine_cpu_keeps_plain_host_off_kvm() {
         // HVF (macOS dev) keeps plain host; invtsc is KVM-only.
         assert_eq!(
-            select_amd64_machine_cpu(ARCH_AMD64, false, true),
+            select_amd64_machine_cpu(ARCH_AMD64, false, true, false),
             ("q35,accel=hvf:tcg", "host")
         );
         // Cross-arch TCG emulation keeps the portable qemu64 model.
         assert_eq!(
-            select_amd64_machine_cpu(ARCH_ARM64, false, false),
+            select_amd64_machine_cpu(ARCH_ARM64, false, false, false),
             ("q35,accel=tcg", "qemu64")
         );
+        assert_eq!(
+            select_amd64_machine_cpu(ARCH_AMD64, true, false, false),
+            ("q35,accel=tcg", "qemu64"),
+            "Linux hosts without usable KVM must select a TCG-compatible CPU"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn qemu_identity_preserves_device_group_when_it_grants_access() {
+        assert_eq!(device_access_group(0o660, 0, 107, 1000, 1000), Some(107));
+        assert_eq!(device_access_group(0o660, 0, 1000, 1000, 1000), Some(1000));
+        assert_eq!(device_access_group(0o600, 0, 107, 1000, 1000), None);
     }
 
     #[test]

@@ -435,13 +435,43 @@ impl McpClient {
     /// Read a resource by URI from the MCP server
     pub async fn read_resource(&self, uri: impl Into<String>) -> Result<ReadResourceResult> {
         let uri = uri.into();
-        self.service()
-            .read_resource(ReadResourceRequestParams {
+        self.read_resource_with_meta(uri, None).await
+    }
+
+    /// Read a resource with protocol metadata for a runtime-backed resolver.
+    pub async fn read_resource_with_meta(
+        &self,
+        uri: impl Into<String>,
+        meta: Option<rmcp::model::Meta>,
+    ) -> Result<ReadResourceResult> {
+        let uri = uri.into();
+        let request = rmcp::model::ClientRequest::ReadResourceRequest(
+            rmcp::model::ReadResourceRequest::new(ReadResourceRequestParams {
                 meta: None,
                 uri: uri.clone(),
-            })
+            }),
+        );
+        let result = self
+            .service()
+            .peer()
+            .send_request_with_option(
+                request,
+                rmcp::service::PeerRequestOptions {
+                    timeout: None,
+                    meta,
+                },
+            )
             .await
-            .map_err(|e| Error::Protocol(format!("Failed to read resource '{}': {}", uri, e)))
+            .map_err(|e| Error::Protocol(format!("Failed to read resource '{}': {}", uri, e)))?
+            .await_response()
+            .await
+            .map_err(|e| Error::Protocol(format!("Failed to read resource '{}': {}", uri, e)))?;
+        match result {
+            rmcp::model::ServerResult::ReadResourceResult(result) => Ok(result),
+            _ => Err(Error::Protocol(format!(
+                "Unexpected response while reading resource '{uri}'"
+            ))),
+        }
     }
 
     /// Gracefully close the connection

@@ -48,6 +48,7 @@ pub fn create_iso<P: AsRef<Path>>(path: P, cfg: Config) -> Result<()> {
     if cfg.instance_id.trim().is_empty() {
         bail!("bootstrap iso: instance ID required");
     }
+
     let hostname = if cfg.hostname.trim().is_empty() {
         cfg.instance_id.clone()
     } else {
@@ -123,12 +124,8 @@ log() {{
 log "begin hostname=${{HOSTNAME}} script_dir=${{SCRIPT_DIR}}"
 
 if [ -n "$HOSTNAME" ]; then
-  if command -v hostnamectl >/dev/null 2>&1; then
-    hostnamectl set-hostname --static "$HOSTNAME" || true
-    hostnamectl set-hostname --pretty "$HOSTNAME" || true
-  else
-    echo "$HOSTNAME" >/etc/hostname
-  fi
+  printf '%s\n' "$HOSTNAME" >/etc/hostname
+  hostname "$HOSTNAME" || true
   if [ -w /etc/hosts ]; then
     if grep -q "127\.0\.1\.1" /etc/hosts; then
       sed -i "s/^127\.0\.1\.1.*/127.0.1.1 ${{HOSTNAME}}/g" /etc/hosts || true
@@ -529,7 +526,10 @@ repair_durable_volume() {
     log "durable volume reports prior errors; forcing full unattended repair"
     e2fsck -f -y "$DEVICE" || STATUS=$?
   else
-    e2fsck -p "$DEVICE" || STATUS=$?
+    # resize2fs refuses to proceed after a preen that skipped a clean
+    # filesystem. Force an unattended pass so growth is valid on both fresh
+    # and previously checked durable volumes.
+    e2fsck -f -p "$DEVICE" || STATUS=$?
   fi
 
   # 0 clean, 1 errors corrected, 2 corrected + reboot advised. 4 and above means
@@ -634,6 +634,19 @@ bind_state /var/cache/openbracket var-cache-openbracket
 bind_state /root root
 bind_state /usr/local usr-local
 
+# Generated applications are Nym-owned durable state, not part of the cattle
+# root disk and not a host shared-mount identity projection. Publish the bind
+# only after the ext4 volume is mounted and initialized, then hand this single
+# namespace to the unprivileged app manager.
+APP_RUNTIME_SOURCE="$MOUNT/nym-app-runtime"
+APP_RUNTIME_TARGET=/home/nym/.runtime/apps
+mkdir -p "$APP_RUNTIME_SOURCE" "$APP_RUNTIME_TARGET"
+chown 1000:1000 "$APP_RUNTIME_SOURCE"
+chmod 0700 "$APP_RUNTIME_SOURCE"
+if ! mountpoint -q "$APP_RUNTIME_TARGET"; then
+  mount --bind "$APP_RUNTIME_SOURCE" "$APP_RUNTIME_TARGET"
+fi
+
 refresh_image_usr_local_path bin/computer-host
 refresh_image_usr_local_path bin/openbracket-docker-ready
 refresh_image_usr_local_path sbin/chevalier-apply-tap-network.sh
@@ -646,7 +659,7 @@ rm -rf "$IMAGE_USR_LOCAL"
 fstrim "$MOUNT" >/dev/null 2>&1 || log "fstrim unavailable on durable volume"
 systemctl enable --now fstrim.timer >/dev/null 2>&1 || true
 
-log "durable machine-state paths mounted"
+log "durable machine-state and Nym app paths mounted"
 EOF
 chmod 0755 /usr/lib/chevalier/durable-volume.sh
 
@@ -1491,6 +1504,14 @@ mod tests {
     }
 
     #[test]
+    fn init_script_sets_hostname_without_waiting_for_dbus() {
+        let script = build_init_script("vm-test", None, None, None, false);
+        assert!(script.contains("printf '%s\\n' \"$HOSTNAME\" >/etc/hostname"));
+        assert!(script.contains("hostname \"$HOSTNAME\" || true"));
+        assert!(!script.contains("hostnamectl"));
+    }
+
+    #[test]
     fn init_script_keeps_portproxy_logs_off_the_serial_console() {
         let script = build_init_script("vm-test", None, None, None, false);
         // The portproxy.service unit must not copy its (potentially multi-MB/min)
@@ -1556,6 +1577,10 @@ mod tests {
         assert!(script.contains("bind_state /var/cache/openbracket var-cache-openbracket"));
         assert!(script.contains("bind_state /root root"));
         assert!(script.contains("bind_state /usr/local usr-local"));
+        assert!(script.contains("APP_RUNTIME_SOURCE=\"$MOUNT/nym-app-runtime\""));
+        assert!(script.contains("APP_RUNTIME_TARGET=/home/nym/.runtime/apps"));
+        assert!(script.contains("chown 1000:1000 \"$APP_RUNTIME_SOURCE\""));
+        assert!(script.contains("mount --bind \"$APP_RUNTIME_SOURCE\" \"$APP_RUNTIME_TARGET\""));
         for managed in [
             "bin/computer-host",
             "bin/openbracket-docker-ready",
@@ -1601,7 +1626,7 @@ mod tests {
         );
 
         // Unattended by design: nothing inside a sandbox VM can answer a prompt.
-        assert!(script.contains("e2fsck -p \"$DEVICE\""));
+        assert!(script.contains("e2fsck -f -p \"$DEVICE\""));
         assert!(script.contains("e2fsck -f -y \"$DEVICE\""));
         assert!(script.contains("if [ \"$DEVICE_BYTES\" -gt \"$FILESYSTEM_BYTES\" ]"));
         assert!(script.contains("resize2fs \"$DEVICE\""));

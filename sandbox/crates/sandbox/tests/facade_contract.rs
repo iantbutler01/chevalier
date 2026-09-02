@@ -50,6 +50,7 @@ struct MockVmdState {
     next_vm_id: usize,
     start_calls: usize,
     stop_calls: usize,
+    restart_calls: usize,
     delete_calls: usize,
     delete_delay: Option<Duration>,
     restore_calls: usize,
@@ -336,6 +337,7 @@ impl VmdService for MockVmd {
         let vm = self
             .vm_mutate(&request.into_inner().vm_id, VmState::Running as i32, false)
             .await?;
+        self.state.lock().await.restart_calls += 1;
         Ok(Response::new(vm))
     }
 
@@ -571,6 +573,9 @@ impl PortProxy for MockPortProxy {
 #[derive(Default)]
 struct MockShellExecState {
     command_invocations: HashMap<String, usize>,
+    /// When set, the readiness probe (`/bin/sh -lc true`) is rejected so the guest
+    /// looks like it is running but its RPC sidecar never answers.
+    fail_readiness_probes: bool,
 }
 
 #[derive(Clone)]
@@ -605,6 +610,9 @@ impl ShellExec for MockShellExec {
                 .command_invocations
                 .entry(command.clone())
                 .or_insert(0) += 1;
+            if guard.fail_readiness_probes && command == "true" {
+                return Err(Status::unavailable("guest rpc sidecar not ready"));
+            }
         }
 
         let mut frames = vec![
@@ -773,6 +781,16 @@ impl TestHarness {
         }
         let _ = self.vmd_join.await;
         let _ = self.portproxy_join.await;
+    }
+}
+
+async fn start_ordered_harnesses() -> (TestHarness, TestHarness) {
+    let first = TestHarness::start().await;
+    let second = TestHarness::start().await;
+    if first.vmd_endpoint < second.vmd_endpoint {
+        (first, second)
+    } else {
+        (second, first)
     }
 }
 
@@ -1418,8 +1436,7 @@ async fn tier_b_eligibility_classifier_sets_metadata_policy() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tier_b_eligible_failover_requires_restore_snapshot_marker() {
-    let mut primary = TestHarness::start().await;
-    let secondary = TestHarness::start().await;
+    let (mut primary, secondary) = start_ordered_harnesses().await;
     wait_for_port_open(primary.portproxy_port as u16).await;
     wait_for_port_open(secondary.portproxy_port as u16).await;
 
@@ -1540,8 +1557,7 @@ async fn warm_pool_prewarms_profiles_by_architecture() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn continuity_rebinds_session_after_primary_vmd_loss() {
-    let mut primary = TestHarness::start().await;
-    let secondary = TestHarness::start().await;
+    let (mut primary, secondary) = start_ordered_harnesses().await;
     wait_for_port_open(primary.portproxy_port as u16).await;
     wait_for_port_open(secondary.portproxy_port as u16).await;
 
@@ -1655,8 +1671,7 @@ async fn continuity_rebinds_session_after_primary_vmd_loss() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn inflight_exec_rebinds_on_rpc_loss_and_runs_exactly_once() {
-    let mut primary = TestHarness::start().await;
-    let secondary = TestHarness::start().await;
+    let (mut primary, secondary) = start_ordered_harnesses().await;
     wait_for_port_open(primary.portproxy_port as u16).await;
     wait_for_port_open(secondary.portproxy_port as u16).await;
 
@@ -1810,4 +1825,166 @@ async fn forward_port_handle_releases_multiplexer_binding() {
     timeout(Duration::from_secs(3), harness.shutdown())
         .await
         .expect("mock harness shutdown timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_create_readiness_timeout_returns_not_ready_without_restart() {
+    let harness = TestHarness::start().await;
+    wait_for_port_open(harness.portproxy_port as u16).await;
+    harness.shell_exec_state.lock().await.fail_readiness_probes = true;
+
+    let sandbox = Sandbox::connect(harness.vmd_endpoint.clone(), sandbox_config())
+        .await
+        .expect("connect sandbox facade to mock vmd");
+
+    let err = match sandbox
+        .session(SessionOptions {
+            session_id: Some("session-not-ready".to_string()),
+            auto_start: true,
+            ..SessionOptions::default()
+        })
+        .await
+    {
+        Ok(_) => panic!("a guest that never answers must fail session creation"),
+        Err(err) => err,
+    };
+
+    match &err {
+        SandboxError::GuestRpcNotReady { vm_id, waited, .. } => {
+            assert_eq!(vm_id, "vm-1");
+            assert!(
+                *waited >= Duration::from_millis(700),
+                "waited should reflect the full readiness budget, got {waited:?}"
+            );
+        }
+        other => panic!("expected GuestRpcNotReady, got {other:?}"),
+    }
+    let guard = harness.vmd_state.lock().await;
+    assert_eq!(guard.restart_calls, 0, "fresh boot must never be restarted");
+    assert_eq!(guard.stop_calls, 0, "fresh boot must never be stopped");
+    let vm = guard.vms.get("vm-1").expect("vm should still exist");
+    assert_eq!(
+        vm.state,
+        VmState::Running as i32,
+        "the booting VM is left running for the caller"
+    );
+    drop(guard);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_sidecar_on_running_vm_restarts_once_and_recovers() {
+    let harness = TestHarness::start().await;
+    wait_for_port_open(harness.portproxy_port as u16).await;
+
+    // Establish a healthy session first so the VM exists and is Running.
+    let creator = Sandbox::connect(harness.vmd_endpoint.clone(), sandbox_config())
+        .await
+        .expect("connect creator facade");
+    let session = creator
+        .session(SessionOptions {
+            session_id: Some("session-stale-sidecar".to_string()),
+            auto_start: true,
+            ..SessionOptions::default()
+        })
+        .await
+        .expect("create healthy session");
+    let vm_id = session.vm_id().to_string();
+
+    // Now the sidecar goes stale: the guest is Running but probes fail until vmd
+    // performs a restart.
+    harness.shell_exec_state.lock().await.fail_readiness_probes = true;
+    let vmd_state = Arc::clone(&harness.vmd_state);
+    let shell_state = Arc::clone(&harness.shell_exec_state);
+    let repair = tokio::spawn(async move {
+        for _ in 0..400 {
+            if vmd_state.lock().await.restart_calls >= 1 {
+                shell_state.lock().await.fail_readiness_probes = false;
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!("restart never observed");
+    });
+
+    // A fresh facade has no cached readiness and must go through the probe.
+    let attacher = Sandbox::connect(harness.vmd_endpoint.clone(), sandbox_config())
+        .await
+        .expect("connect attaching facade");
+    let attached = attacher
+        .attach_session("session-stale-sidecar")
+        .await
+        .expect("attach should recover through exactly one bounded restart");
+    assert_eq!(attached.vm_id(), vm_id);
+    repair.await.expect("repair task");
+
+    let guard = harness.vmd_state.lock().await;
+    assert_eq!(
+        guard.restart_calls, 1,
+        "exactly one restart for a stale sidecar"
+    );
+    assert_eq!(
+        guard.start_calls, 0,
+        "attach must not issue StartVm for a Running VM"
+    );
+    drop(guard);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_sidecar_restart_failure_reports_original_cause() {
+    let harness = TestHarness::start().await;
+    wait_for_port_open(harness.portproxy_port as u16).await;
+
+    let creator = Sandbox::connect(harness.vmd_endpoint.clone(), sandbox_config())
+        .await
+        .expect("connect creator facade");
+    creator
+        .session(SessionOptions {
+            session_id: Some("session-stale-forever".to_string()),
+            auto_start: true,
+            ..SessionOptions::default()
+        })
+        .await
+        .expect("create healthy session");
+
+    // Probes fail before and after the restart.
+    harness.shell_exec_state.lock().await.fail_readiness_probes = true;
+
+    let attacher = Sandbox::connect(harness.vmd_endpoint.clone(), sandbox_config())
+        .await
+        .expect("connect attaching facade");
+    let err = match attacher.attach_session("session-stale-forever").await {
+        Ok(_) => panic!("attach must fail when the sidecar stays stale after a restart"),
+        Err(err) => err,
+    };
+    match &err {
+        SandboxError::GuestRpcNotReady {
+            vm_id,
+            restarted,
+            waited,
+            ..
+        } => {
+            assert_eq!(vm_id, "vm-1");
+            assert!(*restarted, "post-restart failure must be marked as such");
+            assert!(
+                *waited >= Duration::from_millis(1400),
+                "waited should accumulate both readiness budgets, got {waited:?}"
+            );
+        }
+        other => panic!("original readiness cause must be preserved, got {other:?}"),
+    }
+    assert!(
+        err.to_string()
+            .contains("still not ready after one bounded local restart"),
+        "message should say the restart happened: {err}"
+    );
+
+    let guard = harness.vmd_state.lock().await;
+    assert_eq!(guard.restart_calls, 1, "restart is bounded to one attempt");
+    drop(guard);
+
+    harness.shutdown().await;
 }

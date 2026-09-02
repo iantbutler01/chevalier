@@ -41,8 +41,8 @@ impl VmRuntime {
         let runtime_dir = qemu_runtime_dir_for_vm(vm_dir);
         Self {
             qmp_path: runtime_dir.join("qmp.sock"),
+            pid_path: runtime_dir.join("qemu.pid"),
             runtime_dir,
-            pid_path: vm_dir.join("qemu.pid"),
             state: VmState::Stopped,
             started_at: None,
             monitor: None,
@@ -112,6 +112,10 @@ mod tests {
         assert_eq!(
             runtime.qmp_path,
             PathBuf::from("/tmp/chevalier-vmd/e023ca02-7f6d-4dfc-8667-e2bda4e483fa/qmp.sock")
+        );
+        assert_eq!(
+            runtime.pid_path,
+            PathBuf::from("/tmp/chevalier-vmd/e023ca02-7f6d-4dfc-8667-e2bda4e483fa/qemu.pid")
         );
         assert!(runtime.qmp_path.to_string_lossy().len() < 108);
     }

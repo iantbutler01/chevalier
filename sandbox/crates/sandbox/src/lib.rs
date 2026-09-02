@@ -83,6 +83,12 @@ const DEFAULT_PORTPROXY_WRITE_FILE_RPC_TIMEOUT: Duration = Duration::from_secs(1
 /// contract.
 const VMD_DELETE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// A graceful restart is a guest shutdown (vmd waits up to its 180 s graceful-stop
+/// budget) followed by a fresh boot. The ordinary control-plane request timeout is a
+/// few seconds, so issuing `RestartVm` under it guarantees a client-side timeout that
+/// abandons the RPC mid-shutdown. Size the deadline to the lifecycle it covers.
+const VMD_RESTART_TIMEOUT: Duration = Duration::from_secs(240);
+
 const META_SESSION_ID: &str = "chevalier.session_id";
 const META_PARENT_SESSION_ID: &str = "chevalier.parent_session_id";
 const META_PARENT_VM_ID: &str = "chevalier.parent_vm_id";
@@ -162,6 +168,22 @@ pub enum SandboxError {
     SessionNotFound(String),
     #[error("daemon unavailable: {0}")]
     DaemonUnavailable(String),
+    /// The VM is running but its guest RPC sidecar (portproxy/shell exec) did not answer
+    /// within the readiness budget. `restarted == false` means the guest was created or
+    /// started by the current operation and is simply still booting: never a rebind
+    /// candidate and never masked by a restart. `restarted == true` means an
+    /// already-running VM stayed unready even after one bounded local restart, which
+    /// authorizes cross-node escalation while keeping this original cause attached.
+    #[error(
+        "guest RPC not ready for vm {vm_id} on {endpoint} after {waited:?}{}",
+        guest_rpc_restart_note(.restarted)
+    )]
+    GuestRpcNotReady {
+        vm_id: String,
+        endpoint: String,
+        waited: Duration,
+        restarted: bool,
+    },
     #[error("resource exhausted: {0}")]
     ResourceExhausted(String),
     #[error("ownership fence conflict: {0}")]
@@ -173,6 +195,14 @@ pub enum SandboxError {
 }
 
 pub type Result<T> = std::result::Result<T, SandboxError>;
+
+fn guest_rpc_restart_note(restarted: &bool) -> &'static str {
+    if *restarted {
+        " (still not ready after one bounded local restart)"
+    } else {
+        ""
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ResourceLimits {
@@ -964,6 +994,24 @@ pub struct Session {
     shared_mounts: Arc<Vec<SharedMount>>,
 }
 
+/// What the facade may do when a running VM misses its guest RPC readiness budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadinessRecovery {
+    /// The VM was created/started within the current operation: report the miss
+    /// verbatim and leave the boot in progress. Never restart.
+    FreshBoot,
+    /// The VM may have been running for a long time with a stale sidecar: allow one
+    /// bounded restart, but only if this call did not itself start/resume the VM.
+    RestartIfNotFreshlyStarted,
+}
+
+/// Result of [`Sandbox::ensure_vm_running_tracked`].
+struct EnsuredVm {
+    vm: Vm,
+    /// True when this call issued `StartVm`/`ResumeVm`; false when the VM was already running.
+    freshly_started: bool,
+}
+
 #[derive(Clone)]
 struct GuestRpcAccess {
     endpoint: String,
@@ -1176,7 +1224,7 @@ impl Session {
         self.invalidate_exec_transport_path(endpoint).await;
         let _ = self
             .sandbox
-            .restart_vm_on_endpoint(&self.vm_id, endpoint)
+            .restart_vm_on_endpoint(&self.vm_id, endpoint, "exec transport recovery")
             .await;
     }
 
@@ -3259,8 +3307,12 @@ impl Sandbox {
                     .await?;
             }
             let vm = self.ensure_vm_running(&vm.id, &node_endpoint).await?;
-            self.maybe_wait_for_session_guest_rpc(&vm.id, &node_endpoint)
-                .await?;
+            self.maybe_wait_for_session_guest_rpc(
+                &vm.id,
+                &node_endpoint,
+                ReadinessRecovery::RestartIfNotFreshlyStarted,
+            )
+            .await?;
             let next_fence = self
                 .bind_session_route(
                     &session_id,
@@ -3399,8 +3451,14 @@ impl Sandbox {
 
         let running_state = proto::vmd::v1::VmState::Running as i32;
         if auto_start || vm.state == running_state {
-            self.maybe_wait_for_session_guest_rpc(&vm.id, &node_endpoint)
-                .await?;
+            // @dive: This VM was created (and auto-started) by this very call. A missed
+            //        readiness budget here means "still booting", never "stale sidecar".
+            self.maybe_wait_for_session_guest_rpc(
+                &vm.id,
+                &node_endpoint,
+                ReadinessRecovery::FreshBoot,
+            )
+            .await?;
         }
 
         let session = Session {
@@ -3496,8 +3554,12 @@ impl Sandbox {
                 .await?;
         }
         let vm = self.ensure_vm_running(&vm.id, &node_endpoint).await?;
-        self.maybe_wait_for_session_guest_rpc(&vm.id, &node_endpoint)
-            .await?;
+        self.maybe_wait_for_session_guest_rpc(
+            &vm.id,
+            &node_endpoint,
+            ReadinessRecovery::RestartIfNotFreshlyStarted,
+        )
+        .await?;
         let next_fence = self
             .bind_session_route(
                 session_id,
@@ -5035,6 +5097,14 @@ impl Sandbox {
     }
 
     async fn ensure_vm_running(&self, vm_id: &str, endpoint: &str) -> Result<Vm> {
+        Ok(self.ensure_vm_running_tracked(vm_id, endpoint).await?.vm)
+    }
+
+    /// Like [`Self::ensure_vm_running`], but also reports whether this call had to
+    /// start or resume the VM. Readiness policy depends on that distinction: a VM
+    /// that was already running and stops answering has a stale sidecar, while a VM
+    /// we just booted is simply still booting.
+    async fn ensure_vm_running_tracked(&self, vm_id: &str, endpoint: &str) -> Result<EnsuredVm> {
         let mut client = self.vmd_client_for_endpoint(endpoint).await?;
         let mut vm = client
             .get_vm(self.request_with_auth(GetVmRequest {
@@ -5044,6 +5114,7 @@ impl Sandbox {
             .into_inner();
 
         let is_running = vm.state == proto::vmd::v1::VmState::Running as i32;
+        let mut freshly_started = false;
         if !is_running {
             self.invalidate_ready_vm_rpc(vm_id, endpoint).await;
             let action_request = self.request_with_auth(VmActionRequest {
@@ -5054,9 +5125,13 @@ impl Sandbox {
             } else {
                 client.start_vm(action_request).await?.into_inner()
             };
+            freshly_started = true;
         }
 
-        Ok(vm)
+        Ok(EnsuredVm {
+            vm,
+            freshly_started,
+        })
     }
 
     async fn invalidate_ready_vm_rpc(&self, vm_id: &str, endpoint: &str) {
@@ -5068,13 +5143,29 @@ impl Sandbox {
         channels.remove(&cache_key);
     }
 
-    async fn restart_vm_on_endpoint(&self, vm_id: &str, endpoint: &str) -> Result<()> {
-        let mut client = self.vmd_client_for_endpoint(endpoint).await?;
-        let _ = client
+    /// Gracefully restart a VM on its node. `reason` is the failure that motivated the
+    /// restart; it is carried into any restart error so the original cause is never
+    /// masked by the recovery attempt.
+    async fn restart_vm_on_endpoint(
+        &self,
+        vm_id: &str,
+        endpoint: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let mut client = self
+            .vmd_client_for_endpoint_with_timeout(endpoint, VMD_RESTART_TIMEOUT)
+            .await?;
+        if let Err(err) = client
             .restart_vm(self.request_with_auth(VmActionRequest {
                 vm_id: vm_id.to_string(),
             }))
-            .await?;
+            .await
+        {
+            self.invalidate_ready_vm_rpc(vm_id, endpoint).await;
+            return Err(SandboxError::DaemonUnavailable(format!(
+                "restart of vm {vm_id} on {endpoint} (triggered by: {reason}) failed: {err}"
+            )));
+        }
         self.invalidate_ready_vm_rpc(vm_id, endpoint).await;
         Ok(())
     }
@@ -5086,7 +5177,12 @@ impl Sandbox {
             .rpc_port)
     }
 
-    async fn maybe_wait_for_session_guest_rpc(&self, vm_id: &str, endpoint: &str) -> Result<()> {
+    async fn maybe_wait_for_session_guest_rpc(
+        &self,
+        vm_id: &str,
+        endpoint: &str,
+        recovery: ReadinessRecovery,
+    ) -> Result<()> {
         #[cfg(feature = "distributed-control")]
         if matches!(&self.inner.control_backend, ControlBackend::Distributed(_)) {
             // Distributed sessions are route-bound before guest RPC is required; exec/watch paths
@@ -5094,7 +5190,9 @@ impl Sandbox {
             return Ok(());
         }
 
-        let _ = self.ensure_vm_and_get_rpc_port(vm_id, endpoint).await?;
+        let _ = self
+            .ensure_vm_and_get_rpc_access_with(vm_id, endpoint, recovery)
+            .await?;
         Ok(())
     }
 
@@ -5103,25 +5201,86 @@ impl Sandbox {
         vm_id: &str,
         endpoint: &str,
     ) -> Result<GuestRpcAccess> {
+        self.ensure_vm_and_get_rpc_access_with(
+            vm_id,
+            endpoint,
+            ReadinessRecovery::RestartIfNotFreshlyStarted,
+        )
+        .await
+    }
+
+    async fn ensure_vm_and_get_rpc_access_with(
+        &self,
+        vm_id: &str,
+        endpoint: &str,
+        recovery: ReadinessRecovery,
+    ) -> Result<GuestRpcAccess> {
         if let Some(access) = self.cached_guest_rpc_access(vm_id, endpoint).await {
             return Ok(access);
         }
 
-        let mut vm = self.ensure_vm_running(vm_id, endpoint).await?;
-        let mut access = self.guest_rpc_access_from_vm(&vm, endpoint)?;
+        let EnsuredVm {
+            vm,
+            freshly_started,
+        } = self.ensure_vm_running_tracked(vm_id, endpoint).await?;
+        let access = self.guest_rpc_access_from_vm(&vm, endpoint)?;
+        let fresh_boot = freshly_started || recovery == ReadinessRecovery::FreshBoot;
 
         match self.ensure_portproxy_ready(vm_id, endpoint, &access).await {
             Ok(()) => Ok(access),
-            Err(err) if is_rebind_candidate_error(&err) => {
-                // @dive: VM runtime can survive daemon fail-stop while guest RPC sidecars are stale; force one clean local restart before cross-node escalation.
-                self.invalidate_ready_vm_rpc(vm_id, endpoint).await;
-                self.restart_vm_on_endpoint(vm_id, endpoint).await?;
-                vm = self.ensure_vm_running(vm_id, endpoint).await?;
-                access = self.guest_rpc_access_from_vm(&vm, endpoint)?;
-                self.ensure_portproxy_ready(vm_id, endpoint, &access)
-                    .await?;
-                Ok(access)
+            // @dive: A VM this operation just created, started, or resumed is still
+            //        booting; a missed readiness budget is reported as-is and the VM is
+            //        left running for the caller to decide. Restarting it here would only
+            //        mask the real cause and discard the boot in progress.
+            Err(err) if fresh_boot => Err(err),
+            // @dive: A VM that was already running can survive daemon fail-stop while its
+            //        guest RPC sidecars are stale; force exactly one bounded local restart
+            //        before cross-node escalation, keeping the original failure attached.
+            Err(err @ SandboxError::GuestRpcNotReady { .. }) => {
+                self.restart_stale_sidecar_and_wait(vm_id, endpoint, err)
+                    .await
             }
+            Err(err) if is_rebind_candidate_error(&err) => {
+                self.restart_stale_sidecar_and_wait(vm_id, endpoint, err)
+                    .await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn restart_stale_sidecar_and_wait(
+        &self,
+        vm_id: &str,
+        endpoint: &str,
+        cause: SandboxError,
+    ) -> Result<GuestRpcAccess> {
+        let reason = cause.to_string();
+        let already_waited = match &cause {
+            SandboxError::GuestRpcNotReady { waited, .. } => *waited,
+            _ => Duration::ZERO,
+        };
+        self.invalidate_ready_vm_rpc(vm_id, endpoint).await;
+        self.restart_vm_on_endpoint(vm_id, endpoint, &reason)
+            .await?;
+        let vm = self.ensure_vm_running(vm_id, endpoint).await?;
+        let access = self.guest_rpc_access_from_vm(&vm, endpoint)?;
+        match self.ensure_portproxy_ready(vm_id, endpoint, &access).await {
+            Ok(()) => Ok(access),
+            // @dive: The restart is the one local remedy. If the guest is still silent,
+            //        surface the same typed cause (total wait, restart noted) so exec/attach
+            //        callers can escalate cross-node exactly as they did before, without
+            //        the readiness failure being rewritten into a channel error.
+            Err(SandboxError::GuestRpcNotReady {
+                vm_id,
+                endpoint,
+                waited,
+                ..
+            }) => Err(SandboxError::GuestRpcNotReady {
+                vm_id,
+                endpoint,
+                waited: already_waited + waited,
+                restarted: true,
+            }),
             Err(err) => Err(err),
         }
     }
@@ -5192,10 +5351,12 @@ impl Sandbox {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
 
-        Err(SandboxError::DaemonUnavailable(format!(
-            "sandbox guest RPC did not become ready for vm {vm_id} on {}",
-            access.endpoint.as_str()
-        )))
+        Err(SandboxError::GuestRpcNotReady {
+            vm_id: vm_id.to_string(),
+            endpoint: access.endpoint.clone(),
+            waited: start.elapsed(),
+            restarted: false,
+        })
     }
 
     async fn portproxy_client_for_access(
@@ -5842,10 +6003,12 @@ fn is_rebind_candidate_error(err: &SandboxError) -> bool {
                 || message.contains("canceled")
                 || message.contains("connection refused")
         }
+        // A guest that is still booting is not a channel failure. A long-running guest
+        // that stayed silent through its one local restart may be escalated cross-node.
+        SandboxError::GuestRpcNotReady { restarted, .. } => *restarted,
         SandboxError::DaemonUnavailable(message) => {
             let lower = message.to_ascii_lowercase();
-            lower.contains("did not become ready")
-                || lower.contains("transport")
+            lower.contains("transport")
                 || lower.contains("connection reset")
                 || lower.contains("broken pipe")
                 || lower.contains("connection closed")
@@ -6120,5 +6283,64 @@ mod tests {
 
         sandbox.invalidate_ready_vm_rpc("vm-1", "node-1").await;
         assert!(sandbox.inner.portproxy_channels.lock().await.is_empty());
+    }
+
+    #[test]
+    fn guest_rpc_not_ready_is_never_a_rebind_candidate() {
+        let err = SandboxError::GuestRpcNotReady {
+            vm_id: "vm-1".to_string(),
+            endpoint: "http://127.0.0.1:1".to_string(),
+            waited: Duration::from_secs(240),
+            restarted: false,
+        };
+        assert!(!is_rebind_candidate_error(&err));
+        assert_eq!(
+            err.to_string(),
+            "guest RPC not ready for vm vm-1 on http://127.0.0.1:1 after 240s"
+        );
+        let escalate = SandboxError::GuestRpcNotReady {
+            vm_id: "vm-1".to_string(),
+            endpoint: "http://127.0.0.1:1".to_string(),
+            waited: Duration::from_secs(480),
+            restarted: true,
+        };
+        assert!(is_rebind_candidate_error(&escalate));
+        assert!(
+            escalate
+                .to_string()
+                .ends_with("after 480s (still not ready after one bounded local restart)")
+        );
+        // The legacy message form must not sneak back in through DaemonUnavailable either.
+        let legacy = SandboxError::DaemonUnavailable(
+            "sandbox guest RPC did not become ready for vm vm-1".to_string(),
+        );
+        assert!(!is_rebind_candidate_error(&legacy));
+    }
+
+    #[test]
+    fn channel_failures_remain_rebind_candidates() {
+        for message in [
+            "transport error",
+            "connection reset by peer",
+            "broken pipe",
+            "connection refused",
+        ] {
+            assert!(
+                is_rebind_candidate_error(&SandboxError::DaemonUnavailable(message.to_string())),
+                "{message} should authorize rebind"
+            );
+        }
+        assert!(is_rebind_candidate_error(&SandboxError::Grpc(
+            tonic::Status::unavailable("node down")
+        )));
+        assert!(is_rebind_candidate_error(&SandboxError::Grpc(
+            tonic::Status::cancelled("operation was canceled")
+        )));
+    }
+
+    #[test]
+    fn restart_deadline_covers_graceful_stop() {
+        // vmd waits up to 180 s for a graceful guest shutdown before it force-stops.
+        assert!(VMD_RESTART_TIMEOUT >= Duration::from_secs(180 + 30));
     }
 }
