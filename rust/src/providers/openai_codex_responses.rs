@@ -197,6 +197,7 @@ impl OpenAICodexResponsesClient {
         if let Some(ref prompt_cache_key) = self.prompt_cache_key {
             request["prompt_cache_key"] = serde_json::json!(prompt_cache_key);
         }
+
         if let Some(temperature) = config.temperature {
             request["temperature"] = serde_json::json!(temperature);
         }
