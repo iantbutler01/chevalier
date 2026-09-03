@@ -4568,7 +4568,7 @@ impl Manager {
                 image: reference.to_string(),
                 output: tmp_name.clone(),
                 disk_gb: BASE_IMAGE_SIZE_GB,
-                pull: true,
+                pull: !self.cfg.force_local_build,
                 platform: platform.map(ToString::to_string),
                 include_bootstrap: true,
             };
