@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 #[cfg(feature = "distributed-control")]
 mod distributed;
+mod freestyle;
 mod opencomputer;
 pub mod slo;
 pub mod vfs;
@@ -242,6 +243,117 @@ pub enum SandboxProviderConfig {
     #[default]
     Chevalier,
     OpenComputer(OpenComputerBackendConfig),
+    Freestyle(FreestyleBackendConfig),
+}
+
+impl SandboxProviderConfig {
+    /// Stable lowercase provider name for logs, metrics, and callers that persist it.
+    pub fn provider_name(&self) -> &'static str {
+        match self {
+            Self::Chevalier => "chevalier",
+            Self::OpenComputer(_) => "opencomputer",
+            Self::Freestyle(_) => "freestyle",
+        }
+    }
+}
+
+/// Freestyle (freestyle.sh) provider settings. Sessions are full Linux VMs booted
+/// from `snapshot_id`; the facade talks to `api_url` with `api_key` and never to the
+/// guest directly, so no host-side daemon, KVM, or FUSE cooperation is needed.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct FreestyleBackendConfig {
+    pub api_url: String,
+    pub api_key: String,
+    /// Snapshot id, your slug, or a public `{owner}/{slug}`; empty means the platform default.
+    pub snapshot_id: String,
+    /// Suffix for preview hostnames; `style.dev` names are claimed on first use.
+    pub preview_domain_suffix: String,
+    /// A `POST /v5/tls/forward-auth` configuration id to attach to every preview rule.
+    pub forward_auth_id: Option<String>,
+    /// Pause after this many seconds without network activity; `None` never pauses.
+    pub idle_timeout_secs: Option<u64>,
+    /// Delete a VM once it has sat stopped/paused this long; `None` keeps it. Never 0 for
+    /// sessions: Freestyle refuses to pause an ephemeral VM, so idle pause would fail.
+    pub auto_delete_secs: Option<u64>,
+    /// Delete checkpoints nobody has booted for this long; `None` keeps them.
+    pub snapshot_auto_delete_secs: Option<u64>,
+    /// Guest user for exec and shells; `None` is the image default (uid 1000, else root).
+    pub linux_user: Option<String>,
+    pub egress_allowlist: Option<Vec<String>>,
+    /// Shared-mount launch templates keyed by mount tag, guest path, or backend profile.
+    pub shared_mounts: HashMap<String, ManagedMountConfig>,
+}
+
+impl Default for FreestyleBackendConfig {
+    fn default() -> Self {
+        Self {
+            api_url: "https://api.freestyle.sh".to_string(),
+            api_key: String::new(),
+            snapshot_id: String::new(),
+            preview_domain_suffix: "style.dev".to_string(),
+            forward_auth_id: None,
+            idle_timeout_secs: None,
+            auto_delete_secs: None,
+            snapshot_auto_delete_secs: None,
+            linux_user: None,
+            egress_allowlist: None,
+            shared_mounts: HashMap::new(),
+        }
+    }
+}
+
+impl FreestyleBackendConfig {
+    pub fn from_env() -> Result<Self> {
+        fn optional_secs(name: &str) -> Result<Option<u64>> {
+            match std::env::var(name) {
+                Ok(value) if !value.trim().is_empty() => {
+                    value.trim().parse().map(Some).map_err(|err| {
+                        SandboxError::InvalidConfig(format!("invalid {name}: {err}"))
+                    })
+                }
+                _ => Ok(None),
+            }
+        }
+        let mut cfg = Self {
+            api_url: std::env::var("FREESTYLE_API_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "https://api.freestyle.sh".to_string()),
+            api_key: std::env::var("FREESTYLE_API_KEY").unwrap_or_default(),
+            ..Self::default()
+        };
+        if let Ok(snapshot_id) = std::env::var("FREESTYLE_SNAPSHOT_ID") {
+            cfg.snapshot_id = snapshot_id;
+        }
+        if let Ok(suffix) = std::env::var("FREESTYLE_PREVIEW_DOMAIN_SUFFIX")
+            && !suffix.trim().is_empty()
+        {
+            cfg.preview_domain_suffix = suffix;
+        }
+        cfg.forward_auth_id = std::env::var("FREESTYLE_FORWARD_AUTH_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        cfg.linux_user = std::env::var("FREESTYLE_LINUX_USER")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        cfg.idle_timeout_secs = optional_secs("FREESTYLE_IDLE_TIMEOUT_SECS")?;
+        cfg.auto_delete_secs = optional_secs("FREESTYLE_AUTO_DELETE_SECS")?;
+        cfg.snapshot_auto_delete_secs = optional_secs("FREESTYLE_SNAPSHOT_AUTO_DELETE_SECS")?;
+        if let Ok(shared_mounts_json) = std::env::var("FREESTYLE_SHARED_MOUNTS_JSON") {
+            cfg.shared_mounts = serde_json::from_str(&shared_mounts_json).map_err(|err| {
+                SandboxError::InvalidConfig(format!("invalid FREESTYLE_SHARED_MOUNTS_JSON: {err}"))
+            })?;
+        }
+        if let Ok(egress_allowlist_json) = std::env::var("FREESTYLE_EGRESS_ALLOWLIST_JSON") {
+            cfg.egress_allowlist =
+                Some(serde_json::from_str(&egress_allowlist_json).map_err(|err| {
+                    SandboxError::InvalidConfig(format!(
+                        "invalid FREESTYLE_EGRESS_ALLOWLIST_JSON: {err}"
+                    ))
+                })?);
+        }
+        Ok(cfg)
+    }
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -257,12 +369,15 @@ pub struct OpenComputerBackendConfig {
     pub burst: Option<bool>,
     pub secret_store: Option<String>,
     pub egress_allowlist: Option<Vec<String>>,
-    pub mounts: Vec<OpenComputerMountConfig>,
-    pub shared_mounts: HashMap<String, OpenComputerMountConfig>,
+    pub mounts: Vec<ManagedMountConfig>,
+    pub shared_mounts: HashMap<String, ManagedMountConfig>,
 }
 
+/// A mount inside a provider-managed sandbox. OpenComputer accepts every field
+/// (rclone remotes or a `command` driver); Freestyle honors only the `command`
+/// shape (`path`, `command`, `env`, `secrets`, `read_only`).
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
-pub struct OpenComputerMountConfig {
+pub struct ManagedMountConfig {
     #[serde(default)]
     pub path: String,
     #[serde(default)]
@@ -284,6 +399,9 @@ pub struct OpenComputerMountConfig {
     pub mount_options: Vec<String>,
 }
 
+pub type OpenComputerMountConfig = ManagedMountConfig;
+pub type FreestyleMountConfig = ManagedMountConfig;
+
 impl Default for OpenComputerBackendConfig {
     fn default() -> Self {
         Self {
@@ -304,7 +422,7 @@ impl Default for OpenComputerBackendConfig {
     }
 }
 
-impl OpenComputerMountConfig {
+impl ManagedMountConfig {
     pub fn rclone(
         path: impl Into<String>,
         remote: impl Into<String>,
@@ -974,14 +1092,305 @@ struct SandboxInner {
     portproxy_channels: Mutex<HashMap<String, Arc<PortproxyChannelEntry>>>,
     node_multiplexers: Mutex<HashMap<String, Arc<NodePortMultiplexer>>>,
     warm_pool_ready: Mutex<HashSet<String>>,
-    opencomputer_session_aliases: Mutex<HashMap<String, String>>,
+    managed_session_aliases: Mutex<HashMap<String, String>>,
 }
 
 enum ControlBackend {
     Direct,
-    OpenComputer(opencomputer::OpenComputerControl),
+    /// A provider that owns the whole VM lifecycle behind an HTTP API (OpenComputer, Freestyle).
+    Managed(ManagedControl),
     #[cfg(feature = "distributed-control")]
     Distributed(distributed::DistributedControlPlane),
+}
+
+/// A sandbox as a provider-managed backend reports it right after create/get.
+#[derive(Clone, Debug)]
+pub(crate) struct ManagedSandbox {
+    pub id: String,
+}
+
+/// The provider-managed backends behind one method set. Every `Session`/`Sandbox`
+/// branch for these providers goes through here, so adding a backend means adding
+/// a variant and an arm per method, never another branch at a call site.
+#[derive(Clone)]
+enum ManagedControl {
+    OpenComputer(opencomputer::OpenComputerControl),
+    Freestyle(freestyle::FreestyleControl),
+}
+
+impl ManagedControl {
+    fn provider_name(&self) -> &'static str {
+        match self {
+            Self::OpenComputer(_) => "opencomputer",
+            Self::Freestyle(_) => "freestyle",
+        }
+    }
+
+    fn api_url(&self) -> &str {
+        match self {
+            Self::OpenComputer(control) => control.api_url(),
+            Self::Freestyle(control) => control.api_url(),
+        }
+    }
+
+    async fn create_sandbox(
+        &self,
+        image: Option<String>,
+        resources: Option<ResourceLimits>,
+        metadata: HashMap<String, String>,
+        egress_allowlist: Option<Vec<String>>,
+        shared_mounts: &[SharedMount],
+    ) -> Result<ManagedSandbox> {
+        match self {
+            Self::OpenComputer(control) => control
+                .create_sandbox(
+                    image,
+                    resources,
+                    metadata,
+                    None,
+                    egress_allowlist,
+                    shared_mounts,
+                )
+                .await
+                .map(|sandbox| ManagedSandbox {
+                    id: sandbox.sandbox_id,
+                }),
+            Self::Freestyle(control) => control
+                .create_sandbox(image, resources, metadata, egress_allowlist, shared_mounts)
+                .await
+                .map(|vm| ManagedSandbox { id: vm.id }),
+        }
+    }
+
+    async fn get_sandbox(&self, sandbox_id: &str) -> Result<ManagedSandbox> {
+        match self {
+            Self::OpenComputer(control) => {
+                control
+                    .get_sandbox(sandbox_id)
+                    .await
+                    .map(|sandbox| ManagedSandbox {
+                        id: sandbox.sandbox_id,
+                    })
+            }
+            Self::Freestyle(control) => control
+                .get_sandbox(sandbox_id)
+                .await
+                .map(|vm| ManagedSandbox { id: vm.id }),
+        }
+    }
+
+    /// Look a sandbox up by the logical session id stamped in its metadata.
+    async fn find_by_session_id(&self, session_id: &str) -> Result<Option<ManagedSandbox>> {
+        match self {
+            Self::OpenComputer(_) => Ok(None),
+            Self::Freestyle(control) => Ok(control
+                .find_by_session_id(session_id)
+                .await?
+                .map(|vm| ManagedSandbox { id: vm.id })),
+        }
+    }
+
+    /// Bring a paused or stopped sandbox back before it is handed out as attached.
+    async fn ensure_running(&self, sandbox_id: &str) -> Result<()> {
+        match self {
+            Self::OpenComputer(_) => Ok(()),
+            Self::Freestyle(control) => control.ensure_running(sandbox_id).await,
+        }
+    }
+
+    async fn ensure_configured_mounts(
+        &self,
+        sandbox_id: &str,
+        shared_mounts: &[SharedMount],
+    ) -> Result<()> {
+        match self {
+            Self::OpenComputer(control) => {
+                control
+                    .ensure_configured_mounts(sandbox_id, shared_mounts)
+                    .await
+            }
+            Self::Freestyle(control) => {
+                control
+                    .ensure_configured_mounts(sandbox_id, shared_mounts)
+                    .await
+            }
+        }
+    }
+
+    async fn delete_sandbox(&self, sandbox_id: &str) -> Result<()> {
+        match self {
+            Self::OpenComputer(control) => control.delete_sandbox(sandbox_id).await,
+            Self::Freestyle(control) => control.delete_sandbox(sandbox_id).await,
+        }
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
+        match self {
+            Self::OpenComputer(control) => control.list_sessions().await,
+            Self::Freestyle(control) => control.list_sessions().await,
+        }
+    }
+
+    async fn read_file(&self, sandbox_id: &str, path: &str) -> Result<Vec<u8>> {
+        match self {
+            Self::OpenComputer(control) => control.read_file(sandbox_id, path).await,
+            Self::Freestyle(control) => control.read_file(sandbox_id, path).await,
+        }
+    }
+
+    async fn write_file(&self, sandbox_id: &str, path: &str, data: Vec<u8>) -> Result<()> {
+        match self {
+            Self::OpenComputer(control) => control.write_file(sandbox_id, path, data).await,
+            Self::Freestyle(control) => control.write_file(sandbox_id, path, data).await,
+        }
+    }
+
+    async fn list_dir(
+        &self,
+        sandbox_id: &str,
+        path: &str,
+    ) -> Result<Vec<proto::bracket::portproxy::v1::DirectoryEntry>> {
+        match self {
+            Self::OpenComputer(control) => control.list_dir(sandbox_id, path).await,
+            Self::Freestyle(control) => control.list_dir(sandbox_id, path).await,
+        }
+    }
+
+    async fn delete_path(&self, sandbox_id: &str, path: &str) -> Result<()> {
+        match self {
+            Self::OpenComputer(control) => control.delete_path(sandbox_id, path).await,
+            Self::Freestyle(control) => control.delete_path(sandbox_id, path).await,
+        }
+    }
+
+    async fn exec(&self, sandbox_id: &str, command: &str, opts: ExecOptions) -> Result<ExecHandle> {
+        match self {
+            Self::OpenComputer(control) => control.exec(sandbox_id, command, opts).await,
+            Self::Freestyle(control) => control.exec(sandbox_id, command, opts).await,
+        }
+    }
+
+    async fn shell(&self, sandbox_id: &str, opts: ShellOptions) -> Result<ShellHandle> {
+        match self {
+            Self::OpenComputer(control) => control.shell(sandbox_id, opts).await,
+            Self::Freestyle(control) => control.shell(sandbox_id, opts).await,
+        }
+    }
+
+    async fn create_checkpoint(&self, sandbox_id: &str, name: &str) -> Result<String> {
+        match self {
+            Self::OpenComputer(control) => control
+                .create_checkpoint(sandbox_id, name)
+                .await
+                .map(|c| c.id),
+            Self::Freestyle(control) => control
+                .create_checkpoint(sandbox_id, name)
+                .await
+                .map(|c| c.id),
+        }
+    }
+
+    async fn delete_checkpoint(&self, checkpoint_id: &str) -> Result<()> {
+        match self {
+            Self::OpenComputer(_) => Err(SandboxError::Unsupported(
+                "delete_snapshot is not available for OpenComputer sandboxes".to_string(),
+            )),
+            Self::Freestyle(control) => control.delete_checkpoint(checkpoint_id).await,
+        }
+    }
+
+    async fn create_from_checkpoint(
+        &self,
+        checkpoint_id: &str,
+        metadata: HashMap<String, String>,
+        egress_allowlist: Option<Vec<String>>,
+        shared_mounts: &[SharedMount],
+    ) -> Result<ManagedSandbox> {
+        match self {
+            Self::OpenComputer(control) => control
+                .create_from_checkpoint(
+                    checkpoint_id,
+                    metadata,
+                    None,
+                    egress_allowlist,
+                    shared_mounts,
+                )
+                .await
+                .map(|sandbox| ManagedSandbox {
+                    id: sandbox.sandbox_id,
+                }),
+            Self::Freestyle(control) => control
+                .create_from_checkpoint(checkpoint_id, metadata, egress_allowlist, shared_mounts)
+                .await
+                .map(|vm| ManagedSandbox { id: vm.id }),
+        }
+    }
+
+    async fn fork(
+        &self,
+        sandbox: Sandbox,
+        parent: &Session,
+        opts: ForkOptions,
+    ) -> Result<ForkResult> {
+        match self {
+            Self::OpenComputer(control) => control.fork(sandbox, parent, opts).await,
+            Self::Freestyle(control) => control.fork(sandbox, parent, opts).await,
+        }
+    }
+
+    /// Public HTTPS URL for a guest port, created on demand where the provider needs a rule.
+    async fn preview_url(&self, sandbox_id: &str, guest_port: u16) -> Result<String> {
+        match self {
+            Self::OpenComputer(control) => {
+                let sandbox = control.get_sandbox(sandbox_id).await?;
+                let preview = sandbox.preview_domain(guest_port).ok_or_else(|| {
+                    SandboxError::Unsupported(
+                        "OpenComputer did not return a preview domain for this sandbox".to_string(),
+                    )
+                })?;
+                Ok(format!("https://{preview}"))
+            }
+            Self::Freestyle(control) => control.preview_url(sandbox_id, guest_port).await,
+        }
+    }
+
+    async fn state(&self, sandbox_id: &str) -> Result<i32> {
+        match self {
+            Self::OpenComputer(control) => {
+                control.get_sandbox(sandbox_id).await?;
+                Ok(proto::vmd::v1::VmState::Running as i32)
+            }
+            Self::Freestyle(control) => Ok(control
+                .get_sandbox(sandbox_id)
+                .await?
+                .state
+                .as_proto_state()),
+        }
+    }
+
+    async fn vm_action(&self, sandbox_id: &str, action: SessionVmAction) -> Result<i32> {
+        match self {
+            Self::OpenComputer(_) => Err(SandboxError::Unsupported(format!(
+                "{action:?} is not available for OpenComputer sandboxes"
+            ))),
+            Self::Freestyle(control) => {
+                let action = match action {
+                    SessionVmAction::Start | SessionVmAction::Resume => {
+                        freestyle::FreestyleVmAction::Start
+                    }
+                    SessionVmAction::Pause => freestyle::FreestyleVmAction::Pause,
+                    SessionVmAction::Stop => freestyle::FreestyleVmAction::Stop,
+                    SessionVmAction::Restart => {
+                        control
+                            .vm_action(sandbox_id, freestyle::FreestyleVmAction::Stop)
+                            .await?;
+                        freestyle::FreestyleVmAction::Start
+                    }
+                };
+                control.vm_action(sandbox_id, action).await
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1119,7 +1528,7 @@ impl Session {
     pub async fn resolved_endpoint(&self) -> Result<String> {
         if matches!(
             &self.sandbox.inner.control_backend,
-            ControlBackend::OpenComputer(_)
+            ControlBackend::Managed(_)
         ) {
             return Ok(self.current_node_endpoint().await);
         }
@@ -1229,7 +1638,7 @@ impl Session {
     }
 
     pub async fn exec(&self, command: &str, opts: ExecOptions) -> Result<ExecHandle> {
-        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+        if let ControlBackend::Managed(control) = &self.sandbox.inner.control_backend {
             return control.exec(&self.vm_id, command, opts).await;
         }
 
@@ -2086,7 +2495,7 @@ impl Session {
     }
 
     pub async fn shell(&self, opts: ShellOptions) -> Result<ShellHandle> {
-        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+        if let ControlBackend::Managed(control) = &self.sandbox.inner.control_backend {
             return control.shell(&self.vm_id, opts).await;
         }
 
@@ -2210,7 +2619,7 @@ impl Session {
     }
 
     pub async fn read_file(&self, path: &str) -> Result<Vec<u8>> {
-        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+        if let ControlBackend::Managed(control) = &self.sandbox.inner.control_backend {
             return control.read_file(&self.vm_id, path).await;
         }
 
@@ -2233,7 +2642,7 @@ impl Session {
     }
 
     pub async fn write_file(&self, path: &str, data: Vec<u8>) -> Result<()> {
-        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+        if let ControlBackend::Managed(control) = &self.sandbox.inner.control_backend {
             return control.write_file(&self.vm_id, path, data).await;
         }
 
@@ -2266,7 +2675,7 @@ impl Session {
         source_path: &str,
         mode: Option<u32>,
     ) -> Result<()> {
-        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+        if let ControlBackend::Managed(control) = &self.sandbox.inner.control_backend {
             let data = tokio::fs::read(source_path).await?;
             return control.write_file(&self.vm_id, path, data).await;
         }
@@ -2475,7 +2884,7 @@ impl Session {
         &self,
         path: &str,
     ) -> Result<Vec<proto::bracket::portproxy::v1::DirectoryEntry>> {
-        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+        if let ControlBackend::Managed(control) = &self.sandbox.inner.control_backend {
             return control.list_dir(&self.vm_id, path).await;
         }
 
@@ -2498,7 +2907,7 @@ impl Session {
     }
 
     pub async fn delete_path(&self, path: &str) -> Result<()> {
-        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+        if let ControlBackend::Managed(control) = &self.sandbox.inner.control_backend {
             return control.delete_path(&self.vm_id, path).await;
         }
 
@@ -2520,15 +2929,11 @@ impl Session {
     }
 
     pub async fn forward_port(&self, guest_port: u16) -> Result<ForwardHandle> {
-        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
-            let sandbox = control.get_sandbox(&self.vm_id).await?;
-            let preview = sandbox.preview_domain(guest_port).ok_or_else(|| {
-                SandboxError::Unsupported(
-                    "OpenComputer did not return a preview domain for this sandbox".to_string(),
-                )
-            })?;
+        if let ControlBackend::Managed(control) = &self.sandbox.inner.control_backend {
+            let preview = control.preview_url(&self.vm_id, guest_port).await?;
             return Err(SandboxError::Unsupported(format!(
-                "OpenComputer exposes guest port {guest_port} at https://{preview}; the current ForwardHandle API returns local host ports only"
+                "{} exposes guest port {guest_port} at {preview}; the current ForwardHandle API returns local host ports only",
+                control.provider_name()
             )));
         }
 
@@ -2623,14 +3028,8 @@ impl Session {
     }
 
     pub async fn provider_preview_url(&self, guest_port: u16) -> Result<String> {
-        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
-            let sandbox = control.get_sandbox(&self.vm_id).await?;
-            let preview = sandbox.preview_domain(guest_port).ok_or_else(|| {
-                SandboxError::Unsupported(
-                    "OpenComputer did not return a preview domain for this sandbox".to_string(),
-                )
-            })?;
-            return Ok(format!("https://{preview}"));
+        if let ControlBackend::Managed(control) = &self.sandbox.inner.control_backend {
+            return control.preview_url(&self.vm_id, guest_port).await;
         }
 
         Err(SandboxError::Unsupported(
@@ -2639,9 +3038,8 @@ impl Session {
     }
 
     pub async fn state(&self) -> Result<i32> {
-        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
-            control.get_sandbox(&self.vm_id).await?;
-            return Ok(proto::vmd::v1::VmState::Running as i32);
+        if let ControlBackend::Managed(control) = &self.sandbox.inner.control_backend {
+            return control.state(&self.vm_id).await;
         }
 
         let node_endpoint = self.current_node_endpoint().await;
@@ -2658,7 +3056,7 @@ impl Session {
     pub async fn update_resources(&self, vcpu: Option<i32>, memory_mb: Option<i32>) -> Result<i32> {
         if matches!(
             &self.sandbox.inner.control_backend,
-            ControlBackend::OpenComputer(_)
+            ControlBackend::Managed(_)
         ) {
             return Err(SandboxError::Unsupported(
                 "resource updates are only available for vmd-backed sandboxes".to_string(),
@@ -2698,7 +3096,7 @@ impl Session {
     pub async fn reconfigure_shared_mounts(&self, shared_mounts: Vec<SharedMount>) -> Result<i32> {
         if matches!(
             &self.sandbox.inner.control_backend,
-            ControlBackend::OpenComputer(_)
+            ControlBackend::Managed(_)
         ) {
             return Err(SandboxError::Unsupported(
                 "shared mount reconfiguration is only available for vmd-backed sandboxes"
@@ -2755,7 +3153,7 @@ impl Session {
     pub async fn list_pci_devices(&self) -> Result<HostPciInventory> {
         if matches!(
             &self.sandbox.inner.control_backend,
-            ControlBackend::OpenComputer(_)
+            ControlBackend::Managed(_)
         ) {
             return Err(SandboxError::Unsupported(
                 "PCI assignment is only available for vmd-backed sandboxes".to_string(),
@@ -2768,7 +3166,7 @@ impl Session {
     pub async fn attach_pci_device(&self, device_id: &str) -> Result<PciDeviceAction> {
         if matches!(
             &self.sandbox.inner.control_backend,
-            ControlBackend::OpenComputer(_)
+            ControlBackend::Managed(_)
         ) {
             return Err(SandboxError::Unsupported(
                 "PCI assignment is only available for vmd-backed sandboxes".to_string(),
@@ -2789,7 +3187,7 @@ impl Session {
     pub async fn detach_pci_device(&self, device_id: &str) -> Result<PciDeviceAction> {
         if matches!(
             &self.sandbox.inner.control_backend,
-            ControlBackend::OpenComputer(_)
+            ControlBackend::Managed(_)
         ) {
             return Err(SandboxError::Unsupported(
                 "PCI assignment is only available for vmd-backed sandboxes".to_string(),
@@ -2808,13 +3206,8 @@ impl Session {
     }
 
     async fn vm_action(&self, action: SessionVmAction) -> Result<i32> {
-        if matches!(
-            &self.sandbox.inner.control_backend,
-            ControlBackend::OpenComputer(_)
-        ) {
-            return Err(SandboxError::Unsupported(format!(
-                "{action:?} is only available for vmd-backed sandboxes"
-            )));
+        if let ControlBackend::Managed(control) = &self.sandbox.inner.control_backend {
+            return control.vm_action(&self.vm_id, action).await;
         }
 
         let node_endpoint = self.current_node_endpoint().await;
@@ -2858,10 +3251,10 @@ impl Session {
     }
 
     pub async fn snapshot(&self, label: &str, description: &str) -> Result<SessionSnapshot> {
-        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
-            let checkpoint = control.create_checkpoint(&self.vm_id, label).await?;
+        if let ControlBackend::Managed(control) = &self.sandbox.inner.control_backend {
+            let checkpoint_id = control.create_checkpoint(&self.vm_id, label).await?;
             return Ok(SessionSnapshot {
-                id: checkpoint.id,
+                id: checkpoint_id,
                 name: String::new(),
                 label: label.to_string(),
                 description: description.to_string(),
@@ -2900,7 +3293,7 @@ impl Session {
     pub async fn list_snapshots(&self) -> Result<Vec<SessionSnapshot>> {
         if matches!(
             &self.sandbox.inner.control_backend,
-            ControlBackend::OpenComputer(_)
+            ControlBackend::Managed(_)
         ) {
             return Err(SandboxError::Unsupported(
                 "list_snapshots is only available for vmd-backed sandboxes".to_string(),
@@ -2930,7 +3323,7 @@ impl Session {
     pub async fn restore(&self, snapshot_id: &str) -> Result<i32> {
         if matches!(
             &self.sandbox.inner.control_backend,
-            ControlBackend::OpenComputer(_)
+            ControlBackend::Managed(_)
         ) {
             return Err(SandboxError::Unsupported(
                 "restore is only available for vmd-backed sandboxes; use restore_checkpoint for provider-managed sandboxes"
@@ -2954,13 +3347,8 @@ impl Session {
     }
 
     pub async fn delete_snapshot(&self, snapshot_id: &str) -> Result<()> {
-        if matches!(
-            &self.sandbox.inner.control_backend,
-            ControlBackend::OpenComputer(_)
-        ) {
-            return Err(SandboxError::Unsupported(
-                "delete_snapshot is only available for vmd-backed sandboxes".to_string(),
-            ));
+        if let ControlBackend::Managed(control) = &self.sandbox.inner.control_backend {
+            return control.delete_checkpoint(snapshot_id).await;
         }
 
         let node_endpoint = self.resolve_session_endpoint().await?;
@@ -2975,21 +3363,20 @@ impl Session {
     }
 
     pub async fn restore_checkpoint(&self, checkpoint_id: &str) -> Result<Session> {
-        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+        if let ControlBackend::Managed(control) = &self.sandbox.inner.control_backend {
             let child = control
                 .create_from_checkpoint(
                     checkpoint_id,
                     HashMap::new(),
                     None,
-                    None,
                     self.shared_mounts.as_slice(),
                 )
                 .await?;
-            let restored_session_id = child.sandbox_id.clone();
+            let restored_session_id = child.id.clone();
             return Ok(Session::new_with_backend(
                 self.sandbox.clone(),
                 restored_session_id,
-                child.sandbox_id,
+                child.id,
                 control.api_url().to_string(),
                 None,
                 self.shared_mounts.as_ref().clone(),
@@ -3002,7 +3389,7 @@ impl Session {
     }
 
     pub async fn fork(&self, opts: ForkOptions) -> Result<ForkResult> {
-        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+        if let ControlBackend::Managed(control) = &self.sandbox.inner.control_backend {
             return control.fork(self.sandbox.clone(), self, opts).await;
         }
 
@@ -3098,10 +3485,10 @@ impl Session {
     }
 
     pub async fn discard(self) -> Result<()> {
-        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+        if let ControlBackend::Managed(control) = &self.sandbox.inner.control_backend {
             control.delete_sandbox(&self.vm_id).await?;
             self.sandbox
-                .clear_opencomputer_session_aliases(&self.session_id, &self.vm_id)
+                .clear_managed_session_aliases(&self.session_id, &self.vm_id)
                 .await;
             return Ok(());
         }
@@ -3160,7 +3547,7 @@ impl Sandbox {
                 portproxy_channels: Mutex::new(HashMap::new()),
                 node_multiplexers: Mutex::new(HashMap::new()),
                 warm_pool_ready: Mutex::new(HashSet::new()),
-                opencomputer_session_aliases: Mutex::new(HashMap::new()),
+                managed_session_aliases: Mutex::new(HashMap::new()),
             }),
         };
 
@@ -3185,7 +3572,7 @@ impl Sandbox {
 
     pub async fn session(&self, opts: SessionOptions) -> Result<Session> {
         let started = Instant::now();
-        if let ControlBackend::OpenComputer(control) = &self.inner.control_backend {
+        if let ControlBackend::Managed(control) = &self.inner.control_backend {
             let requested_session_id = opts.session_id;
             let mut metadata = opts.metadata;
             metadata
@@ -3208,29 +3595,37 @@ impl Sandbox {
                 META_EXECUTION_FIDELITY_REQUIREMENT.to_string(),
                 "provider-managed".to_string(),
             );
+            if let Some(requested_session_id) = requested_session_id.as_deref() {
+                metadata.insert(
+                    META_SESSION_ID.to_string(),
+                    requested_session_id.to_string(),
+                );
+            }
             let sandbox = control
                 .create_sandbox(
                     opts.image,
                     opts.resources,
                     metadata,
-                    None,
                     opts.egress_allowlist,
                     opts.shared_mounts.as_slice(),
                 )
                 .await?;
-            let logical_session_id =
-                requested_session_id.unwrap_or_else(|| sandbox.sandbox_id.clone());
-            self.bind_opencomputer_session_alias(&logical_session_id, &sandbox.sandbox_id)
+            let logical_session_id = requested_session_id.unwrap_or_else(|| sandbox.id.clone());
+            self.bind_managed_session_alias(&logical_session_id, &sandbox.id)
                 .await;
             let session = Session::new_with_backend(
                 self.clone(),
                 logical_session_id,
-                sandbox.sandbox_id,
+                sandbox.id,
                 control.api_url().to_string(),
                 None,
                 opts.shared_mounts,
             );
-            log_slo_observation("session.create.opencomputer", started.elapsed(), "ok");
+            log_slo_observation(
+                &format!("session.create.{}", control.provider_name()),
+                started.elapsed(),
+                "ok",
+            );
             return Ok(session);
         }
 
@@ -3495,21 +3890,37 @@ impl Sandbox {
 
     pub async fn attach_session(&self, session_id: &str) -> Result<Session> {
         let started = Instant::now();
-        if let ControlBackend::OpenComputer(control) = &self.inner.control_backend {
-            let provider_session_id = self.opencomputer_provider_session_id(session_id).await;
-            let sandbox = control.get_sandbox(&provider_session_id).await?;
-            control
-                .ensure_configured_mounts(&sandbox.sandbox_id, &[])
-                .await?;
+        if let ControlBackend::Managed(control) = &self.inner.control_backend {
+            let provider_session_id = self.managed_provider_session_id(session_id).await;
+            // @dive: The alias map is per-process. After a restart the provider is asked
+            // for the VM that carries this logical session id in its metadata.
+            let sandbox = match control.get_sandbox(&provider_session_id).await {
+                Ok(sandbox) => sandbox,
+                Err(SandboxError::SessionNotFound(_)) if provider_session_id == session_id => {
+                    control
+                        .find_by_session_id(session_id)
+                        .await?
+                        .ok_or_else(|| SandboxError::SessionNotFound(session_id.to_string()))?
+                }
+                Err(error) => return Err(error),
+            };
+            self.bind_managed_session_alias(session_id, &sandbox.id)
+                .await;
+            control.ensure_running(&sandbox.id).await?;
+            control.ensure_configured_mounts(&sandbox.id, &[]).await?;
             let session = Session::new_with_backend(
                 self.clone(),
                 session_id.to_string(),
-                sandbox.sandbox_id,
+                sandbox.id,
                 control.api_url().to_string(),
                 None,
                 Vec::new(),
             );
-            log_slo_observation("session.attach.opencomputer", started.elapsed(), "ok");
+            log_slo_observation(
+                &format!("session.attach.{}", control.provider_name()),
+                started.elapsed(),
+                "ok",
+            );
             return Ok(session);
         }
 
@@ -3591,7 +4002,7 @@ impl Sandbox {
     /// start, or discard; ordinary `attach_session` retains its ready-to-execute contract.
     pub async fn attach_session_passive(&self, session_id: &str) -> Result<Session> {
         let started = Instant::now();
-        if matches!(&self.inner.control_backend, ControlBackend::OpenComputer(_)) {
+        if matches!(&self.inner.control_backend, ControlBackend::Managed(_)) {
             return self.attach_session(session_id).await;
         }
 
@@ -3635,10 +4046,10 @@ impl Sandbox {
     }
 
     pub async fn discard_session_by_id(&self, session_id: &str) -> Result<()> {
-        if let ControlBackend::OpenComputer(control) = &self.inner.control_backend {
-            let provider_session_id = self.opencomputer_provider_session_id(session_id).await;
+        if let ControlBackend::Managed(control) = &self.inner.control_backend {
+            let provider_session_id = self.managed_provider_session_id(session_id).await;
             control.delete_sandbox(&provider_session_id).await?;
-            self.clear_opencomputer_session_aliases(session_id, &provider_session_id)
+            self.clear_managed_session_aliases(session_id, &provider_session_id)
                 .await;
             return Ok(());
         }
@@ -3668,7 +4079,7 @@ impl Sandbox {
     }
 
     pub async fn list_host_pci_devices(&self) -> Result<HostPciInventory> {
-        if matches!(&self.inner.control_backend, ControlBackend::OpenComputer(_)) {
+        if matches!(&self.inner.control_backend, ControlBackend::Managed(_)) {
             return Err(SandboxError::Unsupported(
                 "PCI assignment is only available for vmd-backed sandboxes".to_string(),
             ));
@@ -3696,7 +4107,7 @@ impl Sandbox {
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
-        if let ControlBackend::OpenComputer(control) = &self.inner.control_backend {
+        if let ControlBackend::Managed(control) = &self.inner.control_backend {
             return control.list_sessions().await;
         }
 
@@ -3738,7 +4149,7 @@ impl Sandbox {
     }
 
     pub async fn list_durable_volumes(&self) -> Result<Vec<DurableVolumeInfo>> {
-        if matches!(&self.inner.control_backend, ControlBackend::OpenComputer(_)) {
+        if matches!(&self.inner.control_backend, ControlBackend::Managed(_)) {
             return Ok(Vec::new());
         }
         let mut volumes = HashMap::new();
@@ -3816,7 +4227,7 @@ impl Sandbox {
     }
 
     pub async fn delete_durable_volume(&self, owner_key: &str) -> Result<()> {
-        if matches!(&self.inner.control_backend, ControlBackend::OpenComputer(_)) {
+        if matches!(&self.inner.control_backend, ControlBackend::Managed(_)) {
             return Err(SandboxError::Unsupported(
                 "durable data volumes are only available for vmd-backed sandboxes".to_string(),
             ));
@@ -3865,7 +4276,7 @@ impl Sandbox {
         owner_key: &str,
         size_gb: i32,
     ) -> Result<DurableVolumeInfo> {
-        if matches!(&self.inner.control_backend, ControlBackend::OpenComputer(_)) {
+        if matches!(&self.inner.control_backend, ControlBackend::Managed(_)) {
             return Err(SandboxError::Unsupported(
                 "durable data volumes are only available for vmd-backed sandboxes".to_string(),
             ));
@@ -3926,10 +4337,18 @@ impl Sandbox {
     }
 
     async fn build_control_backend(config: &SandboxConfig) -> Result<ControlBackend> {
-        if let SandboxProviderConfig::OpenComputer(opencomputer_config) = &config.provider {
-            return Ok(ControlBackend::OpenComputer(
-                opencomputer::OpenComputerControl::new(opencomputer_config.clone())?,
-            ));
+        match &config.provider {
+            SandboxProviderConfig::OpenComputer(opencomputer_config) => {
+                return Ok(ControlBackend::Managed(ManagedControl::OpenComputer(
+                    opencomputer::OpenComputerControl::new(opencomputer_config.clone())?,
+                )));
+            }
+            SandboxProviderConfig::Freestyle(freestyle_config) => {
+                return Ok(ControlBackend::Managed(ManagedControl::Freestyle(
+                    freestyle::FreestyleControl::new(freestyle_config.clone())?,
+                )));
+            }
+            SandboxProviderConfig::Chevalier => {}
         }
 
         if let Some(dist_cfg) = config.distributed_control.clone() {
@@ -3952,20 +4371,20 @@ impl Sandbox {
         Ok(ControlBackend::Direct)
     }
 
-    async fn bind_opencomputer_session_alias(&self, logical_session_id: &str, provider_id: &str) {
+    async fn bind_managed_session_alias(&self, logical_session_id: &str, provider_id: &str) {
         if logical_session_id == provider_id {
             return;
         }
         self.inner
-            .opencomputer_session_aliases
+            .managed_session_aliases
             .lock()
             .await
             .insert(logical_session_id.to_string(), provider_id.to_string());
     }
 
-    async fn opencomputer_provider_session_id(&self, session_id: &str) -> String {
+    async fn managed_provider_session_id(&self, session_id: &str) -> String {
         self.inner
-            .opencomputer_session_aliases
+            .managed_session_aliases
             .lock()
             .await
             .get(session_id)
@@ -3973,12 +4392,8 @@ impl Sandbox {
             .unwrap_or_else(|| session_id.to_string())
     }
 
-    async fn clear_opencomputer_session_aliases(
-        &self,
-        logical_session_id: &str,
-        provider_id: &str,
-    ) {
-        let mut aliases = self.inner.opencomputer_session_aliases.lock().await;
+    async fn clear_managed_session_aliases(&self, logical_session_id: &str, provider_id: &str) {
+        let mut aliases = self.inner.managed_session_aliases.lock().await;
         aliases.remove(logical_session_id);
         aliases.retain(|_, mapped_provider_id| mapped_provider_id != provider_id);
     }
@@ -4020,7 +4435,7 @@ impl Sandbox {
 
     async fn ensure_daemon_ready(&self) -> Result<()> {
         match &self.inner.control_backend {
-            ControlBackend::OpenComputer(_) => Ok(()),
+            ControlBackend::Managed(_) => Ok(()),
             ControlBackend::Direct => {
                 let mut last_health_err: Option<String> = None;
                 for endpoint in self.candidate_endpoints().await? {
@@ -4077,7 +4492,7 @@ impl Sandbox {
     }
 
     async fn prewarm_warm_pool_profiles_with_mode(&self, force: bool) -> Result<()> {
-        if let ControlBackend::OpenComputer(_) = &self.inner.control_backend {
+        if let ControlBackend::Managed(_) = &self.inner.control_backend {
             return Ok(());
         }
 
@@ -5030,7 +5445,7 @@ impl Sandbox {
                     }
                 }
             }
-            ControlBackend::Direct | ControlBackend::OpenComputer(_) => {}
+            ControlBackend::Direct | ControlBackend::Managed(_) => {}
         }
 
         for endpoint in self.candidate_endpoints().await? {
@@ -5863,6 +6278,31 @@ fn default_mount_continuity(availability: &SharedMountAvailability) -> SharedMou
     }
 }
 
+/// Render the `{placeholder}` vocabulary shared by every provider-managed mount
+/// template. `mountpoint` is the already-resolved guest path (a template's own
+/// `path`, else the shared mount's `guest_path`); `None` leaves `{mountpoint}`
+/// for a provider that substitutes it on its side (OpenComputer does).
+pub(crate) fn render_shared_mount_template(
+    template: &str,
+    shared: &SharedMount,
+    mountpoint: Option<&str>,
+) -> String {
+    let template = match mountpoint {
+        Some(mountpoint) => template.replace("{mountpoint}", mountpoint),
+        None => template.to_string(),
+    };
+    template
+        .replace("{guest_path}", shared.guest_path.as_str())
+        .replace("{mount_tag}", shared.mount_tag.as_str())
+        .replace("{backend_profile}", shared.backend_profile.as_str())
+        .replace("{vfs_endpoint}", shared.vfs_endpoint.as_str())
+        .replace("{vfs_scope_path}", shared.vfs_scope_path.trim_matches('/'))
+        .replace(
+            "{read_only}",
+            if shared.read_only { "true" } else { "false" },
+        )
+}
+
 fn normalize_mount_backend_profile(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
@@ -6227,26 +6667,26 @@ mod tests {
                 portproxy_channels: Mutex::new(HashMap::new()),
                 node_multiplexers: Mutex::new(HashMap::new()),
                 warm_pool_ready: Mutex::new(HashSet::new()),
-                opencomputer_session_aliases: Mutex::new(HashMap::new()),
+                managed_session_aliases: Mutex::new(HashMap::new()),
             }),
         };
 
         sandbox
-            .bind_opencomputer_session_alias("requested-session", "provider-session")
+            .bind_managed_session_alias("requested-session", "provider-session")
             .await;
         assert_eq!(
             sandbox
-                .opencomputer_provider_session_id("requested-session")
+                .managed_provider_session_id("requested-session")
                 .await,
             "provider-session"
         );
 
         sandbox
-            .clear_opencomputer_session_aliases("requested-session", "provider-session")
+            .clear_managed_session_aliases("requested-session", "provider-session")
             .await;
         assert_eq!(
             sandbox
-                .opencomputer_provider_session_id("requested-session")
+                .managed_provider_session_id("requested-session")
                 .await,
             "requested-session"
         );
@@ -6266,7 +6706,7 @@ mod tests {
                 portproxy_channels: Mutex::new(HashMap::new()),
                 node_multiplexers: Mutex::new(HashMap::new()),
                 warm_pool_ready: Mutex::new(HashSet::new()),
-                opencomputer_session_aliases: Mutex::new(HashMap::new()),
+                managed_session_aliases: Mutex::new(HashMap::new()),
             }),
         };
 

@@ -886,46 +886,20 @@ impl AddMountBody {
 }
 
 fn render_shared_mount_config(config: &mut OpenComputerMountConfig, shared: &SharedMount) {
-    config.path = render_shared_mount_template(&config.path, shared);
-    config.remote = render_shared_mount_template(&config.remote, shared);
-    config.command = config
-        .command
-        .iter()
-        .map(|value| render_shared_mount_template(value, shared))
-        .collect();
+    let render = |value: &str| crate::render_shared_mount_template(value, shared, None);
+    config.path = render(&config.path);
+    config.remote = render(&config.remote);
+    config.command = config.command.iter().map(|value| render(value)).collect();
     config.env = config
         .env
         .iter()
-        .map(|(key, value)| {
-            (
-                render_shared_mount_template(key, shared),
-                render_shared_mount_template(value, shared),
-            )
-        })
+        .map(|(key, value)| (render(key), render(value)))
         .collect();
     config.secrets = config
         .secrets
         .iter()
-        .map(|(key, value)| {
-            (
-                render_shared_mount_template(key, shared),
-                render_shared_mount_template(value, shared),
-            )
-        })
+        .map(|(key, value)| (render(key), render(value)))
         .collect();
-}
-
-fn render_shared_mount_template(template: &str, shared: &SharedMount) -> String {
-    template
-        .replace("{guest_path}", shared.guest_path.as_str())
-        .replace("{mount_tag}", shared.mount_tag.as_str())
-        .replace("{backend_profile}", shared.backend_profile.as_str())
-        .replace("{vfs_endpoint}", shared.vfs_endpoint.as_str())
-        .replace("{vfs_scope_path}", shared.vfs_scope_path.trim_matches('/'))
-        .replace(
-            "{read_only}",
-            if shared.read_only { "true" } else { "false" },
-        )
 }
 
 #[derive(Serialize)]
