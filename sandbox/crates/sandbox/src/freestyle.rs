@@ -40,6 +40,9 @@ const MOUNT_UNIT_PATH: &str = "/etc/systemd/system/chevalier-mounts.service";
 const MOUNT_UNIT: &str = "[Unit]\nDescription=Chevalier shared mounts\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/sh /etc/chevalier/mounts.sh\n\n[Install]\nWantedBy=multi-user.target\n";
 /// Freestyle caps `exec-await` at five minutes of wall clock.
 const EXEC_AWAIT_MAX_MS: u64 = 300_000;
+/// Guest administration (units, mounts, poweroff) always runs as root regardless of
+/// the session user.
+const ROOT_USER: &str = "root";
 const EXEC_AWAIT_DEFAULT_MS: u64 = 30_000;
 
 #[derive(Clone)]
@@ -155,10 +158,17 @@ impl FreestyleControl {
             .send(self.client.post(self.url("/v5/vms")).json(&body))
             .await?;
         let vm: FreestyleVm = decode_json(response, "create vm").await?;
-        if let Some(resources) = resources {
-            self.resize(&vm.id, &resources).await?;
+        let bootstrap = async {
+            if let Some(resources) = resources {
+                self.resize(&vm.id, &resources).await?;
+            }
+            self.ensure_configured_mounts(&vm.id, shared_mounts).await
+        };
+        if let Err(error) = bootstrap.await {
+            // Never leave a half-configured VM behind: the caller has no id to reap it by.
+            let _ = self.delete_sandbox(&vm.id).await;
+            return Err(error);
         }
-        self.ensure_configured_mounts(&vm.id, shared_mounts).await?;
         Ok(vm)
     }
 
@@ -207,6 +217,7 @@ impl FreestyleControl {
                         None,
                         Some(15_000),
                         None,
+                        Some(ROOT_USER),
                     )
                     .await;
                 self.get_sandbox(vm_id).await?
@@ -382,6 +393,7 @@ impl FreestyleControl {
                 (!opts.env.is_empty()).then_some(opts.env),
                 Some(timeout_ms),
                 None,
+                None,
             )
             .await?;
 
@@ -411,6 +423,8 @@ impl FreestyleControl {
         })
     }
 
+    /// `linux_user`: `Some(ROOT_USER)` for guest administration (units, mounts), `None`
+    /// for the configured session user.
     pub(crate) async fn exec_await(
         &self,
         vm_id: &str,
@@ -418,13 +432,14 @@ impl FreestyleControl {
         env: Option<HashMap<String, String>>,
         timeout_ms: Option<u64>,
         stdin: Option<&[u8]>,
+        linux_user: Option<&str>,
     ) -> Result<ExecAwaitResponse> {
         let body = ExecAwaitBody {
             command,
             env,
             timeout_ms: timeout_ms.map(|value| value.clamp(1, EXEC_AWAIT_MAX_MS)),
             stdin: stdin.map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
-            linux_user: self.cfg.linux_user.as_deref(),
+            linux_user: linux_user.or(self.cfg.linux_user.as_deref()),
         };
         let response = self
             .send(
@@ -707,6 +722,7 @@ impl FreestyleControl {
                     None,
                     Some(120_000),
                     None,
+                    Some(ROOT_USER),
                 )
                 .await?;
             return match result.status_code {
@@ -734,8 +750,7 @@ impl FreestyleControl {
                 ),
                 None,
                 Some(120_000),
-                None,
-            )
+                None, Some(ROOT_USER))
             .await?;
         match result.status_code {
             Some(0) => Ok(()),
