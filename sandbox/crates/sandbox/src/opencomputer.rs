@@ -475,7 +475,7 @@ impl OpenComputerControl {
         });
 
         Ok(ExecHandle {
-            input: input_tx,
+            input: input_tx.into(),
             events: Box::pin(ReceiverStream::new(event_rx)),
         })
     }

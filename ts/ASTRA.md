@@ -125,12 +125,24 @@ OpenBracket configures this primitive in its Agent layer using the thread's
 existing execution backend. Its workspace toggle defaults off, independently
 of native compaction. No OpenBracket dependency is required by the Rust core.
 
-Current VMD limitation (2026-09-04): its portproxy exec protocol rejects signals.
-Normal program execution is live-proven in an existing session, but cancellation
-of CPU-bound/waiting programs is not supported reliably until that protocol is
-extended. The executor reports missing termination confirmation rather than
-claiming a process stopped. Local process tests prove the cancellation contract
-for signal-capable adapters, not for the current VMD transport.
+VMD execution control (2026-09-04): direct exec uses `ControlExec`; distributed
+`exec.stream` uses `ControlDaemon` for its existing named guest process group.
+Control uses a separate connection from stdin/stdout so backpressure cannot
+block signal delivery. EOF remains ordered after earlier input and leaves the
+control handle usable. Distributed controls carry the stream's session, VM,
+node, producer epoch, and control sequence; the guest rejects stale owners and
+does not apply duplicate signals twice. Reattachment does not rerun the command.
+
+JavaScript retains `ExecHandle.write()`, `eof()`, `signal()`, and `next()`.
+Rust retains `handle.input.send(ExecInput::...)`, but the field now has type
+`ExecInputSender` rather than a raw Tokio sender. Custom adapters constructing
+`ExecHandle` can convert their existing sender with `.into()`.
+
+The client, VMD, and guest portproxy must all be updated. An older guest cannot
+honor the new control RPCs. Signal acceptance is not exit confirmation: the
+executor still waits for the guest's terminal result and reports missing
+confirmation instead of claiming a process stopped. Detached commands retain
+their separate lifetime semantics.
 
 ## Compaction: opt-in only
 

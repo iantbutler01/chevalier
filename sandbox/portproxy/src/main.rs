@@ -8,6 +8,9 @@
 mod child_tracker;
 mod cli;
 mod daemon;
+mod exec_control;
+#[cfg(test)]
+mod exec_control_tests;
 mod port_forward;
 mod process_group;
 mod services;

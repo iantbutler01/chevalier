@@ -89,7 +89,7 @@ fn sandbox_error(error: crate::sandbox::SandboxError) -> Error {
 }
 
 struct SandboxProgrammaticSession {
-    input: mpsc::Sender<ExecInput>,
+    input: crate::sandbox::ExecInputSender,
     events: Mutex<Pin<Box<dyn Stream<Item = Result<ProgrammaticEvent>> + Send>>>,
 }
 
@@ -187,7 +187,7 @@ mod tests {
             yield Ok(ExecEvent::Exit(0));
         };
         let session = SandboxProgrammaticSession::new(ExecHandle {
-            input,
+            input: input.into(),
             events: Box::pin(events),
         });
         let reader = async {

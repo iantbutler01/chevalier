@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use portable_pty::PtySize;
 use tokio::fs;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
@@ -44,7 +44,20 @@ use nix::sys::signal::Signal;
 type ExecResponseStream = ReceiverStream<Result<ExecResponse, Status>>;
 type InteractiveResponseStream = ReceiverStream<Result<InteractiveShellResponse, Status>>;
 type AttachDaemonResponseStream =
-    GuardedStream<ReceiverStream<Result<AttachDaemonResponse, Status>>>;
+    GuardedStream<Pin<Box<dyn Stream<Item = Result<AttachDaemonResponse, Status>> + Send>>>;
+
+fn attach_stream(
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    replay: Vec<AttachDaemonResponse>,
+    receiver: mpsc::Receiver<Result<AttachDaemonResponse, Status>>,
+) -> AttachDaemonResponseStream {
+    GuardedStream::new(
+        guard,
+        Box::pin(
+            futures::stream::iter(replay.into_iter().map(Ok)).chain(ReceiverStream::new(receiver)),
+        ),
+    )
+}
 
 const DEFAULT_EXEC_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const DEFAULT_EXEC_HOME: &str = "/root";
@@ -139,11 +152,15 @@ async fn write_file_atomic(path: &std::path::Path, data: &[u8]) -> io::Result<()
 #[derive(Clone)]
 pub struct ShellExecService {
     tracker: ChildTracker,
+    controls: Arc<StdMutex<std::collections::HashMap<String, crate::exec_control::ExecControl>>>,
 }
 
 impl ShellExecService {
     pub fn new(tracker: ChildTracker) -> Self {
-        Self { tracker }
+        Self {
+            tracker,
+            controls: Arc::default(),
+        }
     }
 }
 
@@ -151,6 +168,22 @@ impl ShellExecService {
 impl ShellExec for ShellExecService {
     type ExecStream = ExecResponseStream;
     type InteractiveShellStream = InteractiveResponseStream;
+
+    async fn control_exec(
+        &self,
+        request: Request<crate::pb::bracket::portproxy::v1::ExecControlRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let request = request.into_inner();
+        let control = self
+            .controls
+            .lock()
+            .unwrap()
+            .get(&request.execution_id)
+            .cloned()
+            .ok_or_else(|| Status::not_found("execution is not active"))?;
+        control.apply(request).await?;
+        Ok(Response::new(Empty {}))
+    }
 
     async fn exec(
         &self,
@@ -246,6 +279,24 @@ impl ShellExec for ShellExecService {
         };
         let timeout = start.timeout.map(|secs| Duration::from_secs(secs as u64));
 
+        let (control, mut control_receiver) = crate::exec_control::channel();
+        let execution_id = start.execution_id;
+        if !execution_id.is_empty() {
+            let mut controls = self.controls.lock().unwrap();
+            if controls.contains_key(&execution_id) {
+                kill_process_group_or_child(pid, &mut child);
+                tokio::spawn(async move {
+                    let _ = child.wait().await;
+                });
+                return Err(Status::already_exists(
+                    "execution identity is already active",
+                ));
+            }
+            controls.insert(execution_id.clone(), control.clone());
+        }
+        let controls = self.controls.clone();
+        let mut stdin_eof = control_receiver.eof.clone();
+
         let (tx, rx) = mpsc::channel(32);
 
         // The timeout is an inactivity deadline. Reader activity is coalesced
@@ -269,8 +320,9 @@ impl ShellExec for ShellExecService {
         drop(activity_tx);
 
         tokio::spawn(async move {
-            loop {
-                match stream.message().await {
+            let forward = async {
+                loop {
+                    match stream.message().await {
                     Ok(Some(ExecRequest {
                         request:
                             Some(crate::pb::bracket::portproxy::v1::exec_request::Request::StdinData(
@@ -282,6 +334,9 @@ impl ShellExec for ShellExecService {
                             break;
                         }
                     }
+                    Ok(Some(ExecRequest {
+                        request: Some(crate::pb::bracket::portproxy::v1::exec_request::Request::StdinEof(true)),
+                    })) => break,
                     Ok(Some(_)) => {
                         debug!("ignoring unexpected exec message");
                     }
@@ -291,8 +346,14 @@ impl ShellExec for ShellExecService {
                         break;
                     }
                 }
+                }
+            };
+            tokio::select! {
+                _ = crate::exec_control::stdin_closed(&mut stdin_eof) => {},
+                _ = forward => {},
             }
-            let _ = stdin.shutdown().await;
+            drop(stdin);
+            drop(control);
         });
 
         tokio::spawn(async move {
@@ -306,7 +367,7 @@ impl ShellExec for ShellExecService {
                 let outcome = loop {
                     tokio::select! {
                         biased;
-                        status = child.wait() => break Some(status),
+                        status = control_receiver.wait(pid, child.wait()) => break Some(status),
                         activity = activity_rx.recv(), if readers_open => {
                             if activity.is_some() {
                                 inactivity.as_mut().reset(tokio::time::Instant::now() + duration);
@@ -339,12 +400,14 @@ impl ShellExec for ShellExecService {
                             }))
                             .await;
 
-                        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-                        finalize_exec_with_code(pid, tx, 124).await
+                        match child.wait().await {
+                            Ok(_) => finalize_exec_with_code(pid, tx, 124).await,
+                            Err(error) => finalize_exec_wait_error(pid, tx, error).await,
+                        }
                     }
                 }
             } else {
-                match child.wait().await {
+                match control_receiver.wait(pid, child.wait()).await {
                     Ok(exit) => {
                         drain_exec_readers(stdout_reader, stderr_reader).await;
                         finalize_exec_status(pid, tx, exit).await
@@ -352,6 +415,7 @@ impl ShellExec for ShellExecService {
                     Err(err) => finalize_exec_wait_error(pid, tx, err).await,
                 }
             };
+            controls.lock().unwrap().remove(&execution_id);
             // STALL DIAGNOSTIC (keep: low-noise): action-boundary exit breadcrumb.
             // total_ms is recv->exit; a >5s total or >1s spawn_delay is the ~30s
             // stall we are hunting, so it rises to WARN; healthy execs stay debug.
@@ -852,6 +916,20 @@ impl DaemonManagerService {
 impl DaemonManager for DaemonManagerService {
     type AttachDaemonStream = AttachDaemonResponseStream;
 
+    async fn control_daemon(
+        &self,
+        request: Request<crate::pb::bracket::portproxy::v1::ExecControlRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let request = request.into_inner();
+        let entry = self
+            .registry
+            .get(&request.execution_id)
+            .await
+            .ok_or_else(|| Status::not_found("daemon not found"))?;
+        entry.control.apply(request).await?;
+        Ok(Response::new(Empty {}))
+    }
+
     async fn exec_daemon(
         &self,
         request: Request<ExecDaemonRequest>,
@@ -900,33 +978,12 @@ impl DaemonManager for DaemonManagerService {
         let cached_exit = entry.cached_exit_code();
         let replay_frames = entry.drain_output_backlog().await;
 
-        // @dive: Replay any buffered output the child wrote before this attach
-        //        arrived. We send these synchronously so the post-exit fast
-        //        path below can rely on the backlog being delivered first,
-        //        ahead of the ExitCode frame.
-        for frame in replay_frames {
-            let response = match frame.kind {
-                OutputKind::Stdout => {
-                    crate::pb::bracket::portproxy::v1::attach_daemon_response::Response::StdoutData(
-                        frame.data,
-                    )
-                }
-                OutputKind::Stderr => {
-                    crate::pb::bracket::portproxy::v1::attach_daemon_response::Response::StderrData(
-                        frame.data,
-                    )
-                }
-            };
-            if tx
-                .send(Ok(AttachDaemonResponse {
-                    response: Some(response),
-                }))
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
+        let replay_responses = replay_frames.into_iter().map(|frame| AttachDaemonResponse {
+            response: Some(match frame.kind {
+                OutputKind::Stdout => crate::pb::bracket::portproxy::v1::attach_daemon_response::Response::StdoutData(frame.data),
+                OutputKind::Stderr => crate::pb::bracket::portproxy::v1::attach_daemon_response::Response::StderrData(frame.data),
+            }),
+        }).collect::<Vec<_>>();
 
         // @dive: Post-exit fast path. When attach arrives after the daemon's
         //        child has already exited (common for fast `echo`-class
@@ -946,7 +1003,7 @@ impl DaemonManager for DaemonManagerService {
                 }))
                 .await;
             drop(tx);
-            let stream = GuardedStream::new(guard, ReceiverStream::new(rx));
+            let stream = attach_stream(guard, replay_responses, rx);
             return Ok(Response::new(stream));
         }
 
@@ -979,7 +1036,7 @@ impl DaemonManager for DaemonManagerService {
                     .await;
             }
             drop(tx);
-            let stream = GuardedStream::new(guard, ReceiverStream::new(rx));
+            let stream = attach_stream(guard, replay_responses, rx);
             return Ok(Response::new(stream));
         }
         let mut stdout_rx = stdout_rx.unwrap();
@@ -1140,6 +1197,7 @@ impl DaemonManager for DaemonManagerService {
         {
             let entry = entry.clone();
             tokio::spawn(async move {
+                let mut stdin_eof = entry.stdin_eof.clone();
                 loop {
                     match stream.message().await {
                         Ok(Some(AttachDaemonRequest {
@@ -1157,10 +1215,20 @@ impl DaemonManager for DaemonManagerService {
                                 // write to.
                                 break;
                             };
-                            if let Err(err) = stdin.write_all(&data).await {
+                            let write = tokio::select! {
+                                _ = crate::exec_control::stdin_closed(&mut stdin_eof) => break,
+                                result = stdin.write_all(&data) => result,
+                            };
+                            if let Err(err) = write {
                                 debug!("daemon stdin write failed: {err}");
                                 break;
                             }
+                        }
+                        Ok(Some(AttachDaemonRequest {
+                            request: Some(crate::pb::bracket::portproxy::v1::attach_daemon_request::Request::StdinEof(true)),
+                        })) => {
+                            *entry.stdin.lock().await = None;
+                            break;
                         }
                         Ok(Some(_)) => {}
                         Ok(None) => break,
@@ -1173,7 +1241,7 @@ impl DaemonManager for DaemonManagerService {
             });
         }
 
-        let stream = GuardedStream::new(guard, ReceiverStream::new(rx));
+        let stream = attach_stream(guard, replay_responses, rx);
         Ok(Response::new(stream))
     }
 }
@@ -1539,6 +1607,7 @@ mod tests {
         tx.send(ExecRequest {
             request: Some(
                 crate::pb::bracket::portproxy::v1::exec_request::Request::Start(ExecStart {
+                    execution_id: String::new(),
                     args: vec!["sh".to_string(), "-lc".to_string(), command.to_string()],
                     env: HashMap::new(),
                     timeout: Some(timeout_secs),
@@ -1629,6 +1698,7 @@ mod tests {
         tx.send(ExecRequest {
             request: Some(
                 crate::pb::bracket::portproxy::v1::exec_request::Request::Start(ExecStart {
+                    execution_id: String::new(),
                     args: vec![
                         "sh".to_string(),
                         "-lc".to_string(),

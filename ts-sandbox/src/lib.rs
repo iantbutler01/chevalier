@@ -70,7 +70,7 @@ impl From<ExecEvent> for ExecEventJs {
 /// Bidirectional handle to a running exec: write stdin, read events via `next()`.
 #[napi]
 pub struct ExecHandle {
-    input: tokio::sync::mpsc::Sender<ExecInput>,
+    input: chevalier_sandbox::ExecInputSender,
     events: Arc<Mutex<EventStream<ExecEvent>>>,
 }
 

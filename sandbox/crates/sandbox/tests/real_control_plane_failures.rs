@@ -10,12 +10,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_nats::jetstream::consumer::pull;
 use async_nats::jetstream::{self};
 use chevalier_sandbox::{
-    DistributedControlConfig, ExecEvent, ExecOptions, Sandbox, SandboxConfig, SandboxError,
-    SessionOptions,
+    DistributedControlConfig, ExecEvent, ExecInput, ExecOptions, Sandbox, SandboxConfig,
+    SandboxError, SessionOptions,
 };
 use etcd_client::{Client as EtcdClient, GetOptions};
 use futures::StreamExt;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
@@ -90,6 +90,84 @@ fn direct_sandbox_config() -> SandboxConfig {
     };
     cfg.default_architecture = optional_env("CHEVALIER_SANDBOX_REAL_DEFAULT_ARCHITECTURE");
     cfg
+}
+
+#[tokio::test]
+#[ignore = "requires an explicitly selected existing sandbox with current portproxy; exercises only owned temporary processes"]
+async fn real_exec_eof_preserves_control_until_confirmed_exit() {
+    let mut config = match required_env("CHEVALIER_SANDBOX_REAL_EXEC_MODE").as_str() {
+        "distributed" => control_plane_sandbox_config(),
+        "direct" => direct_sandbox_config(),
+        other => panic!("unknown exec mode: {other}"),
+    };
+    config.auth_token = optional_env("CHEVALIER_SANDBOX_REAL_AUTH_TOKEN");
+    let sandbox = Sandbox::connect(required_env("CHEVALIER_SANDBOX_REAL_ENDPOINT"), config)
+        .await
+        .unwrap();
+    let session = sandbox
+        .attach_session_passive(&required_env("CHEVALIER_SANDBOX_REAL_SESSION_ID"))
+        .await
+        .unwrap();
+    let mut execution = timeout(
+        Duration::from_secs(60),
+        session.exec(
+            "cat; printf '\\nEOF-OBSERVED\\n'; sleep 120",
+            ExecOptions {
+                timeout_secs: Some(30),
+                ..ExecOptions::default()
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    execution
+        .input
+        .send(ExecInput::Data(b"ordered input\n".to_vec()))
+        .await
+        .unwrap();
+    execution.input.send(ExecInput::Eof).await.unwrap();
+    let mut output = Vec::new();
+    timeout(Duration::from_secs(15), async {
+        while let Some(event) = execution.events.next().await {
+            match event.unwrap() {
+                ExecEvent::Stdout(bytes) => {
+                    output.extend(bytes);
+                    if String::from_utf8_lossy(&output).contains("EOF-OBSERVED") {
+                        return;
+                    }
+                }
+                ExecEvent::Exit(code) => panic!("exited before EOF: {code}"),
+                ExecEvent::Timeout => panic!("timed out before EOF"),
+                ExecEvent::Stderr(_) => {}
+            }
+        }
+        panic!("stream closed before EOF");
+    })
+    .await
+    .expect("ordered EOF must reach the guest");
+    assert!(String::from_utf8_lossy(&output).contains("ordered input"));
+    execution.input.send(ExecInput::Signal(9)).await.unwrap();
+    timeout(Duration::from_secs(15), async {
+        while let Some(event) = execution.events.next().await {
+            match event.unwrap() {
+                ExecEvent::Exit(code) => {
+                    assert_ne!(code, 0);
+                    assert_ne!(code, 124, "timeout is not signal confirmation");
+                    return;
+                }
+                ExecEvent::Timeout => panic!("timeout is not signal confirmation"),
+                _ => {}
+            }
+        }
+        panic!("stream closed without guest exit confirmation");
+    })
+    .await
+    .expect("stop must confirm exit within 15 seconds");
+    assert!(timeout(Duration::from_secs(3), execution.events.next())
+        .await
+        .expect("terminal exec must release its stream without dropping the input handle")
+        .is_none());
 }
 
 fn run_docker(args: &[&str]) {

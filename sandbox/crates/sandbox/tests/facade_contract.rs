@@ -585,6 +585,12 @@ struct MockShellExec {
 
 #[tonic::async_trait]
 impl ShellExec for MockShellExec {
+    async fn control_exec(
+        &self,
+        _request: Request<chevalier_sandbox::proto::bracket::portproxy::v1::ExecControlRequest>,
+    ) -> Result<Response<chevalier_sandbox::proto::google::protobuf::Empty>, Status> {
+        Err(Status::unimplemented("control is not part of this fixture"))
+    }
     type ExecStream = Pin<Box<dyn Stream<Item = Result<ExecResponse, Status>> + Send>>;
     type InteractiveShellStream =
         Pin<Box<dyn Stream<Item = Result<InteractiveShellResponse, Status>> + Send>>;
@@ -1180,8 +1186,6 @@ async fn bidi_exec_shell_and_file_contract() {
         .send(ExecInput::Eof)
         .await
         .expect("send exec eof");
-    drop(exec.input);
-
     let mut exec_events = exec.events;
     let mut observed_exec = Vec::new();
     for _ in 0..16 {
@@ -1213,6 +1217,14 @@ async fn bidi_exec_shell_and_file_contract() {
             "exit:124",
         ]
     );
+
+    assert!(
+        timeout(Duration::from_secs(3), exec_events.next())
+            .await
+            .expect("terminal exec must close even while its input handle is retained")
+            .is_none()
+    );
+    drop(exec.input);
 
     let shell = session
         .shell(Default::default())

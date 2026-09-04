@@ -707,8 +707,35 @@ pub enum ShellEvent {
 pub type EventStream<T> = Pin<Box<dyn Stream<Item = Result<T>> + Send>>;
 
 pub struct ExecHandle {
-    pub input: mpsc::Sender<ExecInput>,
+    pub input: ExecInputSender,
     pub events: EventStream<ExecEvent>,
+}
+
+#[derive(Clone)]
+pub struct ExecInputSender {
+    data: mpsc::Sender<ExecInput>,
+    control: mpsc::Sender<ExecInput>,
+}
+
+impl ExecInputSender {
+    pub async fn send(
+        &self,
+        input: ExecInput,
+    ) -> std::result::Result<(), mpsc::error::SendError<ExecInput>> {
+        match input {
+            ExecInput::Signal(_) => self.control.send(input).await,
+            _ => self.data.send(input).await,
+        }
+    }
+}
+
+impl From<mpsc::Sender<ExecInput>> for ExecInputSender {
+    fn from(data: mpsc::Sender<ExecInput>) -> Self {
+        Self {
+            control: data.clone(),
+            data,
+        }
+    }
 }
 
 #[cfg(feature = "distributed-control")]
@@ -1710,6 +1737,7 @@ impl Session {
                 .unwrap_or_else(|| self.sandbox.inner.cfg.default_shell.clone());
 
             let (req_tx, req_rx) = mpsc::channel(64);
+            let execution_id = Uuid::new_v4().to_string();
             req_tx
                 .send(ExecRequest {
                     request: Some(exec_request::Request::Start(ExecStart {
@@ -1717,6 +1745,7 @@ impl Session {
                         env: opts.env.clone(),
                         detach: opts.detach,
                         timeout: opts.timeout_secs,
+                        execution_id: execution_id.clone(),
                     })),
                 })
                 .await
@@ -1774,11 +1803,43 @@ impl Session {
             let mut stream = exec_response.into_inner();
 
             let (input_tx, mut input_rx) = mpsc::channel(64);
+            let (control_tx, mut control_rx) = mpsc::channel(8);
             let (event_tx, event_rx) = mpsc::channel(128);
 
+            let mut control_client = ShellExecClient::new(exec_endpoint.connect_lazy());
+            let control_auth = access.auth_header.clone();
+            let control_events = event_tx.clone();
+            let mut input_tasks = tokio::task::JoinSet::new();
+            input_tasks.spawn(async move {
+                let mut control_seq = 0;
+                while let Some(input) = control_rx.recv().await {
+                    if let ExecInput::Signal(signal) = input {
+                        control_seq += 1;
+                        let request = proto::bracket::portproxy::v1::ExecControlRequest {
+                            execution_id: execution_id.clone(),
+                            producer_epoch: 0,
+                            control_seq,
+                            control: Some(proto::bracket::portproxy::v1::exec_control_request::Control::Signal(signal)),
+                        };
+                        let mut request =
+                            request_with_optional_auth(request, control_auth.as_ref());
+                        request.set_timeout(Duration::from_secs(5));
+                        if let Err(error) = control_client.control_exec(request).await {
+                            let already_exited = error.code() == tonic::Code::NotFound
+                                || (error.code() == tonic::Code::FailedPrecondition
+                                    && error.message() == "execution has exited");
+                            if !already_exited {
+                                let _ = control_events.send(Err(SandboxError::Grpc(error))).await;
+                            }
+                        }
+                    }
+                }
+            });
+
             let event_tx_input = event_tx.clone();
+            let input_control = control_tx.clone();
             if let Some(req_tx) = req_tx_for_stdin {
-                tokio::spawn(async move {
+                input_tasks.spawn(async move {
                     while let Some(input) = input_rx.recv().await {
                         match input {
                             ExecInput::Data(data) => {
@@ -1792,13 +1853,16 @@ impl Session {
                                     break;
                                 }
                             }
-                            ExecInput::Eof => break,
-                            ExecInput::Signal(sig) => {
-                                let _ = event_tx_input
-                                    .send(Err(SandboxError::Unsupported(format!(
-                                        "exec signal forwarding not supported by portproxy API: {sig}"
-                                    ))))
+                            ExecInput::Eof => {
+                                let _ = req_tx
+                                    .send(ExecRequest {
+                                        request: Some(exec_request::Request::StdinEof(true)),
+                                    })
                                     .await;
+                                break;
+                            }
+                            ExecInput::Signal(signal) => {
+                                let _ = input_control.send(ExecInput::Signal(signal)).await;
                             }
                             ExecInput::Resize { cols, rows } => {
                                 let _ = event_tx_input
@@ -1812,16 +1876,12 @@ impl Session {
                     drop(req_tx);
                 });
             } else {
-                tokio::spawn(async move {
+                input_tasks.spawn(async move {
                     while let Some(input) = input_rx.recv().await {
                         match input {
                             ExecInput::Data(_) | ExecInput::Eof => {}
-                            ExecInput::Signal(sig) => {
-                                let _ = event_tx_input
-                                    .send(Err(SandboxError::Unsupported(format!(
-                                        "exec signal forwarding not supported by portproxy API: {sig}"
-                                    ))))
-                                    .await;
+                            ExecInput::Signal(signal) => {
+                                let _ = input_control.send(ExecInput::Signal(signal)).await;
                             }
                             ExecInput::Resize { cols, rows } => {
                                 let _ = event_tx_input
@@ -1878,10 +1938,14 @@ impl Session {
                         }
                     }
                 }
+                drop(input_tasks);
             });
 
             let handle = ExecHandle {
-                input: input_tx,
+                input: ExecInputSender {
+                    data: input_tx,
+                    control: control_tx,
+                },
                 events: Box::pin(ReceiverStream::new(event_rx)),
             };
             log_slo_observation("exec.stream.establish.warm_vm", started.elapsed(), "ok");
@@ -2151,17 +2215,57 @@ impl Session {
         )));
 
         let control_for_input = control.clone();
+        let (control_tx, mut control_rx) = mpsc::channel(8);
+        let control_for_signals = control.clone();
+        let routing_for_signals = routing_state.clone();
+        let signal_session = self.session_id.clone();
+        let signal_vm = self.vm_id.clone();
+        let signal_errors = event_tx.clone();
+        let mut input_tasks = tokio::task::JoinSet::new();
+        input_tasks.spawn(async move {
+            let mut control_seq = 0u64;
+            while let Some(ExecInput::Signal(signal)) = control_rx.recv().await {
+                control_seq += 1;
+                let (stream_id, target_node_id, producer_epoch) =
+                    routing_for_signals.lock().await.clone();
+                let request_id = Uuid::new_v4().to_string();
+                let payload = json!({
+                    "stream_id": stream_id,
+                    "session_id": signal_session,
+                    "vm_id": signal_vm,
+                    "target_node_id": target_node_id,
+                    "producer_epoch": producer_epoch,
+                    "input_kind": "signal",
+                    "signal": signal,
+                    "input_seq": control_seq,
+                    "idempotency_key": request_id,
+                });
+                if let Err(error) = control_for_signals
+                    .publish_command("exec.stream.control", &request_id, payload)
+                    .await
+                {
+                    let _ = signal_errors.send(Err(error)).await;
+                }
+            }
+        });
         let routing_for_input = routing_state.clone();
         let session_id_input = self.session_id.clone();
         let vm_id_input = self.vm_id.clone();
         let event_tx_input = event_tx.clone();
-        tokio::spawn(async move {
+        let input_control = control_tx.clone();
+        input_tasks.spawn(async move {
             let mut input_seq = 0u64;
+            let mut previous_route = None;
             while let Some(input) = input_rx.recv().await {
-                let (stream_id_input, target_node_id_input, _producer_epoch_input) = {
+                let (stream_id_input, target_node_id_input, producer_epoch_input) = {
                     let guard = routing_for_input.lock().await;
                     (guard.0.clone(), guard.1.clone(), guard.2)
                 };
+                let route = (target_node_id_input.clone(), producer_epoch_input);
+                if previous_route.as_ref() != Some(&route) {
+                    input_seq = 0;
+                    previous_route = Some(route);
+                }
                 match input {
                     ExecInput::Eof => {
                         input_seq = input_seq.saturating_add(1);
@@ -2172,12 +2276,13 @@ impl Session {
                             "target_node_id": target_node_id_input.as_str(),
                             "input_seq": input_seq,
                             "input_kind": "eof",
-                            "idempotency_key": format!("exec-stream-input-{stream_id_input}-{input_seq}"),
+                            "producer_epoch": producer_epoch_input,
+                            "idempotency_key": format!("exec-stream-input-{stream_id_input}-{producer_epoch_input}-{input_seq}"),
                         });
                         if let Err(err) = control_for_input
                             .publish_command(
                                 "exec.stream.input",
-                                format!("exec-stream-input:{stream_id_input}:{input_seq}").as_str(),
+                                format!("exec-stream-input:{stream_id_input}:{producer_epoch_input}:{input_seq}").as_str(),
                                 payload,
                             )
                             .await
@@ -2186,12 +2291,8 @@ impl Session {
                         }
                         break;
                     }
-                    ExecInput::Signal(sig) => {
-                        let _ = event_tx_input
-                            .send(Err(SandboxError::Unsupported(format!(
-                                "exec signal forwarding not supported by portproxy API: {sig}"
-                            ))))
-                            .await;
+                    ExecInput::Signal(signal) => {
+                        let _ = input_control.send(ExecInput::Signal(signal)).await;
                     }
                     ExecInput::Resize { cols, rows } => {
                         let _ = event_tx_input
@@ -2210,12 +2311,13 @@ impl Session {
                             "input_seq": input_seq,
                             "input_kind": "stdin",
                             "data": bytes,
-                            "idempotency_key": format!("exec-stream-input-{stream_id_input}-{input_seq}"),
+                            "producer_epoch": producer_epoch_input,
+                            "idempotency_key": format!("exec-stream-input-{stream_id_input}-{producer_epoch_input}-{input_seq}"),
                         });
                         if let Err(err) = control_for_input
                             .publish_command(
                                 "exec.stream.input",
-                                format!("exec-stream-input:{stream_id_input}:{input_seq}").as_str(),
+                                format!("exec-stream-input:{stream_id_input}:{producer_epoch_input}:{input_seq}").as_str(),
                                 payload,
                             )
                             .await
@@ -2486,10 +2588,14 @@ impl Session {
                     _ => {}
                 }
             }
+            drop(input_tasks);
         });
 
         Ok(ExecHandle {
-            input: input_tx,
+            input: ExecInputSender {
+                data: input_tx,
+                control: control_tx,
+            },
             events: Box::pin(ReceiverStream::new(event_rx)),
         })
     }
@@ -5888,6 +5994,7 @@ async fn probe_shell_exec_ready(
     if req_tx
         .send(ExecRequest {
             request: Some(exec_request::Request::Start(ExecStart {
+                execution_id: String::new(),
                 args: vec!["/bin/sh".to_string(), "-lc".to_string(), "true".to_string()],
                 env: HashMap::new(),
                 detach: false,
@@ -6531,6 +6638,28 @@ pub type ChevalierSandboxResult<T> = Result<T>;
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn exec_signal_bypasses_a_full_stdin_queue() {
+        let (data, mut data_receiver) = tokio::sync::mpsc::channel(1);
+        let (control, mut control_receiver) = tokio::sync::mpsc::channel(1);
+        let input = super::ExecInputSender { data, control };
+        input.send(super::ExecInput::Data(vec![1])).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            input.send(super::ExecInput::Signal(9)),
+        )
+        .await
+        .expect("control cannot wait for stdin space")
+        .unwrap();
+        assert!(matches!(
+            control_receiver.recv().await,
+            Some(super::ExecInput::Signal(9))
+        ));
+        assert!(matches!(
+            data_receiver.recv().await,
+            Some(super::ExecInput::Data(_))
+        ));
+    }
     use super::*;
 
     #[test]

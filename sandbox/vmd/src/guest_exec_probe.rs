@@ -118,6 +118,7 @@ pub async fn probe_guest_exec_ready(
     req_tx
         .send(ExecRequest {
             request: Some(exec_request::Request::Start(ExecStart {
+                execution_id: String::new(),
                 args: vec!["/bin/sh".to_string(), "-lc".to_string(), "true".to_string()],
                 env: HashMap::new(),
                 detach: false,
@@ -184,6 +185,7 @@ pub async fn run_guest_shell_exec(
     req_tx
         .send(ExecRequest {
             request: Some(exec_request::Request::Start(ExecStart {
+                execution_id: String::new(),
                 args: vec![
                     "/bin/sh".to_string(),
                     "-lc".to_string(),
@@ -393,6 +395,14 @@ mod tests {
 
     #[tonic::async_trait]
     impl ShellExec for CountingShellExec {
+        async fn control_exec(
+            &self,
+            _request: Request<crate::proto::bracket::portproxy::v1::ExecControlRequest>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented(
+                "readiness probe has no process control",
+            ))
+        }
         type ExecStream = ExecResponseStream;
         type InteractiveShellStream = InteractiveResponseStream;
 

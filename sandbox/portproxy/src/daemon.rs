@@ -126,11 +126,14 @@ impl DaemonRegistry {
         let (stderr_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         let (exit_tx, _) = watch::channel(None::<i32>);
         let output_backlog = Arc::new(Mutex::new(OutputBacklog::default()));
+        let (control, mut control_receiver) = crate::exec_control::channel();
 
         let stdout_tx_for_reader = stdout_tx.clone();
         let stderr_tx_for_reader = stderr_tx.clone();
         let stderr_tx_for_timeout = stderr_tx.clone();
         let entry = Arc::new(DaemonEntry {
+            control,
+            stdin_eof: control_receiver.eof.clone(),
             _name: req.name.clone(),
             stdin: Mutex::new(Some(stdin)),
             stdout_tx: std::sync::Mutex::new(Some(stdout_tx)),
@@ -150,6 +153,16 @@ impl DaemonRegistry {
             daemons.insert(req.name.clone(), entry.clone());
         }
         let mut child_exit = self.tracker.register(pid);
+        let stdin_entry = entry.clone();
+        tokio::spawn(async move {
+            let mut eof = stdin_entry.stdin_eof.clone();
+            let mut exited = stdin_entry.exit_tx.subscribe();
+            tokio::select! {
+                _ = crate::exec_control::stdin_closed(&mut eof) => {},
+                _ = exited.wait_for(|code| code.is_some()) => {},
+            }
+            *stdin_entry.stdin.lock().await = None;
+        });
 
         spawn_reader(
             stdout,
@@ -174,7 +187,12 @@ impl DaemonRegistry {
         let post_exit_entry = entry.clone();
         tokio::spawn(async move {
             let exit_code = match timeout {
-                Some(timeout) => match tokio::time::timeout(timeout, child_exit.wait()).await {
+                Some(timeout) => match tokio::time::timeout(
+                    timeout,
+                    control_receiver.wait(pid, child_exit.wait()),
+                )
+                .await
+                {
                     Ok(Ok(exit)) => Some(exit.protocol_code()),
                     Ok(Err(err)) => Some(daemon_wait_error_code(&req.name, err)),
                     Err(_) => {
@@ -185,15 +203,16 @@ impl DaemonRegistry {
                         }
                         let _ = stderr_tx_for_timeout.send(timeout_message);
                         kill_process_group_or_child(pid, &mut child);
-                        let _ = tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            child_exit.wait(),
-                        )
-                        .await;
-                        Some(124)
+                        match child_exit.wait().await {
+                            Ok(_) => Some(124),
+                            Err(error) => {
+                                error!("daemon {} termination unconfirmed: {error}", req.name);
+                                None
+                            }
+                        }
                     }
                 },
-                None => match child_exit.wait().await {
+                None => match control_receiver.wait(pid, child_exit.wait()).await {
                     Ok(exit) => Some(exit.protocol_code()),
                     Err(err) => Some(daemon_wait_error_code(&req.name, err)),
                 },
@@ -246,6 +265,8 @@ impl DaemonRegistry {
 }
 
 pub struct DaemonEntry {
+    pub control: crate::exec_control::ExecControl,
+    pub stdin_eof: watch::Receiver<bool>,
     pub(crate) _name: String,
     /// Set to `None` after the daemon's child exits so the stdin-forwarder in
     /// attach_daemon can detect the post-exit state and stop trying to write

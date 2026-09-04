@@ -418,7 +418,7 @@ impl FreestyleControl {
         let _ = event_tx.send(Ok(terminal)).await;
         drop(event_tx);
         Ok(ExecHandle {
-            input: input_tx,
+            input: input_tx.into(),
             events: Box::pin(ReceiverStream::new(event_rx)),
         })
     }

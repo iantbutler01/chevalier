@@ -18,12 +18,14 @@ service PortProxy {
 }
 
 service ShellExec {
+  rpc ControlExec(ExecControlRequest) returns (google.protobuf.Empty);
   rpc Exec(stream ExecRequest) returns (stream ExecResponse);
   rpc InteractiveShell(stream InteractiveShellRequest)
       returns (stream InteractiveShellResponse);
 }
 
 service DaemonManager {
+  rpc ControlDaemon(ExecControlRequest) returns (google.protobuf.Empty);
   rpc ExecDaemon(ExecDaemonRequest) returns (ExecDaemonResponse);
   rpc AttachDaemon(stream AttachDaemonRequest)
       returns (stream AttachDaemonResponse);
@@ -43,6 +45,7 @@ message AttachDaemonRequest {
   oneof request {
     AttachDaemonStart start = 1;
     bytes stdin_data = 2;
+    bool stdin_eof = 3;
   }
 }
 
@@ -60,6 +63,7 @@ message ExecRequest {
   oneof request {
     ExecStart start = 1;
     bytes stdin_data = 2;
+    bool stdin_eof = 3;
   }
 }
 
@@ -68,6 +72,18 @@ message ExecStart {
   map<string, string> env = 2;
   bool detach = 3;
   optional int32 timeout = 4;
+  string execution_id = 5;
+}
+
+message ExecControlRequest {
+  string execution_id = 1;
+  uint64 producer_epoch = 4;
+  uint64 control_seq = 5;
+  oneof control {
+    int32 signal = 2;
+    bool stdin_eof = 3;
+    bool claim = 6;
+  }
 }
 
 message ExecResponse {

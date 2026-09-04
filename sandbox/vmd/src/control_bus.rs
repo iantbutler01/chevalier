@@ -115,6 +115,13 @@ struct ExecRunPayload {
 struct ActiveExecStream {
     request_tx: mpsc::Sender<AttachDaemonRequest>,
     last_input_seq: std::sync::Arc<Mutex<u64>>,
+    session_id: String,
+    vm_id: String,
+    node_id: String,
+    producer_epoch: u64,
+    daemon_name: String,
+    control_client: DaemonManagerClient<tonic::transport::Channel>,
+    auth: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +162,16 @@ struct ExecStreamInputPayload {
     input_kind: String,
     #[serde(default)]
     data: Option<Vec<u8>>,
+    #[serde(default)]
+    producer_epoch: Option<u64>,
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    vm_id: String,
+    #[serde(default)]
+    target_node_id: String,
+    #[serde(default)]
+    signal: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -885,6 +902,7 @@ pub async fn start_with_trigger(
     let vm_snapshot_state = VmSnapshotState::new();
     // @dive: Enforces a hard bound on in-flight control commands; overload is signaled deterministically via NAK+retry hint.
     let inflight_limit = std::sync::Arc::new(Semaphore::new(config.max_inflight_commands));
+    let control_limit = std::sync::Arc::new(Semaphore::new(8));
 
     let join = tokio::spawn(async move {
         const DEDUPE_TTL: Duration = Duration::from_secs(600);
@@ -897,7 +915,10 @@ pub async fn start_with_trigger(
                     };
                     match maybe_msg {
                         Ok(message) => {
-                            let permit = match inflight_limit.clone().try_acquire_owned() {
+                            let is_exec_control = serde_json::from_slice::<CommandEnvelope>(&message.payload)
+                                .is_ok_and(|envelope| envelope.command_type == "exec.stream.control");
+                            let limit = if is_exec_control { &control_limit } else { &inflight_limit };
+                            let permit = match limit.clone().try_acquire_owned() {
                                 Ok(permit) => permit,
                                 Err(_) => {
                                     handle_overloaded_command_message(
@@ -1588,7 +1609,9 @@ async fn process_command_message(
             .await;
             return;
         }
-    } else if envelope.command_type == "exec.stream.input" {
+    } else if envelope.command_type == "exec.stream.input"
+        || envelope.command_type == "exec.stream.control"
+    {
         if let Err(err) = handle_exec_stream_input_command(&envelope, active_exec_streams).await {
             handle_failed_command_message(
                 &message,
@@ -1724,6 +1747,7 @@ async fn handle_exec_run_command(
     req_tx
         .send(ExecRequest {
             request: Some(exec_request::Request::Start(ExecStart {
+                execution_id: String::new(),
                 args: vec![shell, "-lc".to_string(), payload.command.clone()],
                 env: payload.env,
                 detach: payload.detach,
@@ -2345,6 +2369,31 @@ async fn handle_exec_stream_start_command(
     };
     let mut stream = response.into_inner();
 
+    let mut control_client = DaemonManagerClient::new(
+        tonic::transport::Endpoint::from_shared(endpoint.clone())?
+            .connect_timeout(Duration::from_secs(5))
+            .connect_lazy(),
+    );
+    let mut claim = request_with_portproxy_auth(
+        crate::proto::bracket::portproxy::v1::ExecControlRequest {
+            execution_id: daemon_name.clone(),
+            producer_epoch,
+            control_seq: 0,
+            control: Some(
+                crate::proto::bracket::portproxy::v1::exec_control_request::Control::Claim(true),
+            ),
+        },
+        portproxy_auth.as_ref(),
+    );
+    claim.set_timeout(Duration::from_secs(5));
+    if let Err(error) = control_client.control_daemon(claim).await {
+        if error.code() != tonic::Code::FailedPrecondition
+            || error.message() != "execution has exited"
+        {
+            return Err(anyhow!("claim exec stream control: {error}"));
+        }
+    }
+
     {
         let mut guard = active_exec_streams.lock().await;
         guard.insert(
@@ -2352,6 +2401,13 @@ async fn handle_exec_stream_start_command(
             ActiveExecStream {
                 request_tx: req_tx.clone(),
                 last_input_seq: std::sync::Arc::new(Mutex::new(0)),
+                session_id: session_id.clone(),
+                vm_id: vm_id.clone(),
+                node_id: node_id.to_string(),
+                producer_epoch,
+                daemon_name: daemon_name.clone(),
+                control_client,
+                auth: portproxy_auth.clone(),
             },
         );
     }
@@ -2400,7 +2456,12 @@ async fn handle_exec_stream_start_command(
     {
         {
             let mut guard = active_exec_streams.lock().await;
-            guard.remove(&stream_id);
+            if guard
+                .get(&stream_id)
+                .is_some_and(|active| active.producer_epoch == producer_epoch)
+            {
+                guard.remove(&stream_id);
+            }
         }
         return Err(err);
     }
@@ -2970,97 +3031,83 @@ async fn handle_exec_stream_input_command(
     active_exec_streams: &std::sync::Arc<Mutex<HashMap<String, ActiveExecStream>>>,
 ) -> Result<()> {
     let payload: ExecStreamInputPayload = serde_json::from_value(envelope.payload.clone())
-        .context("decode exec.stream.input command payload")?;
-    if payload.stream_id.trim().is_empty() {
-        return Err(anyhow!("exec.stream.input payload missing stream_id"));
+        .context("decode exec stream control/input payload")?;
+    let active = active_exec_streams
+        .lock()
+        .await
+        .get(&payload.stream_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("exec stream is not active: {}", payload.stream_id))?;
+    validate_exec_input_identity(&active, &payload)?;
+    if payload.input_kind == "signal" {
+        let signal = payload
+            .signal
+            .ok_or_else(|| anyhow!("missing exec signal"))?;
+        let mut client = active.control_client.clone();
+        let mut request = request_with_portproxy_auth(
+            crate::proto::bracket::portproxy::v1::ExecControlRequest {
+                execution_id: active.daemon_name.clone(),
+                producer_epoch: active.producer_epoch,
+                control_seq: payload.input_seq,
+                control: Some(
+                    crate::proto::bracket::portproxy::v1::exec_control_request::Control::Signal(
+                        signal,
+                    ),
+                ),
+            },
+            active.auth.as_ref(),
+        );
+        request.set_timeout(Duration::from_secs(5));
+        client
+            .control_daemon(request)
+            .await
+            .context("forward exec stream signal")?;
+        return Ok(());
     }
-
-    let input_kind = payload.input_kind.trim().to_ascii_lowercase();
-    match input_kind.as_str() {
-        "stdin" => {
-            debug!(
-                stream_id = %payload.stream_id,
-                input_seq = payload.input_seq,
-                "exec.stream.input stdin chunk"
-            );
-            let active = {
-                let guard = active_exec_streams.lock().await;
-                guard.get(&payload.stream_id).cloned()
-            };
-            let active = active.ok_or_else(|| {
-                anyhow!(
-                    "exec.stream.input stream_id {} not found for stdin seq={}",
-                    payload.stream_id,
-                    payload.input_seq
-                )
-            })?;
-            if !accept_next_input_seq(&active, payload.input_seq).await? {
-                return Ok(());
-            }
-            active
-                .request_tx
-                .send(AttachDaemonRequest {
-                    request: Some(attach_daemon_request::Request::StdinData(
-                        payload.data.unwrap_or_default(),
-                    )),
-                })
-                .await
-                .map_err(|_| {
-                    anyhow!(
-                        "exec.stream.input stream_id {} stdin channel closed",
-                        payload.stream_id
-                    )
-                })?;
-        }
-        "eof" => {
-            debug!(
-                stream_id = %payload.stream_id,
-                input_seq = payload.input_seq,
-                "exec.stream.input eof"
-            );
-            let active = {
-                let guard = active_exec_streams.lock().await;
-                guard.get(&payload.stream_id).cloned()
-            };
-            if let Some(active) = active {
-                if !accept_next_input_seq(&active, payload.input_seq).await? {
-                    return Ok(());
-                }
-                let removed = {
-                    let mut guard = active_exec_streams.lock().await;
-                    guard.remove(&payload.stream_id)
-                };
-                let Some(active) = removed else {
-                    return Ok(());
-                };
-                drop(active.request_tx);
-            }
-        }
-        other => {
-            return Err(anyhow!("unsupported exec.stream.input kind: {other}"));
-        }
+    let request = match payload.input_kind.as_str() {
+        "stdin" => attach_daemon_request::Request::StdinData(payload.data.unwrap_or_default()),
+        "eof" => attach_daemon_request::Request::StdinEof(true),
+        other => return Err(anyhow!("unsupported exec stream input kind: {other}")),
+    };
+    let mut last = active.last_input_seq.lock().await;
+    if payload.input_seq == 0 {
+        return Err(anyhow!("input_seq must be positive"));
     }
-
+    if payload.input_seq <= *last {
+        return Ok(());
+    }
+    if payload.input_seq != last.saturating_add(1) {
+        return Err(anyhow!(
+            "exec stream input out of order: got {}, expected {}",
+            payload.input_seq,
+            last.saturating_add(1)
+        ));
+    }
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        active.request_tx.send(AttachDaemonRequest {
+            request: Some(request),
+        }),
+    )
+    .await
+    .context("exec stream stdin queue busy")?
+    .map_err(|_| anyhow!("exec stream stdin closed"))?;
+    *last = payload.input_seq;
     Ok(())
 }
 
-async fn accept_next_input_seq(active: &ActiveExecStream, input_seq: u64) -> Result<bool> {
-    if input_seq == 0 {
-        return Ok(true);
+fn validate_exec_input_identity(
+    active: &ActiveExecStream,
+    payload: &ExecStreamInputPayload,
+) -> Result<()> {
+    if payload.producer_epoch != Some(active.producer_epoch)
+        || payload.session_id != active.session_id
+        || payload.vm_id != active.vm_id
+        || payload.target_node_id != active.node_id
+    {
+        return Err(anyhow!("stale or mismatched exec stream owner"));
     }
-    let mut last_input_seq = active.last_input_seq.lock().await;
-    if input_seq <= *last_input_seq {
-        return Ok(false);
-    }
-    let expected = last_input_seq.saturating_add(1);
-    if input_seq != expected {
-        return Err(anyhow!(
-            "exec.stream.input out of order: got seq={}, expected seq={expected}",
-            input_seq
-        ));
-    }
-    *last_input_seq = input_seq;
-    Ok(true)
+    Ok(())
 }
 
 // @dive: Publish a synthetic terminal "error" event when handle_exec_stream_start_command
@@ -3957,6 +4004,77 @@ mod tests {
         );
         assert_eq!(value.get("producer_epoch").and_then(Value::as_u64), Some(2));
         assert_eq!(value.get("sequence").and_then(Value::as_u64), Some(4));
+    }
+
+    #[tokio::test]
+    async fn exec_stream_input_preserves_control_after_eof_and_rejects_stale_owners() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let active = ActiveExecStream {
+            request_tx: sender,
+            last_input_seq: std::sync::Arc::new(Mutex::new(0)),
+            session_id: "session".into(),
+            vm_id: "vm".into(),
+            node_id: "node".into(),
+            producer_epoch: 3,
+            daemon_name: "daemon".into(),
+            auth: None,
+            control_client: DaemonManagerClient::new(
+                tonic::transport::Endpoint::from_static("http://127.0.0.1:9").connect_lazy(),
+            ),
+        };
+        let streams = std::sync::Arc::new(Mutex::new(HashMap::from([(
+            "stream".into(),
+            active.clone(),
+        )])));
+        let payload = json!({"stream_id":"stream", "session_id":"session", "vm_id":"vm", "target_node_id":"node", "producer_epoch":3, "input_seq":1, "input_kind":"eof"});
+        let envelope =
+            serde_json::from_value(json!({"command_type":"exec.stream.input", "payload":payload}))
+                .unwrap();
+        handle_exec_stream_input_command(&envelope, &streams)
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.recv().await.unwrap().request,
+            Some(attach_daemon_request::Request::StdinEof(true))
+        ));
+        handle_exec_stream_input_command(&envelope, &streams)
+            .await
+            .unwrap();
+        assert!(receiver.try_recv().is_err());
+        assert!(streams.lock().await.contains_key("stream"));
+        for (field, value) in [
+            ("producer_epoch", json!(2)),
+            ("session_id", json!("other")),
+            ("vm_id", json!("other")),
+            ("target_node_id", json!("other")),
+        ] {
+            let mut stale = payload.clone();
+            stale[field] = value;
+            stale["input_kind"] = json!("signal");
+            stale["signal"] = json!(9);
+            let stale: ExecStreamInputPayload = serde_json::from_value(stale).unwrap();
+            assert!(
+                validate_exec_input_identity(&active, &stale).is_err(),
+                "accepted stale {field}"
+            );
+        }
+        drop(receiver);
+        let mut failed = payload;
+        failed["input_kind"] = json!("stdin");
+        failed["input_seq"] = json!(2);
+        let envelope =
+            serde_json::from_value(json!({"command_type":"exec.stream.input", "payload":failed}))
+                .unwrap();
+        assert!(
+            handle_exec_stream_input_command(&envelope, &streams)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            *active.last_input_seq.lock().await,
+            1,
+            "failed forwarding must not acknowledge input"
+        );
     }
 
     #[test]
