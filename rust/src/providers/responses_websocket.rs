@@ -39,6 +39,7 @@ pub async fn connect(
             let mut pending = 0usize;
             let mut accepted = Vec::<Value>::new();
             let mut terminal_seen = false;
+            let mut completed_response = false;
             loop {
                 tokio::select! {
                     _ = sender.closed() => return Ok(()),
@@ -64,13 +65,17 @@ pub async fn connect(
                             return Err(Error::Inference("Responses control send failed".into()));
                         }
                         if command.kind == "response.steer" { pending += 1; }
+                        if command.kind == "response.create" { completed_response = false; }
                         let _ = command.reply.send(Ok(()));
                     }
                     incoming = tokio::time::timeout(timeout, socket.next()) => {
-                        let message = incoming.map_err(|_| Error::Inference("Responses WebSocket idle timeout".into()))?
-                            .ok_or_else(|| Error::Inference("Responses WebSocket closed before completion".into()))?
-                            .map_err(|error| Error::Inference(error.to_string()))?;
-                        if message.is_close() { return Err(Error::Inference("Responses WebSocket closed before completion".into())); }
+                        let message = match incoming {
+                            Ok(Some(Ok(message))) if !message.is_close() => message,
+                            _ if completed_response => return Ok(()),
+                            Err(_) => return Err(Error::Inference("Responses WebSocket idle timeout".into())),
+                            Ok(Some(Err(error))) => return Err(Error::Inference(error.to_string())),
+                            _ => return Err(Error::Inference("Responses WebSocket closed before completion".into())),
+                        };
                         let Some(text) = message.as_text() else { continue; };
                         let mut event: Value = serde_json::from_str(text)?;
                         let kind = event["type"].as_str().unwrap_or("").to_owned();
@@ -78,6 +83,7 @@ pub async fn connect(
                         if !rate_limits.is_empty() { let _ = sender.send(Ok(StreamChunk::RateLimits(rate_limits))); }
                         if kind == "response.created" {
                             terminal_seen = false;
+                            completed_response = false;
                             let next_id = event["response"]["id"].as_str().map(str::to_owned);
                             if response_id.is_some() && next_id != response_id {
                                 for steer in accepted.drain(..) {
@@ -106,6 +112,7 @@ pub async fn connect(
                         let terminal = matches!(kind.as_str(), "response.completed" | "response.done" | "response.incomplete");
                         if terminal {
                             terminal_seen = true;
+                            completed_response = kind != "response.incomplete";
                             if kind == "response.incomplete" && event["response"]["incomplete_details"]["reason"] != "steered" {
                                 return Err(Error::Inference(event.to_string()));
                             }
@@ -147,6 +154,97 @@ mod tests {
     use crate::providers::{GenerationConfig, InferenceClient};
     use tokio::net::TcpListener;
     use tokio_websockets::{Message, ServerBuilder};
+
+    #[tokio::test]
+    async fn disconnect_preserves_completed_work_but_not_an_unfinished_continuation() {
+        for (mode, ending) in ["completed", "unfinished", "continuation", "steered"]
+            .into_iter()
+            .flat_map(|mode| ["close", "drop", "timeout"].map(|ending| (mode, ending)))
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = ServerBuilder::new().accept(socket).await.unwrap();
+                socket.next().await.unwrap().unwrap();
+                socket
+                    .send(Message::text(
+                        json!({"type":"response.created","response":{"id":"resp_1"}}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                socket.next().await.unwrap().unwrap();
+                socket
+                    .send(Message::text(
+                        json!({"type":"response.steer.accepted","steer":{"id":"steer_1"}})
+                            .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                if mode != "unfinished" {
+                    let terminal = if mode == "steered" {
+                        "response.incomplete"
+                    } else {
+                        "response.completed"
+                    };
+                    socket.send(Message::text(json!({"type":terminal,"response":{"id":"resp_1","incomplete_details":{"reason":"steered"},"output":[{"type":"function_call","call_id":"call_1","name":"todo_list","arguments":"{}"}]}}).to_string())).await.unwrap();
+                }
+                if mode == "continuation" {
+                    socket.send(Message::text(json!({"type":"response.steer.pending","steer":{"id":"steer_1"},"required_input":[]}).to_string())).await.unwrap();
+                    socket.next().await.unwrap().unwrap();
+                }
+                if ending == "close" {
+                    socket.send(Message::close(None, "")).await.unwrap();
+                }
+                if ending == "timeout" {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            });
+            let control = ResponsesControl::default();
+            let mut config = GenerationConfig::new("gpt-6-astra");
+            config.timeout = Some(Duration::from_millis(250));
+            config.responses = Some(ResponsesOptions {
+                websocket: true,
+                control: Some(control.clone()),
+                ..Default::default()
+            });
+            let client = OpenAIResponsesClient::new("fixture", "gpt-6-astra")
+                .with_api_url(format!("http://{address}/v1/responses"));
+            let mut stream = client.connect_and_listen(&[], &config).await.unwrap();
+            let mut completed = false;
+            let mut failed = false;
+            let mut applied = false;
+            let mut sent = false;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(StreamChunk::ResponseId(_)) if !sent => {
+                            sent = true;
+                            control
+                                .send("response.steer", json!("Subagent completed"))
+                                .await
+                                .unwrap();
+                        }
+                        Ok(StreamChunk::ResponseItems(_)) => completed = true,
+                        Ok(StreamChunk::Steering(event)) => {
+                            applied |= event["status"] == "applied";
+                            if event["status"] == "pending" {
+                                control.send("response.create", json!([])).await.unwrap();
+                            }
+                        }
+                        Err(_) => failed = true,
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            server.await.unwrap();
+            assert_eq!(completed, mode != "unfinished", "{mode}");
+            assert_eq!(failed, mode != "completed", "{mode}/{ending}");
+            assert!(!applied, "unacknowledged steering must remain undelivered");
+        }
+    }
 
     #[tokio::test]
     async fn steering_keeps_the_same_connection_through_acceptance_required_input_and_application()
@@ -304,6 +402,56 @@ mod tests {
         drop(stream);
         server.await.unwrap();
         assert!(control.send("response.steer", json!("late")).await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the freshly built ts native binding and JavaScript output"]
+    async fn native_binding_preserves_tool_execution_after_completed_response_disconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../ts/test-fixtures/astra-steering.cjs");
+        let node = tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::process::Command::new("node")
+                    .arg(script)
+                    .env(
+                        "CHEVALIER_ASTRA_FIXTURE",
+                        format!("http://{address}/v1/responses"),
+                    )
+                    .env("CHEVALIER_ASTRA_FIXTURE_MODE", "completed")
+                    .output(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        });
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = ServerBuilder::new().accept(socket).await.unwrap();
+        socket.next().await.unwrap().unwrap();
+        socket
+            .send(Message::text(
+                json!({"type":"response.created","response":{"id":"resp_1"}}).to_string(),
+            ))
+            .await
+            .unwrap();
+        socket.next().await.unwrap().unwrap();
+        let item = json!({"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{}"});
+        for event in [
+            json!({"type":"response.steer.accepted","steer":{"id":"steer_1"}}),
+            json!({"type":"response.output_item.done","item":item}),
+            json!({"type":"response.completed","response":{"id":"resp_1","output":[item]}}),
+        ] {
+            socket.send(Message::text(event.to_string())).await.unwrap();
+        }
+        socket.send(Message::close(None, "")).await.unwrap();
+        let output = node.await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[tokio::test]

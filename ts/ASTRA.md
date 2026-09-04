@@ -64,6 +64,13 @@ AbortSignal makes iteration reject with its abort reason. Neither operation
 undoes host tools; the host owns their cancellation. Persist steering inputs
 and delivery state in the host: queued steering does not survive disconnects.
 
+If a response has completed but steering remains unapplied, a subsequent
+disconnect or idle timeout ends that completed stream successfully. Its tool
+calls remain available to the host. This does not acknowledge steering delivery;
+retain unapplied inputs for the next turn. Starting a continuation clears this
+completion state, so disconnects before its completion still fail. An incomplete
+response interrupted by steering is not a completed response.
+
 WebSocket mode is explicit and does not silently fall back to SSE. The Codex
 subscription transport uses its own URL and credentials; local fixtures prove
 the wire implementation, not upstream subscription capability. Unsupported
