@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use futures::{SinkExt, StreamExt, channel::mpsc};
+use futures::{SinkExt, Stream, StreamExt, channel::mpsc};
 use http::{HeaderMap, HeaderName, HeaderValue, Uri};
 use reqwest::{StatusCode, header};
 use serde_json::Value;
@@ -33,6 +33,16 @@ use super::openai_responses_streaming::{ResponsesToolAccumulator, parse_openai_r
 
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
+
+async fn next_stream_item_with_idle_timeout<S>(
+    stream: &mut S,
+    timeout: Duration,
+) -> std::result::Result<Option<S::Item>, tokio::time::error::Elapsed>
+where
+    S: Stream + Unpin,
+{
+    tokio::time::timeout(timeout, stream.next()).await
+}
 const OPENBRACKET_ORIGINATOR: &str = "openbracket";
 const OPENBRACKET_USER_AGENT: &str = concat!(
     "openbracket/",
@@ -311,6 +321,7 @@ impl OpenAICodexResponsesClient {
     async fn connect_websocket_stream(
         &self,
         body: Value,
+        read_timeout: Option<Duration>,
         has_tools: bool,
     ) -> Result<Pin<Box<dyn futures::stream::Stream<Item = Result<StreamChunk>> + Send>>> {
         let websocket_request = wrap_websocket_request_body(body)?;
@@ -346,8 +357,21 @@ impl OpenAICodexResponsesClient {
         }
         tokio::spawn(async move {
             let mut accumulator = ResponsesToolAccumulator::new();
+            let read_timeout = read_timeout.unwrap_or(Duration::from_secs(180));
 
-            while let Some(item) = client.next().await {
+            loop {
+                let item = match next_stream_item_with_idle_timeout(&mut client, read_timeout).await
+                {
+                    Ok(Some(item)) => item,
+                    Ok(None) => return,
+                    Err(_) => {
+                        let _ = tx.unbounded_send(Err(Error::Inference(format!(
+                            "Codex websocket idle timed out after {}ms",
+                            read_timeout.as_millis()
+                        ))));
+                        return;
+                    }
+                };
                 let message = match item {
                     Ok(message) => message,
                     Err(error) => {
@@ -510,7 +534,7 @@ impl OpenAICodexResponsesClient {
         has_tools: bool,
     ) -> Result<Pin<Box<dyn futures::stream::Stream<Item = Result<StreamChunk>> + Send>>> {
         let mut websocket_stream = match self
-            .connect_websocket_stream(request_body.clone(), has_tools)
+            .connect_websocket_stream(request_body.clone(), timeout, has_tools)
             .await
         {
             Ok(stream) => stream,
@@ -617,7 +641,8 @@ impl InferenceClient for OpenAICodexResponsesClient {
 
         match self.transport {
             CodexSubscriptionTransport::WebSocket => {
-                self.connect_websocket_stream(request_body, has_tools).await
+                self.connect_websocket_stream(request_body, config.timeout, has_tools)
+                    .await
             }
             CodexSubscriptionTransport::Sse => {
                 self.connect_sse_stream(
@@ -1060,6 +1085,27 @@ mod tests {
     use super::*;
 
     const TEST_CODEX_TOKEN: &str = "header.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xMjMifX0.signature";
+
+    #[tokio::test]
+    async fn websocket_stream_wait_is_bounded_when_the_peer_stays_silent() {
+        let mut stream = futures::stream::pending::<()>();
+
+        assert!(
+            next_stream_item_with_idle_timeout(&mut stream, Duration::from_millis(5))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_stream_delivers_available_messages_before_the_idle_timeout() {
+        let mut stream = futures::stream::iter(["message"]);
+
+        assert_eq!(
+            next_stream_item_with_idle_timeout(&mut stream, Duration::from_secs(1)).await,
+            Ok(Some("message"))
+        );
+    }
 
     fn test_client() -> OpenAICodexResponsesClient {
         OpenAICodexResponsesClient::new(
