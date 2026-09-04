@@ -589,10 +589,12 @@ if (!nativeBinding) {
 module.exports = nativeBinding
 module.exports.McpClient = nativeBinding.McpClient
 module.exports.McpServer = nativeBinding.McpServer
+module.exports.ProgrammaticExecution = nativeBinding.ProgrammaticExecution
 module.exports.Runtime = nativeBinding.Runtime
 module.exports.StreamHandle = nativeBinding.StreamHandle
 module.exports.VfsContentHasher = nativeBinding.VfsContentHasher
 module.exports.VfsStorage = nativeBinding.VfsStorage
+module.exports.programmaticDescription = nativeBinding.programmaticDescription
 module.exports.version = nativeBinding.version
 module.exports.vfsContentHash = nativeBinding.vfsContentHash
 module.exports.vfsContentHashAlgorithm = nativeBinding.vfsContentHashAlgorithm

@@ -50,6 +50,7 @@ pub struct Message {
     pub is_error: Option<bool>,
     pub parts: Option<Vec<MediaPartInput>>,
     pub tool_calls: Option<Vec<ToolCallInput>>,
+    pub provider_response: Option<serde_json::Value>,
 }
 
 fn to_media_part(p: &MediaPartInput) -> MediaPart {
@@ -127,7 +128,9 @@ pub fn to_conversation_message(m: &Message) -> ConversationMessage {
                     });
                 }
             }
-            ConversationMessage::AssistantResponse(AssistantResponse::new(parts))
+            let mut response = AssistantResponse::new(parts);
+            response.provider_response = m.provider_response.clone();
+            ConversationMessage::AssistantResponse(response)
         }
         "reasoning" => ConversationMessage::Reasoning(ReasoningSegment::new(
             m.content.clone().unwrap_or_default(),

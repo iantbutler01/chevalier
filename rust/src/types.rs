@@ -77,8 +77,9 @@ impl Provider {
 
         let provider = match provider_str {
             "anthropic" | "kimi-coding" => Provider::Anthropic,
+            "openai" if model_name.starts_with("gpt-6-astra") => Provider::OpenAIResponses,
             "openai" => Provider::OpenAI,
-            "openai-codex-responses" => Provider::OpenAIResponses,
+            "openai-responses" | "openai-codex-responses" => Provider::OpenAIResponses,
             "bedrock" => Provider::Bedrock,
             "google-genai" | "gemini" | "google-gemini" => Provider::GoogleGenAI,
             "google-anthropic" | "vertexai" => Provider::GoogleAnthropic,
@@ -221,6 +222,7 @@ fn is_openai_vision_model(model: &str) -> bool {
         || model.starts_with("gpt-4.1")
         || model.starts_with("gpt-4.5")
         || model.starts_with("gpt-5")
+        || model.starts_with("gpt-6-astra")
         || model.starts_with("o3")
         || model.starts_with("o4")
 }
@@ -342,18 +344,24 @@ impl ChatMessage {
 pub struct AssistantResponse {
     /// Ordered output emitted by the assistant.
     pub output: Vec<ResponsePart>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_response: Option<serde_json::Value>,
 }
 
 impl AssistantResponse {
     /// Create a new response from ordered output items.
     pub fn new(output: Vec<ResponsePart>) -> Self {
-        Self { output }
+        Self {
+            output,
+            provider_response: None,
+        }
     }
 
     /// Create a text-only assistant response.
     pub fn from_text(text: impl Into<String>) -> Self {
         Self {
             output: vec![ResponsePart::Text { text: text.into() }],
+            provider_response: None,
         }
     }
 
@@ -457,6 +465,9 @@ pub enum ResponsePart {
 /// Typed streaming event for progressively building an assistant response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ResponseStreamEvent {
+    ResponseItems(serde_json::Value),
+    Steering(serde_json::Value),
+    ToolMetadata(serde_json::Value),
     /// Ordered output emitted during streaming.
     Output(ResponsePart),
     /// Partial tool-call payload before a complete tool call is available.
@@ -1621,6 +1632,8 @@ mod tests {
 
     #[test]
     fn test_provider_image_input_override() {
+        assert!(Provider::OpenAIResponses.supports_image_input("gpt-6-astra"));
+        assert!(!Provider::OpenAIResponses.supports_image_input("gpt-6-astra@vision=false"));
         assert!(
             Provider::OpenRouter.supports_image_input("qwen/qwen2.5-vl-72b-instruct@vision=true")
         );

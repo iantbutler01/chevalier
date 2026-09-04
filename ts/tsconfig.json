@@ -9,5 +9,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["index.ts"]
+  "include": ["index.ts", "programmatic.ts"]
 }

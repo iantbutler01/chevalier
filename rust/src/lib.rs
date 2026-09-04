@@ -26,6 +26,7 @@ pub mod types;
 
 // Module declarations (implementations coming in phases)
 pub mod parsers;
+pub mod programmatic;
 pub mod providers;
 pub mod schema;
 pub mod templating;

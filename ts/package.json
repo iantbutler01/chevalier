@@ -1,7 +1,7 @@
 {
   "name": "chevalier",
   "version": "0.0.0",
-  "description": "TypeScript bindings for Chevalier \u2014 agents are just functions.",
+  "description": "TypeScript bindings for Chevalier — agents are just functions.",
   "license": "Apache-2.0",
   "type": "commonjs",
   "main": "index.js",
@@ -34,7 +34,9 @@
     "native.d.ts",
     "vfs-gateway-server.js",
     "vfs-gateway-server.d.ts",
-    "*.node"
+    "*.node",
+    "programmatic.js",
+    "programmatic.d.ts"
   ],
   "scripts": {
     "build:native": "napi build --platform --release --js native.js --dts native.d.ts",

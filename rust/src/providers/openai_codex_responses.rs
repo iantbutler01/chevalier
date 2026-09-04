@@ -13,6 +13,14 @@ use serde_json::Value;
 use std::pin::Pin;
 use std::time::Duration;
 
+struct WebSocketTask(tokio::task::AbortHandle);
+
+impl Drop for WebSocketTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 use crate::error::{Error, Result};
 use crate::providers::{
     CodexSubscriptionProviderConfig, CodexSubscriptionTransport, GenerationConfig,
@@ -25,8 +33,8 @@ use crate::types::{
     TokenUsage, ToolCall,
 };
 use crate::utils::{
-    ConversationMessage, convert_messages_to_responses_input, parse_json_value_strict_str,
-    parse_sse_stream, validate_image_input_supported,
+    ConversationMessage, parse_json_value_strict_str, parse_sse_stream,
+    validate_image_input_supported,
 };
 
 use super::openai_responses_streaming::{ResponsesToolAccumulator, parse_openai_responses_event};
@@ -170,7 +178,11 @@ impl OpenAICodexResponsesClient {
             .iter()
             .cloned()
             .map(|mut tool| {
+                let asynchronous = tool.get("async").cloned();
                 fix_tool_schema_for_provider(&mut tool, "openai-codex-responses");
+                if let Some(value) = asynchronous {
+                    tool["async"] = value;
+                }
                 tool
             })
             .collect()
@@ -186,7 +198,11 @@ impl OpenAICodexResponsesClient {
         validate_image_input_supported(messages, Provider::OpenAIResponses, model)?;
 
         let (instructions, input_items) =
-            convert_messages_to_responses_input(messages, Provider::OpenAIResponses)?;
+            crate::utils::message_conversion::responses_input_for_model(
+                messages,
+                Provider::OpenAIResponses,
+                model,
+            )?;
 
         let mut request = serde_json::json!({
             "model": model,
@@ -207,8 +223,11 @@ impl OpenAICodexResponsesClient {
         if let Some(ref prompt_cache_key) = self.prompt_cache_key {
             request["prompt_cache_key"] = serde_json::json!(prompt_cache_key);
         }
+        super::responses_control::apply_compaction(&mut request, config.responses.as_ref(), false);
 
-        if let Some(temperature) = config.temperature {
+        if let Some(temperature) = config.temperature
+            && !model.starts_with("gpt-6-astra")
+        {
             request["temperature"] = serde_json::json!(temperature);
         }
 
@@ -216,6 +235,15 @@ impl OpenAICodexResponsesClient {
             && !tools.is_empty()
         {
             request["tools"] = serde_json::json!(self.normalized_tools(tools));
+            if !model.starts_with("gpt-6-astra")
+                && let Some(tools) = request["tools"].as_array_mut()
+            {
+                for tool in tools {
+                    if let Some(tool) = tool.as_object_mut() {
+                        tool.remove("async");
+                    }
+                }
+            }
             request["tool_choice"] = serde_json::json!("auto");
         }
 
@@ -325,6 +353,7 @@ impl OpenAICodexResponsesClient {
         has_tools: bool,
     ) -> Result<Pin<Box<dyn futures::stream::Stream<Item = Result<StreamChunk>> + Send>>> {
         let websocket_request = wrap_websocket_request_body(body)?;
+        let request_model = websocket_request["model"].clone();
         let request_text = serde_json::to_string(&websocket_request)?;
         let builder = self.websocket_builder()?;
 
@@ -355,7 +384,7 @@ impl OpenAICodexResponsesClient {
         {
             return Ok(Box::pin(rx));
         }
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut accumulator = ResponsesToolAccumulator::new();
             let read_timeout = read_timeout.unwrap_or(Duration::from_secs(180));
 
@@ -420,7 +449,13 @@ impl OpenAICodexResponsesClient {
                 }
 
                 let done = is_completion_event(&event_json);
-                let event_json = normalize_completion_event(event_json);
+                let mut event_json = normalize_completion_event(event_json);
+                if let Some(response) = event_json
+                    .get_mut("response")
+                    .and_then(Value::as_object_mut)
+                {
+                    response.insert("model".into(), request_model.clone());
+                }
                 for chunk in parse_openai_responses_event(&event_json, &mut accumulator, has_tools)
                 {
                     if tx.unbounded_send(Ok(chunk)).is_err() {
@@ -434,7 +469,12 @@ impl OpenAICodexResponsesClient {
             }
         });
 
-        Ok(Box::pin(rx))
+        Ok(Box::pin(futures::stream::unfold(
+            (rx, WebSocketTask(task.abort_handle())),
+            |(mut receiver, task)| async move {
+                receiver.next().await.map(|item| (item, (receiver, task)))
+            },
+        )))
     }
 
     fn handle_error_response(
@@ -483,6 +523,7 @@ impl OpenAICodexResponsesClient {
         let debug = debug_codex_stream();
         let rate_limits = codex_rate_limits_from_headers(response.headers());
         let sse_stream = parse_sse_stream(response);
+        let request_model = request_body["model"].clone();
         let chunk_stream = sse_stream.scan(
             ResponsesToolAccumulator::new(),
             move |accumulator, sse_result| {
@@ -508,7 +549,13 @@ impl OpenAICodexResponsesClient {
                     ))]));
                 }
 
-                let event_json = normalize_completion_event(sse_json);
+                let mut event_json = normalize_completion_event(sse_json);
+                if let Some(response) = event_json
+                    .get_mut("response")
+                    .and_then(Value::as_object_mut)
+                {
+                    response.insert("model".into(), request_model.clone());
+                }
                 let chunks = parse_openai_responses_event(&event_json, accumulator, has_tools);
                 futures::future::ready(Some(chunks.into_iter().map(Ok).collect()))
             },
@@ -589,6 +636,8 @@ impl InferenceClient for OpenAICodexResponsesClient {
 
         while let Some(chunk) = stream.next().await {
             match chunk? {
+                StreamChunk::ResponseItems(data) => response.provider_response = Some(data),
+                StreamChunk::Steering(_) | StreamChunk::ToolMetadata(_) => {}
                 StreamChunk::Content(text) => {
                     response.push_output(ResponsePart::Text { text });
                 }
@@ -640,6 +689,23 @@ impl InferenceClient for OpenAICodexResponsesClient {
         let has_tools = config.tools.as_ref().is_some_and(|tools| !tools.is_empty());
 
         match self.transport {
+            _ if config
+                .responses
+                .as_ref()
+                .is_some_and(|options| options.websocket) =>
+            {
+                super::responses_websocket::connect(
+                    self.websocket_builder()?,
+                    request_body,
+                    config.timeout,
+                    config
+                        .responses
+                        .as_ref()
+                        .and_then(|options| options.control.clone())
+                        .unwrap_or_default(),
+                )
+                .await
+            }
             CodexSubscriptionTransport::WebSocket => {
                 self.connect_websocket_stream(request_body, config.timeout, has_tools)
                     .await
@@ -820,7 +886,7 @@ fn codex_error_detail(event_json: &Value) -> String {
     event_json.to_string()
 }
 
-fn codex_rate_limits_from_headers(headers: &HeaderMap) -> Vec<ProviderRateLimit> {
+pub(crate) fn codex_rate_limits_from_headers(headers: &HeaderMap) -> Vec<ProviderRateLimit> {
     [
         (
             ProviderRateLimitScope::Session,
@@ -879,7 +945,7 @@ fn codex_rate_limit_window_from_event(
     })
 }
 
-fn codex_rate_limits_from_event(event_json: &Value) -> Vec<ProviderRateLimit> {
+pub(crate) fn codex_rate_limits_from_event(event_json: &Value) -> Vec<ProviderRateLimit> {
     if event_json.get("type").and_then(Value::as_str) != Some("codex.rate_limits") {
         return Vec::new();
     }

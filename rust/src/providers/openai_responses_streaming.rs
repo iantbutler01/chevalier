@@ -4,10 +4,11 @@
 
 use crate::providers::StreamChunk;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Default)]
 pub struct ResponsesToolAccumulator {
+    completed_output: BTreeMap<usize, Value>,
     current_tool_calls: HashMap<usize, PartialToolCall>,
     /// Call ids already emitted as ToolCallComplete. The Responses API sends BOTH
     /// `response.function_call_arguments.done` AND a trailing `response.output_item.done`
@@ -19,6 +20,7 @@ pub struct ResponsesToolAccumulator {
 
 #[derive(Debug, Clone)]
 struct PartialToolCall {
+    metadata: Value,
     call_id: String,
     name: String,
     arguments: String,
@@ -27,6 +29,7 @@ struct PartialToolCall {
 impl ResponsesToolAccumulator {
     pub fn new() -> Self {
         Self {
+            completed_output: BTreeMap::new(),
             current_tool_calls: HashMap::new(),
             completed_call_ids: HashSet::new(),
             emitted_reasoning: false,
@@ -49,6 +52,7 @@ impl ResponsesToolAccumulator {
                 call_id: String::new(),
                 name: String::new(),
                 arguments: String::new(),
+                metadata: Value::Null,
             });
 
         if let Some(id) = call_id {
@@ -67,6 +71,7 @@ impl ResponsesToolAccumulator {
                 call_id: String::new(),
                 name: String::new(),
                 arguments: String::new(),
+                metadata: Value::Null,
             });
         entry.arguments.push_str(delta);
     }
@@ -79,6 +84,7 @@ impl ResponsesToolAccumulator {
                 call_id: String::new(),
                 name: String::new(),
                 arguments: String::new(),
+                metadata: Value::Null,
             });
         entry.arguments = args.to_string();
     }
@@ -133,6 +139,9 @@ impl ResponsesToolAccumulator {
             serde_json::json!({
                 "id": call_id,
                 "type": "function",
+                "async": tool.metadata.get("async"),
+                "caller": tool.metadata.get("caller"),
+                "provider_item": tool.metadata,
                 "function": {
                     "name": tool.name,
                     "arguments": tool.arguments
@@ -239,6 +248,9 @@ pub fn parse_openai_responses_event(
                     .or_else(|| item.get("id").and_then(|v| v.as_str()));
                 let name = item.get("name").and_then(|v| v.as_str());
                 accumulator.start_tool(output_index, call_id, name);
+                if let Some(tool) = accumulator.current_tool_calls.get_mut(&output_index) {
+                    tool.metadata = item.clone();
+                }
                 if let Some(partial) = accumulator.tool_partial(output_index) {
                     chunks.push(StreamChunk::ToolCallPartial(partial));
                 }
@@ -271,10 +283,20 @@ pub fn parse_openai_responses_event(
             }
         }
         "response.output_item.done" => {
+            if let Some(item) = event_json.get("item")
+                && item.get("call_id").is_some()
+            {
+                chunks.push(StreamChunk::ToolMetadata(item.clone()));
+            }
             let output_index = event_json
                 .get("output_index")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as usize;
+            if let Some(item) = event_json.get("item") {
+                accumulator
+                    .completed_output
+                    .insert(output_index, item.clone());
+            }
             if let Some(item) = event_json.get("item")
                 && item.get("type").and_then(|v| v.as_str()) == Some("function_call")
                 && has_tools
@@ -289,6 +311,9 @@ pub fn parse_openai_responses_event(
                 if !accumulator.is_completed(output_index, call_id) {
                     let name = item.get("name").and_then(|v| v.as_str());
                     accumulator.start_tool(output_index, call_id, name);
+                    if let Some(tool) = accumulator.current_tool_calls.get_mut(&output_index) {
+                        tool.metadata = item.clone();
+                    }
                     if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
                         accumulator.set_args(output_index, args);
                     }
@@ -304,7 +329,20 @@ pub fn parse_openai_responses_event(
                 push_reasoning(&mut chunks, accumulator, &summary);
             }
         }
-        "response.done" => {
+        "response.done" | "response.completed" => {
+            if let Some(response) = event_json.get("response") {
+                let items = response
+                    .get("output")
+                    .and_then(Value::as_array)
+                    .filter(|items| !items.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| accumulator.completed_output.values().cloned().collect());
+                if !items.is_empty() {
+                    chunks.push(StreamChunk::ResponseItems(serde_json::json!({
+                    "model": response.get("model"), "responseId": response.get("id"), "items": items
+                })));
+                }
+            }
             if let Some(response_id) = event_json
                 .get("response")
                 .and_then(|response| response.get("id"))
@@ -514,13 +552,10 @@ mod tests {
         let mut acc = ResponsesToolAccumulator::new();
         let chunks = parse_openai_responses_event(&event, &mut acc, false);
 
-        assert_eq!(chunks.len(), 1);
-        match &chunks[0] {
-            StreamChunk::Reasoning(text) => {
-                assert_eq!(text, "Checked the failing path.\nValidated the fix.");
-            }
-            _ => panic!("Expected Reasoning chunk"),
-        }
+        assert!(
+            matches!(&chunks[0], StreamChunk::ResponseItems(data) if data["items"] == event["response"]["output"])
+        );
+        assert!(chunks.iter().any(|chunk| matches!(chunk, StreamChunk::Reasoning(text) if text == "Checked the failing path.\nValidated the fix.")));
     }
 
     #[test]

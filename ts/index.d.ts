@@ -1,5 +1,6 @@
 import * as native from "./native.js";
 import type { ZodType } from "zod";
+export * from "./programmatic";
 export type { RunResult, ToolCallJs, ToolSchemaJs, StreamEvent, Message, MediaPartInput, GatewayOptions, ProviderConfigInput, AnthropicCacheConfig, CodexSubscriptionConfigInput, VfsMetadata, VfsObjectState, VfsWriteOptions, } from "./native.js";
 export type McpClientConfig = {
     transport: "http" | "websocket";
@@ -36,6 +37,12 @@ export interface RuntimeOptions {
     apiKey?: string;
 }
 export interface RunArgs<T = unknown> {
+    signal?: AbortSignal;
+    onControl?: (control: StreamControl) => void;
+    responses?: {
+        websocket?: boolean;
+        compactionThreshold?: number;
+    };
     prompt?: string;
     system?: string;
     temperature?: number;
@@ -52,6 +59,7 @@ export interface RunArgs<T = unknown> {
     previousResponseId?: string;
 }
 export interface ToolDef {
+    async?: boolean;
     name: string;
     description?: string;
     /** Zod schema or raw JSON Schema describing the tool's args. */
@@ -81,6 +89,11 @@ export type TypedRunResult<T> = native.RunResult & {
 export type TypedStreamEvent<T> = native.StreamEvent & {
     value?: T;
 };
+export interface StreamControl {
+    steer(input: string | object[]): Promise<void>;
+    continueResponse(input: object[]): Promise<void>;
+    cancel(): void;
+}
 /** The Chevalier agent runtime. */
 export declare class Runtime {
     /** @internal access to the raw napi runtime */

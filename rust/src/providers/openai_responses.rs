@@ -20,8 +20,8 @@ use crate::retry::{RetryConfig, retry_with_backoff};
 use crate::schema::fix_tool_schema_for_provider;
 use crate::types::{AssistantResponse, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{
-    ConversationMessage, convert_messages_to_responses_input, parse_json_value_strict_str,
-    parse_sse_stream, validate_image_input_supported,
+    ConversationMessage, parse_json_value_strict_str, parse_sse_stream,
+    validate_image_input_supported,
 };
 
 use super::openai_responses_streaming::{ResponsesToolAccumulator, parse_openai_responses_event};
@@ -76,7 +76,11 @@ impl OpenAIResponsesClient {
             .iter()
             .cloned()
             .map(|mut tool| {
+                let asynchronous = tool.get("async").cloned();
                 fix_tool_schema_for_provider(&mut tool, provider);
+                if let Some(value) = asynchronous {
+                    tool["async"] = value;
+                }
                 tool
             })
             .collect()
@@ -134,7 +138,11 @@ impl OpenAIResponsesClient {
         validate_image_input_supported(messages, self.provider, model)?;
 
         let (instructions, input_items) =
-            convert_messages_to_responses_input(messages, self.provider)?;
+            crate::utils::message_conversion::responses_input_for_model(
+                messages,
+                self.provider,
+                model,
+            )?;
 
         let mut request = serde_json::json!({
             "model": model,
@@ -144,6 +152,19 @@ impl OpenAIResponsesClient {
             "top_p": config.top_p.unwrap_or(1.0),
             "stream": stream,
         });
+        if model.starts_with("gpt-6-astra") {
+            request.as_object_mut().unwrap().remove("temperature");
+            request.as_object_mut().unwrap().remove("top_p");
+        }
+        if self.provider == Provider::OpenAIResponses {
+            request["store"] = serde_json::json!(false);
+            request["include"] = serde_json::json!(["reasoning.encrypted_content"]);
+        }
+        super::responses_control::apply_compaction(
+            &mut request,
+            config.responses.as_ref(),
+            config.previous_response_id.is_some(),
+        );
 
         if matches!(self.provider, Provider::OpenAIResponses)
             && let Some(retention) = config.prompt_cache_retention
@@ -165,10 +186,19 @@ impl OpenAIResponsesClient {
             && !tools.is_empty()
         {
             request["tools"] = serde_json::json!(self.normalized_tools(tools));
+            if !model.starts_with("gpt-6-astra")
+                && let Some(tools) = request["tools"].as_array_mut()
+            {
+                for tool in tools {
+                    if let Some(tool) = tool.as_object_mut() {
+                        tool.remove("async");
+                    }
+                }
+            }
             request["tool_choice"] = serde_json::json!("auto");
         }
 
-        if let Some(ref reasoning) = self.reasoning {
+        if let Some(ref reasoning) = config.reasoning_effort.as_ref().or(self.reasoning.as_ref()) {
             if reasoning.chars().all(|c| c.is_ascii_digit()) {
                 request["reasoning"] = serde_json::json!({
                     "max_tokens": reasoning.parse::<u32>().unwrap_or(1024)
@@ -393,7 +423,12 @@ impl InferenceClient for OpenAIResponsesClient {
             None
         };
 
-        let response = self.extract_response(&body)?;
+        let mut response = self.extract_response(&body)?;
+        if let Some(items) = body.get("output").and_then(serde_json::Value::as_array) {
+            response.provider_response = Some(
+                serde_json::json!({"model": config.effective_model(&self.model), "responseId": body.get("id"), "items": items}),
+            );
+        }
 
         let has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();
         let has_tool_calls = response.has_tool_calls();
@@ -418,6 +453,29 @@ impl InferenceClient for OpenAIResponsesClient {
         let request_body = self.build_request_body(messages, config, true)?;
         let timeout = config.timeout;
 
+        if let Some(options) = &config.responses
+            && options.websocket
+        {
+            let url = self
+                .api_url
+                .replacen("https://", "wss://", 1)
+                .replacen("http://", "ws://", 1);
+            let uri = url.parse().map_err(|error| {
+                Error::NonRetryable(format!("Invalid Responses WebSocket URL: {error}"))
+            })?;
+            let token = http::HeaderValue::from_str(&format!("Bearer {}", self.api_key))
+                .map_err(|error| Error::NonRetryable(error.to_string()))?;
+            let builder = tokio_websockets::ClientBuilder::from_uri(uri)
+                .add_header(http::header::AUTHORIZATION, token);
+            return super::responses_websocket::connect(
+                builder,
+                request_body,
+                timeout,
+                options.control.clone().unwrap_or_default(),
+            )
+            .await;
+        }
+
         let retry_config = config.retry_config.clone().unwrap_or_default();
         let response = retry_with_backoff(retry_config, || async {
             let resp = self.make_request(request_body.clone(), timeout).await?;
@@ -434,6 +492,7 @@ impl InferenceClient for OpenAIResponsesClient {
 
         let has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();
         let sse_stream = parse_sse_stream(response);
+        let request_model = request_body["model"].clone();
 
         let debug_sse = std::env::var("CHEVALIER_DEBUG_RESPONSES_SSE")
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
@@ -442,13 +501,27 @@ impl InferenceClient for OpenAIResponsesClient {
         let chunk_stream = sse_stream.scan(
             ResponsesToolAccumulator::new(),
             move |accumulator, sse_result| {
-                let sse_json = match sse_result {
+                let mut sse_json = match sse_result {
                     Ok(json) => json,
                     Err(e) => return futures::future::ready(Some(vec![Err(e)])),
                 };
+                if let Some(response) = sse_json
+                    .get_mut("response")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    response.insert("model".into(), request_model.clone());
+                }
 
                 if debug_sse {
                     eprintln!("responses sse event: {}", sse_json);
+                }
+                if matches!(
+                    sse_json["type"].as_str(),
+                    Some("error" | "response.failed" | "response.incomplete")
+                ) {
+                    return futures::future::ready(Some(vec![Err(Error::NonRetryable(
+                        sse_json.to_string(),
+                    ))]));
                 }
 
                 let chunks = parse_openai_responses_event(&sse_json, accumulator, has_tools);

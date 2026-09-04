@@ -6,6 +6,7 @@
 import * as native from "./native.js";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import type { ZodType } from "zod";
+export * from "./programmatic";
 
 export type {
   RunResult,
@@ -183,6 +184,9 @@ export interface RuntimeOptions {
 }
 
 export interface RunArgs<T = unknown> {
+  signal?: AbortSignal;
+  onControl?: (control: StreamControl) => void;
+  responses?: { websocket?: boolean; compactionThreshold?: number };
   prompt?: string;
   system?: string;
   temperature?: number;
@@ -200,6 +204,7 @@ export interface RunArgs<T = unknown> {
 }
 
 export interface ToolDef {
+  async?: boolean;
   name: string;
   description?: string;
   /** Zod schema or raw JSON Schema describing the tool's args. */
@@ -231,6 +236,12 @@ export type TypedRunResult<T> = native.RunResult & { value?: T };
  *  `rateLimits` with `ProviderRateLimit[]` in `data`. */
 export type TypedStreamEvent<T> = native.StreamEvent & { value?: T };
 
+export interface StreamControl {
+  steer(input: string | object[]): Promise<void>;
+  continueResponse(input: object[]): Promise<void>;
+  cancel(): void;
+}
+
 /** The Chevalier agent runtime. */
 export class Runtime {
   /** @internal access to the raw napi runtime */
@@ -242,7 +253,8 @@ export class Runtime {
 
   /** Non-streaming inference. Pass `output` (Zod) to get a typed, validated `value`. */
   async run<T = unknown>(args: RunArgs<T> = {}): Promise<TypedRunResult<T>> {
-    const { output, ...rest } = args;
+    const { output, signal, onControl, ...rest } = args;
+    if (signal || onControl) throw new Error("signal and onControl require runStream");
     const outputSchema = output ? toJsonSchema(output) : undefined;
     let res: TypedRunResult<T>;
     try {
@@ -262,18 +274,32 @@ export class Runtime {
   async *runStream<T = unknown>(
     args: RunArgs<T> = {},
   ): AsyncGenerator<TypedStreamEvent<T>, void, void> {
-    const { output, ...rest } = args;
+    const { output, signal, onControl, ...rest } = args;
+    signal?.throwIfAborted();
     const outputSchema = output ? toJsonSchema(output) : undefined;
     const handle = await this.native.runStream({ ...rest, outputSchema });
     let text = "";
+    let cancelled = false;
+    const cancel = () => { cancelled = true; handle.close(); };
+    signal?.addEventListener("abort", cancel, { once: true });
     try {
+      signal?.throwIfAborted();
+      onControl?.({
+        steer: (input) => handle.steer(input),
+        continueResponse: (input) => handle.continueResponse(input),
+        cancel,
+      });
       for (;;) {
+        signal?.throwIfAborted();
+        if (cancelled) return;
         let ev: native.StreamEvent | null;
         try {
           ev = await handle.next();
         } catch (e) {
           throw toChevalierError(e);
         }
+        signal?.throwIfAborted();
+        if (cancelled) return;
         if (ev == null) return;
         if (ev.type === "content" && ev.text) text += ev.text;
         if (ev.type === "complete" && output && isZod(output)) {
@@ -286,6 +312,7 @@ export class Runtime {
         yield ev as TypedStreamEvent<T>;
       }
     } finally {
+      signal?.removeEventListener("abort", cancel);
       handle.close();
     }
   }
@@ -303,6 +330,7 @@ export class Runtime {
     } else {
       await this.native.registerToolSchema(def.name, def.description ?? "", schema);
     }
+    await this.native.setToolAsync(def.name, def.async ?? false);
   }
 
   async executeToolCall(toolName: string, args: unknown): Promise<string> {

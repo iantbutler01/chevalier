@@ -4,6 +4,8 @@
 //! for various LLM providers (Anthropic, OpenAI, Google, etc.).
 
 use async_trait::async_trait;
+pub mod responses_control;
+pub mod responses_websocket;
 use futures::stream::Stream;
 use std::pin::Pin;
 
@@ -163,6 +165,7 @@ pub struct GenerationConfig {
 
     /// Responses API response to continue from.
     pub previous_response_id: Option<String>,
+    pub responses: Option<responses_control::ResponsesOptions>,
 }
 
 impl Default for GenerationConfig {
@@ -183,6 +186,7 @@ impl Default for GenerationConfig {
             prompt_cache_retention: None,
             provider_config: None,
             previous_response_id: None,
+            responses: None,
         }
     }
 }
@@ -397,6 +401,9 @@ fn normalized_tool_call_json(call: &crate::types::ToolCall) -> serde_json::Value
 /// Stream chunk types
 #[derive(Debug, Clone)]
 pub enum StreamChunk {
+    ResponseItems(serde_json::Value),
+    Steering(serde_json::Value),
+    ToolMetadata(serde_json::Value),
     /// Reasoning/thinking content
     Reasoning(String),
 

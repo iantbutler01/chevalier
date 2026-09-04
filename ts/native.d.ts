@@ -39,6 +39,12 @@ export declare class McpServer {
   serve(transport: string, addr?: string | undefined | null): Promise<void>
 }
 
+export declare class ProgrammaticExecution {
+  constructor(callback: (request: any) => Promise<any>)
+  cancel(): void
+  execute(code: string, tools: any, timeoutMs?: number | undefined | null): Promise<any>
+}
+
 /** The Chevalier agent runtime. */
 export declare class Runtime {
   constructor(options?: RuntimeOptions | undefined | null)
@@ -65,6 +71,7 @@ export declare class Runtime {
   runStream(options: RunOptions): Promise<StreamHandle>
   /** All registered tool schemas (name, description, JSON-schema parameters). */
   getToolSchemas(): Promise<Array<ToolSchemaJs>>
+  setToolAsync(name: string, asynchronous: boolean): Promise<void>
   /** Set a structured system-message prefix applied to subsequent runs. */
   setSystemMessages(messages: Array<Message>): Promise<void>
   /** Set the default prompt used when a run omits `prompt`. */
@@ -99,6 +106,8 @@ export declare class Runtime {
  * calls `close()` in a `finally`.
  */
 export declare class StreamHandle {
+  steer(input: any): Promise<void>
+  continueResponse(input: any): Promise<void>
   /**
    * The next event, or `null` when the stream is exhausted. Throws if the
    * underlying run errored.
@@ -265,7 +274,10 @@ export interface Message {
   isError?: boolean
   parts?: Array<MediaPartInput>
   toolCalls?: Array<ToolCallInput>
+  providerResponse?: any
 }
+
+export declare function programmaticDescription(tools: any): string
 
 /** Provider-specific request shaping. */
 export interface ProviderConfigInput {
@@ -274,8 +286,14 @@ export interface ProviderConfigInput {
   kimiCoding?: KimiCodingConfigInput
 }
 
+export interface ResponsesOptionsInput {
+  websocket?: boolean
+  compactionThreshold?: number
+}
+
 /** Options for a single `run` / `runStream` call. */
 export interface RunOptions {
+  responses?: ResponsesOptionsInput
   prompt?: string
   system?: string
   temperature?: number
@@ -299,6 +317,7 @@ export interface RunOptions {
 
 /** Result of a non-streaming `Runtime.run`. */
 export interface RunResult {
+  providerResponse?: any
   /**
    * Concatenated assistant text (for structured output this is the JSON
    * string to decode against your schema).
@@ -349,6 +368,8 @@ export interface ToolCallInput {
 
 /** A tool call emitted by the model. */
 export interface ToolCallJs {
+  async?: boolean
+  providerMetadata?: any
   toolUseId: string
   toolName: string
   /** Parsed arguments (JSON object). */
@@ -357,6 +378,7 @@ export interface ToolCallJs {
 
 /** Registered tool schema (for introspection / sending to a provider). */
 export interface ToolSchemaJs {
+  async: boolean
   name: string
   description: string
   /** JSON Schema for the tool's parameters. */

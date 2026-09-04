@@ -49,6 +49,7 @@ pub struct RuntimeOptions {
 /// Options for a single `run` / `runStream` call.
 #[napi(object)]
 pub struct RunOptions {
+    pub responses: Option<ResponsesOptionsInput>,
     pub prompt: Option<String>,
     pub system: Option<String>,
     pub temperature: Option<f64>,
@@ -68,6 +69,12 @@ pub struct RunOptions {
     pub timeout_ms: Option<f64>,
     /// Responses API response to continue from.
     pub previous_response_id: Option<String>,
+}
+
+#[napi(object)]
+pub struct ResponsesOptionsInput {
+    pub websocket: Option<bool>,
+    pub compaction_threshold: Option<u32>,
 }
 
 impl RunOptions {
@@ -90,6 +97,13 @@ impl RunOptions {
             timeout: self.timeout_ms.map(|ms| Duration::from_millis(ms as u64)),
             retry_config: None,
             previous_response_id: self.previous_response_id,
+            responses: self.responses.map(|options| {
+                chevalier_core::providers::responses_control::ResponsesOptions {
+                    websocket: options.websocket.unwrap_or(false),
+                    compaction_threshold: options.compaction_threshold,
+                    control: None,
+                }
+            }),
         }
     }
 }
@@ -155,6 +169,7 @@ fn codex_subscription_transport(s: &str) -> Option<CodexSubscriptionTransport> {
 #[napi]
 pub struct Runtime {
     inner: Arc<Mutex<EngineRuntime>>,
+    executor: chevalier_core::runtime::ToolExecutor,
 }
 
 #[napi]
@@ -167,6 +182,7 @@ impl Runtime {
         };
         let engine = EngineRuntime::with_config(model, api_key);
         Self {
+            executor: engine.tool_executor(),
             inner: Arc::new(Mutex::new(engine)),
         }
     }
@@ -247,8 +263,7 @@ impl Runtime {
         args: serde_json::Value,
     ) -> napi::Result<String> {
         let tc = ToolCall::new(tool_name, args);
-        let guard = self.inner.lock().await;
-        guard.execute_tool_call(&tc).await.map_err(to_napi)
+        self.executor.execute(&tc).await.map_err(to_napi)
     }
 
     /// Streaming inference call. Returns a `StreamHandle`; pull events with
@@ -257,12 +272,18 @@ impl Runtime {
     pub async fn run_stream(&self, options: RunOptions) -> napi::Result<StreamHandle> {
         use futures::StreamExt;
         let inner = self.inner.clone();
-        let params = options.into_params();
+        let mut params = options.into_params();
+        let control = params
+            .responses
+            .as_mut()
+            .filter(|options| options.websocket)
+            .map(|options| {
+                let control =
+                    chevalier_core::providers::responses_control::ResponsesControl::default();
+                options.control = Some(control.clone());
+                control
+            });
         // Unbounded so the driver never parks on `send` waiting for the consumer.
-        // It drains the engine stream to completion (or until aborted) and only
-        // then releases the owned runtime lock — so a mid-stream `executeToolCall`
-        // blocks at most until the stream ends, never permanently. `close()`
-        // aborts the task to release the lock + provider request immediately.
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<StreamEvent, String>>();
         let task = tokio::spawn(async move {
             // `guard` must outlive `stream` (the engine's `impl Stream` return
@@ -289,6 +310,7 @@ impl Runtime {
         Ok(StreamHandle {
             rx: Arc::new(Mutex::new(rx)),
             abort: task.abort_handle(),
+            control,
         })
     }
 
@@ -302,6 +324,16 @@ impl Runtime {
             .into_values()
             .map(ToolSchemaJs::from)
             .collect()
+    }
+
+    #[napi]
+    pub async fn set_tool_async(&self, name: String, asynchronous: bool) -> napi::Result<()> {
+        self.inner
+            .lock()
+            .await
+            .set_tool_async(&name, asynchronous)
+            .await
+            .map_err(to_napi)
     }
 
     /// Set a structured system-message prefix applied to subsequent runs.

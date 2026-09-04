@@ -346,6 +346,30 @@ pub fn stream_event_to_python(
     event: EngineResponseStreamEvent,
 ) -> PyResult<PyObject> {
     match event {
+        EngineResponseStreamEvent::ResponseItems(data) => Ok(Py::new(
+            py,
+            ProviderStreamEvent {
+                kind: "responseItems",
+                data,
+            },
+        )?
+        .into_any()),
+        EngineResponseStreamEvent::Steering(data) => Ok(Py::new(
+            py,
+            ProviderStreamEvent {
+                kind: "steering",
+                data,
+            },
+        )?
+        .into_any()),
+        EngineResponseStreamEvent::ToolMetadata(data) => Ok(Py::new(
+            py,
+            ProviderStreamEvent {
+                kind: "toolMetadata",
+                data,
+            },
+        )?
+        .into_any()),
         EngineResponseStreamEvent::Output(output) => {
             Ok(Py::new(py, OutputStreamEvent { output })?.into_any())
         }
@@ -362,6 +386,70 @@ pub fn stream_event_to_python(
         EngineResponseStreamEvent::Complete(response) => {
             Ok(Py::new(py, CompleteStreamEvent { response })?.into_any())
         }
+    }
+}
+
+#[pyclass(frozen, module = "chevalier.chevalier")]
+pub struct ProviderStreamEvent {
+    kind: &'static str,
+    data: serde_json::Value,
+}
+
+#[pymethods]
+impl ProviderStreamEvent {
+    #[getter(r#type)]
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    #[getter]
+    fn data(&self, py: Python<'_>) -> PyResult<PyObject> {
+        to_python(py, &self.data)
+    }
+}
+
+#[cfg(test)]
+mod provider_event_tests {
+    use super::*;
+
+    #[test]
+    fn native_payloads_cross_the_python_boundary_without_loss() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let payloads = [
+                (
+                    "responseItems",
+                    serde_json::json!({"model":"gpt-6-astra", "items":[{"type":"reasoning", "encrypted_content":"opaque", "summary":[]}, {"type":"message", "phase":"commentary"}]}),
+                ),
+                (
+                    "steering",
+                    serde_json::json!({"status":"pending", "steer":{"id":"steer_1"}, "required_input":[{"call_id":"call_1"}]}),
+                ),
+                (
+                    "toolMetadata",
+                    serde_json::json!({"call_id":"call_1", "async":true, "caller":{"type":"direct"}}),
+                ),
+            ];
+            for (kind, payload) in payloads {
+                let event = match kind {
+                    "responseItems" => EngineResponseStreamEvent::ResponseItems(payload.clone()),
+                    "steering" => EngineResponseStreamEvent::Steering(payload.clone()),
+                    _ => EngineResponseStreamEvent::ToolMetadata(payload.clone()),
+                };
+                let event = stream_event_to_python(py, event).unwrap();
+                assert_eq!(
+                    event
+                        .getattr(py, "type")
+                        .unwrap()
+                        .extract::<String>(py)
+                        .unwrap(),
+                    kind
+                );
+                let data = event.getattr(py, "data").unwrap();
+                let restored: serde_json::Value = pythonize::depythonize(data.bind(py)).unwrap();
+                assert_eq!(restored, payload);
+            }
+        });
     }
 }
 

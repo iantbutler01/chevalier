@@ -35,6 +35,7 @@ pub struct Accumulators {
 /// Stored schema information for a tool
 #[derive(Debug, Clone)]
 pub struct ToolSchemaInfo {
+    pub asynchronous: bool,
     pub name: String,
     pub description: String,
     pub fields: Vec<crate::parsers::FieldDescription>,
@@ -86,6 +87,25 @@ pub enum ToolFunction {
     ),
 }
 
+#[derive(Clone)]
+pub struct ToolExecutor {
+    tools: Arc<RwLock<HashMap<String, ToolFunction>>>,
+}
+
+impl ToolExecutor {
+    pub async fn execute(&self, tool_call: &ToolCall) -> Result<String> {
+        let tools = self.tools.read().await;
+        let tool = tools.get(&tool_call.tool_name).ok_or_else(|| {
+            Error::NonRetryable(format!("Tool '{}' not found", tool_call.tool_name))
+        })?;
+        let args = tool_call.args.clone();
+        match tool {
+            ToolFunction::Sync(handler) => handler(args),
+            ToolFunction::Async(handler) => handler(args).await,
+        }
+    }
+}
+
 /// Parameters for `Runtime::run()` and `Runtime::run_stream()`
 #[derive(Debug, Default, Clone)]
 pub struct RunParams {
@@ -106,6 +126,7 @@ pub struct RunParams {
     /// caller for LLM workloads that may exceed the 60s default max_time.
     pub retry_config: Option<crate::retry::RetryConfig>,
     pub previous_response_id: Option<String>,
+    pub responses: Option<crate::providers::responses_control::ResponsesOptions>,
 }
 
 /// Metadata about a tool call for execution context
@@ -262,6 +283,7 @@ impl Runtime {
         let parameters = ToolParametersSchema::from_json_schema(&schema)?;
         let fields = parameters.top_level_field_descriptions();
         let schema_info = ToolSchemaInfo {
+            asynchronous: false,
             name: name.clone(),
             description,
             fields,
@@ -378,6 +400,7 @@ impl Runtime {
         let field_descriptions = T::field_descriptions();
         let parameters = ToolParametersSchema::from_field_descriptions(&field_descriptions);
         let schema_info = ToolSchemaInfo {
+            asynchronous: false,
             name: tool_name.clone(),
             description: format!("Tool: {}", tool_name), // Default description
             fields: field_descriptions,
@@ -421,6 +444,15 @@ impl Runtime {
     pub async fn get_tool_schemas(&self) -> HashMap<String, ToolSchemaInfo> {
         let schemas = self.tool_schemas.read().await;
         schemas.clone()
+    }
+
+    pub async fn set_tool_async(&self, name: &str, asynchronous: bool) -> Result<()> {
+        let mut schemas = self.tool_schemas.write().await;
+        let schema = schemas
+            .get_mut(name)
+            .ok_or_else(|| Error::NonRetryable(format!("Unknown tool: {name}")))?;
+        schema.asynchronous = asynchronous;
+        Ok(())
     }
 
     /// Execute a non-streaming LLM call
@@ -469,6 +501,7 @@ impl Runtime {
             params.previous_response_id,
             runtime_provider_config,
             self.current_call_args.clone(),
+            params.responses,
         )
         .await?;
 
@@ -541,23 +574,19 @@ impl Runtime {
             runtime_provider_config,
             self.current_call_args.clone(),
             self.accumulators.clone(),
+            params.responses,
         )
         .await
     }
 
     /// Execute a tool call
     pub async fn execute_tool_call(&self, tool_call: &ToolCall) -> Result<String> {
-        let tools = self.tools.read().await;
-        let tool_fn = tools.get(&tool_call.tool_name).ok_or_else(|| {
-            Error::NonRetryable(format!("Tool '{}' not found", tool_call.tool_name))
-        })?;
+        self.tool_executor().execute(tool_call).await
+    }
 
-        let args = tool_call.args.clone();
-
-        // Execute based on function type
-        match tool_fn {
-            ToolFunction::Sync(f) => f(args),
-            ToolFunction::Async(f) => f(args).await,
+    pub fn tool_executor(&self) -> ToolExecutor {
+        ToolExecutor {
+            tools: self.tools.clone(),
         }
     }
 

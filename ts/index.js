@@ -36,11 +36,15 @@ var __importStar = (this && this.__importStar) || (function () {
         return result;
     };
 })();
+var __exportStar = (this && this.__exportStar) || function(m, exports) {
+    for (var p in m) if (p !== "default" && !Object.prototype.hasOwnProperty.call(exports, p)) __createBinding(exports, m, p);
+};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.Runtime = exports.ChevalierError = exports.createVfsGatewayServer = exports.version = exports.vfsContentHash = exports.VfsContentHasher = exports.VfsStorage = exports.McpServer = exports.McpClient = void 0;
 exports.agentic = agentic;
 const native = __importStar(require("./native.js"));
 const zod_to_json_schema_1 = require("zod-to-json-schema");
+__exportStar(require("./programmatic"), exports);
 const VFS_ERR_PREFIX = /^VFS:\s+\[([A-Z0-9_]+) status=(\d{3})\]\s*([\s\S]*)$/;
 function setErrorField(error, field, value) {
     try {
@@ -168,7 +172,9 @@ class Runtime {
     }
     /** Non-streaming inference. Pass `output` (Zod) to get a typed, validated `value`. */
     async run(args = {}) {
-        const { output, ...rest } = args;
+        const { output, signal, onControl, ...rest } = args;
+        if (signal || onControl)
+            throw new Error("signal and onControl require runStream");
         const outputSchema = output ? toJsonSchema(output) : undefined;
         let res;
         try {
@@ -186,12 +192,25 @@ class Runtime {
      *  When `output` is given, the `complete` event carries a decoded `value`.
      *  Always closes the underlying stream on exit (including early `break`). */
     async *runStream(args = {}) {
-        const { output, ...rest } = args;
+        const { output, signal, onControl, ...rest } = args;
+        signal?.throwIfAborted();
         const outputSchema = output ? toJsonSchema(output) : undefined;
         const handle = await this.native.runStream({ ...rest, outputSchema });
         let text = "";
+        let cancelled = false;
+        const cancel = () => { cancelled = true; handle.close(); };
+        signal?.addEventListener("abort", cancel, { once: true });
         try {
+            signal?.throwIfAborted();
+            onControl?.({
+                steer: (input) => handle.steer(input),
+                continueResponse: (input) => handle.continueResponse(input),
+                cancel,
+            });
             for (;;) {
+                signal?.throwIfAborted();
+                if (cancelled)
+                    return;
                 let ev;
                 try {
                     ev = await handle.next();
@@ -199,6 +218,9 @@ class Runtime {
                 catch (e) {
                     throw toChevalierError(e);
                 }
+                signal?.throwIfAborted();
+                if (cancelled)
+                    return;
                 if (ev == null)
                     return;
                 if (ev.type === "content" && ev.text)
@@ -215,6 +237,7 @@ class Runtime {
             }
         }
         finally {
+            signal?.removeEventListener("abort", cancel);
             handle.close();
         }
     }
@@ -232,6 +255,7 @@ class Runtime {
         else {
             await this.native.registerToolSchema(def.name, def.description ?? "", schema);
         }
+        await this.native.setToolAsync(def.name, def.async ?? false);
     }
     async executeToolCall(toolName, args) {
         try {

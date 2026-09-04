@@ -574,7 +574,19 @@ fn assistant_response_to_google_message(response: &AssistantResponse) -> Value {
     })
 }
 
-fn assistant_response_to_responses_items(response: &AssistantResponse) -> Vec<Value> {
+fn assistant_response_to_responses_items(
+    response: &AssistantResponse,
+    preserve_native: bool,
+) -> Vec<Value> {
+    if preserve_native
+        && let Some(items) = response
+            .provider_response
+            .as_ref()
+            .and_then(|value| value.get("items"))
+            .and_then(Value::as_array)
+    {
+        return items.clone();
+    }
     let mut items = Vec::new();
     let mut idx = 0;
     while idx < response.output.len() {
@@ -628,6 +640,14 @@ pub fn convert_messages_to_responses_input(
     messages: &[ConversationMessage],
     provider: Provider,
 ) -> Result<(Option<String>, Vec<Value>)> {
+    responses_input(messages, provider, None)
+}
+
+fn responses_input(
+    messages: &[ConversationMessage],
+    provider: Provider,
+    model: Option<&str>,
+) -> Result<(Option<String>, Vec<Value>)> {
     let mut instructions: Vec<String> = Vec::new();
     let mut input_items: Vec<Value> = Vec::new();
 
@@ -672,7 +692,18 @@ pub fn convert_messages_to_responses_input(
                 }
             },
             ConversationMessage::AssistantResponse(response) => {
-                input_items.extend(assistant_response_to_responses_items(response));
+                let preserve_native = provider == Provider::OpenAIResponses
+                    && model.is_some()
+                    && response
+                        .provider_response
+                        .as_ref()
+                        .and_then(|value| value.get("model"))
+                        .and_then(Value::as_str)
+                        == model;
+                input_items.extend(assistant_response_to_responses_items(
+                    response,
+                    preserve_native,
+                ));
             }
             ConversationMessage::ToolCall(tool_call) => {
                 let args_str = tool_call.raw_arguments.clone().unwrap_or_else(|| {
@@ -755,6 +786,14 @@ pub fn convert_messages_to_responses_input(
     };
 
     Ok((instructions, input_items))
+}
+
+pub fn responses_input_for_model(
+    messages: &[ConversationMessage],
+    provider: Provider,
+    model: &str,
+) -> Result<(Option<String>, Vec<Value>)> {
+    responses_input(messages, provider, Some(model))
 }
 
 /// Convert messages to provider-specific format with coalescing
@@ -905,7 +944,8 @@ pub fn convert_messages_to_provider_format(
                             .push(assistant_response_to_openai_chat_message(response));
                     }
                     Provider::OpenAIResponses | Provider::OpenRouterResponses => {
-                        converted_messages.extend(assistant_response_to_responses_items(response));
+                        converted_messages
+                            .extend(assistant_response_to_responses_items(response, false));
                     }
                 }
             }

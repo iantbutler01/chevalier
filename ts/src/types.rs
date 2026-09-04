@@ -9,6 +9,8 @@ use napi_derive::napi;
 /// A tool call emitted by the model.
 #[napi(object)]
 pub struct ToolCallJs {
+    pub r#async: Option<bool>,
+    pub provider_metadata: Option<serde_json::Value>,
     pub tool_use_id: String,
     pub tool_name: String,
     /// Parsed arguments (JSON object).
@@ -21,6 +23,12 @@ impl From<&ToolCall> for ToolCallJs {
             tool_use_id: tc.tool_use_id.clone(),
             tool_name: tc.tool_name.clone(),
             args: tc.args.clone(),
+            r#async: tc
+                .tool_obj
+                .as_ref()
+                .and_then(|value| value.get("async"))
+                .and_then(serde_json::Value::as_bool),
+            provider_metadata: tc.tool_obj.clone(),
         }
     }
 }
@@ -28,6 +36,7 @@ impl From<&ToolCall> for ToolCallJs {
 /// Result of a non-streaming `Runtime.run`.
 #[napi(object)]
 pub struct RunResult {
+    pub provider_response: Option<serde_json::Value>,
     /// Concatenated assistant text (for structured output this is the JSON
     /// string to decode against your schema).
     pub text: String,
@@ -42,6 +51,7 @@ pub struct RunResult {
 /// Registered tool schema (for introspection / sending to a provider).
 #[napi(object)]
 pub struct ToolSchemaJs {
+    pub r#async: bool,
     pub name: String,
     pub description: String,
     /// JSON Schema for the tool's parameters.
@@ -52,6 +62,7 @@ impl From<ToolSchemaInfo> for ToolSchemaJs {
     fn from(s: ToolSchemaInfo) -> Self {
         Self {
             name: s.name,
+            r#async: s.asynchronous,
             description: s.description,
             parameters: s.parameters.to_json_schema(),
         }
@@ -71,6 +82,7 @@ impl From<AssistantResponse> for RunResult {
             reasoning: resp.reasoning(),
             tool_calls,
             signatures,
+            provider_response: resp.provider_response,
         }
     }
 }

@@ -46,6 +46,18 @@ impl From<ResponseStreamEvent> for StreamEvent {
             data: None,
         };
         match ev {
+            ResponseStreamEvent::ResponseItems(data) => StreamEvent {
+                data: Some(data),
+                ..base("responseItems")
+            },
+            ResponseStreamEvent::Steering(data) => StreamEvent {
+                data: Some(data),
+                ..base("steering")
+            },
+            ResponseStreamEvent::ToolMetadata(data) => StreamEvent {
+                data: Some(data),
+                ..base("toolMetadata")
+            },
             ResponseStreamEvent::Output(part) => match part {
                 ResponsePart::Text { text } => StreamEvent {
                     text: Some(text),
@@ -93,12 +105,36 @@ impl From<ResponseStreamEvent> for StreamEvent {
 /// calls `close()` in a `finally`.
 #[napi]
 pub struct StreamHandle {
+    pub(crate) control: Option<chevalier_core::providers::responses_control::ResponsesControl>,
     pub(crate) rx: Arc<Mutex<UnboundedReceiver<Result<StreamEvent, String>>>>,
     pub(crate) abort: AbortHandle,
 }
 
 #[napi]
 impl StreamHandle {
+    #[napi]
+    pub async fn steer(&self, input: serde_json::Value) -> napi::Result<()> {
+        let control = self.control.as_ref().ok_or_else(|| {
+            napi::Error::from_reason("Steering requires an explicitly enabled Responses WebSocket")
+        })?;
+        control
+            .send("response.steer", input)
+            .await
+            .map_err(crate::error::to_napi)
+    }
+
+    #[napi]
+    pub async fn continue_response(&self, input: serde_json::Value) -> napi::Result<()> {
+        let control = self.control.as_ref().ok_or_else(|| {
+            napi::Error::from_reason(
+                "Continuation requires an explicitly enabled Responses WebSocket",
+            )
+        })?;
+        control
+            .send("response.create", input)
+            .await
+            .map_err(crate::error::to_napi)
+    }
     /// The next event, or `null` when the stream is exhausted. Throws if the
     /// underlying run errored.
     #[napi]

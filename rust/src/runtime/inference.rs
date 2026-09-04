@@ -140,6 +140,11 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
         model_part.to_string()
     };
 
+    let provider = if provider == "openai" && model_name.starts_with("gpt-6-astra") {
+        "openai-responses".to_owned()
+    } else {
+        provider
+    };
     Ok(ParsedModelString {
         provider,
         model_name,
@@ -161,6 +166,26 @@ async fn stream_chunk_to_runtime_events(
     response: Arc<RwLock<AssistantResponse>>,
 ) -> Result<Vec<ResponseStreamEvent>> {
     match chunk {
+        StreamChunk::ResponseItems(data) => {
+            let mut response = response.write().await;
+            let mut combined = data.clone();
+            if let Some(previous) = &response.provider_response
+                && previous["model"] == data["model"]
+            {
+                if let (Some(previous), Some(items)) = (
+                    previous["items"].as_array(),
+                    combined["items"].as_array_mut(),
+                ) {
+                    let mut all_items = previous.clone();
+                    all_items.append(items);
+                    *items = all_items;
+                }
+            }
+            response.provider_response = Some(combined);
+            Ok(vec![ResponseStreamEvent::ResponseItems(data)])
+        }
+        StreamChunk::Steering(data) => Ok(vec![ResponseStreamEvent::Steering(data)]),
+        StreamChunk::ToolMetadata(data) => Ok(vec![ResponseStreamEvent::ToolMetadata(data)]),
         StreamChunk::Content(text) => {
             {
                 let mut acc = accumulators.write().await;
@@ -311,6 +336,14 @@ fn generate_tool_schemas(
             let mut tool_schema =
                 generator.generate_schema(tool_name, &schema_info.description, parameters);
             apply_tool_strict_for_provider(&mut tool_schema, &provider, schema_info.strict);
+            if schema_info.asynchronous
+                && matches!(
+                    provider.as_str(),
+                    "openai-responses" | "openai-codex-responses"
+                )
+            {
+                tool_schema["async"] = serde_json::json!(true);
+            }
             tool_schema
         } else {
             // No schema info - generate minimal schema
@@ -331,6 +364,12 @@ fn generate_tool_schemas(
 
 /// Resolve provider key for model strings, including responses modifiers.
 fn resolve_provider_key(model: &str) -> String {
+    if let Ok(parsed) = parse_model_string(model)
+        && parsed.model_name.starts_with("gpt-6-astra")
+        && parsed.provider == "openai-responses"
+    {
+        return parsed.provider;
+    }
     let parts: Vec<&str> = model.split(':').collect();
     if parts.len() >= 3 && parts[1] == "resp" {
         match parts[0] {
@@ -491,6 +530,9 @@ fn create_inference_client_with_config(
         }
         "openai-responses" => {
             let mut client = OpenAIResponsesClient::new(key, model_name);
+            if let Some(url) = server_url {
+                client = client.with_api_url(url);
+            }
             if let Some(r) = reasoning {
                 client = client.with_reasoning(r);
             }
@@ -701,6 +743,7 @@ pub async fn call_llm(
     previous_response_id: Option<String>,
     provider_config: Option<ProviderConfig>,
     _call_context: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>>,
+    responses: Option<crate::providers::responses_control::ResponsesOptions>,
 ) -> Result<CallResult> {
     // Create client
     let client = create_inference_client_with_config(model, api_key, provider_config.as_ref())?;
@@ -760,6 +803,7 @@ pub async fn call_llm(
         },
         provider_config,
         previous_response_id,
+        responses,
     };
 
     // Make API call
@@ -800,6 +844,7 @@ pub async fn call_llm_stream(
     provider_config: Option<ProviderConfig>,
     _call_context: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>>,
     accumulators: Arc<RwLock<Accumulators>>,
+    responses: Option<crate::providers::responses_control::ResponsesOptions>,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<ResponseStreamEvent>> + Send>>> {
     // Create client
     let client = create_inference_client_with_config(model, api_key, provider_config.as_ref())?;
@@ -859,6 +904,7 @@ pub async fn call_llm_stream(
         },
         provider_config,
         previous_response_id,
+        responses,
     };
 
     // Get streaming response
@@ -1201,6 +1247,7 @@ mod tests {
             "get_weather".to_string(),
             ToolSchemaInfo {
                 name: "get_weather".to_string(),
+                asynchronous: false,
                 description: "Get the weather for a location".to_string(),
                 fields: vec![crate::parsers::FieldDescription {
                     name: "location".to_string(),
@@ -1259,6 +1306,7 @@ mod tests {
             "calculate".to_string(),
             ToolSchemaInfo {
                 name: "calculate".to_string(),
+                asynchronous: false,
                 description: "Calculate a math expression".to_string(),
                 fields: vec![crate::parsers::FieldDescription {
                     name: "expression".to_string(),
@@ -1364,6 +1412,7 @@ mod tests {
             "search".to_string(),
             ToolSchemaInfo {
                 name: "search".to_string(),
+                asynchronous: false,
                 description: "Search for documents".to_string(),
                 fields: vec![
                     crate::parsers::FieldDescription {
@@ -1464,6 +1513,7 @@ mod tests {
             "write_thread".to_string(),
             ToolSchemaInfo {
                 name: "write_thread".to_string(),
+                asynchronous: false,
                 description: "Write a thread".to_string(),
                 fields: vec![],
                 strict: None,

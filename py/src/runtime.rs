@@ -77,6 +77,7 @@ impl RunOptions {
                 .map(|milliseconds| Duration::from_millis(milliseconds as u64)),
             retry_config: None,
             previous_response_id: None,
+            responses: None,
         }
     }
 }
