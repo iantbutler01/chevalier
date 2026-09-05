@@ -1174,6 +1174,9 @@ pub async fn register_vm_proxy_policy(
             policy,
         },
     );
+    if state.coredns.is_none() {
+        state.coredns = Some(start_coredns(&state.config).await?);
+    }
     restart_envoy_locked(state, &next_policies).await?;
     state.vm_proxy_policies = next_policies;
     state
