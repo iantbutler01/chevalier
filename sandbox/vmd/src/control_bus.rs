@@ -1883,7 +1883,7 @@ async fn publish_exec_run_error_result(
 }
 
 #[tracing::instrument(
-    skip(envelope, config, manager, active_exec_streams, vm_snapshot_state, jetstream),
+    skip_all,
     fields(command_id = %envelope.command_id, command_type = %envelope.command_type, node_id = %node_id)
 )]
 #[allow(clippy::too_many_arguments)]
