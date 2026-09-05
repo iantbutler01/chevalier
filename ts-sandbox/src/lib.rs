@@ -464,10 +464,12 @@ pub struct SessionInfoJs {
 
 #[napi(object)]
 pub struct SessionDesktopTargetJs {
+    #[napi(ts_type = "\"vnc\" | \"native-window\"")]
     pub kind: String,
     pub host: Option<String>,
     pub port: Option<u32>,
     pub password: Option<String>,
+    #[napi(ts_type = "\"none\" | \"password\" | \"account\"")]
     pub authentication: String,
     pub view_only: bool,
 }

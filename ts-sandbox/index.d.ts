@@ -230,11 +230,11 @@ export interface SessionCheckpointJs {
 }
 
 export interface SessionDesktopTargetJs {
-  kind: string
+  kind: "vnc" | "native-window"
   host?: string
   port?: number
   password?: string
-  authentication: string
+  authentication: "none" | "password" | "account"
   viewOnly: boolean
 }
 

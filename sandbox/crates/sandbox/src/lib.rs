@@ -3202,7 +3202,7 @@ impl Session {
     pub async fn open_desktop(&self) -> Result<SessionDesktopTarget> {
         if matches!(
             &self.sandbox.inner.control_backend,
-            ControlBackend::OpenComputer(_)
+            ControlBackend::Managed(_)
         ) {
             return Err(SandboxError::Unsupported(
                 "VM desktops are only available for vmd-backed sandboxes".to_string(),
@@ -3318,7 +3318,7 @@ impl Session {
     pub async fn close_desktop(&self) -> Result<()> {
         if matches!(
             &self.sandbox.inner.control_backend,
-            ControlBackend::OpenComputer(_)
+            ControlBackend::Managed(_)
         ) {
             return Ok(());
         }

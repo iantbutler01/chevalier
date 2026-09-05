@@ -104,6 +104,7 @@ impl MockVmd {
             shared_mounts: Vec::new(),
             pci_devices: Vec::new(),
             durable_volume: None,
+            desktop: None,
             guest_profile: None,
             guest_runtime: None,
             capabilities: None,
@@ -314,6 +315,22 @@ impl VmdService for MockVmd {
         _request: Request<ResizeDurableVolumeRequest>,
     ) -> Result<Response<chevalier_sandbox::proto::vmd::v1::DurableVolume>, Status> {
         Err(Status::not_found("durable volume not found"))
+    }
+
+    async fn show_vm_desktop(&self, _request: Request<VmActionRequest>) -> Result<Response<Vm>, Status> {
+        Err(Status::unimplemented("desktop unavailable in this fixture"))
+    }
+
+    async fn hide_vm_desktop(&self, _request: Request<VmActionRequest>) -> Result<Response<Vm>, Status> {
+        Err(Status::unimplemented("desktop unavailable in this fixture"))
+    }
+
+    async fn open_vm_desktop(&self, _request: Request<VmActionRequest>) -> Result<Response<chevalier_sandbox::proto::vmd::v1::DesktopEndpoint>, Status> {
+        Err(Status::unimplemented("desktop unavailable in this fixture"))
+    }
+
+    async fn close_vm_desktop(&self, _request: Request<VmActionRequest>) -> Result<Response<Vm>, Status> {
+        Err(Status::unimplemented("desktop unavailable in this fixture"))
     }
 
     async fn start_vm(&self, request: Request<VmActionRequest>) -> Result<Response<Vm>, Status> {

@@ -100,6 +100,7 @@ async fn start(
     sender
         .send(wire::ExecRequest {
             request: Some(wire::exec_request::Request::Start(wire::ExecStart {
+                run_as_root: false,
                 execution_id: identity.into(),
                 args: vec!["/bin/sh".into(), "-c".into(), command.into()],
                 env: HashMap::new(),

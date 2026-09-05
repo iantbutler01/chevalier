@@ -1447,6 +1447,8 @@ impl Action {
             Action::Pause => "pause",
             Action::Resume => "resume",
             Action::ForceStop => "force_stop",
+            Action::ShowDesktop => "show_desktop",
+            Action::HideDesktop => "hide_desktop",
         }
     }
 
