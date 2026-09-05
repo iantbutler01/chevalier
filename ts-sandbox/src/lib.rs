@@ -12,14 +12,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chevalier_sandbox::{
-    DurableVolumeInfo as EngineDurableVolumeInfo, EventStream, ExecEvent, ExecInput, ExecOptions,
-    ForkOptions, ForwardHandle as EngineForwardHandle, HostPciDevice as EngineHostPciDevice,
-    HostPciDeviceState as EngineHostPciDeviceState, HostPciFunction as EngineHostPciFunction,
-    HostPciInventory as EngineHostPciInventory, OpenComputerBackendConfig, OpenComputerMountConfig,
-    PciDeviceAction as EnginePciDeviceAction, ResourceLimits, Sandbox as EngineSandbox,
-    SandboxConfig, SandboxError, SandboxProviderConfig, Session as EngineSession,
+    DistributedControlConfig, DurableVolumeInfo as EngineDurableVolumeInfo, EventStream, ExecEvent,
+    ExecInput, ExecOptions, ForkOptions, ForwardHandle as EngineForwardHandle,
+    HostPciDevice as EngineHostPciDevice, HostPciDeviceState as EngineHostPciDeviceState,
+    HostPciFunction as EngineHostPciFunction, HostPciInventory as EngineHostPciInventory,
+    OpenComputerBackendConfig, OpenComputerMountConfig, PciDeviceAction as EnginePciDeviceAction,
+    ResourceLimits, Sandbox as EngineSandbox, SandboxConfig, SandboxError, SandboxProviderConfig,
+    Session as EngineSession, SessionDesktopAuthentication as EngineSessionDesktopAuthentication,
     SessionDesktopKind as EngineSessionDesktopKind,
-    SessionDesktopAuthentication as EngineSessionDesktopAuthentication,
     SessionDesktopTarget as EngineSessionDesktopTarget, SessionInfo as EngineSessionInfo,
     SessionOptions, SessionSourceType as EngineSessionSourceType, SharedMount,
     SharedMountAvailability, SharedMountContinuity, ShellEvent, ShellInput, ShellOptions,
@@ -973,6 +973,74 @@ pub struct SandboxConnectOptions {
     pub default_disk_gb: Option<u32>,
     pub provider: Option<String>,
     pub open_computer: Option<OpenComputerProviderOpts>,
+    pub distributed_control: Option<DistributedControlOptions>,
+}
+
+#[napi(object)]
+pub struct DistributedControlOptions {
+    pub etcd_endpoints: Vec<String>,
+    pub nats_url: String,
+    pub etcd_prefix: Option<String>,
+    pub cluster_id: Option<String>,
+    pub nats_auth_token: Option<String>,
+    pub required_continuity_tier: Option<String>,
+    pub required_storage_profile: Option<String>,
+    pub allow_tier_a_degraded: Option<bool>,
+    pub allow_cross_node_recovery: Option<bool>,
+    pub nats_stream_replicas: Option<u32>,
+}
+
+impl TryFrom<DistributedControlOptions> for DistributedControlConfig {
+    type Error = SandboxError;
+
+    fn try_from(options: DistributedControlOptions) -> Result<Self, Self::Error> {
+        if options.etcd_endpoints.is_empty()
+            || options
+                .etcd_endpoints
+                .iter()
+                .any(|endpoint| endpoint.trim().is_empty())
+            || options.nats_url.trim().is_empty()
+        {
+            return Err(SandboxError::InvalidConfig(
+                "distributed control requires non-empty etcd endpoints and a NATS URL".into(),
+            ));
+        }
+        if let Some(tier) = options.required_continuity_tier.as_deref() {
+            if !matches!(tier, "tier-a" | "tier-b") {
+                return Err(SandboxError::InvalidConfig(
+                    "required continuity tier must be tier-a or tier-b".into(),
+                ));
+            }
+        }
+        if options.nats_stream_replicas == Some(0) {
+            return Err(SandboxError::InvalidConfig(
+                "NATS stream replicas must be positive".into(),
+            ));
+        }
+        let defaults = Self::default();
+        Ok(Self {
+            etcd_endpoints: options.etcd_endpoints,
+            nats_url: options.nats_url,
+            etcd_prefix: options.etcd_prefix.unwrap_or(defaults.etcd_prefix),
+            cluster_id: options.cluster_id.unwrap_or(defaults.cluster_id),
+            nats_auth_token: options.nats_auth_token,
+            required_continuity_tier: options
+                .required_continuity_tier
+                .or(defaults.required_continuity_tier),
+            required_storage_profile: options.required_storage_profile,
+            allow_tier_a_degraded: options
+                .allow_tier_a_degraded
+                .unwrap_or(defaults.allow_tier_a_degraded),
+            allow_cross_node_recovery: options
+                .allow_cross_node_recovery
+                .unwrap_or(defaults.allow_cross_node_recovery),
+            nats_stream_replicas: options
+                .nats_stream_replicas
+                .map(|n| n as usize)
+                .unwrap_or(defaults.nats_stream_replicas),
+            ..defaults
+        })
+    }
 }
 
 fn positive_resource(value: Option<u32>, label: &str) -> Result<Option<i32>, SandboxError> {
@@ -1096,6 +1164,11 @@ impl Sandbox {
             ..Default::default()
         };
         if let Some(o) = options {
+            cfg.distributed_control = o
+                .distributed_control
+                .map(TryInto::try_into)
+                .transpose()
+                .map_err(sb_err)?;
             if let Some(t) = o.auth_token {
                 cfg.auth_token = Some(t);
             }
@@ -1126,6 +1199,12 @@ impl Sandbox {
             match provider.as_str() {
                 "chevalier" | "local" | "vmd" => {}
                 "opencomputer" | "open-computer" => {
+                    if cfg.distributed_control.is_some() {
+                        return Err(sb_err(SandboxError::InvalidConfig(
+                            "distributed control is only supported by the chevalier provider"
+                                .into(),
+                        )));
+                    }
                     cfg.provider = SandboxProviderConfig::OpenComputer(
                         opencomputer_config_from_options(o.open_computer).map_err(sb_err)?,
                     );

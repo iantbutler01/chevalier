@@ -106,6 +106,19 @@ export declare class ShellHandle {
   next(): Promise<ShellEventJs | null>
 }
 
+export interface DistributedControlOptions {
+  etcdEndpoints: Array<string>
+  natsUrl: string
+  etcdPrefix?: string
+  clusterId?: string
+  natsAuthToken?: string
+  requiredContinuityTier?: string
+  requiredStorageProfile?: string
+  allowTierADegraded?: boolean
+  allowCrossNodeRecovery?: boolean
+  natsStreamReplicas?: number
+}
+
 export interface DurableVolumeInfoJs {
   ownerKey: string
   volumeId: string
@@ -209,6 +222,7 @@ export interface SandboxConnectOptions {
   defaultDiskGb?: number
   provider?: string
   openComputer?: OpenComputerProviderOpts
+  distributedControl?: DistributedControlOptions
 }
 
 export interface SessionCheckpointJs {

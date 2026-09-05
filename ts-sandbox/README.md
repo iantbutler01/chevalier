@@ -75,13 +75,51 @@ Exposed today:
 - `fork`
 - OpenComputer config: API URL/key, template, resources, burst, secret store, egress allowlist, mounts, shared mounts
 
-Not exposed in this TS package yet:
-
 - interactive shell handle
 - port forwarding
 - snapshot/restore helpers
+- distributed discovery, placement, and command routing
 
-Use the Rust crate directly if you need a lower-level surface before the binding catches up.
+## Distributed VMD
+
+`Sandbox.connect` accepts `distributedControl`. The client discovers workers in
+etcd and routes commands through NATS JetStream; there is no separate controller
+binary to deploy. Workers need matching etcd prefixes, NATS cluster settings,
+authentication, and unique stable advertised endpoints. The client must reach
+each worker's advertised host, including dynamic guest RPC/forwarding ports.
+
+```ts
+const sb = await Sandbox.connect("http://worker-a:8052", {
+  defaultImage: "registry.example/sandbox@sha256:...",
+  authToken: process.env.CHEVALIER_SANDBOX_AUTH_TOKEN,
+  distributedControl: {
+    etcdEndpoints: ["http://etcd:2379"],
+    natsUrl: "nats://nats:4222",
+    natsAuthToken: process.env.NATS_AUTH_TOKEN,
+    requiredContinuityTier: "tier-a",
+    allowTierADegraded: true,
+    allowCrossNodeRecovery: false,
+  },
+});
+```
+
+For node-bound disks, set `allowCrossNodeRecovery: false` and session metadata
+`"chevalier.tier_b_eligible": "false"`. An unavailable recorded owner then stays
+an error; a lookup miss on another worker cannot replace it. Existing recovery
+behavior remains the default for callers that omit the policy. Tier-A workers
+must explicitly advertise `CHEVALIER_SANDBOX_NODE_DEGRADED_MODE=true` to be
+admitted by the distributed scheduler. This policy does not provide disk HA.
+
+Build `sandbox/Dockerfile` from the repository root for Linux VMD. It requires
+KVM, FUSE, privileged VM networking, persistent node storage, and a Docker daemon
+for Docker-to-VM conversion. With a separate Docker daemon, mount the VMD data
+directory at the same absolute path in both containers. Use `--force-local-build`
+when private Docker images have no corresponding prebuilt VM registry artifacts.
+
+The real owner-unavailable regression is `node test/distributed-node-bound.cjs`.
+Set `SANDBOX_TEST_NODE_ENDPOINT`, `SANDBOX_TEST_ETCD_HTTP_URL`,
+`SANDBOX_TEST_NATS_URL`, and the optional `SANDBOX_TEST_AUTH_TOKEN` and
+`SANDBOX_TEST_NATS_AUTH_TOKEN`. It uses a unique etcd prefix and deletes it afterward.
 
 ## Build
 

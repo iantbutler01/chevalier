@@ -118,6 +118,7 @@ pub struct DistributedControlConfig {
     pub required_storage_profile: Option<String>,
     pub required_continuity_tier: Option<String>,
     pub allow_tier_a_degraded: bool,
+    pub allow_cross_node_recovery: bool,
     pub tenant_session_quota: Option<usize>,
     pub workspace_session_quota: Option<usize>,
     pub admission_retry_after_ms: u64,
@@ -140,6 +141,7 @@ impl Default for DistributedControlConfig {
             required_storage_profile: None,
             required_continuity_tier: Some("tier-b".to_string()),
             allow_tier_a_degraded: false,
+            allow_cross_node_recovery: true,
             tenant_session_quota: Some(256),
             workspace_session_quota: Some(64),
             admission_retry_after_ms: 2_000,
@@ -5790,6 +5792,12 @@ impl Sandbox {
                     .filter(|endpoint| !endpoint.trim().is_empty())
                 {
                     let endpoint = normalize_endpoint(&endpoint)?;
+                    if !control.allows_cross_node_recovery() {
+                        return self
+                            .find_vm_by_session_id_on_endpoint(session_id, &endpoint)
+                            .await
+                            .map(|vm| vm.map(|vm| (vm, endpoint)));
+                    }
                     attempted.insert(endpoint.clone());
                     match self
                         .find_vm_by_session_id_on_endpoint(session_id, &endpoint)

@@ -238,6 +238,9 @@ impl PortAllocationLease {
 }
 
 impl DistributedControlPlane {
+    pub(crate) fn allows_cross_node_recovery(&self) -> bool {
+        self.cfg.allow_cross_node_recovery
+    }
     pub(crate) async fn connect(cfg: DistributedControlConfig) -> Result<Self> {
         if cfg.etcd_endpoints.is_empty() {
             return Err(SandboxError::InvalidEndpoint(
@@ -396,6 +399,9 @@ impl DistributedControlPlane {
         session_id: &str,
         from_endpoint: &str,
     ) -> Result<Vec<NodeRoute>> {
+        if !self.allows_cross_node_recovery() {
+            return Ok(Vec::new());
+        }
         let routes = self.list_node_routes().await?;
         if routes.is_empty() {
             return Ok(Vec::new());

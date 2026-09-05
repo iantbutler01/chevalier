@@ -1,23 +1,11 @@
-# Build context for sandbox/Dockerfile.vmd is the repo ROOT so the vmd crate can
-# see its sibling workspace dep at ../../hash. Allowlist only what the image
-# needs; everything else (target/, .git, python venvs) stays out.
-**
-!hash/Cargo.toml
-!hash/Cargo.lock
-!hash/src/
-!hash/src/**
-!sandbox/Cargo.toml
-!sandbox/Cargo.lock
-!sandbox/vmd/
-!sandbox/vmd/**
-!sandbox/crates/
-!sandbox/crates/**
-!sandbox/proto/
-!sandbox/proto/**
-!sandbox/portproxy/
-!sandbox/portproxy/**
-!sandbox/patches/
-!sandbox/patches/**
-!sandbox/scripts/build-patched-virtiofsd.sh
-**/target/
-**/target/**
+**/.git
+**/target
+**/node_modules
+**/.run
+**/*.node
+**/*.qcow2
+**/*.img
+**/*.iso
+**/.env*
+**/*.pem
+**/*.key

@@ -15,7 +15,7 @@ napi-derive = "3"
 
 # Sandbox CLIENT only (connects to an external vmd). Isolated from the core
 # binding so codex's in-progress provider work can't break the core build.
-chevalier-sandbox = { path = "../sandbox/crates/sandbox", default-features = false, features = ["client"] }
+chevalier-sandbox = { path = "../sandbox/crates/sandbox", default-features = false, features = ["client", "distributed-control"], version = "0.1.0" }
 
 tokio = { version = "1", features = ["sync"] }
 futures = "0.3"
