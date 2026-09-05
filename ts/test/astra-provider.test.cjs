@@ -28,6 +28,20 @@ const items = [
   { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'lookup', arguments: '{}', async: true, caller: { type: 'direct' } },
 ];
 
+test('PDF document input reaches Responses as a file rather than an image or placeholder', { timeout: 10000 }, async (context) => {
+  const { model, requests } = await fixture(context, async ({ response, emit }) => {
+    emit({ type: 'response.output_text.delta', delta: 'read' });
+    emit({ type: 'response.completed', response: { id: 'pdf', output: [] } });
+    response.end();
+  });
+  const runtime = new Runtime({ model, apiKey: 'fixture' });
+  for await (const event of runtime.runStream({ prompt: '', history: [{ type: 'multimodal', role: 'user', parts: [
+    { type: 'text', text: 'Read this' },
+    { type: 'document', documentBase64: 'JVBERi0xLjQ=', mimeType: 'application/pdf' },
+  ] }] })) {}
+  assert.deepEqual(requests[0].input[0].content[1], { type: 'input_file', filename: 'attachment.pdf', file_data: 'data:application/pdf;base64,JVBERi0xLjQ=' });
+});
+
 test('native state survives the binding and replay without duplicating fallback; async tools start before response finishes', { timeout: 10000 }, async (context) => {
   let release;
   const dispatched = new Promise((resolve) => { release = resolve; });

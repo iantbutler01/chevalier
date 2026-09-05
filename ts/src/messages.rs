@@ -1,7 +1,5 @@
 //! Conversation message inputs (typed napi objects) → engine types.
-//! Covers chat (user/assistant/system), tool results, and reasoning segments —
-//! the message kinds a multi-turn agent loop needs. (Multimodal history is a
-//! follow-up.)
+//! Covers chat, tool results, reasoning, and multimodal history.
 
 use chevalier_core::types::{
     AssistantResponse, ChatMessage, ChatRole, MediaPart, MediaSource, MultimodalMessage,
@@ -10,7 +8,7 @@ use chevalier_core::types::{
 use chevalier_core::utils::ConversationMessage;
 use napi_derive::napi;
 
-/// A part of a multimodal message. `type` is `text` or `image`.
+/// A part of a multimodal message. `type` is `text`, `image`, or `document`.
 #[napi(object)]
 pub struct MediaPartInput {
     #[napi(js_name = "type")]
@@ -19,6 +17,8 @@ pub struct MediaPartInput {
     pub image_base64: Option<String>,
     pub mime_type: Option<String>,
     pub image_url: Option<String>,
+    pub document_base64: Option<String>,
+    pub document_url: Option<String>,
 }
 
 /// A tool call within an `assistantResponse` history message. `args` is the
@@ -55,6 +55,18 @@ pub struct Message {
 
 fn to_media_part(p: &MediaPartInput) -> MediaPart {
     match p.kind.as_str() {
+        "document" => {
+            if let Some(url) = &p.document_url {
+                MediaPart::document(MediaSource::url(url.clone()))
+            } else {
+                MediaPart::document(MediaSource::base64(
+                    p.document_base64.clone().unwrap_or_default(),
+                    p.mime_type
+                        .clone()
+                        .unwrap_or_else(|| "application/pdf".to_string()),
+                ))
+            }
+        }
         "image" => {
             if let Some(url) = &p.image_url {
                 MediaPart::image(MediaSource::url(url.clone()))

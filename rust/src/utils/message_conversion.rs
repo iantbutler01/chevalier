@@ -345,8 +345,17 @@ fn media_part_to_openai_responses_format(part: &MediaPart) -> Value {
             }),
         },
 
-        // OpenAI Responses doesn't support video/documents in chat input
-        MediaPart::Video { .. } | MediaPart::Document { .. } => json!({
+        MediaPart::Document { source } => match source {
+            MediaSource::Base64 { data, mime_type } => json!({
+                "type": "input_file",
+                "filename": "attachment.pdf",
+                "file_data": format!("data:{};base64,{}", mime_type, data)
+            }),
+            MediaSource::FileId { file_id } => json!({ "type": "input_file", "file_id": file_id }),
+            MediaSource::Url { url } => json!({ "type": "input_file", "file_url": url }),
+            MediaSource::FileUri { uri, .. } => json!({ "type": "input_file", "file_url": uri }),
+        },
+        MediaPart::Video { .. } => json!({
             "type": "input_text",
             "text": "[Video/Document not supported by this provider]"
         }),
@@ -1084,6 +1093,26 @@ mod tests {
         assert_eq!(content[0]["tool_use_id"], "toolu_1");
         assert_eq!(content[1]["type"], "tool_result");
         assert_eq!(content[1]["tool_use_id"], "toolu_2");
+    }
+
+    #[test]
+    fn document_bytes_use_each_providers_native_document_contract() {
+        let messages = vec![ConversationMessage::Multimodal(MultimodalMessage::user(
+            vec![MediaPart::document(MediaSource::base64(
+                "JVBERi0xLjQ=",
+                "application/pdf",
+            ))],
+        ))];
+        let google = convert_messages_to_provider_format(&messages, Provider::GoogleGenAI).unwrap();
+        assert_eq!(
+            google[0]["parts"][0]["inline_data"]["mime_type"],
+            "application/pdf"
+        );
+        assert_eq!(google[0]["parts"][0]["inline_data"]["data"], "JVBERi0xLjQ=");
+        let anthropic =
+            convert_messages_to_provider_format(&messages, Provider::Anthropic).unwrap();
+        assert_eq!(anthropic[0]["content"][0]["type"], "document");
+        assert_eq!(anthropic[0]["content"][0]["source"]["data"], "JVBERi0xLjQ=");
     }
 
     #[test]

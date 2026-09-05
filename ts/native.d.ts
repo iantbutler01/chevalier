@@ -245,13 +245,15 @@ export interface McpServerOptions {
   description?: string
 }
 
-/** A part of a multimodal message. `type` is `text` or `image`. */
+/** A part of a multimodal message. `type` is `text`, `image`, or `document`. */
 export interface MediaPartInput {
   type: string
   text?: string
   imageBase64?: string
   mimeType?: string
   imageUrl?: string
+  documentBase64?: string
+  documentUrl?: string
 }
 
 /**
