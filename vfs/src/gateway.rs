@@ -46,6 +46,7 @@ const EXECUTABLE_HEADER: &str = "x-chevalier-vfs-executable";
 const MODE_HEADER: &str = "x-chevalier-vfs-mode";
 const EXPECTED_CONTENT_HASH_HEADER: &str = "x-chevalier-vfs-expected-content-sha256";
 const STREAM_UPLOAD_HEADER: &str = "x-chevalier-vfs-stream-upload";
+const MAX_PATH_BATCH_ITEMS: usize = 4096;
 const DEFAULT_COMPONENT: &str = "vfs_gateway_storage";
 const DEFAULT_REASON: &str = "gateway vfs storage mutation";
 const OP_WRITE: &str = "vfs_write_through";
@@ -337,35 +338,46 @@ impl OptimizedVfsStorage for GatewayVfsStorage {
         paths: &[String],
         _fields: VfsStorageMetadataFields,
     ) -> VfsStorageResult<Vec<Option<VfsStorageMetadata>>> {
-        let scoped_paths = paths
-            .iter()
-            .map(|path| self.path_arg(path))
-            .collect::<Vec<_>>();
-        let response = self
-            .send(
-                self.client
-                    .post(self.url("/metadata-many"))
-                    .json(&PathBatchRequest {
-                        paths: scoped_paths,
-                    }),
-            )
-            .await?;
-        let response = response
-            .json::<MetadataManyResponse>()
-            .await
-            .map_err(|err| {
-                VfsStorageError::Internal(format!("decode gateway metadata_many: {err}"))
-            })?;
-        Ok(response
-            .entries
-            .into_iter()
-            .zip(paths.iter())
-            .map(|(entry, path)| {
-                entry
-                    .map(|metadata| metadata.into_storage_metadata(path.clone()))
-                    .transpose()
-            })
-            .collect::<VfsStorageResult<Vec<_>>>()?)
+        let mut out = Vec::with_capacity(paths.len());
+        for batch in paths.chunks(MAX_PATH_BATCH_ITEMS) {
+            let scoped_paths = batch
+                .iter()
+                .map(|path| self.path_arg(path))
+                .collect::<Vec<_>>();
+            let response = self
+                .send(
+                    self.client
+                        .post(self.url("/metadata-many"))
+                        .json(&PathBatchRequest {
+                            paths: scoped_paths,
+                        }),
+                )
+                .await?;
+            let response = response
+                .json::<MetadataManyResponse>()
+                .await
+                .map_err(|err| {
+                    VfsStorageError::Internal(format!("decode gateway metadata_many: {err}"))
+                })?;
+            if response.entries.len() != batch.len() {
+                return Err(VfsStorageError::Internal(
+                    "gateway batch response length mismatch".to_string(),
+                ));
+            }
+            out.extend(
+                response
+                    .entries
+                    .into_iter()
+                    .zip(batch.iter())
+                    .map(|(entry, path)| {
+                        entry
+                            .map(|metadata| metadata.into_storage_metadata(path.clone()))
+                            .transpose()
+                    })
+                    .collect::<VfsStorageResult<Vec<_>>>()?,
+            );
+        }
+        Ok(out)
     }
 
     async fn list_dir_with_metadata(
@@ -468,29 +480,41 @@ impl OptimizedVfsStorage for GatewayVfsStorage {
     }
 
     async fn read_many(&self, paths: &[String]) -> VfsStorageResult<Vec<(String, Bytes)>> {
-        let scoped_paths = paths
-            .iter()
-            .map(|path| self.path_arg(path))
-            .collect::<Vec<_>>();
-        let response = self
-            .send(
-                self.client
-                    .post(self.url("/read-many"))
-                    .json(&PathBatchRequest {
-                        paths: scoped_paths,
-                    }),
-            )
-            .await?;
-        let response = response
-            .json::<ReadManyResponse>()
-            .await
-            .map_err(|err| VfsStorageError::Internal(format!("decode gateway read_many: {err}")))?;
-        Ok(response
-            .entries
-            .into_iter()
-            .zip(paths.iter())
-            .filter_map(|(entry, path)| entry.map(|bytes| (path.clone(), Bytes::from(bytes))))
-            .collect())
+        let mut out = Vec::with_capacity(paths.len());
+        for batch in paths.chunks(MAX_PATH_BATCH_ITEMS) {
+            let scoped_paths = batch
+                .iter()
+                .map(|path| self.path_arg(path))
+                .collect::<Vec<_>>();
+            let response = self
+                .send(
+                    self.client
+                        .post(self.url("/read-many"))
+                        .json(&PathBatchRequest {
+                            paths: scoped_paths,
+                        }),
+                )
+                .await?;
+            let response = response.json::<ReadManyResponse>().await.map_err(|err| {
+                VfsStorageError::Internal(format!("decode gateway read_many: {err}"))
+            })?;
+            if response.entries.len() != batch.len() {
+                return Err(VfsStorageError::Internal(
+                    "gateway batch response length mismatch".to_string(),
+                ));
+            }
+            out.extend(
+                response
+                    .entries
+                    .into_iter()
+                    .zip(batch.iter())
+                    .filter_map(|(entry, path)| {
+                        entry.map(|bytes| (path.clone(), Bytes::from(bytes)))
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        Ok(out)
     }
 
     async fn read_many_if_etag_mismatch(
@@ -1551,6 +1575,58 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn gateway_path_reads_split_batches_and_preserve_missing_slots() {
+        let count = MAX_PATH_BATCH_ITEMS * 2 + 1;
+        let paths = (0..count).map(|i| format!("file-{i}")).collect::<Vec<_>>();
+        let responses = paths
+            .chunks(MAX_PATH_BATCH_ITEMS)
+            .map(|batch| {
+                serde_json::json!({"entries": vec![serde_json::Value::Null; batch.len()]})
+                    .to_string()
+            })
+            .collect();
+        let (endpoint, requests) = serve_sequence(responses);
+        let storage = GatewayVfsStorage::new(GatewayVfsStorageConfig::new(endpoint));
+        let result = storage
+            .metadata_many(&paths, VfsStorageMetadataFields::default())
+            .await
+            .unwrap();
+        assert_eq!(result.len(), count);
+        assert!(result.iter().all(Option::is_none));
+        for batch in paths.chunks(MAX_PATH_BATCH_ITEMS) {
+            let request = requests.recv().unwrap();
+            let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+            assert_eq!(body["paths"], serde_json::json!(batch));
+        }
+        let responses = paths.chunks(MAX_PATH_BATCH_ITEMS).map(|batch| {
+            serde_json::json!({"entries": batch.iter().map(|path| Some(path.as_bytes().to_vec())).collect::<Vec<_>>()} ).to_string()
+        }).collect();
+        let (endpoint, requests) = serve_sequence(responses);
+        let storage = GatewayVfsStorage::new(GatewayVfsStorageConfig::new(endpoint));
+        let result = storage.read_many(&paths).await.unwrap();
+        assert_eq!(result.len(), count);
+        for (path, bytes) in result {
+            assert_eq!(bytes.as_ref(), path.as_bytes());
+        }
+        drop(requests);
+    }
+
+    #[tokio::test]
+    async fn gateway_rejects_short_metadata_responses() {
+        let (endpoint, requests) = serve_sequence(vec![r#"{"entries":[]}"#.to_string()]);
+        let storage = GatewayVfsStorage::new(GatewayVfsStorageConfig::new(endpoint));
+        let error = storage
+            .metadata_many(
+                &["missing".to_string()],
+                VfsStorageMetadataFields::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("response length mismatch"));
+        drop(requests);
+    }
+
+    #[tokio::test]
     async fn gateway_list_dir_forwards_filters_and_maps_relative_paths() {
         let (endpoint, requests) = serve_one(
             r#"[{"name":"a.txt","kind":"file","size_bytes":3,"content_hash":"hash-a","updated_at":null}]"#,
@@ -1682,6 +1758,7 @@ mod tests {
                 "script.sh",
                 body,
                 Some(VfsStorageWritePrecondition {
+                    expected_current_version: None,
                     predicate: None,
                     fingerprint: Some("old-hash".to_string()),
                     secondary_fingerprint: None,
@@ -2011,6 +2088,7 @@ mod tests {
                 staged.path(),
                 Some(&expected),
                 Some(VfsStorageWritePrecondition {
+                    expected_current_version: None,
                     predicate: None,
                     fingerprint: None,
                     secondary_fingerprint: None,
@@ -2162,6 +2240,7 @@ mod tests {
                     bytes: changed_body,
                     token_count: None,
                     precondition: Some(VfsStorageWritePrecondition {
+                        expected_current_version: None,
                         predicate: None,
                         fingerprint: Some("version-b".to_string()),
                         secondary_fingerprint: Some("secondary-b".to_string()),
@@ -2235,6 +2314,7 @@ mod tests {
             .delete_file_with_metadata(
                 "a.txt",
                 Some(VfsStorageWritePrecondition {
+                    expected_current_version: None,
                     predicate: None,
                     fingerprint: Some("version-a".to_string()),
                     secondary_fingerprint: Some("secondary-a".to_string()),
@@ -2310,6 +2390,7 @@ mod tests {
                 VfsStorageNamespaceMutation::DeleteFile {
                     path: "a.txt".to_string(),
                     precondition: Some(VfsStorageWritePrecondition {
+                        expected_current_version: None,
                         predicate: None,
                         fingerprint: Some("version-a".to_string()),
                         secondary_fingerprint: Some("secondary-a".to_string()),
