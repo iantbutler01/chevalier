@@ -5,6 +5,22 @@ and `openai-responses:gpt-6-astra` remain explicit forms. API keys, inline
 `@server_url=...`, and `@reasoning=...` retain their existing meanings. Astra
 requests omit temperature and top-p. Other models retain their existing routes.
 
+## Model-visible tools
+
+`await runtime.setModelToolNames(["execute_code"])` restricts inference schemas
+without unregistering tools. `getToolSchemas()` and `executeToolCall()` still
+access the registered catalog, so a programmatic executor can use the caller's
+authorized tools. Tools registered later remain hidden unless named in the
+allowlist. Pass `null` to restore the default of exposing all registered tools.
+This restriction applies to every provider and both streaming and non-streaming
+inference. Applications still enforce authorization when dispatching calls;
+schema visibility is not an execution permission boundary.
+
+An async tool declaration is separate from visibility. Astra supports returning
+results while inference continues; applications using synchronous providers
+must still wait at the provider's tool-result boundary. A script can use
+concurrent promises regardless of provider-level async support.
+
 ## Native conversation state
 
 Each `responseItems` stream event has `data: { model, responseId, items }`.

@@ -1254,6 +1254,49 @@ mod tests {
     }
 
     #[test]
+    fn model_visibility_filters_every_provider_without_removing_callable_tools() {
+        let mut tools = HashMap::new();
+        for name in ["read", "execute_code", "late_mcp_tool"] {
+            tools.insert(
+                name.to_string(),
+                ToolFunction::Sync(Box::new(|_| Ok("ok".to_string()))),
+            );
+        }
+        let visible = vec!["execute_code".to_string()];
+        for model in [
+            "anthropic:claude-3",
+            "openai:gpt-4",
+            "google:gemini-2.5-pro",
+            "openai-responses:gpt-6-astra",
+            "openai-codex-responses:gpt-6-astra",
+        ] {
+            let schemas = generate_model_tool_schemas(
+                &tools,
+                &HashMap::new(),
+                &sorted_order(&tools),
+                model,
+                Some(&visible),
+            )
+            .unwrap();
+            assert_eq!(schemas.len(), 1, "{model}");
+            assert!(schemas[0].to_string().contains("execute_code"), "{model}");
+            assert_eq!(
+                generate_model_tool_schemas(
+                    &tools,
+                    &HashMap::new(),
+                    &sorted_order(&tools),
+                    model,
+                    None
+                )
+                .unwrap()
+                .len(),
+                3
+            );
+        }
+        assert_eq!(tools.len(), 3);
+    }
+
+    #[test]
     fn test_generate_tool_schemas_anthropic() {
         let mut tools = HashMap::new();
         tools.insert(
