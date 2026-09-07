@@ -4,7 +4,7 @@ use nix::sys::signal::Signal;
 use tokio::sync::{mpsc, oneshot, watch};
 use tonic::Status;
 
-use crate::pb::bracket::portproxy::v1::{exec_control_request, ExecControlRequest};
+use crate::pb::bracket::portproxy::v1::{ExecControlRequest, exec_control_request};
 use crate::process_group::signal_process_group_or_pid;
 
 type SignalRequest = (

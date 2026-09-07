@@ -4,8 +4,8 @@ use futures::stream;
 use tokio::{net::TcpListener, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{
-    transport::{Channel, Server},
     Request,
+    transport::{Channel, Server},
 };
 
 use crate::pb::bracket::portproxy::v1::{
@@ -31,7 +31,7 @@ async fn services() -> (
         loop {
             for pid in tracked.snapshot() {
                 use nix::{
-                    sys::wait::{waitpid, WaitPidFlag, WaitStatus},
+                    sys::wait::{WaitPidFlag, WaitStatus, waitpid},
                     unistd::Pid,
                 };
                 match waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)) {
@@ -204,10 +204,12 @@ async fn eof_preserves_control_and_stop_reaches_descendants_before_terminal_resu
     .await
     .expect("confirmed terminal result");
     stopped(pid).await;
-    assert!(client
-        .control_exec(signal("eof-tree", 0, 2, 9))
-        .await
-        .is_err());
+    assert!(
+        client
+            .control_exec(signal("eof-tree", 0, 2, 9))
+            .await
+            .is_err()
+    );
     server.abort();
 }
 

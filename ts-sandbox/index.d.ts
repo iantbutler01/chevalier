@@ -62,7 +62,6 @@ export declare class Session {
   /** Read the current VM state from the sandbox provider. */
   getState(): Promise<string>
   updateResources(options: SessionResourceOptions): Promise<string>
-  /** Replace configured shared mounts, restarting the VM only when the contract changed. */
   reconfigureSharedMounts(sharedMounts: Array<SharedMountOpts>): Promise<string>
   listPciDevices(): Promise<HostPciInventoryJs>
   attachPciDevice(deviceId: string): Promise<PciDeviceActionJs>

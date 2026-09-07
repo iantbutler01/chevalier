@@ -15,7 +15,7 @@ use chevalier_sandbox::{
 };
 use etcd_client::{Client as EtcdClient, GetOptions};
 use futures::StreamExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
@@ -164,10 +164,12 @@ async fn real_exec_eof_preserves_control_until_confirmed_exit() {
     })
     .await
     .expect("stop must confirm exit within 15 seconds");
-    assert!(timeout(Duration::from_secs(3), execution.events.next())
-        .await
-        .expect("terminal exec must release its stream without dropping the input handle")
-        .is_none());
+    assert!(
+        timeout(Duration::from_secs(3), execution.events.next())
+            .await
+            .expect("terminal exec must release its stream without dropping the input handle")
+            .is_none()
+    );
 }
 
 fn run_docker(args: &[&str]) {
