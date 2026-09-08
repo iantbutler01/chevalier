@@ -171,15 +171,14 @@ async fn stream_chunk_to_runtime_events(
             let mut combined = data.clone();
             if let Some(previous) = &response.provider_response
                 && previous["model"] == data["model"]
-            {
-                if let (Some(previous), Some(items)) = (
+                && let (Some(previous), Some(items)) = (
                     previous["items"].as_array(),
                     combined["items"].as_array_mut(),
-                ) {
-                    let mut all_items = previous.clone();
-                    all_items.append(items);
-                    *items = all_items;
-                }
+                )
+            {
+                let mut all_items = previous.clone();
+                all_items.append(items);
+                *items = all_items;
             }
             response.provider_response = Some(combined);
             Ok(vec![ResponseStreamEvent::ResponseItems(data)])

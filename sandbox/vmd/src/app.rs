@@ -34,12 +34,13 @@ use crate::pci::{
 use crate::proto::v1::{
     AttachPciDeviceRequest, CreateSnapshotRequest, CreateVmPhase, CreateVmProgress,
     CreateVmRequest, CreateVmStreamResponse, DeleteDurableVolumeRequest, DeleteSnapshotRequest,
-    DeleteVmRequest, DesktopEndpoint, DesktopKind, DetachPciDeviceRequest, DurableVolume, DurableVolumeAttachment, ForkVmRequest,
-    ForkVmResponse, GetSnapshotRequest, GetVmBySessionRequest, GetVmRequest, HealthRequest,
-    HealthResponse, HostPciDevice, HostPciDeviceState, HostPciFunction, InfoRequest, InfoResponse,
-    ListDurableVolumesRequest, ListDurableVolumesResponse, ListHostPciDevicesRequest,
-    ListHostPciDevicesResponse, ListSnapshotsRequest, ListSnapshotsResponse, ListVMsRequest,
-    ListVMsResponse, PciDeviceActionResponse, PreDownloadVmImagePhase, PreDownloadVmImageRequest,
+    DeleteVmRequest, DesktopEndpoint, DesktopKind, DetachPciDeviceRequest, DurableVolume,
+    DurableVolumeAttachment, ForkVmRequest, ForkVmResponse, GetSnapshotRequest,
+    GetVmBySessionRequest, GetVmRequest, HealthRequest, HealthResponse, HostPciDevice,
+    HostPciDeviceState, HostPciFunction, InfoRequest, InfoResponse, ListDurableVolumesRequest,
+    ListDurableVolumesResponse, ListHostPciDevicesRequest, ListHostPciDevicesResponse,
+    ListSnapshotsRequest, ListSnapshotsResponse, ListVMsRequest, ListVMsResponse,
+    PciDeviceActionResponse, PreDownloadVmImagePhase, PreDownloadVmImageRequest,
     PreDownloadVmImageResponse, ResizeDurableVolumeRequest, ResourceSpec, RestoreSnapshotRequest,
     Snapshot, UpdateVmRequest, Vm, VmActionRequest, VmSource, VmSourceType as ProtoVmSourceType,
     VmState as ProtoVmState, create_vm_stream_response,
@@ -1492,7 +1493,11 @@ impl GrpcService {
                     Action::Stop => manager.stop_vm(&task_vm_id).await,
                     Action::Restart => manager.restart_vm(&task_vm_id).await,
                     Action::ForceStop => manager.force_stop_vm(&task_vm_id).await,
-                    Action::ShowDesktop | Action::HideDesktop | Action::Start | Action::Pause | Action::Resume => unreachable!(),
+                    Action::ShowDesktop
+                    | Action::HideDesktop
+                    | Action::Start
+                    | Action::Pause
+                    | Action::Resume => unreachable!(),
                 };
                 match &result {
                     Ok(meta) => info!(

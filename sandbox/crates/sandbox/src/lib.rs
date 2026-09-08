@@ -68,10 +68,11 @@ use proto::bracket::portproxy::v1::{
 use proto::vmd::v1::vmd_service_client::VmdServiceClient;
 use proto::vmd::v1::{
     AttachPciDeviceRequest, CreateSnapshotRequest, CreateVmRequest, DeleteDurableVolumeRequest,
-    DeleteSnapshotRequest, DesktopKind, DetachPciDeviceRequest, ForkVmRequest, GetVmBySessionRequest,
-    GetVmRequest, GuestPlatform, GuestProfile, ListDurableVolumesRequest, ListHostPciDevicesRequest, ListSnapshotsRequest,
-    ListVMsRequest, Metadata, PreDownloadVmImageRequest, ResizeDurableVolumeRequest, ResourceSpec,
-    RestoreSnapshotRequest, UpdateVmRequest, Vm, VmActionRequest, VmSource, VmSourceType,
+    DeleteSnapshotRequest, DesktopKind, DetachPciDeviceRequest, ForkVmRequest,
+    GetVmBySessionRequest, GetVmRequest, GuestPlatform, GuestProfile, ListDurableVolumesRequest,
+    ListHostPciDevicesRequest, ListSnapshotsRequest, ListVMsRequest, Metadata,
+    PreDownloadVmImageRequest, ResizeDurableVolumeRequest, ResourceSpec, RestoreSnapshotRequest,
+    UpdateVmRequest, Vm, VmActionRequest, VmSource, VmSourceType,
 };
 
 const PCI_CAPABILITY_HEADER: &str = "x-chevalier-pci-token";
@@ -4019,12 +4020,12 @@ impl Sandbox {
             }
             let vm = self.ensure_vm_running(&vm.id, &node_endpoint).await?;
             if vm_has_guest_rpc(&vm) {
-            self.maybe_wait_for_session_guest_rpc(
-                &vm.id,
-                &node_endpoint,
-                ReadinessRecovery::RestartIfNotFreshlyStarted,
-            )
-            .await?;
+                self.maybe_wait_for_session_guest_rpc(
+                    &vm.id,
+                    &node_endpoint,
+                    ReadinessRecovery::RestartIfNotFreshlyStarted,
+                )
+                .await?;
             }
             let next_fence = self
                 .bind_session_route(
@@ -4318,12 +4319,12 @@ impl Sandbox {
         }
         let vm = self.ensure_vm_running(&vm.id, &node_endpoint).await?;
         if vm_has_guest_rpc(&vm) {
-        self.maybe_wait_for_session_guest_rpc(
-            &vm.id,
-            &node_endpoint,
-            ReadinessRecovery::RestartIfNotFreshlyStarted,
-        )
-        .await?;
+            self.maybe_wait_for_session_guest_rpc(
+                &vm.id,
+                &node_endpoint,
+                ReadinessRecovery::RestartIfNotFreshlyStarted,
+            )
+            .await?;
         }
         let next_fence = self
             .bind_session_route(

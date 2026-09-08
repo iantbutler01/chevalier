@@ -4,7 +4,7 @@ use crate::sandbox::{EventStream, ExecEvent, ExecHandle, ExecInput, ExecOptions,
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub struct ProgrammaticSandboxConfig {
@@ -170,7 +170,7 @@ mod tests {
 
     #[tokio::test]
     async fn independent_input_unblocks_pending_output_and_utf8_survives_byte_boundaries() {
-        let (input, mut commands) = mpsc::channel(4);
+        let (input, mut commands) = tokio::sync::mpsc::channel(4);
         let events = async_stream::stream! {
             match commands.recv().await.unwrap() {
                 ExecInput::Data(bytes) => assert_eq!(bytes, "request\n".as_bytes()),

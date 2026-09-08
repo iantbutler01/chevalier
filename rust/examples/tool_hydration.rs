@@ -42,6 +42,7 @@ fn run_params(
         timeout: None,
         retry_config: None,
         previous_response_id: None,
+        responses: None,
     }
 }
 

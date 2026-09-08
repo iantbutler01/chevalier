@@ -24,12 +24,13 @@ use chevalier_sandbox::proto::vmd::v1::{
     AttachPciDeviceRequest, CreateSnapshotRequest, CreateVmRequest, CreateVmStreamResponse,
     DeleteDurableVolumeRequest, DeleteSnapshotRequest, DeleteVmRequest, DetachPciDeviceRequest,
     ForkVmRequest, ForkVmResponse, GetSnapshotRequest, GetVmBySessionRequest, GetVmRequest,
-    GuestPlatform, HealthRequest, HealthResponse, InfoRequest, InfoResponse, ListDurableVolumesRequest,
-    ListDurableVolumesResponse, ListHostPciDevicesRequest, ListHostPciDevicesResponse,
-    ListSnapshotsRequest, ListSnapshotsResponse, ListVMsRequest, ListVMsResponse, NetworkSpec,
-    PciDeviceActionResponse, PortProxyPorts, PreDownloadVmImageRequest, PreDownloadVmImageResponse,
-    ResizeDurableVolumeRequest, ResourceSpec, RestoreSnapshotRequest, Snapshot, UpdateVmRequest,
-    Vm, VmActionRequest, VmSource, VmSourceType, VmState, create_vm_stream_response,
+    GuestPlatform, HealthRequest, HealthResponse, InfoRequest, InfoResponse,
+    ListDurableVolumesRequest, ListDurableVolumesResponse, ListHostPciDevicesRequest,
+    ListHostPciDevicesResponse, ListSnapshotsRequest, ListSnapshotsResponse, ListVMsRequest,
+    ListVMsResponse, NetworkSpec, PciDeviceActionResponse, PortProxyPorts,
+    PreDownloadVmImageRequest, PreDownloadVmImageResponse, ResizeDurableVolumeRequest,
+    ResourceSpec, RestoreSnapshotRequest, Snapshot, UpdateVmRequest, Vm, VmActionRequest, VmSource,
+    VmSourceType, VmState, create_vm_stream_response,
 };
 use chevalier_sandbox::{
     ExecEvent, ExecInput, ExecOptions, ForkOptions, Sandbox, SandboxConfig, SandboxError,
@@ -317,19 +318,31 @@ impl VmdService for MockVmd {
         Err(Status::not_found("durable volume not found"))
     }
 
-    async fn show_vm_desktop(&self, _request: Request<VmActionRequest>) -> Result<Response<Vm>, Status> {
+    async fn show_vm_desktop(
+        &self,
+        _request: Request<VmActionRequest>,
+    ) -> Result<Response<Vm>, Status> {
         Err(Status::unimplemented("desktop unavailable in this fixture"))
     }
 
-    async fn hide_vm_desktop(&self, _request: Request<VmActionRequest>) -> Result<Response<Vm>, Status> {
+    async fn hide_vm_desktop(
+        &self,
+        _request: Request<VmActionRequest>,
+    ) -> Result<Response<Vm>, Status> {
         Err(Status::unimplemented("desktop unavailable in this fixture"))
     }
 
-    async fn open_vm_desktop(&self, _request: Request<VmActionRequest>) -> Result<Response<chevalier_sandbox::proto::vmd::v1::DesktopEndpoint>, Status> {
+    async fn open_vm_desktop(
+        &self,
+        _request: Request<VmActionRequest>,
+    ) -> Result<Response<chevalier_sandbox::proto::vmd::v1::DesktopEndpoint>, Status> {
         Err(Status::unimplemented("desktop unavailable in this fixture"))
     }
 
-    async fn close_vm_desktop(&self, _request: Request<VmActionRequest>) -> Result<Response<Vm>, Status> {
+    async fn close_vm_desktop(
+        &self,
+        _request: Request<VmActionRequest>,
+    ) -> Result<Response<Vm>, Status> {
         Err(Status::unimplemented("desktop unavailable in this fixture"))
     }
 

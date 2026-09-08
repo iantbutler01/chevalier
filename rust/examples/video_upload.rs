@@ -158,6 +158,7 @@ async fn analyze_video(
             timeout: None,
             retry_config: None,
             previous_response_id: None,
+            responses: None,
         })
         .await?;
 
