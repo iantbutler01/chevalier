@@ -28,6 +28,8 @@ use tokio::sync::{
 };
 use uuid::Uuid;
 
+#[cfg(unix)]
+use crate::normalize_vfs_mode;
 use crate::{
     OptimizedVfsStorage, SeededFileHash, VfsStorageCasPredicate, VfsStorageDeleteResult,
     VfsStorageDirListFilter, VfsStorageDirListOrder, VfsStorageEntryKind, VfsStorageError,
@@ -36,7 +38,6 @@ use crate::{
     VfsStoragePrefetchResult, VfsStorageReadIfChanged, VfsStorageReadIfChangedResult,
     VfsStorageReadRange, VfsStorageRenameResult, VfsStorageResult, VfsStorageSubtreeOptions,
     VfsStorageWrite, VfsStorageWriteOptions, VfsStorageWritePrecondition, VfsStorageWriteResult,
-    normalize_vfs_mode,
     pack::{SlotCompression, hex_hash},
 };
 
@@ -3099,17 +3100,11 @@ fn metadata_is_recent(metadata: &fs::Metadata) -> bool {
     }
 }
 
-#[cfg(unix)]
 fn trusted_write_cache_reusable(cached: &CachedFileHash) -> bool {
-    cached.trusted_write
-}
-
-#[cfg(not(unix))]
-fn trusted_write_cache_reusable(_cached: &CachedFileHash) -> bool {
     // Unix ctime lets us detect an out-of-band same-size write even when an
     // application preserves mtime. Other platforms keep the conservative
     // recency rehash until an equivalent change-generation signal is available.
-    false
+    cached.trusted_write && cfg!(unix)
 }
 
 #[cfg(unix)]
