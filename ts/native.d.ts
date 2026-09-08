@@ -71,6 +71,7 @@ export declare class Runtime {
   runStream(options: RunOptions): Promise<StreamHandle>
   /** All registered tool schemas (name, description, JSON-schema parameters). */
   getToolSchemas(): Promise<Array<ToolSchemaJs>>
+  setModelToolNames(names?: Array<string> | undefined | null): Promise<void>
   setToolAsync(name: string, asynchronous: boolean): Promise<void>
   /** Set a structured system-message prefix applied to subsequent runs. */
   setSystemMessages(messages: Array<Message>): Promise<void>

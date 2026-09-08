@@ -327,6 +327,16 @@ impl Runtime {
     }
 
     #[napi]
+    pub async fn set_model_tool_names(&self, names: Option<Vec<String>>) -> napi::Result<()> {
+        self.inner
+            .lock()
+            .await
+            .set_model_tool_names(names)
+            .await
+            .map_err(to_napi)
+    }
+
+    #[napi]
     pub async fn set_tool_async(&self, name: String, asynchronous: bool) -> napi::Result<()> {
         self.inner
             .lock()

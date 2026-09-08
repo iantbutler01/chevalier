@@ -268,6 +268,9 @@ class Runtime {
     getToolSchemas() {
         return this.native.getToolSchemas();
     }
+    setModelToolNames(names) {
+        return this.native.setModelToolNames(names);
+    }
     setSystemMessages(messages) {
         return this.native.setSystemMessages(messages);
     }

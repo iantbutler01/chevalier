@@ -298,11 +298,22 @@ async fn stream_chunk_to_runtime_events(
 /// prefix from the insertion point onward. Names absent from `tool_order`
 /// (defensive — should not happen) are appended in sorted order so output
 /// stays deterministic.
+#[cfg(test)]
 fn generate_tool_schemas(
     tools: &HashMap<String, ToolFunction>,
     tool_schemas: &HashMap<String, ToolSchemaInfo>,
     tool_order: &[String],
     model: &str,
+) -> Result<Vec<serde_json::Value>> {
+    generate_model_tool_schemas(tools, tool_schemas, tool_order, model, None)
+}
+
+fn generate_model_tool_schemas(
+    tools: &HashMap<String, ToolFunction>,
+    tool_schemas: &HashMap<String, ToolSchemaInfo>,
+    tool_order: &[String],
+    model: &str,
+    model_tool_names: Option<&[String]>,
 ) -> Result<Vec<serde_json::Value>> {
     if tools.is_empty() {
         return Ok(Vec::new());
@@ -329,6 +340,9 @@ fn generate_tool_schemas(
     tool_names.extend(unordered);
 
     for tool_name in tool_names {
+        if model_tool_names.is_some_and(|names| !names.contains(tool_name)) {
+            continue;
+        }
         // Check if we have schema info for this tool
         let tool_schema = if let Some(schema_info) = tool_schemas.get(tool_name) {
             let mut parameters = schema_info.parameters.to_json_schema();
@@ -727,6 +741,7 @@ pub async fn call_llm(
     model: &str,
     tools: Arc<RwLock<HashMap<String, ToolFunction>>>,
     tool_order: Arc<RwLock<Vec<String>>>,
+    model_tool_names: Arc<RwLock<Option<Vec<String>>>>,
     tool_schema_info: Arc<RwLock<HashMap<String, ToolSchemaInfo>>>,
     output_type_name: Option<String>,
     output_schema: Option<serde_json::Value>,
@@ -765,12 +780,14 @@ pub async fn call_llm(
         let tools_guard = tools.read().await;
         let schemas_guard = tool_schema_info.read().await;
         let order_guard = tool_order.read().await;
+        let model_names_guard = model_tool_names.read().await;
         if !tools_guard.is_empty() {
-            Some(generate_tool_schemas(
+            Some(generate_model_tool_schemas(
                 &tools_guard,
                 &schemas_guard,
                 &order_guard,
                 model,
+                model_names_guard.as_deref(),
             )?)
         } else {
             None
@@ -827,6 +844,7 @@ pub async fn call_llm_stream(
     model: &str,
     tools: Arc<RwLock<HashMap<String, ToolFunction>>>,
     tool_order: Arc<RwLock<Vec<String>>>,
+    model_tool_names: Arc<RwLock<Option<Vec<String>>>>,
     tool_schema_info: Arc<RwLock<HashMap<String, ToolSchemaInfo>>>,
     output_type_name: Option<String>,
     output_schema: Option<serde_json::Value>,
@@ -866,12 +884,14 @@ pub async fn call_llm_stream(
         let tools_guard = tools.read().await;
         let schemas_guard = tool_schema_info.read().await;
         let order_guard = tool_order.read().await;
+        let model_names_guard = model_tool_names.read().await;
         if !tools_guard.is_empty() {
-            Some(generate_tool_schemas(
+            Some(generate_model_tool_schemas(
                 &tools_guard,
                 &schemas_guard,
                 &order_guard,
                 model,
+                model_names_guard.as_deref(),
             )?)
         } else {
             None
@@ -1350,6 +1370,46 @@ mod tests {
             schemas[0]["function"]["parameters"]["properties"]["expression"]["type"],
             "string"
         );
+    }
+
+    #[test]
+    fn model_tool_visibility_preserves_nested_tools() {
+        let mut tools = HashMap::new();
+        for name in ["read_file", "execute_code"] {
+            tools.insert(
+                name.to_string(),
+                ToolFunction::Sync(Box::new(|_| Ok("nested output".into()))),
+            );
+        }
+        let order = vec!["read_file".into(), "execute_code".into()];
+        for model in ["anthropic:claude-3", "openai-responses:gpt-5"] {
+            let filtered = generate_model_tool_schemas(
+                &tools,
+                &HashMap::new(),
+                &order,
+                model,
+                Some(&["execute_code".into()]),
+            )
+            .unwrap();
+            assert_eq!(filtered.len(), 1);
+            assert!(filtered[0].to_string().contains("execute_code"));
+            assert!(!filtered[0].to_string().contains("read_file"));
+            assert!(
+                generate_model_tool_schemas(&tools, &HashMap::new(), &order, model, Some(&[]))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                generate_model_tool_schemas(&tools, &HashMap::new(), &order, model, None)
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+        let ToolFunction::Sync(read) = tools.get("read_file").unwrap() else {
+            panic!("sync tool")
+        };
+        assert_eq!(read(serde_json::json!({})).unwrap(), "nested output");
     }
 
     #[test]

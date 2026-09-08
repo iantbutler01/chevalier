@@ -343,6 +343,9 @@ export class Runtime {
   getToolSchemas(): Promise<native.ToolSchemaJs[]> {
     return this.native.getToolSchemas();
   }
+  setModelToolNames(names: string[] | null): Promise<void> {
+    return this.native.setModelToolNames(names);
+  }
   setSystemMessages(messages: native.Message[]): Promise<void> {
     return this.native.setSystemMessages(messages);
   }

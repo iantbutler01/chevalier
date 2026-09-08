@@ -58,6 +58,7 @@ pub struct Runtime {
     /// existing tool bytes and invalidates provider prompt caches from the
     /// insertion point onward.
     tool_order: Arc<RwLock<Vec<String>>>,
+    model_tool_names: Arc<RwLock<Option<Vec<String>>>>,
     tool_types: Arc<RwLock<HashMap<String, String>>>, // tool_name -> type_name mapping
     tool_schemas: Arc<RwLock<HashMap<String, ToolSchemaInfo>>>, // tool_name -> schema info
     tool_constructors: Arc<RwLock<HashMap<String, Arc<ToolConstructor>>>>, // For NativeToolParser
@@ -162,6 +163,7 @@ impl Runtime {
             used: false,
             tools: Arc::new(RwLock::new(HashMap::new())),
             tool_order: Arc::new(RwLock::new(Vec::new())),
+            model_tool_names: Arc::new(RwLock::new(None)),
             tool_types: Arc::new(RwLock::new(HashMap::new())),
             tool_schemas: Arc::new(RwLock::new(HashMap::new())),
             tool_constructors: Arc::new(RwLock::new(HashMap::new())),
@@ -183,6 +185,7 @@ impl Runtime {
             used: false,
             tools: Arc::new(RwLock::new(HashMap::new())),
             tool_order: Arc::new(RwLock::new(Vec::new())),
+            model_tool_names: Arc::new(RwLock::new(None)),
             tool_types: Arc::new(RwLock::new(HashMap::new())),
             tool_schemas: Arc::new(RwLock::new(HashMap::new())),
             tool_constructors: Arc::new(RwLock::new(HashMap::new())),
@@ -446,6 +449,19 @@ impl Runtime {
         schemas.clone()
     }
 
+    pub async fn set_model_tool_names(&self, names: Option<Vec<String>>) -> Result<()> {
+        let tools = self.tools.read().await;
+        if let Some(names) = &names {
+            for name in names {
+                if !tools.contains_key(name) {
+                    return Err(Error::NonRetryable(format!("Unknown tool: {name}")));
+                }
+            }
+        }
+        *self.model_tool_names.write().await = names;
+        Ok(())
+    }
+
     pub async fn set_tool_async(&self, name: &str, asynchronous: bool) -> Result<()> {
         let mut schemas = self.tool_schemas.write().await;
         let schema = schemas
@@ -485,6 +501,7 @@ impl Runtime {
             &effective_model,
             self.tools.clone(),
             self.tool_order.clone(),
+            self.model_tool_names.clone(),
             self.tool_schemas.clone(),
             params.output_type,
             params.output_schema,
@@ -557,6 +574,7 @@ impl Runtime {
             &effective_model,
             self.tools.clone(),
             self.tool_order.clone(),
+            self.model_tool_names.clone(),
             self.tool_schemas.clone(),
             params.output_type,
             params.output_schema,

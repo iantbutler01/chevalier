@@ -68,6 +68,8 @@ Omit `handler` to register a **schema-only** tool the model can call but you
 dispatch yourself (e.g. an event-driven loop). The agent loop is yours to drive;
 `run`, `runStream`, `executeToolCall`, and `getToolSchemas` are the primitives.
 
+`await rt.setModelToolNames(["execute_code"])` limits the tools advertised during subsequent model calls without unregistering nested tools. `getToolSchemas()` and `executeToolCall()` retain the full registry. Pass `null` to restore all tools or `[]` to advertise none. Unknown names are rejected; registration order is preserved.
+
 ## Streaming
 
 ```ts
