@@ -38,6 +38,7 @@ class SharedMountOpts(TypedDict, total=False):
     vfs_scope_path: str
 
 class SessionOpts(TypedDict, total=False):
+    source_type: Literal["docker", "snapshot", "macos-template", "windows-template"]
     session_id: str
     name: str
     image: str
@@ -87,7 +88,32 @@ class OpenComputerProviderOpts(TypedDict, total=False):
     mounts: List[OpenComputerMountOpts]
     shared_mounts: Dict[str, OpenComputerMountOpts]
 
+class DistributedControlOptions(TypedDict, total=False):
+    etcd_endpoints: Required[List[str]]
+    nats_url: Required[str]
+    etcd_prefix: str
+    cluster_id: str
+    nats_auth_token: str
+    required_continuity_tier: str
+    required_storage_profile: str
+    allow_tier_a_degraded: bool
+    allow_cross_node_recovery: bool
+    nats_stream_replicas: int
+
+class SessionResourceOptions(TypedDict, total=False):
+    vcpu: int
+    memory_mb: int
+
+class SessionDesktopTarget(TypedDict, total=False):
+    kind: Required[Literal["vnc", "native-window"]]
+    host: Optional[str]
+    port: Optional[int]
+    password: Optional[str]
+    authentication: Required[Literal["none", "password", "account"]]
+    view_only: Required[bool]
+
 class SandboxConnectOptions(TypedDict, total=False):
+    distributed_control: DistributedControlOptions
     auth_token: str
     pci_access_token: str
     connect_timeout_ms: float
@@ -184,6 +210,12 @@ class ForwardHandle:
 @final
 class Session:
     @property
+    def workspace_root(self) -> str: ...
+    def update_resources(self, options: SessionResourceOptions) -> Awaitable[str]: ...
+    def reconfigure_shared_mounts(self, shared_mounts: List[SharedMountOpts]) -> Awaitable[str]: ...
+    def open_desktop(self) -> Awaitable[SessionDesktopTarget]: ...
+    def close_desktop(self) -> Awaitable[None]: ...
+    @property
     def session_id(self) -> str: ...
     @property
     def vm_id(self) -> str: ...
@@ -223,6 +255,7 @@ class Sandbox:
     def attach_session_passive(self, session_id: str) -> Awaitable[Session]: ...
     def list_sessions(self) -> Awaitable[List[SessionInfo]]: ...
     def list_durable_volumes(self) -> Awaitable[List[DurableVolumeInfo]]: ...
+    def resize_durable_volume(self, owner_key: str, size_gb: int) -> Awaitable[DurableVolumeInfo]: ...
     def delete_durable_volume(self, owner_key: str) -> Awaitable[None]: ...
     def list_host_pci_devices(self) -> Awaitable[HostPciInventory]: ...
     def discard_session_by_id(self, session_id: str) -> Awaitable[None]: ...

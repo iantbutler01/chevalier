@@ -9,10 +9,13 @@ use tokio::sync::Mutex;
 use crate::error::{invalid_argument, sandbox_error};
 use crate::handles::{ExecHandle, ForwardHandle, ShellHandle};
 use crate::json::{from_python, to_python};
-use crate::options::{ExecOpts, ForkOpts, SessionSnapshotOpts, ShellOpts};
+use crate::options::{
+    ExecOpts, ForkOpts, SessionResourceOptions, SessionSnapshotOpts, SharedMountOpts, ShellOpts,
+    positive_resource,
+};
 use crate::types::{
-    HostPciInventory, PciDeviceAction, SessionCheckpoint, SessionDirectoryEntry, SessionSnapshot,
-    vm_state_label,
+    HostPciInventory, PciDeviceAction, SessionCheckpoint, SessionDesktopTarget,
+    SessionDirectoryEntry, SessionSnapshot, vm_state_label,
 };
 
 #[pyclass(module = "chevalier_sandbox.chevalier_sandbox")]
@@ -30,6 +33,68 @@ impl Session {
     #[getter]
     fn vm_id(&self) -> String {
         self.inner.vm_id().to_string()
+    }
+
+    #[getter]
+    fn workspace_root(&self) -> String {
+        self.inner.workspace_root().to_string()
+    }
+
+    fn update_resources<'py>(
+        &self,
+        py: Python<'py>,
+        options: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let options: SessionResourceOptions = from_python(options)?;
+        if options.vcpu.is_none() && options.memory_mb.is_none() {
+            return Err(invalid_argument("vcpu or memory_mb is required"));
+        }
+        let vcpu = positive_resource(options.vcpu, "vCPU count").map_err(sandbox_error)?;
+        let memory_mb = positive_resource(options.memory_mb, "memory MB").map_err(sandbox_error)?;
+        let session = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            session
+                .update_resources(vcpu, memory_mb)
+                .await
+                .map(vm_state_label)
+                .map_err(sandbox_error)
+        })
+    }
+
+    fn reconfigure_shared_mounts<'py>(
+        &self,
+        py: Python<'py>,
+        shared_mounts: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mounts: Vec<SharedMountOpts> = from_python(shared_mounts)?;
+        let session = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            session
+                .reconfigure_shared_mounts(
+                    mounts
+                        .into_iter()
+                        .map(SharedMountOpts::into_shared_mount)
+                        .collect(),
+                )
+                .await
+                .map(vm_state_label)
+                .map_err(sandbox_error)
+        })
+    }
+
+    fn open_desktop<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let session = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let target = session.open_desktop().await.map_err(sandbox_error)?;
+            Python::with_gil(|py| to_python(py, &SessionDesktopTarget::from(target)))
+        })
+    }
+
+    fn close_desktop<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let session = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            session.close_desktop().await.map_err(sandbox_error)
+        })
     }
 
     #[pyo3(signature = (command, options=None))]

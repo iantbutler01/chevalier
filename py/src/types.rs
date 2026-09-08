@@ -455,6 +455,7 @@ mod provider_event_tests {
 
 #[derive(Serialize)]
 pub struct ToolSchemaOutput {
+    pub r#async: bool,
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
@@ -463,6 +464,7 @@ pub struct ToolSchemaOutput {
 impl From<ToolSchemaInfo> for ToolSchemaOutput {
     fn from(schema: ToolSchemaInfo) -> Self {
         Self {
+            r#async: schema.asynchronous,
             name: schema.name,
             description: schema.description,
             parameters: schema.parameters.to_json_schema(),

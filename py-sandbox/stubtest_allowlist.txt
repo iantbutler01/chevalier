@@ -18,3 +18,7 @@ chevalier_sandbox.SessionSnapshotOpts
 chevalier_sandbox.SharedMountOpts
 chevalier_sandbox.ShellEvent
 chevalier_sandbox.ShellOpts
+
+chevalier_sandbox\.DistributedControlOptions
+chevalier_sandbox\.SessionDesktopTarget
+chevalier_sandbox\.SessionResourceOptions

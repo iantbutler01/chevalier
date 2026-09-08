@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use chevalier_sandbox::{
-    EventStream, ExecEvent, ExecInput, ForwardHandle as EngineForwardHandle, ShellEvent, ShellInput,
+    EventStream, ExecEvent, ExecInput, ExecInputSender, ForwardHandle as EngineForwardHandle,
+    ShellEvent, ShellInput,
 };
 use futures::StreamExt;
 use pyo3::exceptions::PyRuntimeError;
@@ -48,7 +49,7 @@ fn shell_event_to_python(py: Python<'_>, event: ShellEvent) -> PyResult<PyObject
 
 #[pyclass(module = "chevalier_sandbox.chevalier_sandbox")]
 pub struct ExecHandle {
-    pub(crate) input: tokio::sync::mpsc::Sender<ExecInput>,
+    pub(crate) input: ExecInputSender,
     pub(crate) events: Arc<Mutex<EventStream<ExecEvent>>>,
 }
 

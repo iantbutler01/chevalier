@@ -32,6 +32,8 @@ struct RuntimeOptions {
 
 #[derive(Default, Deserialize)]
 struct RunOptions {
+    responses: Option<ResponsesOptionsInput>,
+    previous_response_id: Option<String>,
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
@@ -56,6 +58,12 @@ struct RunOptions {
     timeout_ms: Option<f64>,
 }
 
+#[derive(Deserialize)]
+struct ResponsesOptionsInput {
+    websocket: Option<bool>,
+    compaction_threshold: Option<u32>,
+}
+
 impl RunOptions {
     fn into_params(self) -> RunParams {
         RunParams {
@@ -76,8 +84,14 @@ impl RunOptions {
                 .timeout_ms
                 .map(|milliseconds| Duration::from_millis(milliseconds as u64)),
             retry_config: None,
-            previous_response_id: None,
-            responses: None,
+            previous_response_id: self.previous_response_id,
+            responses: self.responses.map(|options| {
+                chevalier_core::providers::responses_control::ResponsesOptions {
+                    websocket: options.websocket.unwrap_or(false),
+                    compaction_threshold: options.compaction_threshold,
+                    control: None,
+                }
+            }),
         }
     }
 }
@@ -102,6 +116,7 @@ struct KimiCodingConfigInput {
 
 #[derive(Deserialize)]
 struct CodexSubscriptionConfigInput {
+    prompt_cache_key: Option<String>,
     token: String,
     #[serde(default)]
     account_id: Option<String>,
@@ -169,7 +184,7 @@ fn provider_config(config: ProviderConfigInput) -> Option<ProviderConfig> {
             CodexSubscriptionProviderConfig {
                 token: codex.token,
                 account_id: codex.account_id,
-                prompt_cache_key: None,
+                prompt_cache_key: codex.prompt_cache_key,
                 base_url: codex.base_url,
                 transport: codex
                     .transport
@@ -252,6 +267,7 @@ pub(crate) async fn invoke_python_tool(
 
 #[pyclass(module = "chevalier.chevalier")]
 pub struct Runtime {
+    executor: chevalier_core::runtime::ToolExecutor,
     inner: Arc<Mutex<EngineRuntime>>,
 }
 
@@ -261,11 +277,10 @@ impl Runtime {
     #[pyo3(signature = (options=None))]
     fn new(options: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
         let options: RuntimeOptions = options.map(from_python).transpose()?.unwrap_or_default();
+        let engine = EngineRuntime::with_config(options.model, options.api_key);
         Ok(Self {
-            inner: Arc::new(Mutex::new(EngineRuntime::with_config(
-                options.model,
-                options.api_key,
-            ))),
+            executor: engine.tool_executor(),
+            inner: Arc::new(Mutex::new(engine)),
         })
     }
 
@@ -344,12 +359,10 @@ impl Runtime {
         args: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let args = value_from_python(args)?;
-        let inner = self.inner.clone();
+        let executor = self.executor.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            inner
-                .lock()
-                .await
-                .execute_tool_call(&ToolCall::new(tool_name, args))
+            executor
+                .execute(&ToolCall::new(tool_name, args))
                 .await
                 .map_err(to_py_err)
         })
@@ -360,7 +373,17 @@ impl Runtime {
         py: Python<'py>,
         options: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let params = from_python::<RunOptions>(options)?.into_params();
+        let mut params = from_python::<RunOptions>(options)?.into_params();
+        let control = params
+            .responses
+            .as_mut()
+            .filter(|options| options.websocket)
+            .map(|options| {
+                let control =
+                    chevalier_core::providers::responses_control::ResponsesControl::default();
+                options.control = Some(control.clone());
+                control
+            });
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -382,6 +405,7 @@ impl Runtime {
                 }
             });
             Ok(StreamHandle {
+                control,
                 receiver: Arc::new(Mutex::new(receiver)),
                 abort: task.abort_handle(),
             })
@@ -400,6 +424,40 @@ impl Runtime {
                 .map(ToolSchemaOutput::from)
                 .collect();
             Python::with_gil(|py| to_python(py, &schemas))
+        })
+    }
+
+    #[pyo3(signature = (names=None))]
+    fn set_model_tool_names<'py>(
+        &self,
+        py: Python<'py>,
+        names: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner
+                .lock()
+                .await
+                .set_model_tool_names(names)
+                .await
+                .map_err(to_py_err)
+        })
+    }
+
+    fn set_tool_async<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+        asynchronous: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner
+                .lock()
+                .await
+                .set_tool_async(&name, asynchronous)
+                .await
+                .map_err(to_py_err)
         })
     }
 

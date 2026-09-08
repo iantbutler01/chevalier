@@ -45,6 +45,15 @@ def test_runtime_tool_registry_executes_python_coroutines():
         else:
             raise AssertionError("schema-only tool unexpectedly executed")
 
+        await runtime.set_model_tool_names(["host_only"])
+        await runtime.set_tool_async("add", True)
+        schemas = await runtime.get_tool_schemas()
+        assert {schema["name"] for schema in schemas} == {"add", "host_only"}
+        assert next(schema for schema in schemas if schema["name"] == "add")["async"] is True
+        assert await runtime.execute_tool_call("add", {"left": 3}) == "8"
+        with pytest.raises(chevalier.ChevalierError):
+            await runtime.set_model_tool_names(["missing"])
+        await runtime.set_model_tool_names(None)
         await runtime.dispose()
         assert await runtime.get_tool_schemas() == []
 
@@ -305,12 +314,19 @@ def test_stream_close_cancels_driver_and_releases_runtime():
                 "api_key": "test",
             }
         )
+        async def echo(value: str) -> str:
+            return value
+
+        await runtime.tool(echo)
         stream = await runtime.run_stream({"prompt": "stream"})
         event = await asyncio.wait_for(stream.next(), 2)
         assert isinstance(event, chevalier.OutputStreamEvent)
         assert event.type == "output"
         assert isinstance(event.output, chevalier.TextResponsePart)
         assert event.output.text == "first"
+        assert await asyncio.wait_for(runtime.execute_tool_call("echo", {"value": "while streaming"}), 2) == "while streaming"
+        with pytest.raises(chevalier.ChevalierError, match="Responses WebSocket"):
+            await stream.steer({"input": "unsupported"})
         stream.close()
         result = await asyncio.wait_for(runtime.run({"prompt": "after close"}), 2)
         assert result.text() == "complete"

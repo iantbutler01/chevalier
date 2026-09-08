@@ -178,3 +178,33 @@ pub fn vm_state_label(state: i32) -> String {
     }
     .to_string()
 }
+
+#[derive(Serialize)]
+pub struct SessionDesktopTarget {
+    pub kind: String,
+    pub host: Option<String>,
+    pub port: Option<u32>,
+    pub password: Option<String>,
+    pub authentication: String,
+    pub view_only: bool,
+}
+
+impl From<chevalier_sandbox::SessionDesktopTarget> for SessionDesktopTarget {
+    fn from(target: chevalier_sandbox::SessionDesktopTarget) -> Self {
+        Self {
+            kind: match target.kind {
+                chevalier_sandbox::SessionDesktopKind::Vnc => "vnc".to_string(),
+                chevalier_sandbox::SessionDesktopKind::NativeWindow => "native-window".to_string(),
+            },
+            host: target.host,
+            port: target.port.map(u32::from),
+            password: target.password,
+            authentication: match target.authentication {
+                chevalier_sandbox::SessionDesktopAuthentication::None => "none".to_string(),
+                chevalier_sandbox::SessionDesktopAuthentication::Password => "password".to_string(),
+                chevalier_sandbox::SessionDesktopAuthentication::Account => "account".to_string(),
+            },
+            view_only: target.view_only,
+        }
+    }
+}

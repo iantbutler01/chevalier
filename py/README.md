@@ -121,3 +121,33 @@ maturin develop
 cargo test --features pyo3/extension-module
 pytest ../integration_tests
 ```
+
+## Current native API parity
+
+The Python binding supports Responses WebSocket steering and continuation through
+`StreamHandle.steer(input)` and `continue_response(input)`. Enable it with
+`{"responses": {"websocket": True}}` in run options. Run options also accept
+`previous_response_id` and an optional `compaction_threshold` under `responses`.
+Messages preserve `provider_response`, document parts accept `document_url` or
+`document_base64`, and Codex subscription configuration accepts `prompt_cache_key`.
+
+`set_model_tool_names(names)` limits the schemas advertised to the model while
+keeping registered tools executable. `None` restores all tools. `set_tool_async(name,
+asynchronous)` controls the provider's async tool flag, reflected in each schema's
+`"async"` field. Tool execution uses the independent Rust executor so host dispatch
+can proceed while an inference stream holds the runtime lock.
+
+`ProgrammaticExecution(callback)` is the low-level equivalent of the native
+TypeScript programmatic bridge. Create it inside a running asyncio loop. Its async
+callback receives the same JSON operations as the TypeScript adapter: `start`,
+`write`, `next`, `signal`, `call`, and `cancel`. The caller supplies the execution
+backend and tool dispatcher; the Rust engine owns the protocol, execution limits,
+and cancellation. `execute(code, tools, timeout_ms=None)` returns `{"output": [...]}`
+and can be called once; `cancel()` cancels pending work. Tool descriptors use
+`name`, `description`, and `schema`. `programmatic_description(tools)` generates
+the model-facing description from those same descriptors.
+
+The separate sandbox binding also exposes distributed-control connection options,
+Docker/snapshot/macOS/Windows session source types, `workspace_root`, durable-volume
+resizing, session resource updates, shared-mount reconfiguration, and desktop
+open/close operations. All forward to the existing Rust sandbox client.

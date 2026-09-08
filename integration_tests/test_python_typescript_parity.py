@@ -23,6 +23,7 @@ SANDBOX_TYPE_ALIASES = {
     "SessionCheckpointJs": "SessionCheckpoint",
     "SessionDirectoryEntryJs": "SessionDirectoryEntry",
     "SessionInfoJs": "SessionInfo",
+    "SessionDesktopTargetJs": "SessionDesktopTarget",
     "SessionSnapshotJs": "SessionSnapshot",
     "ShellEventJs": "ShellEvent",
 }
@@ -99,6 +100,12 @@ def typescript_interfaces(path):
 def python_typed_dicts(path):
     typed_dicts = {}
     for node in ast.parse(path.read_text()).body:
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name) and node.value.func.id == "TypedDict"):
+            name = node.targets[0].id
+            fields = {key.value for key in node.value.args[1].keys}
+            typed_dicts[name] = (fields, fields)
+            continue
         if not isinstance(node, ast.ClassDef) or not any(
             isinstance(base, ast.Name) and base.id == "TypedDict"
             for base in node.bases

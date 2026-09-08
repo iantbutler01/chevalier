@@ -15,6 +15,8 @@ class MediaPartInput(TypedDict, total=False):
     image_base64: str
     mime_type: str
     image_url: str
+    document_url: str
+    document_base64: str
 
 class ToolCallInput(TypedDict, total=False):
     tool_use_id: Required[str]
@@ -22,6 +24,7 @@ class ToolCallInput(TypedDict, total=False):
     args: Required[str]
 
 class Message(TypedDict, total=False):
+    provider_response: Json
     type: Required[str]
     role: str
     content: str
@@ -31,7 +34,13 @@ class Message(TypedDict, total=False):
     parts: List[MediaPartInput]
     tool_calls: List[ToolCallInput]
 
+class ResponsesOptionsInput(TypedDict, total=False):
+    websocket: bool
+    compaction_threshold: int
+
 class RunOptions(TypedDict, total=False):
+    responses: ResponsesOptionsInput
+    previous_response_id: str
     prompt: str
     system: str
     temperature: float
@@ -49,6 +58,7 @@ class AnthropicCacheConfig(TypedDict, total=False):
     tool_definitions_cache_breakpoint: str
 
 class CodexSubscriptionConfigInput(TypedDict, total=False):
+    prompt_cache_key: str
     token: Required[str]
     account_id: str
     base_url: str
@@ -147,10 +157,7 @@ class ProviderRateLimit:
     @property
     def resets_at_epoch_sec(self) -> int: ...
 
-class ToolSchema(TypedDict):
-    name: str
-    description: str
-    parameters: Json
+ToolSchema = TypedDict("ToolSchema", {"name": str, "description": str, "parameters": Json, "async": bool})
 
 @final
 class OutputStreamEvent:
@@ -203,6 +210,8 @@ class ChevalierError(Exception):
 
 @final
 class StreamHandle:
+    def steer(self, input: Json) -> Awaitable[None]: ...
+    def continue_response(self, input: Json) -> Awaitable[None]: ...
     def next(self) -> Awaitable[Optional[ResponseStreamEvent]]: ...
     def close(self) -> None: ...
 
@@ -215,6 +224,8 @@ class Runtime:
     def execute_tool_call(self, tool_name: str, args: Json) -> Awaitable[str]: ...
     def run_stream(self, options: RunOptions) -> Awaitable[StreamHandle]: ...
     def get_tool_schemas(self) -> Awaitable[List[ToolSchema]]: ...
+    def set_model_tool_names(self, names: Optional[List[str]] = ...) -> Awaitable[None]: ...
+    def set_tool_async(self, name: str, asynchronous: bool) -> Awaitable[None]: ...
     def set_system_messages(self, messages: Sequence[Message]) -> Awaitable[None]: ...
     def set_default_prompt(self, prompt: str) -> Awaitable[None]: ...
     def set_provider_config(self, config: ProviderConfigInput) -> Awaitable[None]: ...
@@ -366,3 +377,11 @@ def vfs_content_hash_algorithm() -> str: ...
 def version() -> str: ...
 
 __version__: str
+
+@final
+class ProgrammaticExecution:
+    def __new__(cls, callback: Callable[[Json], Awaitable[Json]]) -> ProgrammaticExecution: ...
+    def cancel(self) -> None: ...
+    def execute(self, code: str, tools: Json, timeout_ms: Optional[int] = ...) -> Awaitable[Json]: ...
+
+def programmatic_description(tools: Json) -> str: ...

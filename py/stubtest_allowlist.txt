@@ -25,3 +25,5 @@ chevalier.VfsPrefetchOptions
 chevalier.VfsRemoveOptions
 chevalier.VfsSeededHash
 chevalier.VfsWriteOptions
+
+chevalier\.ResponsesOptionsInput

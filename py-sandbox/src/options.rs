@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use chevalier_sandbox::{
-    ExecOptions, ForkOptions, OpenComputerBackendConfig, OpenComputerMountConfig, SandboxError,
-    SharedMount, SharedMountAvailability, SharedMountContinuity, ShellOptions,
+    DistributedControlConfig, ExecOptions, ForkOptions, OpenComputerBackendConfig,
+    OpenComputerMountConfig, SandboxError, SharedMount, SharedMountAvailability,
+    SharedMountContinuity, ShellOptions,
 };
 use serde::Deserialize;
 
@@ -111,7 +112,7 @@ fn shared_mount_continuity(
 }
 
 impl SharedMountOpts {
-    fn into_shared_mount(self) -> SharedMount {
+    pub(crate) fn into_shared_mount(self) -> SharedMount {
         let availability = shared_mount_availability(self.availability);
         let continuity = shared_mount_continuity(self.continuity, &availability);
         SharedMount {
@@ -130,6 +131,7 @@ impl SharedMountOpts {
 
 #[derive(Default, Deserialize)]
 pub struct SessionOpts {
+    pub source_type: Option<SessionSourceType>,
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
@@ -159,6 +161,7 @@ pub struct SessionOpts {
 impl From<SessionOpts> for chevalier_sandbox::SessionOptions {
     fn from(options: SessionOpts) -> Self {
         Self {
+            source_type: options.source_type.unwrap_or_default().into(),
             session_id: options.session_id,
             name: options.name,
             image: options.image,
@@ -216,6 +219,7 @@ pub struct SessionSnapshotOpts {
 
 #[derive(Default, Deserialize)]
 pub struct SandboxConnectOptions {
+    pub distributed_control: Option<DistributedControlOptions>,
     #[serde(default)]
     pub auth_token: Option<String>,
     #[serde(default)]
@@ -361,4 +365,96 @@ pub fn positive_resource(value: Option<u32>, label: &str) -> Result<Option<i32>,
     i32::try_from(value)
         .map(Some)
         .map_err(|_| SandboxError::InvalidConfig(format!("{label} exceeds the supported maximum")))
+}
+
+#[derive(Deserialize)]
+pub struct DistributedControlOptions {
+    pub etcd_endpoints: Vec<String>,
+    pub nats_url: String,
+    pub etcd_prefix: Option<String>,
+    pub cluster_id: Option<String>,
+    pub nats_auth_token: Option<String>,
+    pub required_continuity_tier: Option<String>,
+    pub required_storage_profile: Option<String>,
+    pub allow_tier_a_degraded: Option<bool>,
+    pub allow_cross_node_recovery: Option<bool>,
+    pub nats_stream_replicas: Option<u32>,
+}
+
+impl TryFrom<DistributedControlOptions> for DistributedControlConfig {
+    type Error = SandboxError;
+
+    fn try_from(options: DistributedControlOptions) -> Result<Self, Self::Error> {
+        if options.etcd_endpoints.is_empty()
+            || options
+                .etcd_endpoints
+                .iter()
+                .any(|endpoint| endpoint.trim().is_empty())
+            || options.nats_url.trim().is_empty()
+        {
+            return Err(SandboxError::InvalidConfig(
+                "distributed control requires non-empty etcd endpoints and a NATS URL".into(),
+            ));
+        }
+        if let Some(tier) = options.required_continuity_tier.as_deref()
+            && !matches!(tier, "tier-a" | "tier-b")
+        {
+            return Err(SandboxError::InvalidConfig(
+                "required continuity tier must be tier-a or tier-b".into(),
+            ));
+        }
+        if options.nats_stream_replicas == Some(0) {
+            return Err(SandboxError::InvalidConfig(
+                "NATS stream replicas must be positive".into(),
+            ));
+        }
+        let defaults = Self::default();
+        Ok(Self {
+            etcd_endpoints: options.etcd_endpoints,
+            nats_url: options.nats_url,
+            etcd_prefix: options.etcd_prefix.unwrap_or(defaults.etcd_prefix),
+            cluster_id: options.cluster_id.unwrap_or(defaults.cluster_id),
+            nats_auth_token: options.nats_auth_token,
+            required_continuity_tier: options
+                .required_continuity_tier
+                .or(defaults.required_continuity_tier),
+            required_storage_profile: options.required_storage_profile,
+            allow_tier_a_degraded: options
+                .allow_tier_a_degraded
+                .unwrap_or(defaults.allow_tier_a_degraded),
+            allow_cross_node_recovery: options
+                .allow_cross_node_recovery
+                .unwrap_or(defaults.allow_cross_node_recovery),
+            nats_stream_replicas: options
+                .nats_stream_replicas
+                .map(|n| n as usize)
+                .unwrap_or(defaults.nats_stream_replicas),
+            ..defaults
+        })
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionSourceType {
+    #[default]
+    Docker,
+    Snapshot,
+    MacosTemplate,
+    WindowsTemplate,
+}
+impl From<SessionSourceType> for chevalier_sandbox::SessionSourceType {
+    fn from(value: SessionSourceType) -> Self {
+        match value {
+            SessionSourceType::Docker => Self::Docker,
+            SessionSourceType::Snapshot => Self::Snapshot,
+            SessionSourceType::MacosTemplate => Self::MacosTemplate,
+            SessionSourceType::WindowsTemplate => Self::WindowsTemplate,
+        }
+    }
+}
+#[derive(Deserialize)]
+pub struct SessionResourceOptions {
+    pub vcpu: Option<u32>,
+    pub memory_mb: Option<u32>,
 }

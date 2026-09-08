@@ -7,6 +7,8 @@ use serde::Deserialize;
 
 #[derive(Clone, Deserialize)]
 pub struct MediaPartInput {
+    document_url: Option<String>,
+    document_base64: Option<String>,
     #[serde(rename = "type")]
     kind: String,
     #[serde(default)]
@@ -28,6 +30,7 @@ pub struct ToolCallInput {
 
 #[derive(Clone, Deserialize)]
 pub struct Message {
+    provider_response: Option<serde_json::Value>,
     #[serde(rename = "type")]
     kind: String,
     #[serde(default)]
@@ -48,6 +51,18 @@ pub struct Message {
 
 fn to_media_part(part: &MediaPartInput) -> MediaPart {
     match part.kind.as_str() {
+        "document" => {
+            if let Some(url) = &part.document_url {
+                MediaPart::document(MediaSource::url(url.clone()))
+            } else {
+                MediaPart::document(MediaSource::base64(
+                    part.document_base64.clone().unwrap_or_default(),
+                    part.mime_type
+                        .clone()
+                        .unwrap_or_else(|| "application/pdf".into()),
+                ))
+            }
+        }
         "image" => {
             if let Some(url) = &part.image_url {
                 MediaPart::image(MediaSource::url(url.clone()))
@@ -117,7 +132,11 @@ pub fn to_conversation_message(message: &Message) -> ConversationMessage {
                     });
                 }
             }
-            ConversationMessage::AssistantResponse(AssistantResponse::new(parts))
+            {
+                let mut response = AssistantResponse::new(parts);
+                response.provider_response = message.provider_response.clone();
+                ConversationMessage::AssistantResponse(response)
+            }
         }
         "reasoning" => ConversationMessage::Reasoning(ReasoningSegment::new(
             message.content.clone().unwrap_or_default(),

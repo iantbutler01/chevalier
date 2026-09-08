@@ -33,6 +33,11 @@ impl Sandbox {
             endpoint: endpoint.clone(),
             ..Default::default()
         };
+        config.distributed_control = options
+            .distributed_control
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(sandbox_error)?;
         if let Some(token) = options.auth_token {
             config.auth_token = Some(token);
         }
@@ -62,6 +67,13 @@ impl Sandbox {
         match options.provider.as_deref().unwrap_or("chevalier") {
             "chevalier" | "local" | "vmd" => {}
             "opencomputer" | "open-computer" => {
+                if config.distributed_control.is_some() {
+                    return Err(sandbox_error(
+                        chevalier_sandbox::SandboxError::InvalidConfig(
+                            "distributed control requires the chevalier provider".into(),
+                        ),
+                    ));
+                }
                 config.provider = SandboxProviderConfig::OpenComputer(
                     opencomputer_config_from_options(options.open_computer)
                         .map_err(sandbox_error)?,
@@ -157,6 +169,22 @@ impl Sandbox {
                 .map(DurableVolumeInfo::from)
                 .collect();
             Python::with_gil(|py| to_python(py, &volumes))
+        })
+    }
+
+    fn resize_durable_volume<'py>(
+        &self,
+        py: Python<'py>,
+        owner_key: String,
+        size_gb: i32,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let sandbox = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let volume = sandbox
+                .resize_durable_volume(&owner_key, size_gb)
+                .await
+                .map_err(sandbox_error)?;
+            Python::with_gil(|py| to_python(py, &DurableVolumeInfo::from(volume)))
         })
     }
 

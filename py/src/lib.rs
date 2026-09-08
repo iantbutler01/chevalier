@@ -4,6 +4,7 @@ mod errors;
 mod json;
 mod mcp;
 mod messages;
+mod programmatic;
 mod runtime;
 mod stream;
 mod types;
@@ -34,6 +35,11 @@ fn chevalier(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<types::RateLimitsStreamEvent>()?;
     module.add_class::<types::CompleteStreamEvent>()?;
     module.add_class::<runtime::Runtime>()?;
+    module.add_class::<programmatic::ProgrammaticExecution>()?;
+    module.add_function(wrap_pyfunction!(
+        programmatic::programmatic_description,
+        module
+    )?)?;
     module.add_class::<stream::StreamHandle>()?;
     module.add_class::<mcp::McpClient>()?;
     module.add_class::<mcp::McpServer>()?;
