@@ -175,6 +175,7 @@ async fn run_program(
     let marker = format!("__chevalier_{}__", uuid::Uuid::new_v4());
     let mut jobs: JoinSet<Result<(u64, Value)>> = JoinSet::new();
     let mut terminal = false;
+    let mut awaiting_runner_exit = false;
     let operation = async {
         tokio::time::timeout(options.timeout, session
             .write(&format!(
@@ -223,7 +224,10 @@ async fn run_program(
                                         deadline = Instant::now() + options.timeout;
                                     }
                                 }
-                                ProgramFrame::Error { message } => return Err(failure(message)),
+                                ProgramFrame::Error { message } => {
+                                    awaiting_runner_exit = jobs.is_empty();
+                                    return Err(failure(message));
+                                }
                                 ProgramFrame::Done => {
                                     if !jobs.is_empty() { return Err(failure("Program ended with unawaited tool calls")); }
                                     return Ok(ProgrammaticResult { output });
@@ -266,12 +270,12 @@ async fn run_program(
         _ = options.cancel.cancelled() => Err(failure("Programmatic execution cancelled")),
         result = operation => result,
     };
-    if outcome.is_err() {
+    if outcome.is_err() && !awaiting_runner_exit {
         options.cancel.cancel();
     }
     let cleanup = async {
         if !terminal {
-            let mut signalled = outcome.is_err();
+            let mut signalled = outcome.is_err() && !awaiting_runner_exit;
             if signalled {
                 let _ = session.signal(15).await;
             }

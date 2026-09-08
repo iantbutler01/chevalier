@@ -105,10 +105,17 @@ test("requires explicit sandbox injection without provisioning or fallback", asy
 
 test("syntax failures identify the source line without dispatching earlier calls", async (t) => {
   const { sandbox, children } = await fixture(t);
+  const signals = [];
+  const gracefulSandbox = {
+    startExec: async (options) => {
+      const session = await sandbox.startExec(options);
+      return { ...session, signal: async (signal) => { signals.push(signal); throw new Error("A completed syntax diagnostic must exit without signals"); } };
+    },
+  };
   let dispatched = false;
   await assert.rejects(
     executeProgrammatic('text(await tools.read({}));\nconst command = "first\nsecond";', {
-      sandbox,
+      sandbox: gracefulSandbox,
       tools,
       dispatch: async () => { dispatched = true; },
     }),
@@ -117,10 +124,12 @@ test("syntax failures identify the source line without dispatching earlier calls
       assert.match(error.message, /execute_code:2/);
       assert.match(error.message, /const command = "first/);
       assert.match(error.message, /backticks or escaped newlines/);
+      assert.doesNotMatch(error.message, /termination|without signals/);
       return true;
     },
   );
   assert.equal(dispatched, false);
+  assert.deepEqual(signals, []);
   assert.equal(children.size, 0);
   const corrected = await executeProgrammatic('text(`first\nsecond`);', {
     sandbox, tools, dispatch: async () => null,
