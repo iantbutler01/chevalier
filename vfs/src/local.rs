@@ -3408,10 +3408,15 @@ fn set_mode_nofollow(path: &Path, mode: u32) -> VfsStorageResult<fs::Metadata> {
             path.display()
         )));
     }
+    // libc does not expose this AArch64 constant; Linux scripts/syscall.tbl assigns 452.
+    #[cfg(target_arch = "aarch64")]
+    const FCHMODAT2: libc::c_long = 452;
+    #[cfg(not(target_arch = "aarch64"))]
+    const FCHMODAT2: libc::c_long = libc::SYS_fchmodat2;
     let empty = [0_u8];
     let result = unsafe {
         libc::syscall(
-            libc::SYS_fchmodat2,
+            FCHMODAT2,
             target.as_raw_fd(),
             empty.as_ptr().cast::<libc::c_char>(),
             mode as libc::mode_t,

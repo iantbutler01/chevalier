@@ -56,6 +56,8 @@ jobs:
         with: { node-version: 24 }
       - uses: dtolnay/rust-toolchain@stable
       - run: npm ci
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: npm run build:debug
 
   build:
@@ -110,6 +112,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - run: npm ci
+      - name: Install protobuf compiler (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install protobuf compiler (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      - name: Install protobuf compiler (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc --no-progress -y
       - name: Build native addon
         run: npx napi build --platform --release --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
