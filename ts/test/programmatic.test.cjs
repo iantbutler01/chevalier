@@ -103,6 +103,31 @@ test("requires explicit sandbox injection without provisioning or fallback", asy
   );
 });
 
+test("syntax failures identify the source line without dispatching earlier calls", async (t) => {
+  const { sandbox, children } = await fixture(t);
+  let dispatched = false;
+  await assert.rejects(
+    executeProgrammatic('text(await tools.read({}));\nconst command = "first\nsecond";', {
+      sandbox,
+      tools,
+      dispatch: async () => { dispatched = true; },
+    }),
+    (error) => {
+      assert.match(error.message, /Invalid JavaScript in execute_code; no code or tools ran/);
+      assert.match(error.message, /execute_code:2/);
+      assert.match(error.message, /const command = "first/);
+      assert.match(error.message, /backticks or escaped newlines/);
+      return true;
+    },
+  );
+  assert.equal(dispatched, false);
+  assert.equal(children.size, 0);
+  const corrected = await executeProgrammatic('text(`first\nsecond`);', {
+    sandbox, tools, dispatch: async () => null,
+  });
+  assert.deepEqual(corrected.output, ['first\nsecond']);
+});
+
 test("uses selected execution environment and reaps the process after success", async (t) => {
   const { sandbox, root, children } = await fixture(t);
   const gracefulSandbox = {

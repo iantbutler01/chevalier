@@ -46,7 +46,21 @@ lines.on('line', (line) => {
         if (++emitted > 1000 || bytes > 1048576) throw new Error('Program output exceeds size limit');
         send({ kind: 'output', value: JSON.parse(json) });
       };
-      const run = new Function('tools', 'text', 'return (async () => {\n' + frame.code + '\n})()');
+      let run;
+      try {
+        run = new Function('tools', 'text', 'return (async () => {\n' + frame.code + '\n})()');
+      } catch (error) {
+        if (error instanceof SyntaxError) {
+          let location = error.message;
+          try {
+            new (require('node:vm').Script)('(async () => {\n' + frame.code + '\n})()', { filename: 'execute_code', lineOffset: -1 });
+          } catch (diagnostic) {
+            location = String(diagnostic.stack ?? diagnostic).split('\n\n')[0];
+          }
+          throw new SyntaxError('Invalid JavaScript in execute_code; no code or tools ran. Correct the syntax before retrying. Multiline strings need backticks or escaped newlines.\n' + location);
+        }
+        throw error;
+      }
       Promise.resolve(run(Object.freeze(tools), text)).then(() => {
         finish(pending.size ? new Error('Program ended with unawaited tool calls; await every call') : undefined);
       }, finish);
