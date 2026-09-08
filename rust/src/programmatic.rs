@@ -136,6 +136,7 @@ enum ProgramFrame {
         message: String,
     },
     Done,
+    Heartbeat,
 }
 
 async fn run_program(
@@ -146,7 +147,7 @@ async fn run_program(
     options: ProgrammaticOptions,
 ) -> Result<ProgrammaticResult> {
     let enabled: HashSet<_> = names.iter().cloned().collect();
-    let deadline = Instant::now() + options.timeout;
+    let mut deadline = Instant::now() + options.timeout;
     let command = format!("node -e '{}'", RUNNER.replace('\'', "'\\''"));
     let session = tokio::select! {
         biased;
@@ -175,12 +176,12 @@ async fn run_program(
     let mut jobs: JoinSet<Result<(u64, Value)>> = JoinSet::new();
     let mut terminal = false;
     let operation = async {
-        session
+        tokio::time::timeout(options.timeout, session
             .write(&format!(
                 "{}\n",
-                json!({"marker":marker,"names":names,"code":code})
-            ))
-            .await?;
+                json!({"marker":marker,"names":names,"code":code,"heartbeatMs":(options.timeout.as_millis() / 3).max(1)})
+            )))
+            .await.map_err(|_| failure("Programmatic execution timed out"))??;
         let mut buffer = String::new();
         let mut stderr = String::new();
         let mut seen = HashSet::new();
@@ -194,8 +195,10 @@ async fn run_program(
                 completed = jobs.join_next(), if !jobs.is_empty() => {
                     let (id, mut reply) = completed.ok_or_else(|| failure("Missing tool result"))?
                         .map_err(|error| failure(format!("Tool dispatch failed: {error}")))??;
+                    deadline = Instant::now() + options.timeout;
                     reply["id"] = json!(id);
-                    session.write(&format!("{reply}\n")).await?;
+                    tokio::time::timeout(options.timeout, session.write(&format!("{reply}\n")))
+                        .await.map_err(|_| failure("Programmatic execution timed out"))??;
                 }
                 event = events.recv() => match event.ok_or_else(|| failure("Sandbox stream closed unexpectedly"))?? {
                     None | Some(ProgrammaticEvent::Exit { .. }) => {
@@ -215,6 +218,11 @@ async fn run_program(
                             let frame: ProgramFrame = serde_json::from_str(frame)
                                 .map_err(|_| failure("Invalid programmatic tool call or protocol frame"))?;
                             match frame {
+                                ProgramFrame::Heartbeat => {
+                                    if !jobs.is_empty() {
+                                        deadline = Instant::now() + options.timeout;
+                                    }
+                                }
                                 ProgramFrame::Error { message } => return Err(failure(message)),
                                 ProgramFrame::Done => {
                                     if !jobs.is_empty() { return Err(failure("Program ended with unawaited tool calls")); }
@@ -256,7 +264,6 @@ async fn run_program(
     let outcome = tokio::select! {
         biased;
         _ = options.cancel.cancelled() => Err(failure("Programmatic execution cancelled")),
-        _ = tokio::time::sleep_until(deadline) => Err(failure("Programmatic execution timed out")),
         result = operation => result,
     };
     if outcome.is_err() {

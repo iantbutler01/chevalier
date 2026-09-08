@@ -191,6 +191,8 @@ for (const mode of ["cancel", "unawaited", "throw", "timeout"]) {
         ? "tools.read({});"
         : mode === "throw"
           ? "tools.read({}); throw new Error('broken');"
+          : mode === "timeout"
+            ? "tools.read({}); await new Promise(resolve => setTimeout(resolve, 20)); while (true) {}"
           : "await tools.read({});";
     const task = executeProgrammatic(code, {
       sandbox,
@@ -256,6 +258,19 @@ test("cancels CPU-bound code without blocking host and escalates ignored TERM", 
   await ready.promise;
   controller.abort();
   await failed;
+  assert.equal(children.size, 0);
+});
+
+test("nested waits outlive the code deadline and return their result", async (t) => {
+  const { sandbox, children } = await fixture(t);
+  const result = await executeProgrammatic("text(await tools.read({}));", {
+    sandbox, tools, timeoutMs: 200,
+    dispatch: async () => {
+      await new Promise(resolve => setTimeout(resolve, 700));
+      return "completed";
+    },
+  });
+  assert.deepEqual(result.output, ["completed"]);
   assert.equal(children.size, 0);
 });
 

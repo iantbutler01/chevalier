@@ -25,6 +25,9 @@ lines.on('line', (line) => {
     if (!started) {
       started = true;
       marker = frame.marker;
+      setInterval(() => {
+        if (pending.size && !finished) send({ kind: 'heartbeat' });
+      }, frame.heartbeatMs).unref();
       const tools = Object.create(null);
       for (const name of frame.names) {
         tools[name] = (args = {}) => {

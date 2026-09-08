@@ -146,6 +146,10 @@ impl ProgrammaticDispatcher for Dispatcher {
                 }
             }
             "deny" => Err(Error::NonRetryable("Host approval denied".into())),
+            "slow" => {
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                Ok(json!("finished"))
+            }
             "wait" => {
                 self.entered.notify_one();
                 cancel.cancelled().await;
@@ -172,7 +176,7 @@ fn fixture() -> (Arc<ProcessSandbox>, Arc<Dispatcher>, Vec<ProgrammaticTool>) {
         cancelled: AtomicBool::new(false),
         calls: Mutex::new(Vec::new()),
     });
-    let tools = ["lookup", "deny", "wait", "execute_code"]
+    let tools = ["lookup", "deny", "wait", "slow", "execute_code"]
         .into_iter()
         .map(|name| ProgrammaticTool {
             name: name.into(),
@@ -230,11 +234,13 @@ async fn caller_cancellation_settles_dispatch_and_reaps_process_before_return() 
         dispatcher.clone(),
         ProgrammaticOptions {
             cancel: cancel.clone(),
+            timeout: Duration::from_millis(300),
             ..Default::default()
         },
     );
     let cancellation = async {
         dispatcher.entered.notified().await;
+        tokio::time::sleep(Duration::from_millis(900)).await;
         cancel.cancel();
     };
     let (result, ()) = tokio::time::timeout(Duration::from_secs(8), async {
@@ -244,6 +250,25 @@ async fn caller_cancellation_settles_dispatch_and_reaps_process_before_return() 
     .unwrap();
     assert!(result.unwrap_err().to_string().contains("cancelled"));
     assert!(dispatcher.cancelled.load(Ordering::SeqCst));
+    assert!(sandbox.exited.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn nested_wait_outlives_execution_deadline_then_returns_its_result() {
+    let (sandbox, dispatcher, tools) = fixture();
+    let result = execute_programmatic(
+        "text(await tools.slow({}));",
+        &tools,
+        sandbox.clone(),
+        dispatcher,
+        ProgrammaticOptions {
+            timeout: Duration::from_millis(300),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.output, vec![json!("finished")]);
     assert!(sandbox.exited.load(Ordering::SeqCst));
 }
 
@@ -265,6 +290,37 @@ async fn deadline_terminates_a_silent_process() {
     )
     .await
     .unwrap();
+    assert!(result.unwrap_err().to_string().contains("timed out"));
+    assert!(sandbox.exited.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn pending_tool_does_not_hide_a_blocked_javascript_event_loop() {
+    let (sandbox, dispatcher, tools) = fixture();
+    let result = execute_programmatic(
+        "const waiting = tools.wait({}); await new Promise(resolve => setTimeout(resolve, 20)); while (true) {}",
+        &tools, sandbox.clone(), dispatcher.clone(),
+        ProgrammaticOptions { timeout: Duration::from_millis(300), ..Default::default() },
+    ).await;
+    assert!(result.unwrap_err().to_string().contains("timed out"));
+    assert!(dispatcher.cancelled.load(Ordering::SeqCst));
+    assert!(sandbox.exited.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn deadline_resumes_after_nested_tool_completion() {
+    let (sandbox, dispatcher, tools) = fixture();
+    let result = execute_programmatic(
+        "await tools.slow({}); await new Promise(() => {});",
+        &tools,
+        sandbox.clone(),
+        dispatcher,
+        ProgrammaticOptions {
+            timeout: Duration::from_millis(300),
+            ..Default::default()
+        },
+    )
+    .await;
     assert!(result.unwrap_err().to_string().contains("timed out"));
     assert!(sandbox.exited.load(Ordering::SeqCst));
 }
