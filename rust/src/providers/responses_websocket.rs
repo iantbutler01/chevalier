@@ -5,6 +5,60 @@ use futures::{SinkExt, Stream, StreamExt};
 use serde_json::{Value, json};
 use std::{pin::Pin, time::Duration};
 
+#[derive(Default)]
+struct WireOutputDiagnostics {
+    whitespace_chars: usize,
+    frames: usize,
+    previous_sequence: Option<u64>,
+    non_increasing_sequences: usize,
+    reported: bool,
+}
+
+impl WireOutputDiagnostics {
+    fn observe(&mut self, event: &Value, response_id: Option<&str>) -> Option<Value> {
+        if event["type"] == "response.created" {
+            *self = Self::default();
+        }
+        if !matches!(
+            event["type"].as_str(),
+            Some("response.output_text.delta" | "response.content_part.delta")
+        ) {
+            return None;
+        }
+        let delta = event["delta"].as_str()?;
+        self.frames += 1;
+        if let Some(sequence) = event["sequence_number"].as_u64() {
+            if self
+                .previous_sequence
+                .is_some_and(|previous| sequence <= previous)
+            {
+                self.non_increasing_sequences += 1;
+            }
+            self.previous_sequence = Some(sequence);
+        }
+        for character in delta.chars() {
+            self.whitespace_chars = if character.is_whitespace() {
+                self.whitespace_chars + 1
+            } else {
+                0
+            };
+            if self.whitespace_chars >= 1024 && !self.reported {
+                self.reported = true;
+                return Some(json!({
+                    "responseId": response_id,
+                    "itemId": event["item_id"],
+                    "wireEvent": event["type"],
+                    "sequenceNumber": self.previous_sequence,
+                    "nonIncreasingSequences": self.non_increasing_sequences,
+                    "contentFrames": self.frames,
+                    "consecutiveWhitespaceChars": self.whitespace_chars
+                }));
+            }
+        }
+        None
+    }
+}
+
 pub async fn connect(
     builder: tokio_websockets::ClientBuilder<'static>,
     mut body: Value,
@@ -40,6 +94,7 @@ pub async fn connect(
             let mut accepted = Vec::<Value>::new();
             let mut terminal_seen = false;
             let mut completed_response = false;
+            let mut wire_diagnostics = WireOutputDiagnostics::default();
             loop {
                 tokio::select! {
                     _ = sender.closed() => return Ok(()),
@@ -79,6 +134,9 @@ pub async fn connect(
                         let Some(text) = message.as_text() else { continue; };
                         let mut event: Value = serde_json::from_str(text)?;
                         let kind = event["type"].as_str().unwrap_or("").to_owned();
+                        if let Some(diagnostic) = wire_diagnostics.observe(&event, response_id.as_deref()) {
+                            eprintln!("Responses wire whitespace anomaly: {diagnostic}");
+                        }
                         let rate_limits = super::openai_codex_responses::codex_rate_limits_from_event(&event);
                         if !rate_limits.is_empty() { let _ = sender.send(Ok(StreamChunk::RateLimits(rate_limits))); }
                         if kind == "response.created" {
@@ -154,6 +212,73 @@ mod tests {
     use crate::providers::{GenerationConfig, InferenceClient};
     use tokio::net::TcpListener;
     use tokio_websockets::{Message, ServerBuilder};
+
+    #[test]
+    fn wire_diagnostics_identify_upstream_whitespace_without_logging_content() {
+        let mut diagnostic = WireOutputDiagnostics::default();
+        for sequence in 1..1024 {
+            assert!(diagnostic.observe(&json!({"type":"response.output_text.delta", "sequence_number":sequence, "delta":" "}), Some("resp_fixture")).is_none());
+        }
+        let report = diagnostic.observe(&json!({"type":"response.output_text.delta", "sequence_number":1024, "delta":"\n", "item_id":"msg_fixture"}), Some("resp_fixture")).unwrap();
+        assert_eq!(report["responseId"], "resp_fixture");
+        assert_eq!(report["contentFrames"], 1024);
+        assert_eq!(report["nonIncreasingSequences"], 0);
+        assert!(report.get("delta").is_none());
+        assert!(diagnostic.observe(&json!({"type":"response.output_text.delta", "sequence_number":1025, "delta":" "}), Some("resp_fixture")).is_none());
+    }
+
+    #[tokio::test]
+    async fn wire_content_is_forwarded_once_without_synthesizing_whitespace() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fragments = vec!["Before".to_owned(), " \n\n".repeat(400), "After".to_owned()];
+        let expected = fragments.concat();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = ServerBuilder::new().accept(socket).await.unwrap();
+            socket.next().await.unwrap().unwrap();
+            socket
+                .send(Message::text(
+                    json!({"type":"response.created","response":{"id":"resp_wire"}}).to_string(),
+                ))
+                .await
+                .unwrap();
+            for (index, fragment) in fragments.iter().enumerate() {
+                socket.send(Message::text(json!({"type":"response.output_text.delta","sequence_number":index + 1,"item_id":"msg_wire","delta":fragment}).to_string())).await.unwrap();
+            }
+            let item = json!({"type":"message","id":"msg_wire","role":"assistant","content":[{"type":"output_text","text":fragments.concat()}]});
+            socket
+                .send(Message::text(
+                    json!({"type":"response.output_item.done","output_index":0,"item":item})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+            socket.send(Message::text(json!({"type":"response.completed","response":{"id":"resp_wire","output":[item]}}).to_string())).await.unwrap();
+        });
+        let client = OpenAIResponsesClient::new("fixture", "gpt-6-astra")
+            .with_api_url(format!("http://{address}/v1/responses"));
+        let mut config = GenerationConfig::new("gpt-6-astra");
+        config.responses = Some(ResponsesOptions {
+            websocket: true,
+            control: Some(ResponsesControl::default()),
+            ..Default::default()
+        });
+        let mut stream = client.connect_and_listen(&[], &config).await.unwrap();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(chunk) = stream.next().await {
+                if let StreamChunk::Content(text) = chunk.unwrap() {
+                    received.push(text);
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(received.len(), 3);
+        assert_eq!(received.concat(), expected);
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn disconnect_preserves_completed_work_but_not_an_unfinished_continuation() {
