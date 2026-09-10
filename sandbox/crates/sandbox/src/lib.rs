@@ -1624,6 +1624,17 @@ impl Session {
         self.node_endpoint.lock().await.clone()
     }
 
+    #[cfg(feature = "distributed-control")]
+    async fn current_registered_fence(&self) -> Result<Option<String>> {
+        self.sandbox
+            .current_session_fence_for_endpoint(
+                &self.session_id,
+                &self.vm_id,
+                &self.current_node_endpoint().await,
+            )
+            .await
+    }
+
     async fn update_route_state(
         &self,
         previous_endpoint: &str,
@@ -2054,7 +2065,7 @@ impl Session {
             .unwrap_or_else(|| self.sandbox.inner.cfg.default_shell.clone());
         let stream_id = Uuid::new_v4().to_string();
         let start_idempotency_key = format!("exec-stream-start-{stream_id}");
-        let expected_fence = self.ownership_fence().await;
+        let expected_fence = self.current_registered_fence().await?;
         let distributed::ExecStreamSubscription {
             events: stream_events,
             started,
@@ -2174,7 +2185,7 @@ impl Session {
         let resume_idempotency_key = format!(
             "exec-stream-resume-{logical_stream_id}-{producer_epoch}-{resume_after_event_seq}"
         );
-        let expected_fence = self.ownership_fence().await;
+        let expected_fence = self.current_registered_fence().await?;
         let payload = json!({
             "stream_id": logical_stream_id,
             "logical_stream_id": logical_stream_id,
@@ -2278,6 +2289,7 @@ impl Session {
         let signal_session = self.session_id.clone();
         let signal_vm = self.vm_id.clone();
         let signal_errors = event_tx.clone();
+        let session_for_signals = self.clone();
         let mut input_tasks = tokio::task::JoinSet::new();
         input_tasks.spawn(async move {
             let mut control_seq = 0u64;
@@ -2285,12 +2297,20 @@ impl Session {
                 control_seq += 1;
                 let (stream_id, target_node_id, producer_epoch) =
                     routing_for_signals.lock().await.clone();
+                let expected_fence = match session_for_signals.current_registered_fence().await {
+                    Ok(fence) => fence,
+                    Err(error) => {
+                        let _ = signal_errors.send(Err(error)).await;
+                        break;
+                    }
+                };
                 let request_id = Uuid::new_v4().to_string();
                 let payload = json!({
                     "stream_id": stream_id,
                     "session_id": signal_session,
                     "vm_id": signal_vm,
                     "target_node_id": target_node_id,
+                    "expected_fence": expected_fence,
                     "producer_epoch": producer_epoch,
                     "input_kind": "signal",
                     "signal": signal,
@@ -2310,6 +2330,7 @@ impl Session {
         let vm_id_input = self.vm_id.clone();
         let event_tx_input = event_tx.clone();
         let input_control = control_tx.clone();
+        let session_for_input = self.clone();
         input_tasks.spawn(async move {
             let mut input_seq = 0u64;
             let mut previous_route = None;
@@ -2317,6 +2338,13 @@ impl Session {
                 let (stream_id_input, target_node_id_input, producer_epoch_input) = {
                     let guard = routing_for_input.lock().await;
                     (guard.0.clone(), guard.1.clone(), guard.2)
+                };
+                let expected_fence = match session_for_input.current_registered_fence().await {
+                    Ok(fence) => fence,
+                    Err(error) => {
+                        let _ = event_tx_input.send(Err(error)).await;
+                        break;
+                    }
                 };
                 let route = (target_node_id_input.clone(), producer_epoch_input);
                 if previous_route.as_ref() != Some(&route) {
@@ -2331,6 +2359,7 @@ impl Session {
                             "session_id": session_id_input.as_str(),
                             "vm_id": vm_id_input.as_str(),
                             "target_node_id": target_node_id_input.as_str(),
+                            "expected_fence": expected_fence,
                             "input_seq": input_seq,
                             "input_kind": "eof",
                             "producer_epoch": producer_epoch_input,
@@ -2365,6 +2394,7 @@ impl Session {
                             "session_id": session_id_input.as_str(),
                             "vm_id": vm_id_input.as_str(),
                             "target_node_id": target_node_id_input.as_str(),
+                            "expected_fence": expected_fence,
                             "input_seq": input_seq,
                             "input_kind": "stdin",
                             "data": bytes,
@@ -2647,6 +2677,12 @@ impl Session {
             }
             drop(input_tasks);
         });
+
+        if opts.close_stdin_on_start {
+            input_tx.send(ExecInput::Eof).await.map_err(|_| {
+                SandboxError::InvalidResponse("failed to enqueue distributed exec EOF".into())
+            })?;
+        }
 
         Ok(ExecHandle {
             input: ExecInputSender {
@@ -5344,6 +5380,29 @@ impl Sandbox {
         Ok(None)
     }
 
+    async fn current_session_fence_for_endpoint(
+        &self,
+        session_id: &str,
+        vm_id: &str,
+        endpoint: &str,
+    ) -> Result<Option<String>> {
+        #[cfg(feature = "distributed-control")]
+        if let ControlBackend::Distributed(control) = &self.inner.control_backend {
+            let route = control
+                .get_session_route(session_id)
+                .await?
+                .ok_or_else(|| SandboxError::SessionNotFound(session_id.to_string()))?;
+            if route.vm_id != vm_id || normalize_endpoint(&route.endpoint)? != endpoint {
+                return Err(SandboxError::FenceConflict(format!(
+                    "session owner changed for session_id={session_id}; attach the session again"
+                )));
+            }
+            return Ok(route.ownership_fence);
+        }
+        let _ = (session_id, vm_id, endpoint);
+        Ok(None)
+    }
+
     async fn ensure_vm_and_get_rpc_access_for_session(
         &self,
         session_id: &str,
@@ -5443,7 +5502,14 @@ impl Sandbox {
     ) -> Result<(String, Option<String>)> {
         let normalized_endpoint = normalize_endpoint(endpoint)?;
         match self.ensure_vm_running(vm_id, &normalized_endpoint).await {
-            Ok(_) => Ok((normalized_endpoint, None)),
+            Ok(_) => {
+                // A second attach can rotate the fence while this VM remains healthy.
+                // Refresh only for the same registered owner, never authorize a stale VM.
+                let fence = self
+                    .current_session_fence_for_endpoint(session_id, vm_id, &normalized_endpoint)
+                    .await?;
+                Ok((normalized_endpoint, fence))
+            }
             Err(initial_err) => {
                 if let Some((rebound_endpoint, next_fence)) = self
                     .rebind_session_endpoint(

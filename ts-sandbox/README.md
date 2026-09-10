@@ -121,6 +121,21 @@ Set `SANDBOX_TEST_NODE_ENDPOINT`, `SANDBOX_TEST_ETCD_HTTP_URL`,
 `SANDBOX_TEST_NATS_URL`, and the optional `SANDBOX_TEST_AUTH_TOKEN` and
 `SANDBOX_TEST_NATS_AUTH_TOKEN`. It uses a unique etcd prefix and deletes it afterward.
 
+Cached distributed sessions refresh their ownership fence before executing on
+the same registered VM and endpoint. Attaching another client can rotate that
+fence without moving the VM. A handle whose registered owner changed instead
+fails explicitly and must be attached again; it cannot adopt a different VM's fence.
+
+Run `node test/cached-session-fence.cjs` against an existing test session with
+`SANDBOX_TEST_SESSION_ID`, `SANDBOX_ENDPOINT`, `SANDBOX_IMAGE`,
+`SANDBOX_ARCHITECTURE`, `SANDBOX_AUTH_TOKEN`, and
+`OPENBRACKET_SANDBOX_DISTRIBUTED_CONTROL`. It verifies execution through the
+original handle after a second attachment, stdin/EOF and cancellation after an
+attachment during a running command, and noninteractive EOF at launch. It does
+not edit the repository or discard the session and has a 60-second deadline.
+Every input and signal carries the current same-owner fence; omitting it makes
+the worker reject input even when command startup succeeded.
+
 ## Build
 
 ```bash
