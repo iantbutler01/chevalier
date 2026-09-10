@@ -3099,7 +3099,7 @@ impl Manager {
                         .map(map_bootstrap_shared_mount)
                         .collect(),
                     network: Some(map_bootstrap_network(&child_meta)),
-                    http_proxy_url: None,
+                    http_proxy_url: self.cfg.guest_network.http_proxy_url(),
                     portproxy_auth_token: child_meta
                         .metadata
                         .get(META_PORTPROXY_AUTH_TOKEN)
@@ -3302,7 +3302,7 @@ impl Manager {
                         .map(map_bootstrap_shared_mount)
                         .collect(),
                     network: Some(map_bootstrap_network(&child_meta)),
-                    http_proxy_url: None,
+                    http_proxy_url: self.cfg.guest_network.http_proxy_url(),
                     portproxy_auth_token: child_meta
                         .metadata
                         .get(META_PORTPROXY_AUTH_TOKEN)
@@ -4618,7 +4618,7 @@ impl Manager {
                     network: tap_spec
                         .as_ref()
                         .map(|_| map_bootstrap_network(&meta_snapshot)),
-                    http_proxy_url: None,
+                    http_proxy_url: cfg.guest_network.http_proxy_url(),
                     portproxy_auth_token: meta_snapshot
                         .metadata
                         .get(META_PORTPROXY_AUTH_TOKEN)
@@ -6015,7 +6015,7 @@ impl Manager {
                 .map(map_bootstrap_shared_mount)
                 .collect(),
             network: Some(map_bootstrap_network(&guard.metadata)),
-            http_proxy_url: None,
+            http_proxy_url: self.cfg.guest_network.http_proxy_url(),
             portproxy_auth_token: guard
                 .metadata
                 .metadata
