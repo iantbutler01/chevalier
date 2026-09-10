@@ -615,6 +615,18 @@ impl FreestyleControl {
     }
 
     pub(crate) async fn delete_checkpoint(&self, checkpoint_id: &str) -> Result<()> {
+        // On Freestyle a checkpoint and a base image are the same kind of
+        // object in one namespace, so this endpoint will happily delete the
+        // image every sandbox boots from. A stale checkpoint record or a
+        // mistyped id would take the whole provider down until someone
+        // rebuilds the snapshot, so the configured base is not deletable
+        // through the checkpoint path at all. Deleting it is a deliberate
+        // operator act, not something a session can reach.
+        if !self.cfg.snapshot_id.is_empty() && checkpoint_id.trim() == self.cfg.snapshot_id {
+            return Err(SandboxError::InvalidConfig(format!(
+                "refusing to delete {checkpoint_id}: it is the configured base image"
+            )));
+        }
         let response = self
             .client
             .delete(self.url(&format!(
@@ -1546,5 +1558,29 @@ mod tests {
             control.preview_domain("vm-0f3a-9b", 8080),
             "nym-0f3a9b-p8080.style.dev"
         );
+    }
+
+    /// A checkpoint and a base image share one namespace on Freestyle, so the
+    /// delete path must not be able to remove the image every sandbox boots
+    /// from - losing it takes the provider down until someone rebuilds it.
+    #[tokio::test]
+    async fn delete_checkpoint_refuses_the_configured_base_image() {
+        let control = FreestyleControl::new(FreestyleBackendConfig {
+            api_key: "k".to_string(),
+            snapshot_id: "nym-desktop".to_string(),
+            ..FreestyleBackendConfig::default()
+        })
+        .unwrap();
+
+        let error = control
+            .delete_checkpoint("nym-desktop")
+            .await
+            .expect_err("the base image must not be deletable as a checkpoint");
+        assert!(
+            matches!(error, SandboxError::InvalidConfig(_)),
+            "expected InvalidConfig, got {error:?}"
+        );
+        // Whitespace must not smuggle it past the guard.
+        assert!(control.delete_checkpoint("  nym-desktop  ").await.is_err());
     }
 }
