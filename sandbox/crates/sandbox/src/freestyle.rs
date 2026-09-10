@@ -58,6 +58,8 @@ pub(crate) struct FreestyleVm {
     pub state: FreestyleVmState,
     #[serde(default)]
     pub metadata: HashMap<String, String>,
+    #[serde(default)]
+    pub slug: Option<String>,
     #[serde(default, rename = "displayName")]
     pub display_name: Option<String>,
 }
@@ -282,10 +284,38 @@ impl FreestyleControl {
             ]))
             .await?;
         let page: ListVmsResponse = decode_json(response, "list vms").await?;
-        Ok(page.vms.into_iter().find(|vm| {
+        if let Some(vm) = page.vms.into_iter().find(|vm| {
             vm.metadata
                 .get(META_SESSION_ID)
                 .is_some_and(|value| value == session_id)
+        }) {
+            return Ok(Some(vm));
+        }
+        self.find_by_session_slug(session_id).await
+    }
+
+    /// Freestyle drops a metadata value longer than 63 characters, silently, so
+    /// a session id shaped `nym-<uuid>-<uuid>` — 77 characters — never reaches
+    /// the metadata the lookup above searches. The slug does survive: it comes
+    /// from the same session id and is written before the cap applies. Without
+    /// this fallback a restarted process cannot recognise the VM it already
+    /// owns, so it abandons a running VM and builds another one.
+    async fn find_by_session_slug(&self, session_id: &str) -> Result<Option<FreestyleVm>> {
+        let slug = session_slug(session_id);
+        let response = self
+            .send(
+                self.client
+                    .get(self.url("/v5/vms"))
+                    .query(&[("slug", slug.as_str()), ("limit", "2")]),
+            )
+            .await?;
+        let page: ListVmsResponse = decode_json(response, "list vms").await?;
+        Ok(page.vms.into_iter().find(|vm| {
+            vm.slug.as_deref() == Some(slug.as_str())
+                && vm
+                    .metadata
+                    .get(META_MANAGED_BY)
+                    .is_some_and(|value| value == MANAGED_BY_VALUE)
         }))
     }
 
@@ -1460,6 +1490,34 @@ mod tests {
             detached_command("/bin/bash", "sleep 100")
                 .starts_with("nohup '/bin/bash' -lc 'sleep 100' >/dev/null")
         );
+    }
+
+    /// The reason attaching to an existing session had to gain a slug fallback:
+    /// a Nym's session id is longer than a Freestyle metadata value may be, and
+    /// the value is dropped rather than rejected, so the metadata lookup can
+    /// never match. The slug is derived from the same id before the cap.
+    #[test]
+    fn a_nym_session_id_is_too_long_for_metadata_but_survives_as_a_slug() {
+        let session_id = format!(
+            "nym-{}-{}",
+            "ef7704f6-9168-4218-b155-0dcc6c8adbaa", "13530284-8050-482f-9c9b-cd7a20694330"
+        );
+        assert!(
+            session_id.len() > 63,
+            "expected a session id past the metadata cap, got {}",
+            session_id.len()
+        );
+
+        let mut metadata = HashMap::new();
+        metadata.insert(META_SESSION_ID.to_string(), session_id.clone());
+        assert!(
+            metadata_within_limits(metadata).is_empty(),
+            "the session id is silently dropped from metadata"
+        );
+
+        let slug = session_slug(&session_id);
+        assert_eq!(slug.len(), 63);
+        assert!(session_id.to_lowercase().starts_with(&slug[..41]));
     }
 
     #[test]
