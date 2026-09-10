@@ -968,6 +968,7 @@ pub struct SandboxConnectOptions {
     pub auth_token: Option<String>,
     pub pci_access_token: Option<String>,
     pub connect_timeout_ms: Option<f64>,
+    pub prewarm_on_start: Option<bool>,
     pub default_image: Option<String>,
     pub default_architecture: Option<String>,
     pub default_vcpu: Option<u32>,
@@ -1179,6 +1180,9 @@ impl Sandbox {
             }
             if let Some(ms) = o.connect_timeout_ms {
                 cfg.connect_timeout = Duration::from_millis(ms as u64);
+            }
+            if let Some(prewarm_on_start) = o.prewarm_on_start {
+                cfg.prewarm_on_start = prewarm_on_start;
             }
             if let Some(img) = o.default_image {
                 cfg.default_image = img;

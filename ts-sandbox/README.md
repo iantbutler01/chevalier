@@ -21,6 +21,12 @@ const sb = await Sandbox.connect("http://127.0.0.1:8052", {
 });
 ```
 
+`Sandbox.connect` prepares the default image on all reachable workers before returning
+by default. Latency-sensitive clients can pass `prewarmOnStart: false` to connect
+without waiting for fleet-wide image preparation; session creation still prepares
+the required image on its selected worker. The native binding regression test is
+`node ts-sandbox/test/connect-prewarm.cjs`.
+
 OpenComputer:
 
 ```ts

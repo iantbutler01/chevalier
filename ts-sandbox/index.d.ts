@@ -215,6 +215,7 @@ export interface SandboxConnectOptions {
   authToken?: string
   pciAccessToken?: string
   connectTimeoutMs?: number
+  prewarmOnStart?: boolean
   defaultImage?: string
   defaultArchitecture?: string
   defaultVcpu?: number
