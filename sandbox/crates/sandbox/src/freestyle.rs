@@ -29,6 +29,10 @@ use crate::{
 const META_MANAGED_BY: &str = "chevalier.managed_by";
 const MANAGED_BY_VALUE: &str = "chevalier-sandbox";
 const META_SESSION_ID: &str = "chevalier.session_id";
+/// Freestyle drops a metadata value past this length instead of rejecting it,
+/// so anything longer has to be carried in pieces.
+const METADATA_VALUE_LIMIT: usize = 63;
+const META_SESSION_ID_TAIL: &str = "chevalier.session_id.tail";
 const META_NAME: &str = "chevalier.name";
 /// Guest-side marker directory: one file per mount tag records that the mount
 /// command was launched in this boot, so attach does not relaunch it.
@@ -138,6 +142,9 @@ impl FreestyleControl {
             .filter(|value| !value.is_empty())
             .or_else(|| (!self.cfg.snapshot_id.is_empty()).then(|| self.cfg.snapshot_id.clone()));
         metadata.insert(META_MANAGED_BY.to_string(), MANAGED_BY_VALUE.to_string());
+        if let Some(session_id) = metadata.get(META_SESSION_ID).cloned() {
+            store_session_id(&mut metadata, &session_id);
+        }
         let slug = metadata
             .get("chevalier.requested_session_id")
             .map(|value| session_slug(value));
@@ -255,7 +262,7 @@ impl FreestyleControl {
             let page: ListVmsResponse = decode_json(response, "list vms").await?;
             let count = page.vms.len();
             for vm in page.vms {
-                let Some(session_id) = vm.metadata.get(META_SESSION_ID).cloned() else {
+                let Some(session_id) = session_id_from_metadata(&vm.metadata) else {
                     continue;
                 };
                 sessions.push(crate::SessionInfo {
@@ -277,18 +284,19 @@ impl FreestyleControl {
 
     /// Find a VM by the logical session id the facade stamped into its metadata.
     pub(crate) async fn find_by_session_id(&self, session_id: &str) -> Result<Option<FreestyleVm>> {
+        let (head, _) = split_session_id(session_id);
         let response = self
             .send(self.client.get(self.url("/v5/vms")).query(&[
-                ("metadata", format!("{META_SESSION_ID}:{session_id}")),
+                ("metadata", format!("{META_SESSION_ID}:{head}")),
                 ("limit", "2".to_string()),
             ]))
             .await?;
         let page: ListVmsResponse = decode_json(response, "list vms").await?;
-        if let Some(vm) = page.vms.into_iter().find(|vm| {
-            vm.metadata
-                .get(META_SESSION_ID)
-                .is_some_and(|value| value == session_id)
-        }) {
+        if let Some(vm) = page
+            .vms
+            .into_iter()
+            .find(|vm| session_id_from_metadata(&vm.metadata).as_deref() == Some(session_id))
+        {
             return Ok(Some(vm));
         }
         self.find_by_session_slug(session_id).await
@@ -1079,6 +1087,40 @@ fn session_slug(session_id: &str) -> String {
 
 /// Metadata is capped at 64 entries of 63-char keys/values; drop what cannot fit
 /// rather than failing the create.
+/// Split a session id at the platform's value limit, on a character boundary.
+fn split_session_id(session_id: &str) -> (&str, &str) {
+    if session_id.len() <= METADATA_VALUE_LIMIT {
+        return (session_id, "");
+    }
+    let mut cut = METADATA_VALUE_LIMIT;
+    while cut > 0 && !session_id.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    session_id.split_at(cut)
+}
+
+/// Record a session id across as many keys as the value limit demands. A Nym's
+/// id is 77 characters and used to be dropped whole, which left the VM
+/// unfindable by every lookup that reads this key back.
+fn store_session_id(metadata: &mut HashMap<String, String>, session_id: &str) {
+    let (head, tail) = split_session_id(session_id);
+    metadata.insert(META_SESSION_ID.to_string(), head.to_string());
+    if tail.is_empty() {
+        metadata.remove(META_SESSION_ID_TAIL);
+    } else {
+        metadata.insert(META_SESSION_ID_TAIL.to_string(), tail.to_string());
+    }
+}
+
+/// The session id a VM carries, rejoined from however many keys hold it.
+fn session_id_from_metadata(metadata: &HashMap<String, String>) -> Option<String> {
+    let head = metadata.get(META_SESSION_ID)?;
+    Some(match metadata.get(META_SESSION_ID_TAIL) {
+        Some(tail) => format!("{head}{tail}"),
+        None => head.clone(),
+    })
+}
+
 fn metadata_within_limits(metadata: HashMap<String, String>) -> HashMap<String, String> {
     let mut entries: Vec<(String, String)> = metadata
         .into_iter()
@@ -1489,6 +1531,39 @@ mod tests {
         assert!(
             detached_command("/bin/bash", "sleep 100")
                 .starts_with("nohup '/bin/bash' -lc 'sleep 100' >/dev/null")
+        );
+    }
+
+    /// The registry has to survive a restart: a VM created for a session must
+    /// still be findable, and listable, by that session id afterwards.
+    #[test]
+    fn a_session_id_past_the_value_limit_round_trips_through_metadata() {
+        let session_id =
+            "nym-ef7704f6-9168-4218-b155-0dcc6c8adbaa-13530284-8050-482f-9c9b-cd7a20694330";
+        assert!(session_id.len() > METADATA_VALUE_LIMIT);
+
+        let mut metadata = HashMap::new();
+        store_session_id(&mut metadata, session_id);
+        let stored = metadata_within_limits(metadata);
+
+        assert!(
+            stored.contains_key(META_SESSION_ID) && stored.contains_key(META_SESSION_ID_TAIL),
+            "both halves must clear the platform limit"
+        );
+        assert_eq!(
+            session_id_from_metadata(&stored).as_deref(),
+            Some(session_id)
+        );
+    }
+
+    #[test]
+    fn a_short_session_id_stays_in_one_key() {
+        let mut metadata = HashMap::new();
+        store_session_id(&mut metadata, "session-1");
+        assert!(!metadata.contains_key(META_SESSION_ID_TAIL));
+        assert_eq!(
+            session_id_from_metadata(&metadata).as_deref(),
+            Some("session-1")
         );
     }
 
