@@ -3,6 +3,9 @@
 //! This module contains the fundamental data structures used throughout
 //! the framework: messages, tool calls, tool results, and reasoning segments.
 
+use std::collections::HashMap;
+use std::sync::RwLock;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -135,12 +138,22 @@ impl Provider {
     }
 
     /// Check whether this provider/model pair can inspect image inputs.
+    ///
+    /// Consulted in order: an explicit `@vision=` on the model string, then
+    /// whatever the host application has registered, then the built-in
+    /// heuristics. Only the last of those is guesswork — it recognises a few
+    /// families by prefix and answers `false` for everything else, which is
+    /// wrong for most of what a router can reach. A host that knows its models
+    /// should say so with `register_model_image_input`.
     pub fn supports_image_input(&self, model: &str) -> bool {
         if let Some(image_input) = model_image_input_override(model) {
             return image_input;
         }
 
         let normalized = normalize_capability_model_name(model);
+        if let Some(registered) = registered_model_image_input(&normalized) {
+            return registered;
+        }
 
         match self {
             Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic => {
@@ -153,6 +166,46 @@ impl Provider {
             }
         }
     }
+}
+
+/// Image-input support declared by the host, keyed by bare model id.
+static MODEL_IMAGE_INPUT: RwLock<Option<HashMap<String, bool>>> = RwLock::new(None);
+
+/// Declare whether a model can accept image input, overriding the built-in
+/// prefix heuristics.
+///
+/// Model capabilities belong to whoever maintains a model catalog, not to this
+/// crate: a hard-coded prefix list cannot describe a router's catalogue and goes
+/// stale the moment a provider ships something new. Call this once at startup
+/// with what your catalog knows. Ids are matched bare — `gpt-5.6-luna`, not
+/// `openrouter:openai/gpt-5.6-luna`.
+pub fn register_model_image_input<I, S>(entries: I)
+where
+    I: IntoIterator<Item = (S, bool)>,
+    S: Into<String>,
+{
+    let mut guard = MODEL_IMAGE_INPUT
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    for (model, supported) in entries {
+        map.insert(bare_model_id(&model.into()).to_ascii_lowercase(), supported);
+    }
+}
+
+/// The bare id a capability is keyed by: no provider prefix, no `@` parameters.
+fn bare_model_id(model: &str) -> &str {
+    let model = model.split('@').next().unwrap_or(model);
+    model.rsplit(['/', ':']).next().unwrap_or(model)
+}
+
+fn registered_model_image_input(model: &str) -> Option<bool> {
+    let guard = MODEL_IMAGE_INPUT
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let map = guard.as_ref()?;
+    let id = bare_model_id(model).to_ascii_lowercase();
+    map.get(&id).copied()
 }
 
 fn model_image_input_override(model: &str) -> Option<bool> {
@@ -1775,5 +1828,53 @@ mod tests {
 
         assert_eq!(format["type"], "thinking");
         assert_eq!(format["thinking"], "Thinking...");
+    }
+}
+
+#[cfg(test)]
+mod model_capability_tests {
+    use super::{Provider, register_model_image_input};
+
+    /// The built-in heuristics recognise a few families by prefix and answer
+    /// `false` for everything else, which is wrong for most of a router's
+    /// catalogue. A host that knows its models must be able to say so.
+    #[test]
+    fn a_registered_model_overrides_the_built_in_guess() {
+        assert!(!Provider::OpenRouter.supports_image_input("z-ai/glm-vision-probe"));
+        register_model_image_input([("glm-vision-probe", true)]);
+        assert!(Provider::OpenRouter.supports_image_input("z-ai/glm-vision-probe"));
+    }
+
+    /// Registration is keyed bare, so the same declaration answers for the id
+    /// however a caller spells it.
+    #[test]
+    fn registration_is_keyed_by_bare_id() {
+        register_model_image_input([("openrouter:vendor/spelling-probe", true)]);
+        for spelling in [
+            "spelling-probe",
+            "vendor/spelling-probe",
+            "openrouter:vendor/spelling-probe",
+            "vendor/spelling-probe@reasoning=high",
+        ] {
+            assert!(
+                Provider::OpenRouter.supports_image_input(spelling),
+                "not found for {spelling}"
+            );
+        }
+    }
+
+    /// An explicit `@vision=` on the string is the most specific statement there
+    /// is and outranks both the registry and the heuristics.
+    #[test]
+    fn the_model_string_outranks_a_registration() {
+        register_model_image_input([("outranked-probe", true)]);
+        assert!(!Provider::OpenRouter.supports_image_input("vendor/outranked-probe@vision=false"));
+    }
+
+    /// Nothing registered leaves the previous behaviour exactly as it was.
+    #[test]
+    fn an_unregistered_model_still_falls_back_to_the_heuristics() {
+        assert!(Provider::OpenAI.supports_image_input("gpt-5.6-luna"));
+        assert!(!Provider::OpenRouter.supports_image_input("vendor/never-registered-probe"));
     }
 }
