@@ -50,6 +50,9 @@ pub struct BedrockClient {
     model: String,
     region_name: String,
     anthropic_version: String,
+    /// `@vision=` override for image-input support, or `None` to ask the
+    /// provider's capability table.
+    image_input: Option<bool>,
     trace_callback: Option<TraceCallback>,
     #[cfg(feature = "bedrock")]
     runtime_client: Arc<OnceCell<BedrockRuntimeClient>>,
@@ -78,6 +81,7 @@ impl BedrockClient {
             model: model.into(),
             region_name: region_name.unwrap_or_else(|| "us-east-1".to_string()),
             anthropic_version: "bedrock-2023-05-31".to_string(),
+            image_input: None,
             trace_callback: None,
             #[cfg(feature = "bedrock")]
             runtime_client: Arc::new(OnceCell::new()),
@@ -107,7 +111,7 @@ impl BedrockClient {
         config: &GenerationConfig,
     ) -> Result<serde_json::Value> {
         let model = config.effective_model(&self.model);
-        validate_image_input_supported(messages, Provider::Bedrock, model)?;
+        validate_image_input_supported(messages, Provider::Bedrock, model, self.image_input)?;
 
         // Extract system message if present
         let (system, remaining_messages) = self.extract_system_message(messages)?;
@@ -186,6 +190,16 @@ impl BedrockClient {
             return Ok((Some(chat_msg.content.clone()), &messages[1..]));
         }
         Ok((None, messages))
+    }
+}
+
+#[cfg(feature = "bedrock")]
+impl BedrockClient {
+    /// Override whether this model accepts image input, from the model
+    /// string's `@vision=` parameter.
+    pub fn with_image_input(mut self, image_input: Option<bool>) -> Self {
+        self.image_input = image_input;
+        self
     }
 }
 

@@ -32,6 +32,9 @@ pub struct OAIClient {
     reasoning: Option<String>,
     ranking_referer: Option<String>,
     ranking_title: Option<String>,
+    /// `@vision=` override for image-input support, or `None` to ask the
+    /// provider's capability table.
+    image_input: Option<bool>,
     trace_callback: Option<TraceCallback>,
     provider: Provider,
 }
@@ -45,6 +48,7 @@ impl Clone for OAIClient {
             reasoning: self.reasoning.clone(),
             ranking_referer: self.ranking_referer.clone(),
             ranking_title: self.ranking_title.clone(),
+            image_input: self.image_input,
             trace_callback: self.trace_callback.clone(),
             provider: self.provider,
         }
@@ -89,6 +93,7 @@ impl OAIClient {
             reasoning: None,
             ranking_referer: None,
             ranking_title: None,
+            image_input: None,
             trace_callback: None,
             provider: Provider::OpenAI,
         }
@@ -159,7 +164,7 @@ impl OAIClient {
         stream: bool,
     ) -> Result<serde_json::Value> {
         let model = config.effective_model(&self.model);
-        validate_image_input_supported(messages, self.provider, model)?;
+        validate_image_input_supported(messages, self.provider, model, self.image_input)?;
 
         // Convert messages to provider format
         let formatted_messages = convert_messages_to_provider_format(messages, self.provider)?;
@@ -328,6 +333,15 @@ impl OAIClient {
     }
 }
 
+impl OAIClient {
+    /// Override whether this model accepts image input, from the model
+    /// string's `@vision=` parameter.
+    pub fn with_image_input(mut self, image_input: Option<bool>) -> Self {
+        self.image_input = image_input;
+        self
+    }
+}
+
 #[async_trait]
 impl InferenceClient for OAIClient {
     async fn get_generation(
@@ -462,6 +476,47 @@ impl InferenceClient for OAIClient {
 mod tests {
     use super::*;
     use crate::types::ChatMessage;
+
+    const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+
+    fn image_message() -> Vec<ConversationMessage> {
+        use crate::types::{MediaPart, MediaSource, MultimodalMessage};
+        vec![ConversationMessage::Multimodal(MultimodalMessage::user(
+            vec![
+                MediaPart::text("What color is this image?"),
+                MediaPart::image(MediaSource::base64(TINY_PNG, "image/png")),
+            ],
+        ))]
+    }
+
+    /// The model string's `@vision=` reaches dispatch even though the wire
+    /// model id no longer carries it.
+    #[test]
+    fn declared_image_input_reaches_request_building() {
+        let config = GenerationConfig::default();
+
+        let refused = OAIClient::new("test-key", "vendor/undocumented-vision-model")
+            .with_provider(Provider::OpenRouter)
+            .build_request_body(&image_message(), &config, false);
+        assert!(
+            refused.is_err(),
+            "an unknown model should be refused without an override"
+        );
+
+        OAIClient::new("test-key", "vendor/undocumented-vision-model")
+            .with_provider(Provider::OpenRouter)
+            .with_image_input(Some(true))
+            .build_request_body(&image_message(), &config, false)
+            .expect("@vision=true must reach the dispatch check");
+
+        let refused = OAIClient::new("test-key", "gpt-4o")
+            .with_image_input(Some(false))
+            .build_request_body(&image_message(), &config, false);
+        assert!(
+            refused.is_err(),
+            "@vision=false must refuse a model the table would have allowed"
+        );
+    }
 
     #[test]
     fn test_client_creation() {

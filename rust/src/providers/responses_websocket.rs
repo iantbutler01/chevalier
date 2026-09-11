@@ -231,7 +231,7 @@ mod tests {
     async fn wire_content_is_forwarded_once_without_synthesizing_whitespace() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let fragments = vec!["Before".to_owned(), " \n\n".repeat(400), "After".to_owned()];
+        let fragments = ["Before".to_owned(), " \n\n".repeat(400), "After".to_owned()];
         let expected = fragments.concat();
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();

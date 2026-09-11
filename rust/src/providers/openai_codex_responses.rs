@@ -84,6 +84,9 @@ pub struct OpenAICodexResponsesClient {
     transport: CodexSubscriptionTransport,
     sse_header_timeout: Duration,
     websocket_connect_timeout: Duration,
+    /// `@vision=` override for image-input support, or `None` to ask the
+    /// provider's capability table.
+    image_input: Option<bool>,
     trace_callback: Option<TraceCallback>,
 }
 
@@ -103,6 +106,7 @@ impl Clone for OpenAICodexResponsesClient {
             transport: self.transport,
             sse_header_timeout: self.sse_header_timeout,
             websocket_connect_timeout: self.websocket_connect_timeout,
+            image_input: self.image_input,
             trace_callback: self.trace_callback.clone(),
         }
     }
@@ -163,6 +167,7 @@ impl OpenAICodexResponsesClient {
             websocket_connect_timeout: config
                 .websocket_connect_timeout
                 .unwrap_or(DEFAULT_WEBSOCKET_CONNECT_TIMEOUT),
+            image_input: None,
             trace_callback: None,
         })
     }
@@ -195,7 +200,12 @@ impl OpenAICodexResponsesClient {
         stream: bool,
     ) -> Result<Value> {
         let model = config.effective_model(&self.model);
-        validate_image_input_supported(messages, Provider::OpenAIResponses, model)?;
+        validate_image_input_supported(
+            messages,
+            Provider::OpenAIResponses,
+            model,
+            self.image_input,
+        )?;
 
         let (instructions, input_items) =
             crate::utils::message_conversion::responses_input_for_model(
@@ -620,6 +630,15 @@ impl OpenAICodexResponsesClient {
                     .await
             }
         }
+    }
+}
+
+impl OpenAICodexResponsesClient {
+    /// Override whether this model accepts image input, from the model
+    /// string's `@vision=` parameter.
+    pub fn with_image_input(mut self, image_input: Option<bool>) -> Self {
+        self.image_input = image_input;
+        self
     }
 }
 

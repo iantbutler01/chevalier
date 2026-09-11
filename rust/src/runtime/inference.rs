@@ -85,6 +85,19 @@ struct ParsedModelString {
     server_url: Option<String>,
     inline_api_key: Option<String>,
     prompt_cache_retention: Option<PromptCacheRetention>,
+    /// `@vision=` override for whether this model accepts image input.
+    image_input: Option<bool>,
+}
+
+fn parse_image_input(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        other => Err(Error::NonRetryable(format!(
+            "Unsupported @vision value '{}'. Expected true or false.",
+            other
+        ))),
+    }
 }
 
 fn parse_prompt_cache_retention(value: &str) -> Result<PromptCacheRetention> {
@@ -117,21 +130,39 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
     let mut server_url = None;
     let mut inline_api_key = None;
     let mut prompt_cache_retention = None;
+    let mut image_input = None;
 
     let model_name = if model_part.contains('@') {
         let model_parts: Vec<&str> = model_part.split('@').collect();
 
+        // An unrecognized parameter is an error, never a silent drop: the model
+        // string is often set live from a config service, where a misspelled
+        // `@reasoning=` would otherwise run the model at its default effort and
+        // report success.
         for param in &model_parts[1..] {
-            if param.starts_with("reasoning=") {
-                reasoning = Some(param.strip_prefix("reasoning=").unwrap().to_string());
-            } else if param.starts_with("server_url=") {
-                server_url = Some(param.strip_prefix("server_url=").unwrap().to_string());
-            } else if param.starts_with("api_key=") {
-                inline_api_key = Some(param.strip_prefix("api_key=").unwrap().to_string());
-            } else if param.starts_with("cache=") {
-                prompt_cache_retention = Some(parse_prompt_cache_retention(
-                    param.strip_prefix("cache=").unwrap(),
-                )?);
+            let (key, value) = param.split_once('=').ok_or_else(|| {
+                Error::NonRetryable(format!(
+                    "Invalid model parameter '@{}' in '{}'. Expected '@name=value'.",
+                    param, model_str
+                ))
+            })?;
+
+            match key {
+                "reasoning" | "reasoning_level" | "reasoning_effort" => {
+                    reasoning = Some(value.to_string());
+                }
+                "server_url" => server_url = Some(value.to_string()),
+                "api_key" => inline_api_key = Some(value.to_string()),
+                "cache" => prompt_cache_retention = Some(parse_prompt_cache_retention(value)?),
+                "vision" => image_input = Some(parse_image_input(value)?),
+                _ => {
+                    return Err(Error::NonRetryable(format!(
+                        "Unknown model parameter '@{}' in '{}'. Supported parameters: reasoning \
+                         (aliases reasoning_level, reasoning_effort), cache, vision, server_url, \
+                         api_key.",
+                        key, model_str
+                    )));
+                }
             }
         }
 
@@ -152,6 +183,7 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
         server_url,
         inline_api_key,
         prompt_cache_retention,
+        image_input,
     })
 }
 
@@ -435,6 +467,7 @@ fn create_inference_client_with_config(
     let server_url = parsed.server_url;
     let inline_api_key = parsed.inline_api_key;
     let model_name = parsed.model_name;
+    let image_input = parsed.image_input;
 
     // Resolve API key: @api_key= > api_key parameter > env var
     let key = if let Some(k) = inline_api_key {
@@ -507,7 +540,7 @@ fn create_inference_client_with_config(
                     )));
                 }
             }
-            Box::new(client)
+            Box::new(client.with_image_input(image_input))
         }
         "kimi-coding" => {
             let config = resolve_kimi_coding_config(key, server_url, provider_config);
@@ -527,7 +560,7 @@ fn create_inference_client_with_config(
             if config.auth_kind == KimiCodingAuthKind::OAuth {
                 client = client.with_bearer_auth();
             }
-            Box::new(client)
+            Box::new(client.with_image_input(image_input))
         }
         "openai" => {
             let mut client = OAIClient::new(key, model_name);
@@ -539,7 +572,7 @@ fn create_inference_client_with_config(
             if let Some(r) = reasoning {
                 client = client.with_reasoning(r);
             }
-            Box::new(client)
+            Box::new(client.with_image_input(image_input))
         }
         "openai-responses" => {
             let mut client = OpenAIResponsesClient::new(key, model_name);
@@ -549,7 +582,7 @@ fn create_inference_client_with_config(
             if let Some(r) = reasoning {
                 client = client.with_reasoning(r);
             }
-            Box::new(client)
+            Box::new(client.with_image_input(image_input))
         }
         "openai-codex-responses" => {
             let config = resolve_codex_subscription_config(key, server_url, provider_config)?;
@@ -557,21 +590,21 @@ fn create_inference_client_with_config(
             if let Some(r) = reasoning {
                 client = client.with_reasoning(r);
             }
-            Box::new(client)
+            Box::new(client.with_image_input(image_input))
         }
         "openrouter" => {
             let mut client = OpenRouterClient::new(key, model_name, None, None);
             if let Some(r) = reasoning {
                 client = client.with_reasoning(r);
             }
-            Box::new(client)
+            Box::new(client.with_image_input(image_input))
         }
         "openrouter-responses" => {
             let mut client = OpenRouterResponsesClient::new(key, model_name, None, None);
             if let Some(r) = reasoning {
                 client = client.with_reasoning(r);
             }
-            Box::new(client)
+            Box::new(client.with_image_input(image_input))
         }
         "google" | "google-gemini" | "google-genai" | "gemini" => {
             let mut client = GoogleGenAIClient::new(key, model_name);
@@ -580,7 +613,7 @@ fn create_inference_client_with_config(
             {
                 client = client.with_thinking_budget(budget);
             }
-            Box::new(client)
+            Box::new(client.with_image_input(image_input))
         }
         "custom-openai" => {
             let url = server_url.ok_or_else(|| {
@@ -592,7 +625,7 @@ fn create_inference_client_with_config(
             if let Some(r) = reasoning {
                 client = client.with_reasoning(r);
             }
-            Box::new(client)
+            Box::new(client.with_image_input(image_input))
         }
         _ => {
             return Err(Error::NonRetryable(format!(
@@ -1075,6 +1108,45 @@ mod tests {
     fn test_parse_model_string_rejects_invalid_cache_retention() {
         let result = parse_model_string("openai:gpt-5.1@cache=forever");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_model_string_rejects_unknown_parameter() {
+        let error = parse_model_string("openai:gpt-5.6-luna@reasonig=max")
+            .expect_err("a misspelled parameter must not be silently dropped");
+        let message = error.to_string();
+        assert!(message.contains("@reasonig"), "{message}");
+        assert!(message.contains("Supported parameters"), "{message}");
+    }
+
+    #[test]
+    fn test_parse_model_string_rejects_parameter_without_value() {
+        assert!(parse_model_string("openai:gpt-5.6-luna@reasoning").is_err());
+    }
+
+    #[test]
+    fn test_parse_model_string_accepts_reasoning_aliases() {
+        for spelling in ["reasoning", "reasoning_level", "reasoning_effort"] {
+            let parsed = parse_model_string(&format!("openai:gpt-5.6-luna@{spelling}=max"))
+                .unwrap_or_else(|error| panic!("@{spelling} should parse: {error}"));
+            assert_eq!(parsed.model_name, "gpt-5.6-luna");
+            assert_eq!(parsed.reasoning.as_deref(), Some("max"), "@{spelling}");
+        }
+    }
+
+    #[test]
+    fn test_parse_model_string_carries_vision_override() {
+        let parsed =
+            parse_model_string("openrouter:z-ai/glm-5.3-flash@vision=false@reasoning=high")
+                .unwrap();
+        assert_eq!(parsed.model_name, "z-ai/glm-5.3-flash");
+        assert_eq!(parsed.image_input, Some(false));
+        assert_eq!(parsed.reasoning.as_deref(), Some("high"));
+
+        let parsed = parse_model_string("openrouter:vendor/text-only@vision=true").unwrap();
+        assert_eq!(parsed.image_input, Some(true));
+
+        assert!(parse_model_string("openrouter:vendor/text-only@vision=maybe").is_err());
     }
 
     #[tokio::test]

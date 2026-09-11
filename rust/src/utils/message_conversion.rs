@@ -374,12 +374,18 @@ pub fn messages_contain_image_input(messages: &[ConversationMessage]) -> bool {
 }
 
 /// Fail before dispatch when a provider/model cannot carry image input.
+///
+/// `declared_image_input` is the client's `@vision=` override, which the model
+/// string carries but the wire model id does not — by dispatch time the
+/// parameters have been stripped off, so the override has to arrive separately.
 pub fn validate_image_input_supported(
     messages: &[ConversationMessage],
     provider: Provider,
     model: &str,
+    declared_image_input: Option<bool>,
 ) -> Result<()> {
-    if messages_contain_image_input(messages) && !provider.supports_image_input(model) {
+    let supported = declared_image_input.unwrap_or_else(|| provider.supports_image_input(model));
+    if messages_contain_image_input(messages) && !supported {
         return Err(Error::Validation(
             "This Nym's current model cannot inspect images.".to_string(),
         ));

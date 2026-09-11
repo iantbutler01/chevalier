@@ -52,6 +52,13 @@ impl OpenRouterClient {
         self
     }
 
+    /// Override whether this model accepts image input, from the model
+    /// string's `@vision=` parameter.
+    pub fn with_image_input(mut self, image_input: Option<bool>) -> Self {
+        self.inner = self.inner.with_image_input(image_input);
+        self
+    }
+
     /// Populate cost information from OpenRouter response
     ///
     /// OpenRouter returns cost information in the response metadata:

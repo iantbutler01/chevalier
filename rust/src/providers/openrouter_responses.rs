@@ -52,6 +52,13 @@ impl OpenRouterResponsesClient {
         self
     }
 
+    /// Override whether this model accepts image input, from the model
+    /// string's `@vision=` parameter.
+    pub fn with_image_input(mut self, image_input: Option<bool>) -> Self {
+        self.inner = self.inner.with_image_input(image_input);
+        self
+    }
+
     #[allow(dead_code)]
     async fn populate_cost(&self, _response: &mut GenerationResponse) -> Result<()> {
         Ok(())

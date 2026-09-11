@@ -34,6 +34,9 @@ pub struct OpenAIResponsesClient {
     reasoning: Option<String>,
     ranking_referer: Option<String>,
     ranking_title: Option<String>,
+    /// `@vision=` override for image-input support, or `None` to ask the
+    /// provider's capability table.
+    image_input: Option<bool>,
     trace_callback: Option<TraceCallback>,
     provider: Provider,
 }
@@ -47,6 +50,7 @@ impl Clone for OpenAIResponsesClient {
             reasoning: self.reasoning.clone(),
             ranking_referer: self.ranking_referer.clone(),
             ranking_title: self.ranking_title.clone(),
+            image_input: self.image_input,
             trace_callback: self.trace_callback.clone(),
             provider: self.provider,
         }
@@ -95,6 +99,7 @@ impl OpenAIResponsesClient {
             reasoning: None,
             ranking_referer: None,
             ranking_title: None,
+            image_input: None,
             trace_callback: None,
             provider: Provider::OpenAIResponses,
         }
@@ -135,7 +140,7 @@ impl OpenAIResponsesClient {
         stream: bool,
     ) -> Result<serde_json::Value> {
         let model = config.effective_model(&self.model);
-        validate_image_input_supported(messages, self.provider, model)?;
+        validate_image_input_supported(messages, self.provider, model, self.image_input)?;
 
         let (instructions, input_items) =
             crate::utils::message_conversion::responses_input_for_model(
@@ -373,6 +378,15 @@ impl OpenAIResponsesClient {
             Ok(response_text)
         })
         .await
+    }
+}
+
+impl OpenAIResponsesClient {
+    /// Override whether this model accepts image input, from the model
+    /// string's `@vision=` parameter.
+    pub fn with_image_input(mut self, image_input: Option<bool>) -> Self {
+        self.image_input = image_input;
+        self
     }
 }
 
