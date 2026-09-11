@@ -367,7 +367,11 @@ pub fn parse_openai_responses_event(
                         .and_then(|d| d.get("cached_tokens"))
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0),
-                    cache_write_input_tokens: 0,
+                    cache_write_input_tokens: usage
+                        .get("input_tokens_details")
+                        .and_then(|details| details.get("cache_write_tokens"))
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0),
                     reasoning_tokens: usage
                         .get("output_tokens_details")
                         .and_then(|d| d.get("reasoning_tokens"))
@@ -566,6 +570,7 @@ mod tests {
                 "usage": {
                     "input_tokens": 10,
                     "output_tokens": 5,
+                    "input_tokens_details": { "cached_tokens": 4, "cache_write_tokens": 2 },
                     "output_tokens_details": { "reasoning_tokens": 3 },
                     "cost": 0.0004
                 }
@@ -582,6 +587,14 @@ mod tests {
                 provider_cost_dollars,
                 ..
             } => {
+                assert!(matches!(
+                    &chunks[0],
+                    StreamChunk::Usage {
+                        cached_tokens: 4,
+                        cache_write_input_tokens: 2,
+                        ..
+                    }
+                ));
                 assert_eq!(*input_tokens, 10);
                 assert_eq!(*output_tokens, 5);
                 assert_eq!(*reasoning_tokens, Some(3));

@@ -194,3 +194,14 @@ Protocol references: [steering](https://developers.openai.com/api/docs/guides/st
 [async tools](https://developers.openai.com/api/docs/guides/async-tool-calling),
 [reasoning](https://developers.openai.com/api/docs/guides/reasoning), and
 [compaction](https://developers.openai.com/api/docs/guides/compaction).
+
+## Cache usage
+
+Responses usage maps `input_tokens_details.cached_tokens` to `cached_tokens`
+and `input_tokens_details.cache_write_tokens` to `cache_write_input_tokens`
+in native `usage` events. Missing details remain zero. Both ordinary Responses
+and Codex subscription streams use this parser; nonstreaming Responses uses the
+same mapping. Cache reads and writes are subsets of Responses input tokens.
+
+2026-09-11: cache writes previously were hardcoded to zero even when reported.
+The corrected mapping follows the [Responses usage schema](https://developers.openai.com/api/reference/cli/resources/responses/methods/retrieve).

@@ -240,7 +240,11 @@ impl OpenAIResponsesClient {
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
-            cache_write_input_tokens: 0,
+            cache_write_input_tokens: usage
+                .get("input_tokens_details")
+                .and_then(|details| details.get("cache_write_tokens"))
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0),
             reasoning_tokens: usage
                 .get("output_tokens_details")
                 .and_then(|d| d.get("reasoning_tokens"))
@@ -638,7 +642,8 @@ mod tests {
             "input_tokens": 100,
             "output_tokens": 50,
             "input_tokens_details": {
-                "cached_tokens": 25
+                "cached_tokens": 25,
+                "cache_write_tokens": 40
             }
         });
 
@@ -646,6 +651,7 @@ mod tests {
         assert_eq!(parsed.input_tokens, 100);
         assert_eq!(parsed.output_tokens, 50);
         assert_eq!(parsed.cached_tokens, 25);
+        assert_eq!(parsed.cache_write_input_tokens, 40);
     }
 
     #[test]
