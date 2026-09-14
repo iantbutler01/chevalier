@@ -27,6 +27,44 @@ pub enum ProviderSort {
     Price,
 }
 
+/// A soft routing preference, expressed as a scalar or recent percentile thresholds.
+/// Values are positive token rates or seconds, depending on the request field.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "serde_json::Value", into = "serde_json::Value")]
+pub struct PerformanceThreshold(serde_json::Value);
+
+impl TryFrom<serde_json::Value> for PerformanceThreshold {
+    type Error = String;
+
+    fn try_from(value: serde_json::Value) -> std::result::Result<Self, Self::Error> {
+        let positive = |v: &serde_json::Value| v.as_f64().is_some_and(|n| n.is_finite() && n > 0.0);
+        let valid = match &value {
+            serde_json::Value::Number(_) => positive(&value),
+            serde_json::Value::Object(percentiles) => {
+                !percentiles.is_empty()
+                    && percentiles.iter().all(|(key, v)| {
+                        matches!(key.as_str(), "p50" | "p75" | "p90" | "p99") && positive(v)
+                    })
+            }
+            _ => false,
+        };
+        if valid {
+            Ok(Self(value))
+        } else {
+            Err(
+                "expected a positive number or nonempty p50/p75/p90/p99 object of positive numbers"
+                    .into(),
+            )
+        }
+    }
+}
+
+impl From<PerformanceThreshold> for serde_json::Value {
+    fn from(value: PerformanceThreshold) -> Self {
+        value.0
+    }
+}
+
 /// OpenRouter client (extends OpenAI API)
 #[derive(Debug, Clone)]
 pub struct OpenRouterClient {
@@ -75,6 +113,18 @@ impl OpenRouterClient {
     /// Prefer upstreams by a serving metric, retaining automatic fallback.
     pub fn with_provider_sort(mut self, sort: ProviderSort) -> Self {
         self.inner = self.inner.with_openrouter_provider_sort(sort);
+        self
+    }
+
+    /// Prefer endpoints meeting recent throughput and first-token latency thresholds.
+    pub fn with_performance_preferences(
+        mut self,
+        min_throughput: Option<PerformanceThreshold>,
+        max_latency: Option<PerformanceThreshold>,
+    ) -> Self {
+        self.inner = self
+            .inner
+            .with_openrouter_performance_preferences(min_throughput, max_latency);
         self
     }
 

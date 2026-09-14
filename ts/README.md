@@ -192,3 +192,11 @@ The shared Rust runtime sends `provider: {"sort": "throughput"}`; it adds no
 provider allowlist. `latency` and `price` are also supported. Omitting the option
 retains OpenRouter's default routing. Throughput routing can select a more
 expensive provider than price-based routing.
+
+OpenRouter also accepts recent performance preferences through the shared model parser:
+`@provider_min_throughput={"p90":40}@provider_max_latency={"p90":2.5}`.
+These send `provider.preferred_min_throughput` (tokens/second) and
+`provider.preferred_max_latency` (seconds to first token). Each accepts a positive
+number or a nonempty object with `p50`, `p75`, `p90`, or `p99` positive values.
+They combine with `@provider_sort=throughput` and preserve automatic fallbacks.
+OpenRouter uses these as soft routing preferences, not per-request deadlines.

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
-use crate::providers::openrouter::ProviderSort;
+use crate::providers::openrouter::{PerformanceThreshold, ProviderSort};
 use crate::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, KimiCodingAuthKind,
     KimiCodingProviderConfig, OAIClient, OpenAICodexResponsesClient, OpenAIResponsesClient,
@@ -85,6 +85,8 @@ struct ParsedModelString {
     reasoning: Option<String>,
     openrouter_providers: Option<Vec<String>>,
     openrouter_provider_sort: Option<ProviderSort>,
+    openrouter_min_throughput: Option<PerformanceThreshold>,
+    openrouter_max_latency: Option<PerformanceThreshold>,
     server_url: Option<String>,
     inline_api_key: Option<String>,
     prompt_cache_retention: Option<PromptCacheRetention>,
@@ -132,6 +134,8 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
     let mut reasoning = None;
     let mut openrouter_providers = None;
     let mut openrouter_provider_sort = None;
+    let mut openrouter_min_throughput = None;
+    let mut openrouter_max_latency = None;
     let mut server_url = None;
     let mut inline_api_key = None;
     let mut prompt_cache_retention = None;
@@ -157,6 +161,20 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
                     reasoning = Some(value.to_string());
                 }
                 "server_url" => server_url = Some(value.to_string()),
+                "provider_min_throughput" | "provider_max_latency" => {
+                    if provider != "openrouter" {
+                        return Err(Error::NonRetryable(format!(
+                            "@{key} requires openrouter chat completions"
+                        )));
+                    }
+                    let threshold = serde_json::from_str::<PerformanceThreshold>(value)
+                        .map_err(|error| Error::NonRetryable(format!("Invalid @{key}: {error}")))?;
+                    if key == "provider_min_throughput" {
+                        openrouter_min_throughput = Some(threshold);
+                    } else {
+                        openrouter_max_latency = Some(threshold);
+                    }
+                }
                 "provider_sort" if provider == "openrouter" => {
                     openrouter_provider_sort = Some(
                         serde_json::from_value(serde_json::json!(value)).map_err(|_| {
@@ -196,7 +214,7 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
                     return Err(Error::NonRetryable(format!(
                         "Unknown model parameter '@{}' in '{}'. Supported parameters: reasoning \
                          (aliases reasoning_level, reasoning_effort), cache, vision, server_url, \
-                         api_key, provider, provider_sort (OpenRouter chat completions only).",
+                         api_key, provider, provider_sort, provider_min_throughput, provider_max_latency (OpenRouter chat completions only).",
                         key, model_str
                     )));
                 }
@@ -219,6 +237,8 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
         reasoning,
         openrouter_providers,
         openrouter_provider_sort,
+        openrouter_min_throughput,
+        openrouter_max_latency,
         server_url,
         inline_api_key,
         prompt_cache_retention,
@@ -637,6 +657,10 @@ fn create_inference_client_with_config(
             if let Some(upstreams) = parsed.openrouter_providers {
                 client = client.with_upstream_providers(upstreams);
             }
+            client = client.with_performance_preferences(
+                parsed.openrouter_min_throughput,
+                parsed.openrouter_max_latency,
+            );
             if let Some(sort) = parsed.openrouter_provider_sort {
                 client = client.with_provider_sort(sort);
             }
@@ -1193,6 +1217,45 @@ mod tests {
         assert_eq!(parsed.image_input, Some(true));
 
         assert!(parse_model_string("openrouter:vendor/text-only@vision=maybe").is_err());
+    }
+
+    #[test]
+    fn openrouter_performance_preferences_validate_and_preserve_model_name() {
+        for key in ["provider_min_throughput", "provider_max_latency"] {
+            for value in ["40", "2.5", r#"{"p90":40,"p99":2.5}"#] {
+                let parsed =
+                    parse_model_string(&format!("openrouter:vendor/model@{key}={value}")).unwrap();
+                assert_eq!(parsed.model_name, "vendor/model");
+                let preference = if key == "provider_min_throughput" {
+                    parsed.openrouter_min_throughput
+                } else {
+                    parsed.openrouter_max_latency
+                };
+                assert_eq!(
+                    serde_json::to_value(preference.unwrap()).unwrap(),
+                    serde_json::from_str::<serde_json::Value>(value).unwrap()
+                );
+            }
+            for value in [
+                "",
+                "0",
+                "-1",
+                "null",
+                "[]",
+                "{}",
+                r#"{"p95":40}"#,
+                r#"{"p90":0}"#,
+                r#"{"p90":"40"}"#,
+            ] {
+                assert!(
+                    parse_model_string(&format!("openrouter:test@{key}={value}")).is_err(),
+                    "{key}={value}"
+                );
+            }
+            for route in ["openai:test", "openrouter:resp:test"] {
+                assert!(parse_model_string(&format!("{route}@{key}=40")).is_err());
+            }
+        }
     }
 
     #[test]

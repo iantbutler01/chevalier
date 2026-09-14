@@ -7,7 +7,7 @@
 //! - Streaming with delta-based tool call accumulation
 //! - Usage tracking with cache metrics
 
-use super::openrouter::ProviderSort;
+use super::openrouter::{PerformanceThreshold, ProviderSort};
 use async_trait::async_trait;
 use futures::stream::{Stream, StreamExt};
 use reqwest::StatusCode;
@@ -40,6 +40,8 @@ pub struct OAIClient {
     provider: Provider,
     openrouter_providers: Option<Vec<String>>,
     openrouter_provider_sort: Option<ProviderSort>,
+    openrouter_min_throughput: Option<PerformanceThreshold>,
+    openrouter_max_latency: Option<PerformanceThreshold>,
 }
 
 impl Clone for OAIClient {
@@ -56,6 +58,8 @@ impl Clone for OAIClient {
             provider: self.provider,
             openrouter_providers: self.openrouter_providers.clone(),
             openrouter_provider_sort: self.openrouter_provider_sort,
+            openrouter_min_throughput: self.openrouter_min_throughput.clone(),
+            openrouter_max_latency: self.openrouter_max_latency.clone(),
         }
     }
 }
@@ -103,6 +107,8 @@ impl OAIClient {
             provider: Provider::OpenAI,
             openrouter_providers: None,
             openrouter_provider_sort: None,
+            openrouter_min_throughput: None,
+            openrouter_max_latency: None,
         }
     }
 
@@ -168,6 +174,16 @@ impl OAIClient {
         self
     }
 
+    pub(crate) fn with_openrouter_performance_preferences(
+        mut self,
+        min_throughput: Option<PerformanceThreshold>,
+        max_latency: Option<PerformanceThreshold>,
+    ) -> Self {
+        self.openrouter_min_throughput = min_throughput;
+        self.openrouter_max_latency = max_latency;
+        self
+    }
+
     pub(crate) fn with_openrouter_providers(mut self, providers: Vec<String>) -> Self {
         self.openrouter_providers = Some(providers);
         self
@@ -223,6 +239,15 @@ impl OAIClient {
             && let Some(sort) = self.openrouter_provider_sort
         {
             request["provider"]["sort"] = serde_json::json!(sort);
+        }
+
+        if matches!(self.provider, Provider::OpenRouter) {
+            if let Some(ref minimum) = self.openrouter_min_throughput {
+                request["provider"]["preferred_min_throughput"] = serde_json::json!(minimum);
+            }
+            if let Some(ref maximum) = self.openrouter_max_latency {
+                request["provider"]["preferred_max_latency"] = serde_json::json!(maximum);
+            }
         }
 
         // Add stream_options for usage tracking when streaming
@@ -584,6 +609,57 @@ mod tests {
                 .unwrap();
             assert_eq!(body["provider"], serde_json::json!({"sort": "throughput"}));
         }
+    }
+
+    #[test]
+    fn performance_preferences_reach_streaming_and_nonstreaming_requests() {
+        let preferences = || {
+            (
+                serde_json::from_value(serde_json::json!({"p90":40})).unwrap(),
+                serde_json::from_value(serde_json::json!({"p90":2.5})).unwrap(),
+            )
+        };
+        for pinned in [false, true] {
+            let (minimum, maximum) = preferences();
+            let mut client = OAIClient::new("test-key", "test")
+                .with_provider(Provider::OpenRouter)
+                .with_openrouter_provider_sort(ProviderSort::Throughput)
+                .with_openrouter_performance_preferences(Some(minimum), Some(maximum))
+                .clone();
+            if pinned {
+                client =
+                    client.with_openrouter_providers(vec!["fireworks".into(), "baseten".into()]);
+            }
+            for stream in [false, true] {
+                let body = client
+                    .build_request_body(&[], &GenerationConfig::new("test"), stream)
+                    .unwrap();
+                assert_eq!(body["provider"]["sort"], "throughput");
+                assert_eq!(
+                    body["provider"]["preferred_min_throughput"],
+                    serde_json::json!({"p90":40})
+                );
+                assert_eq!(
+                    body["provider"]["preferred_max_latency"],
+                    serde_json::json!({"p90":2.5})
+                );
+                if pinned {
+                    assert_eq!(
+                        body["provider"]["only"],
+                        serde_json::json!(["fireworks", "baseten"])
+                    );
+                    assert_eq!(body["provider"]["allow_fallbacks"], true);
+                } else {
+                    assert!(body["provider"].get("only").is_none());
+                }
+            }
+        }
+        let (minimum, maximum) = preferences();
+        let body = OAIClient::new("test-key", "test")
+            .with_openrouter_performance_preferences(Some(minimum), Some(maximum))
+            .build_request_body(&[], &GenerationConfig::new("test"), false)
+            .unwrap();
+        assert!(body.get("provider").is_none());
     }
 
     const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
