@@ -16,6 +16,7 @@ use std::collections::HashMap;
 #[derive(Debug, Default)]
 pub struct OpenAIToolAccumulator {
     current_tool_calls: HashMap<usize, PartialToolCall>,
+    response_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +30,7 @@ impl OpenAIToolAccumulator {
     pub fn new() -> Self {
         Self {
             current_tool_calls: HashMap::new(),
+            response_id: None,
         }
     }
 
@@ -116,6 +118,12 @@ pub fn parse_openai_chunk(
     has_tools: bool,
 ) -> Vec<StreamChunk> {
     let mut chunks = Vec::new();
+    if let Some(id) = chunk_json.get("id").and_then(Value::as_str)
+        && accumulator.response_id.as_deref() != Some(id)
+    {
+        accumulator.response_id = Some(id.to_string());
+        chunks.push(StreamChunk::ResponseId(id.to_string()));
+    }
 
     // OpenRouter may attach usage to its final choice-bearing chunk rather than
     // sending a separate chunk with no choices.
@@ -233,6 +241,19 @@ pub fn parse_openai_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emits_generation_identity_once_before_usage() {
+        let mut accumulator = OpenAIToolAccumulator::new();
+        let chunk =
+            serde_json::json!({"id":"gen-123", "usage":{"prompt_tokens":10,"completion_tokens":2}});
+        let first = parse_openai_chunk(&chunk, &mut accumulator, false);
+        assert!(matches!(&first[0], StreamChunk::ResponseId(id) if id == "gen-123"));
+        assert!(matches!(first[1], StreamChunk::Usage { .. }));
+        let second = parse_openai_chunk(&chunk, &mut accumulator, false);
+        assert_eq!(second.len(), 1);
+        assert!(matches!(second[0], StreamChunk::Usage { .. }));
+    }
 
     #[test]
     fn test_accumulator_new() {

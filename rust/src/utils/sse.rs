@@ -26,17 +26,15 @@ use crate::utils::parse_json_value_strict_str;
 pub fn parse_sse_stream(
     response: reqwest::Response,
 ) -> Pin<Box<dyn Stream<Item = Result<serde_json::Value>> + Send>> {
-    let event_stream = response.bytes_stream().eventsource();
+    let event_stream = response.bytes_stream().eventsource().take_while(|event| {
+        // [DONE] ends the protocol even if the upstream keeps the body open.
+        futures::future::ready(!matches!(event, Ok(event) if event.data == "[DONE]"))
+    });
 
     let json_stream = event_stream.filter_map(|event_result| async move {
         match event_result {
             Ok(event) => {
                 let data = event.data;
-
-                // Skip [DONE] markers
-                if data == "[DONE]" {
-                    return None;
-                }
 
                 // Parse JSON
                 match parse_json_value_strict_str(&data) {
