@@ -168,3 +168,13 @@ The separate sandbox binding also exposes distributed-control connection options
 Docker/snapshot/macOS/Windows session source types, `workspace_root`, durable-volume
 resizing, session resource updates, shared-mount reconfiguration, and desktop
 open/close operations. All forward to the existing Rust sandbox client.
+
+### OpenRouter automatic routing
+
+Append `@provider_sort=throughput` to an OpenRouter chat model string to prefer
+faster upstream generation while retaining automatic fallback across providers:
+`openrouter:deepseek/deepseek-v4.1-flash@reasoning=medium@provider_sort=throughput`.
+The shared Rust runtime sends `provider: {"sort": "throughput"}`; it adds no
+provider allowlist. `latency` and `price` are also supported. Omitting the option
+retains OpenRouter's default routing. Throughput routing can select a more
+expensive provider than price-based routing.

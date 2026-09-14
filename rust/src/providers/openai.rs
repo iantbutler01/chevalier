@@ -7,6 +7,7 @@
 //! - Streaming with delta-based tool call accumulation
 //! - Usage tracking with cache metrics
 
+use super::openrouter::ProviderSort;
 use async_trait::async_trait;
 use futures::stream::{Stream, StreamExt};
 use reqwest::StatusCode;
@@ -38,6 +39,7 @@ pub struct OAIClient {
     trace_callback: Option<TraceCallback>,
     provider: Provider,
     openrouter_providers: Option<Vec<String>>,
+    openrouter_provider_sort: Option<ProviderSort>,
 }
 
 impl Clone for OAIClient {
@@ -53,6 +55,7 @@ impl Clone for OAIClient {
             trace_callback: self.trace_callback.clone(),
             provider: self.provider,
             openrouter_providers: self.openrouter_providers.clone(),
+            openrouter_provider_sort: self.openrouter_provider_sort,
         }
     }
 }
@@ -99,6 +102,7 @@ impl OAIClient {
             trace_callback: None,
             provider: Provider::OpenAI,
             openrouter_providers: None,
+            openrouter_provider_sort: None,
         }
     }
 
@@ -159,6 +163,11 @@ impl OAIClient {
         self
     }
 
+    pub(crate) fn with_openrouter_provider_sort(mut self, sort: ProviderSort) -> Self {
+        self.openrouter_provider_sort = Some(sort);
+        self
+    }
+
     pub(crate) fn with_openrouter_providers(mut self, providers: Vec<String>) -> Self {
         self.openrouter_providers = Some(providers);
         self
@@ -208,6 +217,12 @@ impl OAIClient {
                 "allow_fallbacks": providers.len() > 1,
                 "require_parameters": true,
             });
+        }
+
+        if matches!(self.provider, Provider::OpenRouter)
+            && let Some(sort) = self.openrouter_provider_sort
+        {
+            request["provider"]["sort"] = serde_json::json!(sort);
         }
 
         // Add stream_options for usage tracking when streaming
@@ -554,6 +569,20 @@ mod tests {
                     "require_parameters": true,
                 })
             );
+        }
+    }
+
+    #[test]
+    fn throughput_routing_keeps_all_providers_eligible_in_both_modes() {
+        let client = OAIClient::new("test-key", "test")
+            .with_provider(Provider::OpenRouter)
+            .with_openrouter_provider_sort(ProviderSort::Throughput)
+            .clone();
+        for stream in [false, true] {
+            let body = client
+                .build_request_body(&[], &GenerationConfig::new("test"), stream)
+                .unwrap();
+            assert_eq!(body["provider"], serde_json::json!({"sort": "throughput"}));
         }
     }
 

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
+use crate::providers::openrouter::ProviderSort;
 use crate::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, KimiCodingAuthKind,
     KimiCodingProviderConfig, OAIClient, OpenAICodexResponsesClient, OpenAIResponsesClient,
@@ -83,6 +84,7 @@ struct ParsedModelString {
     model_name: String,
     reasoning: Option<String>,
     openrouter_providers: Option<Vec<String>>,
+    openrouter_provider_sort: Option<ProviderSort>,
     server_url: Option<String>,
     inline_api_key: Option<String>,
     prompt_cache_retention: Option<PromptCacheRetention>,
@@ -129,6 +131,7 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
 
     let mut reasoning = None;
     let mut openrouter_providers = None;
+    let mut openrouter_provider_sort = None;
     let mut server_url = None;
     let mut inline_api_key = None;
     let mut prompt_cache_retention = None;
@@ -154,6 +157,20 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
                     reasoning = Some(value.to_string());
                 }
                 "server_url" => server_url = Some(value.to_string()),
+                "provider_sort" if provider == "openrouter" => {
+                    openrouter_provider_sort = Some(
+                        serde_json::from_value(serde_json::json!(value)).map_err(|_| {
+                            Error::NonRetryable(
+                                "@provider_sort requires throughput, latency, or price".into(),
+                            )
+                        })?,
+                    );
+                }
+                "provider_sort" => {
+                    return Err(Error::NonRetryable(
+                        "@provider_sort requires openrouter chat completions".into(),
+                    ));
+                }
                 "provider" if provider == "openrouter" => {
                     let providers: Vec<String> = value
                         .split(',')
@@ -179,7 +196,7 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
                     return Err(Error::NonRetryable(format!(
                         "Unknown model parameter '@{}' in '{}'. Supported parameters: reasoning \
                          (aliases reasoning_level, reasoning_effort), cache, vision, server_url, \
-                         api_key, provider (OpenRouter chat completions only).",
+                         api_key, provider, provider_sort (OpenRouter chat completions only).",
                         key, model_str
                     )));
                 }
@@ -201,6 +218,7 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
         model_name,
         reasoning,
         openrouter_providers,
+        openrouter_provider_sort,
         server_url,
         inline_api_key,
         prompt_cache_retention,
@@ -618,6 +636,9 @@ fn create_inference_client_with_config(
             let mut client = OpenRouterClient::new(key, model_name, None, None);
             if let Some(upstreams) = parsed.openrouter_providers {
                 client = client.with_upstream_providers(upstreams);
+            }
+            if let Some(sort) = parsed.openrouter_provider_sort {
+                client = client.with_provider_sort(sort);
             }
             if let Some(r) = reasoning {
                 client = client.with_reasoning(r);
@@ -1172,6 +1193,27 @@ mod tests {
         assert_eq!(parsed.image_input, Some(true));
 
         assert!(parse_model_string("openrouter:vendor/text-only@vision=maybe").is_err());
+    }
+
+    #[test]
+    fn openrouter_sort_validates_values_and_route() {
+        for (name, sort) in [
+            ("throughput", ProviderSort::Throughput),
+            ("latency", ProviderSort::Latency),
+            ("price", ProviderSort::Price),
+        ] {
+            let parsed =
+                parse_model_string(&format!("openrouter:test@provider_sort={name}")).unwrap();
+            assert_eq!(parsed.openrouter_provider_sort, Some(sort));
+            assert_eq!(parsed.openrouter_providers, None);
+        }
+        for model in [
+            "openrouter:test@provider_sort=fast",
+            "openai:test@provider_sort=throughput",
+            "openrouter:resp:test@provider_sort=throughput",
+        ] {
+            assert!(parse_model_string(model).is_err(), "{model}");
+        }
     }
 
     #[test]

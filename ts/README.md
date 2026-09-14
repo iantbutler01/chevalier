@@ -182,3 +182,13 @@ are published as `optionalDependencies`; `npm install` fetches the right one.
 ## License
 
 Apache-2.0
+
+### OpenRouter automatic routing
+
+Append `@provider_sort=throughput` to an OpenRouter chat model string to prefer
+faster upstream generation while retaining automatic fallback across providers:
+`openrouter:deepseek/deepseek-v4.1-flash@reasoning=medium@provider_sort=throughput`.
+The shared Rust runtime sends `provider: {"sort": "throughput"}`; it adds no
+provider allowlist. `latency` and `price` are also supported. Omitting the option
+retains OpenRouter's default routing. Throughput routing can select a more
+expensive provider than price-based routing.

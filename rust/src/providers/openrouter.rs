@@ -18,6 +18,15 @@ use crate::utils::ConversationMessage;
 
 use super::openai::OAIClient;
 
+/// Automatic upstream routing preference; does not restrict eligible providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderSort {
+    Throughput,
+    Latency,
+    Price,
+}
+
 /// OpenRouter client (extends OpenAI API)
 #[derive(Debug, Clone)]
 pub struct OpenRouterClient {
@@ -60,6 +69,12 @@ impl OpenRouterClient {
     /// Try upstreams in order, allowing fallbacks only within this list.
     pub fn with_upstream_providers(mut self, providers: Vec<String>) -> Self {
         self.inner = self.inner.with_openrouter_providers(providers);
+        self
+    }
+
+    /// Prefer upstreams by a serving metric, retaining automatic fallback.
+    pub fn with_provider_sort(mut self, sort: ProviderSort) -> Self {
+        self.inner = self.inner.with_openrouter_provider_sort(sort);
         self
     }
 
