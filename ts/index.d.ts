@@ -113,6 +113,7 @@ export declare class Runtime {
     executeToolCall(toolName: string, args: unknown): Promise<string>;
     getToolSchemas(): Promise<native.ToolSchemaJs[]>;
     setModelToolNames(names: string[] | null): Promise<void>;
+    setToolAsync(name: string, asynchronous: boolean): Promise<void>;
     setSystemMessages(messages: native.Message[]): Promise<void>;
     setDefaultPrompt(prompt: string): Promise<void>;
     setProviderConfig(config: native.ProviderConfigInput): Promise<void>;

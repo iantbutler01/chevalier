@@ -271,6 +271,9 @@ class Runtime {
     setModelToolNames(names) {
         return this.native.setModelToolNames(names);
     }
+    setToolAsync(name, asynchronous) {
+        return this.native.setToolAsync(name, asynchronous);
+    }
     setSystemMessages(messages) {
         return this.native.setSystemMessages(messages);
     }

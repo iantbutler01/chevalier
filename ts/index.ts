@@ -348,6 +348,9 @@ export class Runtime {
   setModelToolNames(names: string[] | null): Promise<void> {
     return this.native.setModelToolNames(names);
   }
+  setToolAsync(name: string, asynchronous: boolean): Promise<void> {
+    return this.native.setToolAsync(name, asynchronous);
+  }
   setSystemMessages(messages: native.Message[]): Promise<void> {
     return this.native.setSystemMessages(messages);
   }

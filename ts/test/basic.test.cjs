@@ -36,6 +36,12 @@ test("tool handler round-trip + schema introspection", async () => {
   assert.deepStrictEqual(seen, { a: 2, b: 3 });
   const schemas = await rt.getToolSchemas();
   assert.ok(schemas.some((s) => s.name === "add"));
+  await rt.setToolAsync("add", true);
+  assert.strictEqual((await rt.getToolSchemas()).find((s) => s.name === "add").async, true);
+  await rt.setToolAsync("add", false);
+  assert.strictEqual((await rt.getToolSchemas()).find((s) => s.name === "add").async, false);
+  assert.strictEqual(await rt.executeToolCall("add", { a: 4, b: 5 }), "9");
+  await rt.dispose();
 });
 
 test("vfs local round-trip", async () => {
