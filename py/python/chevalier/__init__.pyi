@@ -6,7 +6,7 @@ AsyncToolHandler = Callable[..., Awaitable[Optional[str]]]
 __all__: List[str]
 
 class RuntimeOptions(TypedDict, total=False):
-    """Model strings accept @provider=<slug> to pin OpenRouter chat completions without fallbacks."""
+    """Model strings accept @provider=<slug,...> for an ordered OpenRouter allowlist; one slug disables fallbacks."""
     model: str
     api_key: str
 

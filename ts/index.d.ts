@@ -33,8 +33,8 @@ export declare class ChevalierError extends Error {
 export interface RuntimeOptions {
     /** Provider model string, e.g. `anthropic:claude-3-5-sonnet` or
      *  `custom-openai:my-model@server_url=http://host:port/v1/chat/completions`.
-     *  OpenRouter chat completions accepts `@provider=fireworks` to pin the
-     *  upstream with fallbacks disabled and parameter support required. */
+     *  OpenRouter chat completions accepts `@provider=fireworks,deepseek,baseten` for an
+     *  ordered allowlist. A single provider disables fallbacks. */
     model?: string;
     apiKey?: string;
 }

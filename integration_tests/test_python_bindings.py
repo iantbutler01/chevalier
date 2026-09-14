@@ -14,6 +14,25 @@ def run(coroutine):
     return asyncio.run(coroutine)
 
 
+def test_openrouter_provider_list_rejects_empty_entries_before_request():
+    async def scenario():
+        runtime = chevalier.Runtime({"model": "openrouter:test@provider=fireworks,,baseten", "api_key": "test"})
+        try:
+            with pytest.raises(chevalier.ChevalierError, match="comma-separated list of nonempty provider slugs"):
+                await runtime.run({"prompt": "test"})
+            stream = await runtime.run_stream({"prompt": "test"})
+            try:
+                with pytest.raises(chevalier.ChevalierError, match="comma-separated list of nonempty provider slugs"):
+                    while await stream.next() is not None:
+                        pass
+            finally:
+                stream.close()
+        finally:
+            await runtime.dispose()
+
+    run(scenario())
+
+
 def test_runtime_tool_registry_executes_python_coroutines():
     async def scenario():
         runtime = chevalier.Runtime({})

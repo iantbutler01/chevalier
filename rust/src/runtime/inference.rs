@@ -82,7 +82,7 @@ struct ParsedModelString {
     provider: String,
     model_name: String,
     reasoning: Option<String>,
-    openrouter_provider: Option<String>,
+    openrouter_providers: Option<Vec<String>>,
     server_url: Option<String>,
     inline_api_key: Option<String>,
     prompt_cache_retention: Option<PromptCacheRetention>,
@@ -128,7 +128,7 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
     };
 
     let mut reasoning = None;
-    let mut openrouter_provider = None;
+    let mut openrouter_providers = None;
     let mut server_url = None;
     let mut inline_api_key = None;
     let mut prompt_cache_retention = None;
@@ -154,12 +154,22 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
                     reasoning = Some(value.to_string());
                 }
                 "server_url" => server_url = Some(value.to_string()),
-                "provider" if provider == "openrouter" && !value.trim().is_empty() => {
-                    openrouter_provider = Some(value.to_string());
+                "provider" if provider == "openrouter" => {
+                    let providers: Vec<String> = value
+                        .split(',')
+                        .map(|slug| slug.trim().to_string())
+                        .collect();
+                    if providers.iter().any(String::is_empty) {
+                        return Err(Error::NonRetryable(
+                            "@provider requires a comma-separated list of nonempty provider slugs"
+                                .to_string(),
+                        ));
+                    }
+                    openrouter_providers = Some(providers);
                 }
                 "provider" => {
                     return Err(Error::NonRetryable(
-                        "@provider requires openrouter chat completions and a nonempty provider slug".to_string(),
+                        "@provider requires openrouter chat completions".to_string(),
                     ));
                 }
                 "api_key" => inline_api_key = Some(value.to_string()),
@@ -190,7 +200,7 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
         provider,
         model_name,
         reasoning,
-        openrouter_provider,
+        openrouter_providers,
         server_url,
         inline_api_key,
         prompt_cache_retention,
@@ -448,7 +458,7 @@ fn resolve_provider_key(model: &str) -> String {
 /// - `@cache=<value>` - OpenAI prompt cache retention (`in_memory` or `24h`)
 /// - `@vision=<true|false>` - image-input capability override consumed by `Provider::supports_image_input`
 /// - `@server_url=<url>` - custom API endpoint (required for `custom-openai`, optional for `openai`)
-/// - `@provider=<slug>` - pin an OpenRouter chat-completions upstream; no fallbacks
+/// - `@provider=<slug,...>` - ordered OpenRouter chat-completions allowlist; fallback within the list
 /// - `@api_key=<key>` - inline API key (overrides env var and `api_key` parameter)
 ///
 /// Examples:
@@ -606,8 +616,8 @@ fn create_inference_client_with_config(
         }
         "openrouter" => {
             let mut client = OpenRouterClient::new(key, model_name, None, None);
-            if let Some(upstream) = parsed.openrouter_provider {
-                client = client.with_upstream_provider(upstream);
+            if let Some(upstreams) = parsed.openrouter_providers {
+                client = client.with_upstream_providers(upstreams);
             }
             if let Some(r) = reasoning {
                 client = client.with_reasoning(r);
@@ -1171,11 +1181,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.model_name, "deepseek/deepseek-v4.1-flash");
-        assert_eq!(parsed.openrouter_provider.as_deref(), Some("fireworks"));
+        assert_eq!(
+            parsed.openrouter_providers,
+            Some(vec!["fireworks".to_string()])
+        );
         assert_eq!(parsed.reasoning.as_deref(), Some("high"));
+        let parsed = parse_model_string(
+            "openrouter:test@provider= fireworks, deepseek, baseten @reasoning=high",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.openrouter_providers,
+            Some(vec![
+                "fireworks".into(),
+                "deepseek".into(),
+                "baseten".into()
+            ])
+        );
         for model in [
             "openrouter:test@provider=",
             "openrouter:test@provider= ",
+            "openrouter:test@provider=fireworks,",
+            "openrouter:test@provider=,baseten",
+            "openrouter:test@provider=fireworks, ,baseten",
             "openai:test@provider=fireworks",
             "openrouter:resp:test@provider=fireworks",
         ] {

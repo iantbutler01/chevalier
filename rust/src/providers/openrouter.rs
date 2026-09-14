@@ -53,8 +53,13 @@ impl OpenRouterClient {
     }
 
     /// Pin an upstream provider with fallbacks disabled and parameter support required.
-    pub fn with_upstream_provider(mut self, provider: impl Into<String>) -> Self {
-        self.inner = self.inner.with_openrouter_provider(provider);
+    pub fn with_upstream_provider(self, provider: impl Into<String>) -> Self {
+        self.with_upstream_providers(vec![provider.into()])
+    }
+
+    /// Try upstreams in order, allowing fallbacks only within this list.
+    pub fn with_upstream_providers(mut self, providers: Vec<String>) -> Self {
+        self.inner = self.inner.with_openrouter_providers(providers);
         self
     }
 

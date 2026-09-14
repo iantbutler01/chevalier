@@ -34,16 +34,17 @@ the JavaScript/TypeScript binding:
 
 ```python
 runtime = Runtime({
-    "model": "openrouter:deepseek/deepseek-v4.1-flash@provider=fireworks@reasoning=high",
+    "model": "openrouter:deepseek/deepseek-v4.1-flash@provider=fireworks,deepseek,baseten@reasoning=high",
 })
 ```
 
-`@provider=<slug>` sends `provider: {"only": [slug], "allow_fallbacks": False,
-"require_parameters": True}` on every streaming and non-streaming request.
-The route must support the requested parameters; an unavailable route fails
-instead of switching providers. It also works in a per-call `model` override.
+`@provider=<slug,...>` parses a comma-separated list, trims whitespace, and
+rejects empty entries. The request sends that list as both `provider.order` and
+`provider.only`, with `require_parameters: true`. Multiple entries enable fallback
+within the list; a single entry disables fallback. Providers outside the list
+are never eligible. The same syntax works in a per-call `model` override.
 Omit it to retain OpenRouter's default routing. Other APIs, including OpenRouter
-Responses, reject this parameter. Pinning does not guarantee cache hits.
+Responses, reject this parameter. Fallback can reduce cache reuse.
 
 `Runtime.run()` returns the Rust runtime's canonical `AssistantResponse`. Its ordered
 `output` contains `TextResponsePart`, `ReasoningResponsePart`, `ToolResponsePart`,

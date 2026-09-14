@@ -37,7 +37,7 @@ pub struct OAIClient {
     image_input: Option<bool>,
     trace_callback: Option<TraceCallback>,
     provider: Provider,
-    openrouter_provider: Option<String>,
+    openrouter_providers: Option<Vec<String>>,
 }
 
 impl Clone for OAIClient {
@@ -52,7 +52,7 @@ impl Clone for OAIClient {
             image_input: self.image_input,
             trace_callback: self.trace_callback.clone(),
             provider: self.provider,
-            openrouter_provider: self.openrouter_provider.clone(),
+            openrouter_providers: self.openrouter_providers.clone(),
         }
     }
 }
@@ -98,7 +98,7 @@ impl OAIClient {
             image_input: None,
             trace_callback: None,
             provider: Provider::OpenAI,
-            openrouter_provider: None,
+            openrouter_providers: None,
         }
     }
 
@@ -159,8 +159,8 @@ impl OAIClient {
         self
     }
 
-    pub(crate) fn with_openrouter_provider(mut self, provider: impl Into<String>) -> Self {
-        self.openrouter_provider = Some(provider.into());
+    pub(crate) fn with_openrouter_providers(mut self, providers: Vec<String>) -> Self {
+        self.openrouter_providers = Some(providers);
         self
     }
 
@@ -200,11 +200,12 @@ impl OAIClient {
         }
 
         if matches!(self.provider, Provider::OpenRouter)
-            && let Some(ref provider) = self.openrouter_provider
+            && let Some(ref providers) = self.openrouter_providers
         {
             request["provider"] = serde_json::json!({
-                "only": [provider],
-                "allow_fallbacks": false,
+                "order": providers,
+                "only": providers,
+                "allow_fallbacks": providers.len() > 1,
                 "require_parameters": true,
             });
         }
@@ -506,7 +507,7 @@ mod tests {
     fn openrouter_pin_survives_clone_and_both_request_modes() {
         let client = OAIClient::new("test-key", "deepseek/deepseek-v4.1-flash")
             .with_provider(Provider::OpenRouter)
-            .with_openrouter_provider("fireworks")
+            .with_openrouter_providers(vec!["fireworks".into()])
             .clone();
         let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
         let config = GenerationConfig::new("deepseek/deepseek-v4.1-flash");
@@ -517,7 +518,7 @@ mod tests {
             assert_eq!(
                 body["provider"],
                 serde_json::json!({
-                    "only": ["fireworks"], "allow_fallbacks": false, "require_parameters": true,
+                    "order": ["fireworks"], "only": ["fireworks"], "allow_fallbacks": false, "require_parameters": true,
                 })
             );
             assert_eq!(body["max_tokens"], 4096);
@@ -527,6 +528,32 @@ mod tests {
                 .build_request_body(&messages, &config, stream)
                 .unwrap();
             assert!(unpinned.get("provider").is_none());
+        }
+    }
+
+    #[test]
+    fn openrouter_provider_list_bounds_fallbacks_and_preserves_order() {
+        let client = OAIClient::new("test-key", "test")
+            .with_provider(Provider::OpenRouter)
+            .with_openrouter_providers(vec![
+                "fireworks".into(),
+                "deepseek".into(),
+                "baseten".into(),
+            ])
+            .clone();
+        for stream in [false, true] {
+            let body = client
+                .build_request_body(&[], &GenerationConfig::new("test"), stream)
+                .unwrap();
+            assert_eq!(
+                body["provider"],
+                serde_json::json!({
+                    "order": ["fireworks", "deepseek", "baseten"],
+                    "only": ["fireworks", "deepseek", "baseten"],
+                    "allow_fallbacks": true,
+                    "require_parameters": true,
+                })
+            );
         }
     }
 
