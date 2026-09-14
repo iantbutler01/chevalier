@@ -42,6 +42,7 @@ pub struct OAIClient {
     openrouter_provider_sort: Option<ProviderSort>,
     openrouter_min_throughput: Option<PerformanceThreshold>,
     openrouter_max_latency: Option<PerformanceThreshold>,
+    openrouter_cache_prefix: Option<String>,
 }
 
 impl Clone for OAIClient {
@@ -60,6 +61,7 @@ impl Clone for OAIClient {
             openrouter_provider_sort: self.openrouter_provider_sort,
             openrouter_min_throughput: self.openrouter_min_throughput.clone(),
             openrouter_max_latency: self.openrouter_max_latency.clone(),
+            openrouter_cache_prefix: self.openrouter_cache_prefix.clone(),
         }
     }
 }
@@ -109,6 +111,7 @@ impl OAIClient {
             openrouter_provider_sort: None,
             openrouter_min_throughput: None,
             openrouter_max_latency: None,
+            openrouter_cache_prefix: None,
         }
     }
 
@@ -184,6 +187,11 @@ impl OAIClient {
         self
     }
 
+    pub(crate) fn with_openrouter_cache_prefix(mut self, prefix: String) -> Self {
+        self.openrouter_cache_prefix = Some(prefix);
+        self
+    }
+
     pub(crate) fn with_openrouter_providers(mut self, providers: Vec<String>) -> Self {
         self.openrouter_providers = Some(providers);
         self
@@ -248,6 +256,32 @@ impl OAIClient {
             if let Some(ref maximum) = self.openrouter_max_latency {
                 request["provider"]["preferred_max_latency"] = serde_json::json!(maximum);
             }
+        }
+
+        if matches!(self.provider, Provider::OpenRouter)
+            && let Some(prefix) = &self.openrouter_cache_prefix
+        {
+            let message = request["messages"]
+                .as_array_mut()
+                .and_then(|messages| messages.last_mut())
+                .ok_or_else(|| {
+                    Error::NonRetryable("Cache prefix requires a final user message".into())
+                })?;
+            let content = message["content"]
+                .as_str()
+                .filter(|content| {
+                    message["role"] == "user" && !prefix.is_empty() && content.starts_with(prefix)
+                })
+                .ok_or_else(|| {
+                    Error::NonRetryable(
+                        "Final user message does not start with the configured cache prefix".into(),
+                    )
+                })?;
+            message["content"] = serde_json::json!([
+                {"type":"text", "text":prefix, "prompt_cache_breakpoint":{"mode":"explicit"}},
+                {"type":"text", "text": &content[prefix.len()..]}
+            ]);
+            request["prompt_cache_options"] = serde_json::json!({"mode":"explicit", "ttl":"30m"});
         }
 
         // Add stream_options for usage tracking when streaming
@@ -317,7 +351,9 @@ impl OAIClient {
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
-            cache_write_input_tokens: 0,
+            cache_write_input_tokens: usage["prompt_tokens_details"]["cache_write_tokens"]
+                .as_u64()
+                .unwrap_or(0),
             reasoning_tokens: usage
                 .get("completion_tokens_details")
                 .and_then(|d| d.get("reasoning_tokens"))
@@ -660,6 +696,64 @@ mod tests {
             .build_request_body(&[], &GenerationConfig::new("test"), false)
             .unwrap();
         assert!(body.get("provider").is_none());
+    }
+
+    #[test]
+    fn explicit_prefix_preserves_text_and_excludes_changing_candidate() {
+        let client = OAIClient::new("key", "openai/gpt-5.6-luna")
+            .with_provider(Provider::OpenRouter)
+            .with_openrouter_cache_prefix("{\"out\":".into())
+            .clone();
+        for stream in [false, true] {
+            for text in [r#"{"out":""}"#, r#"{"out":{"content":"你好"}}"#] {
+                let messages = vec![ConversationMessage::Chat(crate::types::ChatMessage::user(
+                    text,
+                ))];
+                let body = client
+                    .build_request_body(&messages, &GenerationConfig::default(), stream)
+                    .unwrap();
+                let blocks = body["messages"][0]["content"].as_array().unwrap();
+                assert_eq!(
+                    blocks
+                        .iter()
+                        .map(|b| b["text"].as_str().unwrap())
+                        .collect::<String>(),
+                    text
+                );
+                assert_eq!(blocks[0]["text"], "{\"out\":");
+                assert_eq!(blocks[0]["prompt_cache_breakpoint"]["mode"], "explicit");
+                assert!(blocks[1].get("prompt_cache_breakpoint").is_none());
+                assert_eq!(
+                    body["prompt_cache_options"],
+                    serde_json::json!({"mode":"explicit","ttl":"30m"})
+                );
+            }
+        }
+        for messages in [
+            vec![],
+            vec![ConversationMessage::Chat(crate::types::ChatMessage::user(
+                "other",
+            ))],
+            vec![ConversationMessage::Chat(
+                crate::types::ChatMessage::assistant(r#"{"out":""}"#),
+            )],
+        ] {
+            assert!(
+                client
+                    .build_request_body(&messages, &GenerationConfig::default(), true)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn cache_writes_are_reported_separately_from_reads() {
+        let usage = OAIClient::new("key", "model").parse_usage(&serde_json::json!({
+            "prompt_tokens":15000,"completion_tokens":400,
+            "prompt_tokens_details":{"cached_tokens":14000,"cache_write_tokens":500}
+        }));
+        assert_eq!(usage.cached_tokens, 14000);
+        assert_eq!(usage.cache_write_input_tokens, 500);
     }
 
     const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";

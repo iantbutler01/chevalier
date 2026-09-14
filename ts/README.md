@@ -200,3 +200,11 @@ These send `provider.preferred_min_throughput` (tokens/second) and
 number or a nonempty object with `p50`, `p75`, `p90`, or `p99` positive values.
 They combine with `@provider_sort=throughput` and preserve automatic fallbacks.
 OpenRouter uses these as soft routing preferences, not per-request deadlines.
+
+For OpenRouter models supporting explicit prompt caching (such as GPT-5.6),
+`@cache_prefix={"out":` marks a cache boundary after that literal prefix in the
+final user message. The message must start with the configured prefix. The client
+splits it into two text blocks without changing the concatenated text, marks the
+first block, and requests explicit-only caching with a 30-minute TTL. Everything
+through that boundary is reusable; the changing suffix is not written to cache.
+This is opt-in and fails before sending if the final message does not match.

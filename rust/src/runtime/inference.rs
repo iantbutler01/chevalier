@@ -87,6 +87,7 @@ struct ParsedModelString {
     openrouter_provider_sort: Option<ProviderSort>,
     openrouter_min_throughput: Option<PerformanceThreshold>,
     openrouter_max_latency: Option<PerformanceThreshold>,
+    openrouter_cache_prefix: Option<String>,
     server_url: Option<String>,
     inline_api_key: Option<String>,
     prompt_cache_retention: Option<PromptCacheRetention>,
@@ -136,6 +137,7 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
     let mut openrouter_provider_sort = None;
     let mut openrouter_min_throughput = None;
     let mut openrouter_max_latency = None;
+    let mut openrouter_cache_prefix = None;
     let mut server_url = None;
     let mut inline_api_key = None;
     let mut prompt_cache_retention = None;
@@ -161,6 +163,12 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
                     reasoning = Some(value.to_string());
                 }
                 "server_url" => server_url = Some(value.to_string()),
+                "cache_prefix" => {
+                    if provider != "openrouter" || value.is_empty() {
+                        return Err(Error::NonRetryable("@cache_prefix requires OpenRouter chat completions and a nonempty literal prefix".into()));
+                    }
+                    openrouter_cache_prefix = Some(value.to_owned());
+                }
                 "provider_min_throughput" | "provider_max_latency" => {
                     if provider != "openrouter" {
                         return Err(Error::NonRetryable(format!(
@@ -214,7 +222,7 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
                     return Err(Error::NonRetryable(format!(
                         "Unknown model parameter '@{}' in '{}'. Supported parameters: reasoning \
                          (aliases reasoning_level, reasoning_effort), cache, vision, server_url, \
-                         api_key, provider, provider_sort, provider_min_throughput, provider_max_latency (OpenRouter chat completions only).",
+                         api_key, provider, provider_sort, cache_prefix, provider_min_throughput, provider_max_latency (OpenRouter chat completions only).",
                         key, model_str
                     )));
                 }
@@ -239,6 +247,7 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
         openrouter_provider_sort,
         openrouter_min_throughput,
         openrouter_max_latency,
+        openrouter_cache_prefix,
         server_url,
         inline_api_key,
         prompt_cache_retention,
@@ -656,6 +665,9 @@ fn create_inference_client_with_config(
             let mut client = OpenRouterClient::new(key, model_name, None, None);
             if let Some(upstreams) = parsed.openrouter_providers {
                 client = client.with_upstream_providers(upstreams);
+            }
+            if let Some(prefix) = parsed.openrouter_cache_prefix {
+                client = client.with_cache_prefix(prefix);
             }
             client = client.with_performance_preferences(
                 parsed.openrouter_min_throughput,
@@ -1255,6 +1267,23 @@ mod tests {
             for route in ["openai:test", "openrouter:resp:test"] {
                 assert!(parse_model_string(&format!("{route}@{key}=40")).is_err());
             }
+        }
+    }
+
+    #[test]
+    fn cache_prefix_is_literal_and_openrouter_only() {
+        let parsed = parse_model_string(
+            r#"openrouter:openai/gpt-5.6-luna@reasoning=high@cache_prefix={"out":"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.openrouter_cache_prefix.as_deref(), Some("{\"out\":"));
+        assert_eq!(parsed.model_name, "openai/gpt-5.6-luna");
+        for model in [
+            "openrouter:test@cache_prefix=",
+            "openai:test@cache_prefix=x",
+            "openrouter:resp:test@cache_prefix=x",
+        ] {
+            assert!(parse_model_string(model).is_err());
         }
     }
 

@@ -128,6 +128,13 @@ impl OpenRouterClient {
         self
     }
 
+    /// Cache through a literal prefix of the final user message, excluding its variable suffix.
+    /// Requires an upstream model supporting explicit prompt caching.
+    pub fn with_cache_prefix(mut self, prefix: String) -> Self {
+        self.inner = self.inner.with_openrouter_cache_prefix(prefix);
+        self
+    }
+
     /// Override whether this model accepts image input, from the model
     /// string's `@vision=` parameter.
     pub fn with_image_input(mut self, image_input: Option<bool>) -> Self {

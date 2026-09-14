@@ -136,7 +136,9 @@ pub fn parse_openai_chunk(
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
-            cache_write_input_tokens: 0,
+            cache_write_input_tokens: usage["prompt_tokens_details"]["cache_write_tokens"]
+                .as_u64()
+                .unwrap_or(0),
             reasoning_tokens: usage
                 .get("completion_tokens_details")
                 .and_then(|d| d.get("reasoning_tokens"))
@@ -163,7 +165,9 @@ pub fn parse_openai_chunk(
     }
 
     // Handle reasoning (o-series models)
-    if let Some(reasoning) = delta.get("reasoning").and_then(|r| r.as_str())
+    if let Some(reasoning) = delta
+        .get("reasoning")
+        .and_then(|r| r.as_str())
         .or_else(|| delta.get("reasoning_content").and_then(|r| r.as_str()))
         && !reasoning.is_empty()
     {
@@ -541,7 +545,7 @@ mod tests {
                 "prompt_tokens": 100,
                 "completion_tokens": 50,
                 "prompt_tokens_details": {
-                    "cached_tokens": 25
+                    "cached_tokens": 25, "cache_write_tokens": 40
                 },
                 "completion_tokens_details": { "reasoning_tokens": 12 },
                 "cost": 0.00125
@@ -557,6 +561,7 @@ mod tests {
                 input_tokens,
                 output_tokens,
                 cached_tokens,
+                cache_write_input_tokens,
                 reasoning_tokens,
                 provider_cost_dollars,
                 ..
@@ -564,6 +569,7 @@ mod tests {
                 assert_eq!(*input_tokens, 100);
                 assert_eq!(*output_tokens, 50);
                 assert_eq!(*cached_tokens, 25);
+                assert_eq!(*cache_write_input_tokens, 40);
                 assert_eq!(*reasoning_tokens, Some(12));
                 assert_eq!(*provider_cost_dollars, Some(0.00125));
             }
