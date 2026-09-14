@@ -26,6 +26,7 @@ class ToolCallInput(TypedDict, total=False):
 
 class Message(TypedDict, total=False):
     provider_response: Json
+    reasoning: str
     type: Required[str]
     role: str
     content: str

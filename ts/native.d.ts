@@ -272,6 +272,7 @@ export interface Message {
   type: string
   role?: string
   content?: string
+  reasoning?: string
   toolUseId?: string
   toolName?: string
   isError?: boolean

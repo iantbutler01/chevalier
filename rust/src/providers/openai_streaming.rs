@@ -164,6 +164,7 @@ pub fn parse_openai_chunk(
 
     // Handle reasoning (o-series models)
     if let Some(reasoning) = delta.get("reasoning").and_then(|r| r.as_str())
+        .or_else(|| delta.get("reasoning_content").and_then(|r| r.as_str()))
         && !reasoning.is_empty()
     {
         chunks.push(StreamChunk::Reasoning(reasoning.to_string()));

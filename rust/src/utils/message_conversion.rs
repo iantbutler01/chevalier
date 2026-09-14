@@ -511,6 +511,10 @@ fn assistant_response_to_openai_chat_message(response: &AssistantResponse) -> Va
     if !tool_calls.is_empty() {
         message["tool_calls"] = json!(tool_calls);
     }
+    let reasoning = response.reasoning();
+    if !reasoning.is_empty() {
+        message["reasoning_content"] = json!(reasoning);
+    }
     message
 }
 
@@ -1041,6 +1045,19 @@ pub fn convert_messages_to_provider_format(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assistant_chat_history_retains_reasoning_without_exposing_it_as_text() {
+        let response = AssistantResponse::new(vec![
+            ResponsePart::Reasoning { text: "retained reasoning".into() },
+            ResponsePart::Text { text: "visible answer".into() },
+        ]);
+        let message = assistant_response_to_openai_chat_message(&response);
+        assert_eq!(message["content"], "visible answer");
+        assert_eq!(message["reasoning_content"], "retained reasoning");
+        let empty = assistant_response_to_openai_chat_message(&AssistantResponse::default());
+        assert!(empty.get("reasoning_content").is_none());
+    }
 
     #[test]
     fn test_openai_no_coalescing() {

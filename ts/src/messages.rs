@@ -45,6 +45,7 @@ pub struct Message {
     pub kind: String,
     pub role: Option<String>,
     pub content: Option<String>,
+    pub reasoning: Option<String>,
     pub tool_use_id: Option<String>,
     pub tool_name: Option<String>,
     pub is_error: Option<bool>,
@@ -119,6 +120,9 @@ pub fn to_conversation_message(m: &Message) -> ConversationMessage {
         }
         "assistantResponse" | "assistant_response" => {
             let mut parts: Vec<ResponsePart> = Vec::new();
+            if let Some(text) = &m.reasoning {
+                parts.push(ResponsePart::Reasoning { text: text.clone() });
+            }
             if let Some(text) = &m.content
                 && !text.is_empty()
             {
