@@ -47,6 +47,21 @@ const rt = new Runtime({
 
 API keys come from `apiKey` or the provider's env var (`ANTHROPIC_API_KEY`, …).
 
+Pin an OpenRouter chat-completions upstream in the model string:
+
+```ts
+const rt = new Runtime({
+  model: "openrouter:deepseek/deepseek-v4.1-flash@provider=fireworks@reasoning=high",
+});
+```
+
+`@provider=<slug>` sends `provider: { only: [slug], allow_fallbacks: false,
+require_parameters: true }` on every streaming and non-streaming request.
+The route must support the requested parameters; an unavailable route fails
+instead of switching providers. The same syntax works in a per-call `model`
+override. Omit it to retain OpenRouter's default routing. Other APIs, including
+OpenRouter Responses, reject this parameter. Pinning does not guarantee cache hits.
+
 ## Tools
 
 ```ts

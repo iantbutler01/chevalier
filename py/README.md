@@ -29,6 +29,22 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+Pin an OpenRouter chat-completions upstream with the same model string used by
+the JavaScript/TypeScript binding:
+
+```python
+runtime = Runtime({
+    "model": "openrouter:deepseek/deepseek-v4.1-flash@provider=fireworks@reasoning=high",
+})
+```
+
+`@provider=<slug>` sends `provider: {"only": [slug], "allow_fallbacks": False,
+"require_parameters": True}` on every streaming and non-streaming request.
+The route must support the requested parameters; an unavailable route fails
+instead of switching providers. It also works in a per-call `model` override.
+Omit it to retain OpenRouter's default routing. Other APIs, including OpenRouter
+Responses, reject this parameter. Pinning does not guarantee cache hits.
+
 `Runtime.run()` returns the Rust runtime's canonical `AssistantResponse`. Its ordered
 `output` contains `TextResponsePart`, `ReasoningResponsePart`, `ToolResponsePart`,
 and `SignatureResponsePart` values; `text()`, `reasoning()`, `tool_calls()`, and

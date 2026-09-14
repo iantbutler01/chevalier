@@ -37,6 +37,7 @@ pub struct OAIClient {
     image_input: Option<bool>,
     trace_callback: Option<TraceCallback>,
     provider: Provider,
+    openrouter_provider: Option<String>,
 }
 
 impl Clone for OAIClient {
@@ -51,6 +52,7 @@ impl Clone for OAIClient {
             image_input: self.image_input,
             trace_callback: self.trace_callback.clone(),
             provider: self.provider,
+            openrouter_provider: self.openrouter_provider.clone(),
         }
     }
 }
@@ -96,6 +98,7 @@ impl OAIClient {
             image_input: None,
             trace_callback: None,
             provider: Provider::OpenAI,
+            openrouter_provider: None,
         }
     }
 
@@ -156,6 +159,11 @@ impl OAIClient {
         self
     }
 
+    pub(crate) fn with_openrouter_provider(mut self, provider: impl Into<String>) -> Self {
+        self.openrouter_provider = Some(provider.into());
+        self
+    }
+
     /// Build request body for OpenAI API
     fn build_request_body(
         &self,
@@ -172,16 +180,33 @@ impl OAIClient {
         let mut request = serde_json::json!({
             "model": model,
             "messages": formatted_messages,
-            "max_completion_tokens": config.max_tokens.unwrap_or(4096),
             "temperature": config.temperature.unwrap_or(0.7),
             "top_p": config.top_p.unwrap_or(1.0),
             "stream": stream,
         });
 
+        // OpenRouter's parameter-aware routing recognizes max_tokens.
+        let token_limit_field = if matches!(self.provider, Provider::OpenRouter) {
+            "max_tokens"
+        } else {
+            "max_completion_tokens"
+        };
+        request[token_limit_field] = serde_json::json!(config.max_tokens.unwrap_or(4096));
+
         if matches!(self.provider, Provider::OpenAI)
             && let Some(retention) = config.prompt_cache_retention
         {
             request["prompt_cache_retention"] = serde_json::json!(retention.as_str());
+        }
+
+        if matches!(self.provider, Provider::OpenRouter)
+            && let Some(ref provider) = self.openrouter_provider
+        {
+            request["provider"] = serde_json::json!({
+                "only": [provider],
+                "allow_fallbacks": false,
+                "require_parameters": true,
+            });
         }
 
         // Add stream_options for usage tracking when streaming
@@ -476,6 +501,34 @@ impl InferenceClient for OAIClient {
 mod tests {
     use super::*;
     use crate::types::ChatMessage;
+
+    #[test]
+    fn openrouter_pin_survives_clone_and_both_request_modes() {
+        let client = OAIClient::new("test-key", "deepseek/deepseek-v4.1-flash")
+            .with_provider(Provider::OpenRouter)
+            .with_openrouter_provider("fireworks")
+            .clone();
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let config = GenerationConfig::new("deepseek/deepseek-v4.1-flash");
+        for stream in [false, true] {
+            let body = client
+                .build_request_body(&messages, &config, stream)
+                .unwrap();
+            assert_eq!(
+                body["provider"],
+                serde_json::json!({
+                    "only": ["fireworks"], "allow_fallbacks": false, "require_parameters": true,
+                })
+            );
+            assert_eq!(body["max_tokens"], 4096);
+            assert!(body.get("max_completion_tokens").is_none());
+            let unpinned = OAIClient::new("test-key", "test")
+                .with_provider(Provider::OpenRouter)
+                .build_request_body(&messages, &config, stream)
+                .unwrap();
+            assert!(unpinned.get("provider").is_none());
+        }
+    }
 
     const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
 

@@ -41,6 +41,8 @@ type ToolHandler = ThreadsafeFunction<
 pub struct RuntimeOptions {
     /// Provider model string, e.g. `anthropic:claude-3-5-sonnet` or
     /// `openai:gpt-4o@server_url=http://host:port/v1`.
+    /// OpenRouter chat completions accepts `@provider=fireworks` to pin the
+    /// upstream with fallbacks disabled and parameter support required.
     pub model: Option<String>,
     /// API key. Falls back to the provider's env var when omitted.
     pub api_key: Option<String>,

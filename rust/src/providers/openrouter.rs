@@ -52,6 +52,12 @@ impl OpenRouterClient {
         self
     }
 
+    /// Pin an upstream provider with fallbacks disabled and parameter support required.
+    pub fn with_upstream_provider(mut self, provider: impl Into<String>) -> Self {
+        self.inner = self.inner.with_openrouter_provider(provider);
+        self
+    }
+
     /// Override whether this model accepts image input, from the model
     /// string's `@vision=` parameter.
     pub fn with_image_input(mut self, image_input: Option<bool>) -> Self {
