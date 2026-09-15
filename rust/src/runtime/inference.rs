@@ -880,7 +880,15 @@ pub async fn call_llm(
     let parsed_model = parse_model_string(model)?;
     let provider_key = resolve_provider_key(model);
     if allow_tool_calls == Some(false)
-        && !matches!(provider_key.as_str(), "openai" | "openrouter" | "custom-openai" | "openai-responses" | "openrouter-responses" | "openai-codex-responses")
+        && !matches!(
+            provider_key.as_str(),
+            "openai"
+                | "openrouter"
+                | "custom-openai"
+                | "openai-responses"
+                | "openrouter-responses"
+                | "openai-codex-responses"
+        )
     {
         return Err(Error::NonRetryable(
             "allow_tool_calls=false requires a Chat Completions or Responses provider".into(),
@@ -993,7 +1001,15 @@ pub async fn call_llm_stream(
     let parsed_model = parse_model_string(model)?;
     let provider_key = resolve_provider_key(model);
     if allow_tool_calls == Some(false)
-        && !matches!(provider_key.as_str(), "openai" | "openrouter" | "custom-openai" | "openai-responses" | "openrouter-responses" | "openai-codex-responses")
+        && !matches!(
+            provider_key.as_str(),
+            "openai"
+                | "openrouter"
+                | "custom-openai"
+                | "openai-responses"
+                | "openrouter-responses"
+                | "openai-codex-responses"
+        )
     {
         return Err(Error::NonRetryable(
             "allow_tool_calls=false requires a Chat Completions or Responses provider".into(),

@@ -1049,8 +1049,12 @@ mod tests {
     #[test]
     fn assistant_chat_history_retains_reasoning_without_exposing_it_as_text() {
         let response = AssistantResponse::new(vec![
-            ResponsePart::Reasoning { text: "retained reasoning".into() },
-            ResponsePart::Text { text: "visible answer".into() },
+            ResponsePart::Reasoning {
+                text: "retained reasoning".into(),
+            },
+            ResponsePart::Text {
+                text: "visible answer".into(),
+            },
         ]);
         let message = assistant_response_to_openai_chat_message(&response);
         assert_eq!(message["content"], "visible answer");

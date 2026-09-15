@@ -254,7 +254,11 @@ impl OpenAICodexResponsesClient {
                     }
                 }
             }
-            request["tool_choice"] = serde_json::json!(if config.allow_tool_calls == Some(false) { "none" } else { "auto" });
+            request["tool_choice"] = serde_json::json!(if config.allow_tool_calls == Some(false) {
+                "none"
+            } else {
+                "auto"
+            });
         }
 
         if self.reasoning.is_some() || self.reasoning_summary.is_some() {
