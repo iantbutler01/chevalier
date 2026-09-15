@@ -193,6 +193,8 @@ export interface RunArgs<T = unknown> {
   system?: string;
   temperature?: number;
   topP?: number;
+  /** Chat Completions / Responses: false retains schemas but disables native tool calls. */
+  allowToolCalls?: boolean;
   maxTokens?: number;
   model?: string;
   apiKey?: string;

@@ -302,6 +302,7 @@ export interface RunOptions {
   system?: string
   temperature?: number
   topP?: number
+  allowToolCalls?: boolean
   maxTokens?: number
   /** Override the runtime's model for this call. */
   model?: string

@@ -194,3 +194,5 @@ splits it into two text blocks without changing the concatenated text, marks the
 first block, and requests explicit-only caching with a 30-minute TTL. Everything
 through that boundary is reusable; the changing suffix is not written to cache.
 This is opt-in and fails before sending if the final message does not match.
+
+For Chat Completions and Responses providers, set `"allow_tool_calls": False` in run options to retain tool schemas while requesting text only (`tool_choice: "none"`). Omit it for normal automatic tool calling. Unsupported provider routes reject this option rather than silently allowing calls.

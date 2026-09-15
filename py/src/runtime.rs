@@ -43,6 +43,8 @@ struct RunOptions {
     #[serde(default)]
     top_p: Option<f64>,
     #[serde(default)]
+    allow_tool_calls: Option<bool>,
+    #[serde(default)]
     max_tokens: Option<u32>,
     #[serde(default)]
     model: Option<String>,
@@ -76,6 +78,7 @@ impl RunOptions {
             output_schema: self.output_schema,
             temperature: self.temperature.map(|value| value as f32),
             top_p: self.top_p.map(|value| value as f32),
+            allow_tool_calls: self.allow_tool_calls,
             max_tokens: self.max_tokens,
             reasoning_effort: None,
             model: self.model,

@@ -294,7 +294,7 @@ impl OAIClient {
             && !tools.is_empty()
         {
             request["tools"] = serde_json::json!(self.normalized_tools(tools));
-            request["tool_choice"] = serde_json::json!("auto");
+            request["tool_choice"] = serde_json::json!(if config.allow_tool_calls == Some(false) { "none" } else { "auto" });
         }
 
         // Add reasoning if configured (client-level, then config-level fallback)
@@ -908,6 +908,21 @@ mod tests {
 
         assert!(body["tools"].is_array());
         assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn disabled_tool_calls_retain_schemas_and_reasoning() {
+        let client = OAIClient::new("test-key", "gpt-5.6-luna").with_reasoning("high");
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Re-evaluate"))];
+        let tools = vec![serde_json::json!({"type":"function","function":{"name":"read"}})];
+        let mut config = GenerationConfig::new("gpt-5.6-luna").with_tools(tools.clone());
+        config.allow_tool_calls = Some(false);
+        for stream in [false, true] {
+            let body = client.build_request_body(&messages, &config, stream).unwrap();
+            assert_eq!(body["tools"], serde_json::json!(tools));
+            assert_eq!(body["tool_choice"], "none");
+            assert_eq!(body["reasoning_effort"], "high");
+        }
     }
 
     #[test]

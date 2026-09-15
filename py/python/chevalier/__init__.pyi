@@ -47,6 +47,7 @@ class RunOptions(TypedDict, total=False):
     system: str
     temperature: float
     top_p: float
+    allow_tool_calls: bool
     max_tokens: int
     model: str
     api_key: str

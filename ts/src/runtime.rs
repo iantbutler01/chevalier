@@ -56,6 +56,7 @@ pub struct RunOptions {
     pub system: Option<String>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    pub allow_tool_calls: Option<bool>,
     pub max_tokens: Option<u32>,
     /// Override the runtime's model for this call.
     pub model: Option<String>,
@@ -92,6 +93,7 @@ impl RunOptions {
             output_schema: self.output_schema,
             temperature: self.temperature.map(|v| v as f32),
             top_p: self.top_p.map(|v| v as f32),
+            allow_tool_calls: self.allow_tool_calls,
             max_tokens: self.max_tokens,
             reasoning_effort: None,
             model: self.model,

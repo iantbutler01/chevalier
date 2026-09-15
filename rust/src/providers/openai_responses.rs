@@ -200,7 +200,7 @@ impl OpenAIResponsesClient {
                     }
                 }
             }
-            request["tool_choice"] = serde_json::json!("auto");
+            request["tool_choice"] = serde_json::json!(if config.allow_tool_calls == Some(false) { "none" } else { "auto" });
         }
 
         if let Some(ref reasoning) = config.reasoning_effort.as_ref().or(self.reasoning.as_ref()) {

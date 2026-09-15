@@ -865,6 +865,7 @@ pub async fn call_llm(
     history: Option<Vec<ConversationMessage>>,
     temperature: Option<f32>,
     top_p: Option<f32>,
+    allow_tool_calls: Option<bool>,
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
     timeout: Option<std::time::Duration>,
@@ -878,6 +879,13 @@ pub async fn call_llm(
     let client = create_inference_client_with_config(model, api_key, provider_config.as_ref())?;
     let parsed_model = parse_model_string(model)?;
     let provider_key = resolve_provider_key(model);
+    if allow_tool_calls == Some(false)
+        && !matches!(provider_key.as_str(), "openai" | "openrouter" | "custom-openai" | "openai-responses" | "openrouter-responses" | "openai-codex-responses")
+    {
+        return Err(Error::NonRetryable(
+            "allow_tool_calls=false requires a Chat Completions or Responses provider".into(),
+        ));
+    }
     let message_provider = resolve_provider_for_caching(model);
 
     let messages =
@@ -920,6 +928,7 @@ pub async fn call_llm(
         max_tokens,
         temperature,
         top_p,
+        allow_tool_calls,
         tools: tool_schemas,
         native_tools: true, // Always true - we only support native tools
         reasoning_effort,
@@ -968,6 +977,7 @@ pub async fn call_llm_stream(
     history: Option<Vec<ConversationMessage>>,
     temperature: Option<f32>,
     top_p: Option<f32>,
+    allow_tool_calls: Option<bool>,
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
     timeout: Option<std::time::Duration>,
@@ -982,6 +992,13 @@ pub async fn call_llm_stream(
     let client = create_inference_client_with_config(model, api_key, provider_config.as_ref())?;
     let parsed_model = parse_model_string(model)?;
     let provider_key = resolve_provider_key(model);
+    if allow_tool_calls == Some(false)
+        && !matches!(provider_key.as_str(), "openai" | "openrouter" | "custom-openai" | "openai-responses" | "openrouter-responses" | "openai-codex-responses")
+    {
+        return Err(Error::NonRetryable(
+            "allow_tool_calls=false requires a Chat Completions or Responses provider".into(),
+        ));
+    }
     let message_provider = resolve_provider_for_caching(model);
 
     let messages =
@@ -1024,6 +1041,7 @@ pub async fn call_llm_stream(
         max_tokens,
         temperature,
         top_p,
+        allow_tool_calls,
         tools: tool_schemas,
         native_tools: true, // Always true - we only support native tools
         reasoning_effort,
