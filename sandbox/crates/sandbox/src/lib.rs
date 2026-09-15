@@ -275,6 +275,12 @@ pub struct FreestyleBackendConfig {
     pub preview_domain_suffix: String,
     /// A `POST /v5/tls/forward-auth` configuration id to attach to every preview rule.
     pub forward_auth_id: Option<String>,
+    /// Private network every session VM joins, by slug. The network is created when it
+    /// does not exist yet, with no rules of its own, so a VM on it is reachable only
+    /// from whatever a firewall rule names — a tunnel, or another VM. `None` leaves
+    /// sessions off every private network, reachable only through preview URLs.
+    #[serde(default)]
+    pub vpc: Option<String>,
     /// Pause after this many seconds without network activity; `None` never pauses.
     pub idle_timeout_secs: Option<u64>,
     /// Delete a VM once it has sat stopped/paused this long; `None` keeps it. Never 0 for
@@ -297,6 +303,7 @@ impl Default for FreestyleBackendConfig {
             snapshot_id: String::new(),
             preview_domain_suffix: "style.dev".to_string(),
             forward_auth_id: None,
+            vpc: None,
             idle_timeout_secs: None,
             auto_delete_secs: None,
             snapshot_auto_delete_secs: None,
@@ -338,6 +345,10 @@ impl FreestyleBackendConfig {
         cfg.forward_auth_id = std::env::var("FREESTYLE_FORWARD_AUTH_ID")
             .ok()
             .filter(|value| !value.trim().is_empty());
+        cfg.vpc = std::env::var("FREESTYLE_VPC")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         cfg.linux_user = std::env::var("FREESTYLE_LINUX_USER")
             .ok()
             .filter(|value| !value.trim().is_empty());
@@ -1417,6 +1428,15 @@ impl ManagedControl {
                 Ok(format!("https://{preview}"))
             }
             Self::Freestyle(control) => control.preview_url(sandbox_id, guest_port).await,
+        }
+    }
+
+    /// The sandbox's address on the private network it was created in, when it has one.
+    /// Callers on that network reach the guest directly at it, with no public hostname.
+    async fn private_address(&self, sandbox_id: &str) -> Result<Option<String>> {
+        match self {
+            Self::OpenComputer(_) => Ok(None),
+            Self::Freestyle(control) => control.private_address(sandbox_id).await,
         }
     }
 
@@ -3198,6 +3218,15 @@ impl Session {
         Err(SandboxError::Unsupported(
             "provider preview URLs are only available for provider-managed sandboxes".to_string(),
         ))
+    }
+
+    /// The VM's address on its provider-side private network, when it is on one. `None`
+    /// means there is no private path to this session and callers must use a preview URL.
+    pub async fn provider_private_address(&self) -> Result<Option<String>> {
+        if let ControlBackend::Managed(control) = &self.sandbox.inner.control_backend {
+            return control.private_address(&self.vm_id).await;
+        }
+        Ok(None)
     }
 
     pub async fn open_desktop(&self) -> Result<SessionDesktopTarget> {

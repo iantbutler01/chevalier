@@ -66,6 +66,38 @@ pub(crate) struct FreestyleVm {
     pub slug: Option<String>,
     #[serde(default, rename = "displayName")]
     pub display_name: Option<String>,
+    /// The private networks this VM is on; at most one today. A VM record carries the
+    /// same list twice, under `vpcs` and under `networks` — reading one of them is
+    /// reading both, and reading both is a duplicate field.
+    #[serde(default)]
+    pub vpcs: Vec<FreestyleVmNetwork>,
+}
+
+/// One VM's place on a private network, as the API reports it.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct FreestyleVmNetwork {
+    #[serde(default)]
+    pub ipv4: Option<String>,
+    #[serde(default, rename = "vpcSlug")]
+    pub vpc_slug: Option<String>,
+    #[serde(default, rename = "vpcSlugAtAttach")]
+    pub vpc_slug_at_attach: Option<String>,
+}
+
+impl FreestyleVm {
+    /// The VM's IPv4 address on `vpc`, or on its only network when no slug is named.
+    /// A renamed network still answers to the slug it was attached under.
+    pub(crate) fn private_address(&self, vpc: Option<&str>) -> Option<String> {
+        self.vpcs
+            .iter()
+            .find(|network| {
+                vpc.is_none_or(|slug| {
+                    network.vpc_slug.as_deref() == Some(slug)
+                        || network.vpc_slug_at_attach.as_deref() == Some(slug)
+                })
+            })
+            .and_then(|network| network.ipv4.clone())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -162,6 +194,10 @@ impl FreestyleControl {
             idle_timeout_seconds: self.cfg.idle_timeout_secs.map(|value| value as i64),
             auto_delete_seconds: self.cfg.auto_delete_secs.map(|value| value as i64),
             automatic_restart: Some(true),
+            networks: match self.private_network().await? {
+                Some(vpc) => vec![AttachNetworkBody { vpc, ipv4: true }],
+                None => Vec::new(),
+            },
         };
         let response = self
             .send(self.client.post(self.url("/v5/vms")).json(&body))
@@ -880,6 +916,69 @@ impl FreestyleControl {
         Ok(format!("https://{domain}"))
     }
 
+    /// The configured private network, created on first use. It is created with no rules
+    /// of its own — members cannot even reach each other — so joining it exposes nothing;
+    /// reaching a VM on it takes an explicit firewall rule naming a tunnel or a VM.
+    async fn private_network(&self) -> Result<Option<String>> {
+        let Some(slug) = self
+            .cfg
+            .vpc
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        let existing = self
+            .client
+            .get(self.url(&format!("/v5/vpcs/{}", urlencoding::encode(slug))))
+            .bearer_auth(&self.cfg.api_key)
+            .send()
+            .await
+            .map_err(|err| {
+                SandboxError::DaemonUnavailable(format!("Freestyle request failed: {err}"))
+            })?;
+        if existing.status().is_success() {
+            return Ok(Some(slug.to_string()));
+        }
+        if existing.status() != StatusCode::NOT_FOUND {
+            return Err(freestyle_response_error(existing).await);
+        }
+        let body = CreateVpcBody {
+            slug,
+            display_name: "Chevalier session VMs",
+            firewall: FirewallSpec { rules: Vec::new() },
+        };
+        match self
+            .send(self.client.post(self.url("/v5/vpcs")).json(&body))
+            .await
+        {
+            Ok(_) => Ok(Some(slug.to_string())),
+            // Another process created it between the probe and the create.
+            Err(error) => {
+                let recheck = self
+                    .send(
+                        self.client
+                            .get(self.url(&format!("/v5/vpcs/{}", urlencoding::encode(slug)))),
+                    )
+                    .await;
+                if recheck.is_ok() {
+                    Ok(Some(slug.to_string()))
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    /// The VM's address on the configured private network, when it is on one.
+    pub(crate) async fn private_address(&self, vm_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .get_sandbox(vm_id)
+            .await?
+            .private_address(self.cfg.vpc.as_deref()))
+    }
+
     fn preview_domain(&self, vm_id: &str, guest_port: u16) -> String {
         let label = vm_id
             .trim_start_matches("vm-")
@@ -1154,6 +1253,23 @@ struct CreateVmBody {
     auto_delete_seconds: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     automatic_restart: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    networks: Vec<AttachNetworkBody>,
+}
+
+/// Join one private network at create, taking an auto-allocated IPv4 address on it.
+#[derive(Serialize)]
+struct AttachNetworkBody {
+    vpc: String,
+    ipv4: bool,
+}
+
+#[derive(Serialize)]
+struct CreateVpcBody<'a> {
+    slug: &'a str,
+    #[serde(rename = "displayName")]
+    display_name: &'a str,
+    firewall: FirewallSpec,
 }
 
 #[derive(Serialize)]
@@ -1490,6 +1606,7 @@ mod tests {
             idle_timeout_seconds: Some(900),
             auto_delete_seconds: None,
             automatic_restart: Some(true),
+            networks: Vec::new(),
         };
         assert_eq!(
             serde_json::to_value(body).unwrap(),
@@ -1503,6 +1620,74 @@ mod tests {
                 "automaticRestart": true
             })
         );
+    }
+
+    #[test]
+    fn create_body_joins_the_configured_private_network() {
+        let body = CreateVmBody {
+            snapshot_id: Some("sh-1".to_string()),
+            slug: None,
+            reassign_slug: false,
+            display_name: None,
+            metadata: HashMap::new(),
+            firewall: FirewallSpec::for_egress(None),
+            tls: TlsSpec::for_egress_domains(None),
+            idle_timeout_seconds: None,
+            auto_delete_seconds: None,
+            automatic_restart: Some(true),
+            networks: vec![AttachNetworkBody {
+                vpc: "nym-apps".to_string(),
+                ipv4: true,
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(body).unwrap()["networks"],
+            json!([{"vpc": "nym-apps", "ipv4": true}])
+        );
+    }
+
+    #[test]
+    fn private_address_reads_the_named_network_and_survives_a_rename() {
+        let vm: FreestyleVm = serde_json::from_value(json!({
+            "id": "vm-1",
+            "state": "running",
+            "vpcs": [{
+                "ipv4": "10.45.62.7",
+                "vpcSlug": "nym-apps-renamed",
+                "vpcSlugAtAttach": "nym-apps"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            vm.private_address(Some("nym-apps")).as_deref(),
+            Some("10.45.62.7")
+        );
+        assert_eq!(vm.private_address(None).as_deref(), Some("10.45.62.7"));
+        assert_eq!(vm.private_address(Some("other")), None);
+    }
+
+    #[test]
+    fn a_vm_record_carrying_both_network_spellings_still_decodes() {
+        // A create answer lists the attachments twice, as `vpcs` and as `networks`.
+        let vm: FreestyleVm = serde_json::from_value(json!({
+            "id": "vm-1",
+            "state": "running",
+            "vpcs": [{"ipv4": "10.45.62.8", "vpcSlug": "nym-apps", "vpcSlugAtAttach": "nym-apps"}],
+            "networks": [{"ipv4": "10.45.62.8", "vpcSlug": "nym-apps", "vpcSlugAtAttach": "nym-apps"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            vm.private_address(Some("nym-apps")).as_deref(),
+            Some("10.45.62.8")
+        );
+    }
+
+    #[test]
+    fn a_vm_on_no_private_network_has_no_private_address() {
+        let vm: FreestyleVm =
+            serde_json::from_value(json!({"id": "vm-1", "state": "running"})).unwrap();
+        assert_eq!(vm.private_address(Some("nym-apps")), None);
+        assert_eq!(vm.private_address(None), None);
     }
 
     #[test]
