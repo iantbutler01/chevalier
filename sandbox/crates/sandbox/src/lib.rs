@@ -294,6 +294,8 @@ pub struct FreestyleBackendConfig {
     /// Guest user for exec and shells; `None` is the image default (uid 1000, else root).
     pub linux_user: Option<String>,
     pub egress_allowlist: Option<Vec<String>>,
+    /// Exact service endpoints retained when a persistent VM is reused.
+    pub required_egress_domains: Vec<String>,
     /// Shared-mount launch templates keyed by mount tag, guest path, or backend profile.
     pub shared_mounts: HashMap<String, ManagedMountConfig>,
 }
@@ -313,6 +315,7 @@ impl Default for FreestyleBackendConfig {
             snapshot_auto_delete_secs: None,
             linux_user: None,
             egress_allowlist: None,
+            required_egress_domains: Vec::new(),
             shared_mounts: HashMap::new(),
         }
     }

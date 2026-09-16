@@ -190,16 +190,20 @@ impl FreestyleControl {
             .get("chevalier.requested_session_id")
             .map(|value| session_slug(value));
         let display_name = metadata.get(META_NAME).cloned();
+        let mut effective_egress = egress_allowlist.or_else(|| self.cfg.egress_allowlist.clone());
+        if let Some(domains) = effective_egress.as_mut() {
+            domains.extend(self.cfg.required_egress_domains.iter().cloned());
+            domains.sort();
+            domains.dedup();
+        }
         let body = CreateVmBody {
             reassign_slug: slug.is_some() && !self.cfg.require_persistent,
             snapshot_id,
             slug,
             display_name,
             metadata: metadata_within_limits(metadata),
-            firewall: FirewallSpec::for_egress(
-                egress_allowlist.or_else(|| self.cfg.egress_allowlist.clone()),
-            ),
-            tls: TlsSpec::for_egress_domains(self.cfg.egress_allowlist.as_deref()),
+            firewall: FirewallSpec::for_egress(effective_egress.clone()),
+            tls: TlsSpec::for_egress_domains(effective_egress.as_deref()),
             idle_timeout_seconds: self.cfg.idle_timeout_secs.map(|value| value as i64),
             auto_delete_seconds: self.cfg.auto_delete_secs.map(|value| value as i64),
             automatic_restart: Some(true),
@@ -295,6 +299,9 @@ impl FreestyleControl {
 
     pub(crate) async fn vm_action(&self, vm_id: &str, action: FreestyleVmAction) -> Result<i32> {
         self.ensure_retention(vm_id).await?;
+        if action == FreestyleVmAction::Start {
+            self.ensure_required_egress(vm_id).await?;
+        }
         let mut current = self.get_sandbox(vm_id).await?;
         if current.state == FreestyleVmState::Pausing {
             current = self.wait_for_state(vm_id, FreestyleVmState::Paused).await?;
@@ -950,6 +957,45 @@ impl FreestyleControl {
             })
     }
 
+    /// Service endpoints are reconciled on reuse, because persistent VMs predate
+    /// newly required endpoints. No L3 Internet grant or wildcard is introduced.
+    async fn ensure_required_egress(&self, vm_id: &str) -> Result<()> {
+        for domain in &self.cfg.required_egress_domains {
+            let response = self
+                .send(
+                    self.client
+                        .get(self.url("/v5/tls"))
+                        .query(&[("domain", domain.as_str())]),
+                )
+                .await?;
+            let existing: ListTlsRulesResponse =
+                decode_json(response, "list egress tls rules").await?;
+            if existing.rules.iter().any(|rule| {
+                rule.domain == *domain
+                    && rule.source.vm_id.as_deref() == Some(vm_id)
+                    && rule.destination.public == Some(true)
+            }) {
+                continue;
+            }
+            let body = CreateTlsRuleBody {
+                action: "allow",
+                domain: domain.clone(),
+                source: TlsEndpoint {
+                    vm_id: Some(vm_id.to_string()),
+                    ..TlsEndpoint::default()
+                },
+                destination: TlsEndpoint::public(),
+                protocol: "http",
+                forward_auth: None,
+            };
+            let response = self
+                .send(self.client.post(self.url("/v5/tls")).json(&body))
+                .await?;
+            let _: TlsRule = decode_json(response, "create required egress tls rule").await?;
+        }
+        Ok(())
+    }
+
     // ----- ingress / preview -----
 
     /// Public HTTPS entry to a guest port. Freestyle terminates TLS at its edge and
@@ -1405,7 +1451,7 @@ impl TlsSpec {
                 domain: domain.clone(),
                 source: TlsEndpoint::default(),
                 destination: TlsEndpoint::public(),
-                protocol: "tcp",
+                protocol: "http",
                 forward_auth: None,
             })
             .collect();
@@ -1463,6 +1509,8 @@ struct TlsRule {
     #[allow(dead_code)]
     id: String,
     domain: String,
+    #[serde(default)]
+    source: TlsEndpoint,
     destination: TlsEndpoint,
 }
 
@@ -1926,6 +1974,7 @@ mod tests {
         let tls = TlsSpec::for_egress_domains(allow.as_deref()).unwrap();
         assert_eq!(tls.rules.len(), 1);
         assert_eq!(tls.rules[0].domain, "api.openai.com");
+        assert_eq!(tls.rules[0].protocol, "http", "tcp is public ingress only");
         assert_eq!(
             serde_json::to_value(&tls.rules[0]).unwrap()["destination"],
             json!({"public": true})
