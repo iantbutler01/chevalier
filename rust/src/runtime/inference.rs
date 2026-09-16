@@ -663,6 +663,15 @@ fn create_inference_client_with_config(
         }
         "openrouter" => {
             let mut client = OpenRouterClient::new(key, model_name, None, None);
+            // `@server_url=` names the OpenRouter API base (for example the US-only
+            // `https://us.openrouter.ai/api/v1`); OPENROUTER_BASE_URL does the same for
+            // every call in the process.
+            if let Some(base) = server_url
+                .clone()
+                .or_else(|| std::env::var("OPENROUTER_BASE_URL").ok())
+            {
+                client = client.with_api_base(base);
+            }
             if let Some(upstreams) = parsed.openrouter_providers {
                 client = client.with_upstream_providers(upstreams);
             }
@@ -683,6 +692,12 @@ fn create_inference_client_with_config(
         }
         "openrouter-responses" => {
             let mut client = OpenRouterResponsesClient::new(key, model_name, None, None);
+            if let Some(base) = server_url
+                .clone()
+                .or_else(|| std::env::var("OPENROUTER_BASE_URL").ok())
+            {
+                client = client.with_api_base(base);
+            }
             if let Some(r) = reasoning {
                 client = client.with_reasoning(r);
             }

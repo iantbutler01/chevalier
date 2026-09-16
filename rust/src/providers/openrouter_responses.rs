@@ -46,6 +46,16 @@ impl OpenRouterResponsesClient {
         Self { inner }
     }
 
+    /// Route through another OpenRouter API base, such as the US-only
+    /// `https://us.openrouter.ai/api/v1`; the responses path is appended.
+    pub fn with_api_base(mut self, base: impl Into<String>) -> Self {
+        let base = base.into();
+        self.inner = self
+            .inner
+            .with_api_url(format!("{}/responses", base.trim_end_matches('/')));
+        self
+    }
+
     /// Set reasoning mode
     pub fn with_reasoning(mut self, reasoning: impl Into<String>) -> Self {
         self.inner = self.inner.with_reasoning(reasoning);
