@@ -283,6 +283,9 @@ pub struct FreestyleBackendConfig {
     pub vpc: Option<String>,
     /// Pause after this many seconds without network activity; `None` never pauses.
     pub idle_timeout_secs: Option<u64>,
+    /// Require indefinite VM retention, including on accounts with plan retention caps.
+    #[serde(default)]
+    pub require_persistent: bool,
     /// Delete a VM once it has sat stopped/paused this long; `None` keeps it. Never 0 for
     /// sessions: Freestyle refuses to pause an ephemeral VM, so idle pause would fail.
     pub auto_delete_secs: Option<u64>,
@@ -305,6 +308,7 @@ impl Default for FreestyleBackendConfig {
             forward_auth_id: None,
             vpc: None,
             idle_timeout_secs: None,
+            require_persistent: false,
             auto_delete_secs: None,
             snapshot_auto_delete_secs: None,
             linux_user: None,
@@ -4388,6 +4392,27 @@ impl Sandbox {
     /// start, or discard; ordinary `attach_session` retains its ready-to-execute contract.
     pub async fn attach_session_passive(&self, session_id: &str) -> Result<Session> {
         let started = Instant::now();
+        if let ControlBackend::Managed(ManagedControl::Freestyle(control)) =
+            &self.inner.control_backend
+        {
+            let provider_id = self.managed_provider_session_id(session_id).await;
+            let vm = match control.get_sandbox(&provider_id).await {
+                Ok(vm) => vm,
+                Err(SandboxError::SessionNotFound(_)) if provider_id == session_id => control
+                    .find_by_session_id(session_id)
+                    .await?
+                    .ok_or_else(|| SandboxError::SessionNotFound(session_id.to_string()))?,
+                Err(error) => return Err(error),
+            };
+            return Ok(Session::new_with_backend(
+                self.clone(),
+                session_id.to_string(),
+                vm.id,
+                control.api_url().to_string(),
+                None,
+                Vec::new(),
+            ));
+        }
         if matches!(&self.inner.control_backend, ControlBackend::Managed(_)) {
             return self.attach_session(session_id).await;
         }
@@ -6211,10 +6236,10 @@ impl Sandbox {
         // from opening one TCP connection per file before the first connects.
         let cache_key = ready_key(endpoint, vm_id);
         let mut channels = self.inner.portproxy_channels.lock().await;
-        if let Some(entry) = channels.get(&cache_key) {
-            if entry.endpoint == rpc_endpoint {
-                return Arc::clone(entry);
-            }
+        if let Some(entry) = channels.get(&cache_key)
+            && entry.endpoint == rpc_endpoint
+        {
+            return Arc::clone(entry);
         }
         let entry = Arc::new(PortproxyChannelEntry {
             endpoint: rpc_endpoint.to_string(),
