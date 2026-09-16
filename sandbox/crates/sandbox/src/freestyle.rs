@@ -60,6 +60,10 @@ pub(crate) struct FreestyleControl {
 pub(crate) struct FreestyleVm {
     pub id: String,
     pub state: FreestyleVmState,
+    #[serde(default, rename = "autoDeleteSeconds")]
+    auto_delete_seconds: Option<u64>,
+    #[serde(default, rename = "ttlSeconds")]
+    ttl_seconds: Option<u64>,
     #[serde(default)]
     pub metadata: HashMap<String, String>,
     #[serde(default)]
@@ -138,6 +142,11 @@ impl FreestyleControl {
                     .to_string(),
             ));
         }
+        if cfg.require_persistent && cfg.auto_delete_secs.is_some() {
+            return Err(SandboxError::InvalidConfig(
+                "persistent Freestyle computers cannot set FREESTYLE_AUTO_DELETE_SECS".to_string(),
+            ));
+        }
         cfg.snapshot_id = cfg.snapshot_id.trim().to_string();
         cfg.preview_domain_suffix = cfg
             .preview_domain_suffix
@@ -182,7 +191,7 @@ impl FreestyleControl {
             .map(|value| session_slug(value));
         let display_name = metadata.get(META_NAME).cloned();
         let body = CreateVmBody {
-            reassign_slug: slug.is_some(),
+            reassign_slug: slug.is_some() && !self.cfg.require_persistent,
             snapshot_id,
             slug,
             display_name,
@@ -204,6 +213,7 @@ impl FreestyleControl {
             .await?;
         let vm: FreestyleVm = decode_json(response, "create vm").await?;
         let bootstrap = async {
+            self.validate_retention(&vm)?;
             if let Some(resources) = resources {
                 self.resize(&vm.id, &resources).await?;
             }
@@ -220,6 +230,51 @@ impl FreestyleControl {
     pub(crate) async fn get_sandbox(&self, vm_id: &str) -> Result<FreestyleVm> {
         let response = self.send(self.client.get(self.vm_url(vm_id, ""))).await?;
         decode_json(response, "get vm").await
+    }
+
+    fn validate_retention(&self, vm: &FreestyleVm) -> Result<()> {
+        if self.cfg.require_persistent
+            && (vm.auto_delete_seconds.is_some() || vm.ttl_seconds.is_some())
+        {
+            return Err(SandboxError::InvalidConfig(format!(
+                "Freestyle VM {} has a deletion deadline; indefinite retention is required (check the account plan)",
+                vm.id,
+            )));
+        }
+        Ok(())
+    }
+
+    async fn ensure_retention(&self, vm_id: &str) -> Result<()> {
+        if !self.cfg.require_persistent {
+            return Ok(());
+        }
+        let response = self.send(self.client.patch(self.vm_url(vm_id, "")).json(
+            &serde_json::json!({
+                "autoDeleteSeconds": -1,
+                "ttlSeconds": -1,
+                "idleTimeoutSeconds": self.cfg.idle_timeout_secs.map_or(-1, |seconds| seconds as i64),
+            }),
+        )).await?;
+        let vm: FreestyleVm = decode_json(response, "set persistent retention").await?;
+        self.validate_retention(&vm)
+    }
+
+    async fn wait_for_state(&self, vm_id: &str, state: FreestyleVmState) -> Result<FreestyleVm> {
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                let vm = self.get_sandbox(vm_id).await?;
+                if vm.state == state {
+                    return Ok(vm);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            SandboxError::DaemonUnavailable(format!(
+                "Freestyle VM {vm_id} did not reach {state:?} within 120s"
+            ))
+        })?
     }
 
     pub(crate) async fn delete_sandbox(&self, vm_id: &str) -> Result<()> {
@@ -239,18 +294,44 @@ impl FreestyleControl {
     }
 
     pub(crate) async fn vm_action(&self, vm_id: &str, action: FreestyleVmAction) -> Result<i32> {
+        self.ensure_retention(vm_id).await?;
+        let mut current = self.get_sandbox(vm_id).await?;
+        if current.state == FreestyleVmState::Pausing {
+            current = self.wait_for_state(vm_id, FreestyleVmState::Paused).await?;
+        }
+        if (action == FreestyleVmAction::Start && current.state == FreestyleVmState::Running)
+            || (action == FreestyleVmAction::Pause
+                && matches!(
+                    current.state,
+                    FreestyleVmState::Paused | FreestyleVmState::Stopped
+                ))
+            || (action == FreestyleVmAction::Stop && current.state == FreestyleVmState::Stopped)
+        {
+            return Ok(current.state.as_proto_state());
+        }
+        if current.state == FreestyleVmState::Starting {
+            let vm = self
+                .wait_for_state(vm_id, FreestyleVmState::Running)
+                .await?;
+            if action == FreestyleVmAction::Start {
+                return Ok(vm.state.as_proto_state());
+            }
+        }
         let vm = match action {
             FreestyleVmAction::Start => {
                 let response = self
                     .send(self.client.post(self.vm_url(vm_id, "/start")))
                     .await?;
-                decode_json::<FreestyleVm>(response, "start vm").await?
+                decode_json::<FreestyleVm>(response, "start vm").await?;
+                self.wait_for_state(vm_id, FreestyleVmState::Running)
+                    .await?
             }
             FreestyleVmAction::Pause => {
                 let response = self
                     .send(self.client.post(self.vm_url(vm_id, "/pause")))
                     .await?;
-                decode_json::<FreestyleVm>(response, "pause vm").await?
+                decode_json::<FreestyleVm>(response, "pause vm").await?;
+                self.wait_for_state(vm_id, FreestyleVmState::Paused).await?
             }
             FreestyleVmAction::Stop => {
                 // There is no stop endpoint: the guest powers itself off. The command
@@ -265,7 +346,8 @@ impl FreestyleControl {
                         Some(ROOT_USER),
                     )
                     .await;
-                self.get_sandbox(vm_id).await?
+                self.wait_for_state(vm_id, FreestyleVmState::Stopped)
+                    .await?
             }
         };
         Ok(vm.state.as_proto_state())
@@ -273,15 +355,9 @@ impl FreestyleControl {
 
     /// Resume a paused VM or boot a stopped one; a running VM is left alone.
     pub(crate) async fn ensure_running(&self, vm_id: &str) -> Result<()> {
-        let vm = self.get_sandbox(vm_id).await?;
-        match vm.state {
-            FreestyleVmState::Running | FreestyleVmState::Starting => Ok(()),
-            FreestyleVmState::Paused | FreestyleVmState::Pausing | FreestyleVmState::Stopped => {
-                self.vm_action(vm_id, FreestyleVmAction::Start)
-                    .await
-                    .map(|_| ())
-            }
-        }
+        self.vm_action(vm_id, FreestyleVmAction::Start)
+            .await
+            .map(|_| ())
     }
 
     pub(crate) async fn list_sessions(&self) -> Result<Vec<crate::SessionInfo>> {
@@ -1565,6 +1641,155 @@ mod tests {
     use super::*;
     use crate::{SharedMountAvailability, SharedMountContinuity};
     use serde_json::json;
+
+    #[test]
+    fn persistent_computers_reject_expiration_and_plan_caps() {
+        assert!(
+            FreestyleControl::new(FreestyleBackendConfig {
+                api_key: "test".into(),
+                require_persistent: true,
+                auto_delete_secs: Some(3600),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        let control = FreestyleControl::new(FreestyleBackendConfig {
+            api_key: "test".into(),
+            require_persistent: true,
+            ..Default::default()
+        })
+        .unwrap();
+        for deadline in [
+            json!({"autoDeleteSeconds": 0}),
+            json!({"autoDeleteSeconds": 3600}),
+            json!({"ttlSeconds": 7200}),
+        ] {
+            let mut record = json!({"id": "vm-test", "state": "running"});
+            record
+                .as_object_mut()
+                .unwrap()
+                .extend(deadline.as_object().unwrap().clone());
+            let vm = serde_json::from_value(record).unwrap();
+            assert!(control.validate_retention(&vm).is_err());
+        }
+        let vm = serde_json::from_value(json!({"id": "vm-test", "state": "paused"})).unwrap();
+        control.validate_retention(&vm).unwrap();
+    }
+
+    /// Only creates and mutates its own VM and network. Opt in with the named env var.
+    #[tokio::test]
+    async fn persistent_computer_live_lifecycle() {
+        if std::env::var("NYM_FREESTYLE_LIFECYCLE_LIVE").as_deref() != Ok("1") {
+            return;
+        }
+        use crate::{SandboxConfig, SandboxProviderConfig, SessionOptions};
+        use futures::FutureExt;
+        let slug = format!("nym-lifecycle-{}", Uuid::new_v4().simple());
+        let cfg = FreestyleBackendConfig {
+            api_key: std::env::var("FREESTYLE_API_KEY").expect("live API key"),
+            require_persistent: true,
+            snapshot_id: "nym-desktop".into(),
+            vpc: Some(slug.clone()),
+            ..Default::default()
+        };
+        let control = FreestyleControl::new(cfg.clone()).unwrap();
+        let sandbox_config = SandboxConfig {
+            provider: SandboxProviderConfig::Freestyle(cfg),
+            prewarm_on_start: false,
+            ..Default::default()
+        };
+        let sandbox = Sandbox::new(sandbox_config.clone()).await.unwrap();
+        let session = sandbox
+            .session(SessionOptions {
+                session_id: Some(slug.clone()),
+                name: Some(slug.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let vm_id = session.vm_id().to_string();
+        eprintln!("scratch VM {vm_id}, network {slug}");
+        let proof = std::panic::AssertUnwindSafe(async {
+            let marker = control.exec_await(&vm_id,
+                "echo persistent-computer > /root/nym-lifecycle-proof; cat /proc/sys/kernel/random/boot_id",
+                None, Some(30_000), None, Some(ROOT_USER)).await.unwrap();
+            assert_eq!(marker.status_code, Some(0));
+            let private_address = session.provider_private_address().await.unwrap();
+            assert!(private_address.is_some());
+            let preview = session.provider_preview_url(8080).await.unwrap();
+            let setup = control.exec_await(&vm_id,
+                "printf 'NYM_STREAMD_PROXY_TOKEN=lifecycle-proof\\n' > /home/nym/.config/nym-streamd/runtime.env; pkill -x streamd; for i in $(seq 1 30); do curl -fsS -H 'x-nym-streamd-token: lifecycle-proof' http://127.0.0.1:8080/api/local/health && exit 0; sleep 1; done; exit 1",
+                None, Some(45_000), None, Some(ROOT_USER)).await.unwrap();
+            assert_eq!(setup.status_code, Some(0), "stream setup: {:?}", setup.stderr);
+            let health = format!("{preview}/api/local/health");
+            let response = control.client.get(&health).header("x-nym-streamd-token", "lifecycle-proof").send().await.unwrap();
+            assert!(response.status().is_success(), "stream health: {}", response.status());
+
+            let paused = session.pause().await.unwrap();
+            assert_eq!(paused, crate::proto::vmd::v1::VmState::Paused as i32);
+            // A new process and passive attach must not wake the machine.
+            let fresh = Sandbox::new(sandbox_config.clone()).await.unwrap();
+            let passive = fresh.attach_session_passive(&vm_id).await.unwrap();
+            assert_eq!(passive.state().await.unwrap(), paused);
+            assert_eq!(passive.pause().await.unwrap(), paused);
+            let resumed = fresh.attach_session(&vm_id).await.unwrap();
+            assert_eq!(resumed.vm_id(), vm_id);
+            let output = control.exec_await(&vm_id,
+                "cat /root/nym-lifecycle-proof; cat /proc/sys/kernel/random/boot_id",
+                None, Some(30_000), None, Some(ROOT_USER)).await.unwrap();
+            assert_eq!(output.status_code, Some(0));
+            assert_eq!(output.stdout, Some(format!("persistent-computer\n{}", marker.stdout.unwrap())));
+            assert_eq!(resumed.provider_private_address().await.unwrap(), private_address);
+            assert_eq!(resumed.provider_preview_url(8080).await.unwrap(), preview);
+            assert!(control.client.get(&health).header("x-nym-streamd-token", "lifecycle-proof").send().await.unwrap().status().is_success());
+            // A retry cannot take the slug and leave another machine running.
+            let mut retry_config = sandbox_config.clone();
+            if let SandboxProviderConfig::Freestyle(config) = &mut retry_config.provider {
+                config.vpc = None;
+            }
+            let retry = Sandbox::new(retry_config).await.unwrap();
+            assert!(retry.session(SessionOptions {
+                session_id: Some(slug.clone()), ..Default::default()
+            }).await.is_err());
+            assert_eq!(control.find_by_session_id(&slug).await.unwrap().unwrap().id, vm_id);
+            // Remove old deployment deadlines before pausing an existing machine.
+            control.send(control.client.patch(control.vm_url(&vm_id, "")).json(
+                &json!({"autoDeleteSeconds": 3600, "idleTimeoutSeconds": 3600, "ttlSeconds": 7200})
+            )).await.unwrap();
+            resumed.pause().await.unwrap();
+            let vm = control.get_sandbox(&vm_id).await.unwrap();
+            assert_eq!(vm.state, FreestyleVmState::Paused);
+            assert_eq!(vm.auto_delete_seconds, None);
+            assert_eq!(vm.ttl_seconds, None);
+        }).catch_unwind().await;
+        control.delete_sandbox(&vm_id).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let response = control
+                    .client
+                    .delete(control.url(&format!("/v5/vpcs/{slug}")))
+                    .bearer_auth(&control.cfg.api_key)
+                    .send()
+                    .await
+                    .unwrap();
+                if response.status().is_success() {
+                    break;
+                }
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        })
+        .await
+        .expect("network reservations must release after VM deletion");
+        assert!(matches!(
+            control.get_sandbox(&vm_id).await,
+            Err(SandboxError::SessionNotFound(_))
+        ));
+        eprintln!("deleted scratch VM {vm_id} and network {slug}");
+        if let Err(panic) = proof {
+            std::panic::resume_unwind(panic);
+        }
+    }
 
     fn shared_mount() -> SharedMount {
         SharedMount {
