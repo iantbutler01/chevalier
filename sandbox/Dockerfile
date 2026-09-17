@@ -27,9 +27,10 @@ ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PROXY_BIN=/opt/chevalier/portproxy/bin
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates cryptsetup-bin docker.io docker-buildx dosfstools e2fsprogs extlinux fdisk fuse3 \
+    ca-certificates cryptsetup-bin docker.io docker-buildx dosfstools e2fsprogs fdisk fuse3 \
     iproute2 iptables kpartx parted qemu-system-x86 qemu-system-arm qemu-efi-aarch64 \
     qemu-utils util-linux virtiofsd \
+    && if [ "$TARGETARCH" = "amd64" ]; then apt-get install -y --no-install-recommends extlinux; fi \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /out/vmd /out/vmdctl /usr/local/bin/
 COPY --from=builder /out/portproxy /opt/chevalier/portproxy/bin/portproxy-linux-${TARGETARCH}
