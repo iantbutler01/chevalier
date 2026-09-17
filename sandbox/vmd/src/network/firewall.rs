@@ -10,6 +10,8 @@ use tracing::warn;
 
 use crate::config::Config;
 
+pub(super) const LAN_EGRESS_MARK: u32 = 0x4000;
+
 const FILTER_TABLE: &str = "filter";
 const CHAIN_NAME: &str = "CHEVALIER_QEMU_EGRESS";
 const ACCOUNT_CHAIN_NAME: &str = "CHEVALIER_QEMU_ACCOUNT";
@@ -662,6 +664,25 @@ fn install_service_private_egress_rules(
             ensure_service_dns_allow_rule(service, cgroup_path, dns_addr, protocol)?;
         }
     }
+    for cidr in PRIVATE_RANGES {
+        if !Command::new("iptables")
+            .args(service_lan_allow_rule_args(
+                "-C",
+                service,
+                cgroup_path,
+                cidr,
+            ))
+            .status()?
+            .success()
+        {
+            run_iptables(service_lan_allow_rule_args(
+                "-I",
+                service,
+                cgroup_path,
+                cidr,
+            ))?;
+        }
+    }
     for cidr in RESOLVED_IP_BLOCK_RANGES {
         ensure_service_private_drop_rule(service, cgroup_path, cidr)?;
     }
@@ -675,6 +696,16 @@ fn remove_service_private_egress_rules(
 ) -> Result<()> {
     if !cfg!(target_os = "linux") || unsafe { libc::geteuid() } != 0 {
         return Ok(());
+    }
+    for cidr in PRIVATE_RANGES {
+        let _ = Command::new("iptables")
+            .args(service_lan_allow_rule_args(
+                "-D",
+                service,
+                cgroup_path,
+                cidr,
+            ))
+            .status()?;
     }
     for cidr in RESOLVED_IP_BLOCK_RANGES {
         let _ = Command::new("iptables")
@@ -833,6 +864,25 @@ fn service_established_allow_rule_args(
         "-j".to_string(),
         "ACCEPT".to_string(),
     ]
+}
+
+fn service_lan_allow_rule_args(
+    operation: &'static str,
+    service: &str,
+    cgroup_path: &str,
+    cidr: &str,
+) -> Vec<String> {
+    let mut args = service_private_drop_rule_args(operation, service, cgroup_path, cidr);
+    args.truncate(args.len() - 2);
+    args.extend([
+        "-m".into(),
+        "mark".into(),
+        "--mark".into(),
+        LAN_EGRESS_MARK.to_string(),
+        "-j".into(),
+        "ACCEPT".into(),
+    ]);
+    args
 }
 
 fn service_private_drop_rule_args(
@@ -1720,5 +1770,20 @@ mod tests {
             parse_counter_for_comment(contents, ACCOUNT_CHAIN_NAME, "chevalier-vm-bytes:vm-1"),
             Some((34, 5678))
         );
+    }
+    #[test]
+    fn lan_exception_requires_both_service_identity_and_opt_in_mark() {
+        let args = service_lan_allow_rule_args("-I", "envoy", "services/envoy", "192.168.0.0/16");
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--path", "services/envoy"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--mark", LAN_EGRESS_MARK.to_string().as_str()])
+        );
+        assert!(args.windows(2).any(|pair| pair == ["-d", "192.168.0.0/16"]));
+        assert!(args.ends_with(&["-j".into(), "ACCEPT".into()]));
+        assert_eq!(LAN_EGRESS_MARK & 1, 0);
     }
 }

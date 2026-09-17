@@ -270,6 +270,22 @@ fn install_capture_rules(spec: &VmTapNetworkSpec) -> Result<()> {
     let gateway_ip = spec.gateway_ip.to_string();
     let envoy_port = spec.envoy_port.to_string();
     let dns_port = POLICY_DNS_PORT.to_string();
+    iptables(
+        &[
+            "-t",
+            "mangle",
+            "-A",
+            "PREROUTING",
+            "-i",
+            tap,
+            "!",
+            "-s",
+            &spec.guest_ip.to_string(),
+            "-j",
+            "DROP",
+        ],
+        "reject spoofed tap source addresses",
+    )?;
 
     iptables(
         &[

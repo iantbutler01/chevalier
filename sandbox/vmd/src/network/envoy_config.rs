@@ -11,6 +11,7 @@ use super::{FALLBACK_THREAT_HOSTS, VmProxyListener, VmProxyPolicyConfig};
 
 const ENVOY_CLUSTER_NAME: &str = "dynamic_forward_proxy_cluster";
 const ENVOY_ORIGINAL_DST_CLUSTER_NAME: &str = "original_dst_cluster";
+const ENVOY_LAN_CLUSTER_NAME: &str = "original_dst_lan_cluster";
 const ENVOY_DNS_CACHE_NAME: &str = "dynamic_forward_proxy_cache_config";
 
 pub(super) fn render(
@@ -68,6 +69,7 @@ impl Builder {
                 "clusters": [
                     self.dynamic_forward_proxy_cluster(),
                     original_dst_cluster(),
+                    lan_original_dst_cluster(),
                 ],
             },
         });
@@ -119,7 +121,11 @@ impl Builder {
         let mut filters = tcp_policy_filters(name, policy);
         filters.push(tcp_proxy_filter(
             name,
-            ENVOY_ORIGINAL_DST_CLUSTER_NAME,
+            if policy.is_some_and(|policy| policy.allow_lan) {
+                ENVOY_LAN_CLUSTER_NAME
+            } else {
+                ENVOY_ORIGINAL_DST_CLUSTER_NAME
+            },
             tcp_access_log_format(name, policy, vm_id),
             self.access_log_path.as_str(),
         ));
@@ -227,8 +233,22 @@ fn original_dst_cluster() -> Value {
     })
 }
 
+fn lan_original_dst_cluster() -> Value {
+    let mut cluster = original_dst_cluster();
+    cluster["name"] = json!(ENVOY_LAN_CLUSTER_NAME);
+    cluster["upstream_bind_config"] = json!({ "socket_options": [{
+        "description": "Opted-in VM LAN egress",
+        "level": 1, "name": 36, "int_value": super::firewall::LAN_EGRESS_MARK,
+        "state": "STATE_PREBIND"
+    }] });
+    cluster
+}
+
 fn tcp_policy_filters(name: &str, policy: Option<&VmProxyPolicyConfig>) -> Vec<Value> {
-    let mut filters = vec![tcp_system_deny_filter(name)];
+    let mut filters = vec![tcp_system_deny_filter(
+        name,
+        policy.is_some_and(|policy| policy.allow_lan),
+    )];
     if let Some(policy) = policy {
         if !policy.domain_blocklist.is_empty() {
             filters.push(tcp_sni_deny_filter(
@@ -249,7 +269,7 @@ fn tcp_policy_filters(name: &str, policy: Option<&VmProxyPolicyConfig>) -> Vec<V
     filters
 }
 
-fn tcp_system_deny_filter(name: &str) -> Value {
+fn tcp_system_deny_filter(name: &str, allow_lan: bool) -> Value {
     let mut permissions = Vec::new();
     for (address_prefix, prefix_len) in [
         ("10.0.0.0", 8_u8),
@@ -260,7 +280,14 @@ fn tcp_system_deny_filter(name: &str) -> Value {
         ("169.254.0.0", 16),
         ("198.18.0.0", 15),
     ] {
-        permissions.push(rbac_destination_ip_permission(address_prefix, prefix_len));
+        if !allow_lan
+            || !matches!(
+                address_prefix,
+                "10.0.0.0" | "172.16.0.0" | "192.168.0.0" | "100.64.0.0"
+            )
+        {
+            permissions.push(rbac_destination_ip_permission(address_prefix, prefix_len));
+        }
     }
     for port in [25_u16, 465, 587, 6667, 6697] {
         permissions.push(rbac_destination_port_permission(port));
@@ -691,6 +718,8 @@ mod tests {
         VmProxyListener {
             listen_addr: listen_addr.parse().expect("listen addr"),
             policy: VmProxyPolicyConfig {
+                allow_lan: false,
+                dns_servers: Vec::new(),
                 owner_id: Some("owner-123".to_string()),
                 domain_allowlist: Some(vec!["api.github.com".to_string()]),
                 domain_blocklist: vec!["bad.example".to_string()],
@@ -854,5 +883,37 @@ mod tests {
         assert!(value_contains_str(&parsed, r"svc\.cluster\.local"));
         assert!(value_contains_str(&parsed, r"cloudflare-dns\.com"));
         assert!(value_contains_str(&parsed, r"10\..*"));
+    }
+    #[test]
+    fn lan_opt_in_is_scoped_to_its_listener_and_cluster() {
+        let mut allowed = test_vm_proxy_listener("0.0.0.0:15001");
+        allowed.policy.allow_lan = true;
+        allowed.policy.domain_allowlist = None;
+        let listeners = BTreeMap::from([
+            ("allowed".into(), allowed),
+            ("blocked".into(), test_vm_proxy_listener("0.0.0.0:15002")),
+        ]);
+        let config = parse_envoy_config(&render(
+            None,
+            &listeners,
+            "127.0.0.1:9901".parse().unwrap(),
+            "127.0.0.1:15053".parse().unwrap(),
+            Path::new("/tmp/access.log"),
+        ));
+        let allowed = &config["static_resources"]["listeners"][0];
+        let blocked = &config["static_resources"]["listeners"][1];
+        assert!(!value_contains_str(allowed, "192.168.0.0"));
+        assert!(value_contains_str(blocked, "192.168.0.0"));
+        for reserved in ["127.0.0.0", "169.254.0.0", "198.18.0.0"] {
+            assert!(value_contains_str(allowed, reserved));
+        }
+        assert!(value_contains_str(allowed, ENVOY_LAN_CLUSTER_NAME));
+        assert!(!value_contains_str(blocked, ENVOY_LAN_CLUSTER_NAME));
+        let clusters = &config["static_resources"]["clusters"];
+        assert!(clusters[1].get("upstream_bind_config").is_none());
+        assert_eq!(
+            clusters[2]["upstream_bind_config"]["socket_options"][0]["int_value"],
+            json!(super::super::firewall::LAN_EGRESS_MARK)
+        );
     }
 }

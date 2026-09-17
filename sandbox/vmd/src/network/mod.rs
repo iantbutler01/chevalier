@@ -8,7 +8,7 @@ mod vm_counters;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
@@ -97,6 +97,7 @@ struct NetworkController {
     config: Config,
     firewall: Option<firewall::FirewallHandle>,
     coredns: Option<ManagedProcessHandle>,
+    coredns_views: BTreeMap<String, Vec<IpAddr>>,
     envoy: Option<ManagedProcessHandle>,
     vm_proxy_policies: BTreeMap<String, VmProxyListener>,
     vm_guardrails: BTreeMap<String, VmGuardrail>,
@@ -105,6 +106,10 @@ struct NetworkController {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmProxyPolicyConfig {
+    #[serde(default)]
+    pub allow_lan: bool,
+    #[serde(default)]
+    pub dns_servers: Vec<IpAddr>,
     #[serde(default)]
     pub owner_id: Option<String>,
     #[serde(default)]
@@ -120,6 +125,8 @@ pub struct VmProxyPolicyConfig {
 impl Default for VmProxyPolicyConfig {
     fn default() -> Self {
         Self {
+            allow_lan: false,
+            dns_servers: Vec::new(),
             owner_id: None,
             domain_allowlist: None,
             domain_blocklist: Vec::new(),
@@ -172,7 +179,7 @@ struct CounterDeltaEvent {
 pub async fn start(config: &Config) -> Result<Option<NetworkServicesHandle>> {
     let firewall = Some(firewall::install(config).context("install qemu guest firewall")?);
     let coredns = if needs_coredns(config) {
-        Some(start_coredns(config).await?)
+        Some(start_coredns(config, &BTreeMap::new()).await?)
     } else {
         None
     };
@@ -195,6 +202,7 @@ pub async fn start(config: &Config) -> Result<Option<NetworkServicesHandle>> {
         config: config.clone(),
         firewall,
         coredns,
+        coredns_views: BTreeMap::new(),
         envoy,
         vm_proxy_policies: BTreeMap::new(),
         vm_guardrails: BTreeMap::new(),
@@ -211,7 +219,10 @@ fn needs_coredns(config: &Config) -> bool {
         || config.guest_network.http_proxy_upstream_addr.is_some()
 }
 
-async fn start_coredns(config: &Config) -> Result<ManagedProcessHandle> {
+async fn start_coredns(
+    config: &Config,
+    policies: &BTreeMap<String, VmProxyListener>,
+) -> Result<ManagedProcessHandle> {
     let bind_addr = config
         .network_services
         .coredns_bind_addr
@@ -231,7 +242,7 @@ async fn start_coredns(config: &Config) -> Result<ManagedProcessHandle> {
     let config_path = work_dir.join("Corefile");
     let threat_hosts_path = resolve_coredns_threat_hosts_path(config, &work_dir).await?;
     let process_log_path = work_dir.join("process.log");
-    write_coredns_config(&config_path, bind_addr, &threat_hosts_path).await?;
+    write_coredns_config(&config_path, bind_addr, &threat_hosts_path, policies).await?;
 
     let process_log = tokio::fs::OpenOptions::new()
         .create(true)
@@ -259,14 +270,19 @@ async fn start_coredns(config: &Config) -> Result<ManagedProcessHandle> {
         )
     })?;
 
-    wait_for_listener(
+    if let Err(error) = wait_for_listener(
         bind_addr,
         &mut child,
         "coredns",
         COREDNS_READY_TIMEOUT,
         COREDNS_READY_POLL_INTERVAL,
     )
-    .await?;
+    .await
+    {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(error);
+    }
 
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
     let join = tokio::spawn(async move {
@@ -756,8 +772,9 @@ async fn write_coredns_config(
     path: &Path,
     bind_addr: SocketAddr,
     threat_hosts_path: &Path,
+    policies: &BTreeMap<String, VmProxyListener>,
 ) -> Result<()> {
-    let contents = render_coredns_config(bind_addr, threat_hosts_path);
+    let contents = render_coredns_config(bind_addr, threat_hosts_path, policies);
     write_text_file_atomic(path, &contents, "coredns config").await
 }
 
@@ -837,9 +854,29 @@ async fn write_text_file_atomic(path: &Path, contents: &str, label: &str) -> Res
     write_result
 }
 
-fn render_coredns_config(bind_addr: SocketAddr, threat_hosts_path: &Path) -> String {
-    format!(
-        r#".:{port} {{
+fn render_coredns_config(
+    bind_addr: SocketAddr,
+    threat_hosts_path: &Path,
+    policies: &BTreeMap<String, VmProxyListener>,
+) -> String {
+    let mut views = String::new();
+    for (vm_id, listener) in policies {
+        if listener.policy.dns_servers.is_empty() {
+            continue;
+        }
+        let guest_ip = tap::addressing_for_vm(vm_id).guest_ip;
+        let servers = listener
+            .policy
+            .dns_servers
+            .iter()
+            .map(|ip| SocketAddr::new(*ip, 53).to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        views.push_str(&format!(".:{} {{\n    bind {}\n    view vm_{} {{\n        expr client_ip() == '{}'\n    }}\n    hosts {} {{\n        fallthrough\n    }}\n    forward . {}\n    cache 30\n    errors\n}}\n", bind_addr.port(), bind_addr.ip(), guest_ip.to_string().replace('.', "_"), guest_ip, threat_hosts_path.display(), servers));
+    }
+    views
+        + &format!(
+            r#".:{port} {{
     bind {ip}
     hosts {threat_hosts_path} {{
         fallthrough
@@ -851,10 +888,10 @@ fn render_coredns_config(bind_addr: SocketAddr, threat_hosts_path: &Path) -> Str
     reload
 }}
 "#,
-        ip = bind_addr.ip(),
-        port = bind_addr.port(),
-        threat_hosts_path = threat_hosts_path.display(),
-    )
+            ip = bind_addr.ip(),
+            port = bind_addr.port(),
+            threat_hosts_path = threat_hosts_path.display(),
+        )
 }
 
 fn spawn_limit_enforcer(controller: Arc<tokio::sync::Mutex<Option<NetworkController>>>) {
@@ -1157,6 +1194,14 @@ pub async fn register_vm_proxy_policy(
     listen_addr: SocketAddr,
     policy: VmProxyPolicyConfig,
 ) -> Result<()> {
+    if policy.dns_servers.len() > 3
+        || policy
+            .dns_servers
+            .iter()
+            .any(|ip| ip.is_unspecified() || ip.is_multicast())
+    {
+        bail!("DNS servers must contain at most three unicast IP addresses");
+    }
     let Some(controller) = NETWORK_CONTROLLER.get() else {
         return Ok(());
     };
@@ -1164,6 +1209,14 @@ pub async fn register_vm_proxy_policy(
     let Some(state) = guard.as_mut() else {
         return Ok(());
     };
+    let guest_ip = tap::addressing_for_vm(vm_id).guest_ip;
+    if state
+        .vm_proxy_policies
+        .keys()
+        .any(|id| id != vm_id && tap::addressing_for_vm(id).guest_ip == guest_ip)
+    {
+        bail!("VM network address collides with an existing VM");
+    }
     let max_connections_per_minute = policy.max_connections_per_minute;
     let bandwidth_cap_mb_per_hour = policy.bandwidth_cap_mb_per_hour;
     let mut next_policies = state.vm_proxy_policies.clone();
@@ -1174,10 +1227,11 @@ pub async fn register_vm_proxy_policy(
             policy,
         },
     );
-    if state.coredns.is_none() {
-        state.coredns = Some(start_coredns(&state.config).await?);
+    restart_coredns_locked(state, &next_policies).await?;
+    if let Err(error) = restart_envoy_locked(state, &next_policies).await {
+        restart_coredns_locked(state, &state.vm_proxy_policies.clone()).await?;
+        return Err(error);
     }
-    restart_envoy_locked(state, &next_policies).await?;
     state.vm_proxy_policies = next_policies;
     state
         .vm_guardrails
@@ -1312,7 +1366,11 @@ pub async fn unregister_vm_proxy_policy(vm_id: &str) -> Result<()> {
     if removed_listener.is_some() {
         let mut next_policies = state.vm_proxy_policies.clone();
         next_policies.remove(vm_id);
-        restart_envoy_locked(state, &next_policies).await?;
+        restart_coredns_locked(state, &next_policies).await?;
+        if let Err(error) = restart_envoy_locked(state, &next_policies).await {
+            restart_coredns_locked(state, &state.vm_proxy_policies.clone()).await?;
+            return Err(error);
+        }
         state.vm_proxy_policies = next_policies;
     }
     let removed_guardrail = state.vm_guardrails.remove(vm_id);
@@ -1401,6 +1459,34 @@ pub async fn vm_proxy_activity_snapshot(
     Ok(Some(activity_snapshot))
 }
 
+async fn restart_coredns_locked(
+    state: &mut NetworkController,
+    policies: &BTreeMap<String, VmProxyListener>,
+) -> Result<()> {
+    let views = policies
+        .iter()
+        .filter(|(_, listener)| !listener.policy.dns_servers.is_empty())
+        .map(|(id, listener)| (id.clone(), listener.policy.dns_servers.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if state.coredns.is_some() && state.coredns_views == views {
+        return Ok(());
+    }
+    if let Some(handle) = state.coredns.take() {
+        handle.shutdown().await;
+    }
+    match start_coredns(&state.config, policies).await {
+        Ok(handle) => {
+            state.coredns = Some(handle);
+            state.coredns_views = views;
+            Ok(())
+        }
+        Err(error) => {
+            state.coredns = Some(start_coredns(&state.config, &state.vm_proxy_policies).await?);
+            Err(error)
+        }
+    }
+}
+
 async fn restart_envoy_locked(
     state: &mut NetworkController,
     vm_proxy_policies: &BTreeMap<String, VmProxyListener>,
@@ -1428,6 +1514,8 @@ mod tests {
         VmProxyListener {
             listen_addr: listen_addr.parse().expect("listen addr"),
             policy: VmProxyPolicyConfig {
+                allow_lan: false,
+                dns_servers: Vec::new(),
                 owner_id: Some("owner-123".to_string()),
                 domain_allowlist: Some(vec!["api.github.com".to_string()]),
                 domain_blocklist: vec!["bad.example".to_string()],
@@ -1513,6 +1601,7 @@ mod tests {
         let rendered = render_coredns_config(
             "127.0.0.53:53".parse().expect("bind addr"),
             Path::new("/tmp/threat-domains.hosts"),
+            &BTreeMap::new(),
         );
         assert!(rendered.contains(".:53"));
         assert!(rendered.contains("bind 127.0.0.53"));
@@ -1604,5 +1693,80 @@ mod tests {
         };
 
         assert!(!limit_snapshot_has_activity(&idle_snapshot));
+    }
+    #[test]
+    fn project_dns_views_precede_public_fallback_and_preserve_defaults() {
+        let legacy: VmProxyPolicyConfig = serde_json::from_str(
+            r#"{"bandwidth_cap_mb_per_hour":1,"max_connections_per_minute":2}"#,
+        )
+        .unwrap();
+        assert!(!legacy.allow_lan);
+        assert!(legacy.dns_servers.is_empty());
+        let mut listener = test_vm_proxy_listener("0.0.0.0:15001");
+        listener.policy.dns_servers = vec![
+            "10.0.0.53".parse().unwrap(),
+            "2001:db8::53".parse().unwrap(),
+        ];
+        let policies = BTreeMap::from([("project-vm".into(), listener)]);
+        let config = render_coredns_config(
+            "0.0.0.0:15053".parse().unwrap(),
+            Path::new("/tmp/hosts"),
+            &policies,
+        );
+        assert!(config.contains(&format!(
+            "client_ip() == '{}'",
+            tap::addressing_for_vm("project-vm").guest_ip
+        )));
+        assert!(config.contains("forward . 10.0.0.53:53 [2001:db8::53]:53"));
+        assert!(
+            config.find("view vm_").unwrap() < config.find("forward . 1.1.1.1 8.8.8.8").unwrap()
+        );
+    }
+
+    #[test]
+    #[ignore = "exports configuration for the isolated network integration harness"]
+    fn export_project_network_fixture() {
+        let root = std::path::PathBuf::from(
+            std::env::var("CHEVALIER_NETWORK_FIXTURE_DIR").expect("fixture directory"),
+        );
+        std::fs::create_dir_all(&root).unwrap();
+        let mut policies = BTreeMap::new();
+        for (id, port, allow_lan, dns) in [
+            ("allowed", 15001, true, "127.0.0.2"),
+            ("blocked", 15002, false, "127.0.0.3"),
+        ] {
+            policies.insert(
+                id.into(),
+                VmProxyListener {
+                    listen_addr: format!("0.0.0.0:{port}").parse().unwrap(),
+                    policy: VmProxyPolicyConfig {
+                        allow_lan,
+                        dns_servers: vec![dns.parse().unwrap()],
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        std::fs::write(
+            root.join("envoy.json"),
+            envoy_config::render(
+                None,
+                &policies,
+                "127.0.0.1:9901".parse().unwrap(),
+                "127.0.0.1:15053".parse().unwrap(),
+                Path::new("/tmp/envoy-access.log"),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Corefile"),
+            render_coredns_config(
+                "0.0.0.0:15053".parse().unwrap(),
+                Path::new("/tmp/threat-hosts"),
+                &policies,
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("clients.json"), serde_json::to_vec(&serde_json::json!({"allowed":tap::addressing_for_vm("allowed").guest_ip.to_string(),"blocked":tap::addressing_for_vm("blocked").guest_ip.to_string()})).unwrap()).unwrap();
     }
 }

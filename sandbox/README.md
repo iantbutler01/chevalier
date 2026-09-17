@@ -99,3 +99,33 @@ make verify-strict-real PROFILE=local-dev
 The Makefile also exposes targeted gates for fork, API facade, storage, admission, DR, security, SLO, ownership fence, partition handling, and control-gateway failover.
 
 Real gates need real runtime dependencies. Keep mock/unit checks for fast iteration, but do not use them as proof of product readiness.
+
+## Per-VM managed network settings
+
+Linux managed TAP VMs accept a JSON object in the `chevalier.network_policy` session metadata:
+
+```json
+{"allow_lan": false, "dns_servers": ["1.1.1.1", "8.8.8.8"]}
+```
+
+Both fields are optional. `allow_lan` defaults to false. When true, the VM's transparent TCP proxy
+permits RFC1918 and CGNAT destinations; loopback, link-local, other reserved destinations, and existing
+port/domain restrictions remain blocked. This does not enable arbitrary UDP or guest IPv6 traffic.
+The host must have a route to the destination. An opted-in VM does not relax another VM's policy.
+The shared legacy HTTP proxy retains its default restrictions.
+
+`dns_servers` accepts up to three unicast IP addresses (IPv4 or IPv6) on port 53. An omitted or empty
+list uses public resolvers `1.1.1.1` and `8.8.8.8`. Private resolvers can be selected independently of
+LAN TCP access. CoreDNS selects the resolver set and cache by guest source address; TAP rules reject
+spoofed guest source addresses. Threat-domain filtering remains enabled. These options require managed
+TAP networking; native macOS and Windows user networking do not implement them.
+
+Policies belong to VM session metadata. Clients should apply project changes to newly created VMs;
+retained VMs keep their original policy. Registering or removing custom resolver views currently
+restarts the shared CoreDNS child, so other VMs can see a brief DNS interruption during that operation.
+
+Run `sandbox/scripts/verify_project_network_policy.sh` from the repository root for an isolated Docker
+check using the production config renderers and pinned Envoy/CoreDNS versions. It verifies per-VM DNS
+answers/cache isolation, LAN TCP opt-in, and rejection from a neighboring default-policy VM. The test
+uses a process UID match in place of the production service-cgroup firewall match; Rust unit tests
+cover the cgroup rule construction. No host networking or running VM configuration is changed.
