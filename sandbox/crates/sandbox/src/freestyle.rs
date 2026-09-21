@@ -1106,8 +1106,14 @@ impl FreestyleControl {
             .trim_start_matches("vm-")
             .replace(|c: char| !c.is_ascii_alphanumeric(), "");
         let label: String = label.chars().take(40).collect();
+        let prefix = &self.cfg.preview_domain_prefix;
+        let prefix = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{prefix}-")
+        };
         format!(
-            "nym-{label}-p{guest_port}.{}",
+            "{prefix}nym-{label}-p{guest_port}.{}",
             self.cfg.preview_domain_suffix
         )
     }
@@ -2149,6 +2155,21 @@ mod tests {
         assert_eq!(
             control.preview_domain("vm-0f3a-9b", 8080),
             "nym-0f3a9b-p8080.style.dev"
+        );
+    }
+
+    #[test]
+    fn preview_domain_keeps_staging_inside_the_existing_wildcard() {
+        let control = FreestyleControl::new(FreestyleBackendConfig {
+            api_key: "k".into(),
+            preview_domain_prefix: "staging".into(),
+            preview_domain_suffix: "nyms.metonymous.ai".into(),
+            ..FreestyleBackendConfig::default()
+        })
+        .unwrap();
+        assert_eq!(
+            control.preview_domain("vm-0f3a-9b", 8080),
+            "staging-nym-0f3a9b-p8080.nyms.metonymous.ai"
         );
     }
 

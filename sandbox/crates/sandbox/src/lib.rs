@@ -273,6 +273,9 @@ pub struct FreestyleBackendConfig {
     pub snapshot_id: String,
     /// Suffix for preview hostnames; `style.dev` names are claimed on first use.
     pub preview_domain_suffix: String,
+    /// Optional deployment namespace inside the hostname label.
+    #[serde(default)]
+    pub preview_domain_prefix: String,
     /// A `POST /v5/tls/forward-auth` configuration id to attach to every preview rule.
     pub forward_auth_id: Option<String>,
     /// Private network every session VM joins, by slug. The network is created when it
@@ -307,6 +310,7 @@ impl Default for FreestyleBackendConfig {
             api_key: String::new(),
             snapshot_id: String::new(),
             preview_domain_suffix: "style.dev".to_string(),
+            preview_domain_prefix: String::new(),
             forward_auth_id: None,
             vpc: None,
             idle_timeout_secs: None,
