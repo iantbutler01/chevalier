@@ -233,7 +233,26 @@ impl FreestyleControl {
 
     pub(crate) async fn get_sandbox(&self, vm_id: &str) -> Result<FreestyleVm> {
         let response = self.send(self.client.get(self.vm_url(vm_id, ""))).await?;
-        decode_json(response, "get vm").await
+        let vm: FreestyleVm = decode_json(response, "get vm").await?;
+        if !self.in_configured_vpc(&vm) {
+            return Err(SandboxError::InvalidConfig(format!(
+                "Freestyle VM {} is outside the configured VPC",
+                vm.id
+            )));
+        }
+        Ok(vm)
+    }
+
+    fn in_configured_vpc(&self, vm: &FreestyleVm) -> bool {
+        self.cfg.vpc.as_deref().is_none_or(|vpc| {
+            vm.vpcs.iter().any(|network| {
+                network
+                    .vpc_slug
+                    .as_deref()
+                    .or(network.vpc_slug_at_attach.as_deref())
+                    == Some(vpc)
+            })
+        })
     }
 
     fn validate_retention(&self, vm: &FreestyleVm) -> Result<()> {
@@ -381,6 +400,9 @@ impl FreestyleControl {
             let page: ListVmsResponse = decode_json(response, "list vms").await?;
             let count = page.vms.len();
             for vm in page.vms {
+                if !self.in_configured_vpc(&vm) {
+                    continue;
+                }
                 let Some(session_id) = session_id_from_metadata(&vm.metadata) else {
                     continue;
                 };
@@ -411,11 +433,10 @@ impl FreestyleControl {
             ]))
             .await?;
         let page: ListVmsResponse = decode_json(response, "list vms").await?;
-        if let Some(vm) = page
-            .vms
-            .into_iter()
-            .find(|vm| session_id_from_metadata(&vm.metadata).as_deref() == Some(session_id))
-        {
+        if let Some(vm) = page.vms.into_iter().find(|vm| {
+            self.in_configured_vpc(vm)
+                && session_id_from_metadata(&vm.metadata).as_deref() == Some(session_id)
+        }) {
             return Ok(Some(vm));
         }
         self.find_by_session_slug(session_id).await
@@ -438,7 +459,8 @@ impl FreestyleControl {
             .await?;
         let page: ListVmsResponse = decode_json(response, "list vms").await?;
         Ok(page.vms.into_iter().find(|vm| {
-            vm.slug.as_deref() == Some(slug.as_str())
+            self.in_configured_vpc(vm)
+                && vm.slug.as_deref() == Some(slug.as_str())
                 && vm
                     .metadata
                     .get(META_MANAGED_BY)
