@@ -120,6 +120,12 @@ impl OpenRouterClient {
         self
     }
 
+    /// Never route to these upstreams; every other endpoint stays eligible.
+    pub fn with_ignored_providers(mut self, providers: Vec<String>) -> Self {
+        self.inner = self.inner.with_openrouter_ignored_providers(providers);
+        self
+    }
+
     /// Prefer upstreams by a serving metric, retaining automatic fallback.
     pub fn with_provider_sort(mut self, sort: ProviderSort) -> Self {
         self.inner = self.inner.with_openrouter_provider_sort(sort);

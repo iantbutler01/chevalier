@@ -84,6 +84,7 @@ struct ParsedModelString {
     model_name: String,
     reasoning: Option<String>,
     openrouter_providers: Option<Vec<String>>,
+    openrouter_ignored_providers: Option<Vec<String>>,
     openrouter_provider_sort: Option<ProviderSort>,
     openrouter_min_throughput: Option<PerformanceThreshold>,
     openrouter_max_latency: Option<PerformanceThreshold>,
@@ -134,6 +135,7 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
 
     let mut reasoning = None;
     let mut openrouter_providers = None;
+    let mut openrouter_ignored_providers = None;
     let mut openrouter_provider_sort = None;
     let mut openrouter_min_throughput = None;
     let mut openrouter_max_latency = None;
@@ -183,6 +185,20 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
                         openrouter_max_latency = Some(threshold);
                     }
                 }
+                "provider_ignore" => {
+                    let ignored: Vec<String> = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|slug| !slug.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                    if provider != "openrouter" || ignored.is_empty() {
+                        return Err(Error::NonRetryable(
+                            "@provider_ignore requires OpenRouter chat completions and at least one provider slug".into(),
+                        ));
+                    }
+                    openrouter_ignored_providers = Some(ignored);
+                }
                 "provider_sort" if provider == "openrouter" => {
                     openrouter_provider_sort = Some(
                         serde_json::from_value(serde_json::json!(value)).map_err(|_| {
@@ -222,7 +238,7 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
                     return Err(Error::NonRetryable(format!(
                         "Unknown model parameter '@{}' in '{}'. Supported parameters: reasoning \
                          (aliases reasoning_level, reasoning_effort), cache, vision, server_url, \
-                         api_key, provider, provider_sort, cache_prefix, provider_min_throughput, provider_max_latency (OpenRouter chat completions only).",
+                         api_key, provider, provider_ignore, provider_sort, cache_prefix, provider_min_throughput, provider_max_latency (OpenRouter chat completions only).",
                         key, model_str
                     )));
                 }
@@ -244,6 +260,7 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
         model_name,
         reasoning,
         openrouter_providers,
+        openrouter_ignored_providers,
         openrouter_provider_sort,
         openrouter_min_throughput,
         openrouter_max_latency,
@@ -674,6 +691,9 @@ fn create_inference_client_with_config(
             }
             if let Some(upstreams) = parsed.openrouter_providers {
                 client = client.with_upstream_providers(upstreams);
+            }
+            if let Some(ignored) = parsed.openrouter_ignored_providers {
+                client = client.with_ignored_providers(ignored);
             }
             if let Some(prefix) = parsed.openrouter_cache_prefix {
                 client = client.with_cache_prefix(prefix);
@@ -1331,6 +1351,25 @@ mod tests {
             "openrouter:test@cache_prefix=",
             "openai:test@cache_prefix=x",
             "openrouter:resp:test@cache_prefix=x",
+        ] {
+            assert!(parse_model_string(model).is_err());
+        }
+    }
+
+    #[test]
+    fn provider_ignore_excludes_upstreams_alongside_sorting() {
+        let parsed = parse_model_string(
+            "openrouter:deepseek/deepseek-v4.1-flash@provider_sort=latency@provider_ignore=makora, chutes",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.openrouter_ignored_providers,
+            Some(vec!["makora".to_string(), "chutes".to_string()])
+        );
+        assert_eq!(parsed.openrouter_providers, None);
+        for model in [
+            "openrouter:test@provider_ignore=",
+            "openai:test@provider_ignore=makora",
         ] {
             assert!(parse_model_string(model).is_err());
         }

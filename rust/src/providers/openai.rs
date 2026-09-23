@@ -39,6 +39,7 @@ pub struct OAIClient {
     trace_callback: Option<TraceCallback>,
     provider: Provider,
     openrouter_providers: Option<Vec<String>>,
+    openrouter_ignored_providers: Option<Vec<String>>,
     openrouter_provider_sort: Option<ProviderSort>,
     openrouter_min_throughput: Option<PerformanceThreshold>,
     openrouter_max_latency: Option<PerformanceThreshold>,
@@ -58,6 +59,7 @@ impl Clone for OAIClient {
             trace_callback: self.trace_callback.clone(),
             provider: self.provider,
             openrouter_providers: self.openrouter_providers.clone(),
+            openrouter_ignored_providers: self.openrouter_ignored_providers.clone(),
             openrouter_provider_sort: self.openrouter_provider_sort,
             openrouter_min_throughput: self.openrouter_min_throughput.clone(),
             openrouter_max_latency: self.openrouter_max_latency.clone(),
@@ -108,6 +110,7 @@ impl OAIClient {
             trace_callback: None,
             provider: Provider::OpenAI,
             openrouter_providers: None,
+            openrouter_ignored_providers: None,
             openrouter_provider_sort: None,
             openrouter_min_throughput: None,
             openrouter_max_latency: None,
@@ -197,6 +200,11 @@ impl OAIClient {
         self
     }
 
+    pub(crate) fn with_openrouter_ignored_providers(mut self, providers: Vec<String>) -> Self {
+        self.openrouter_ignored_providers = Some(providers);
+        self
+    }
+
     /// Build request body for OpenAI API
     fn build_request_body(
         &self,
@@ -241,6 +249,12 @@ impl OAIClient {
                 "allow_fallbacks": providers.len() > 1,
                 "require_parameters": true,
             });
+        }
+
+        if matches!(self.provider, Provider::OpenRouter)
+            && let Some(ref ignored) = self.openrouter_ignored_providers
+        {
+            request["provider"]["ignore"] = serde_json::json!(ignored);
         }
 
         if matches!(self.provider, Provider::OpenRouter)
@@ -912,6 +926,22 @@ mod tests {
 
         assert!(body["tools"].is_array());
         assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn ignored_openrouter_providers_are_sent_with_the_sort() {
+        let client = OAIClient::new("test-key", "deepseek/deepseek-v4.1-flash")
+            .with_provider(Provider::OpenRouter)
+            .with_openrouter_ignored_providers(vec!["makora".into()])
+            .with_openrouter_provider_sort(ProviderSort::Latency);
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("hi"))];
+        let config = GenerationConfig::new("deepseek/deepseek-v4.1-flash");
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+        assert_eq!(body["provider"]["ignore"], serde_json::json!(["makora"]));
+        assert_eq!(body["provider"]["sort"], "latency");
+        assert!(body["provider"].get("only").is_none());
     }
 
     #[test]
