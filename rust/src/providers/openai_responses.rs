@@ -157,7 +157,8 @@ impl OpenAIResponsesClient {
             "top_p": config.top_p.unwrap_or(1.0),
             "stream": stream,
         });
-        if model.starts_with("gpt-6-astra") {
+        // The GPT-6 family (Astra, Sol, Luna) rejects sampling parameters.
+        if model.starts_with("gpt-6-") {
             request.as_object_mut().unwrap().remove("temperature");
             request.as_object_mut().unwrap().remove("top_p");
         }
