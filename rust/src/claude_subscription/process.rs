@@ -37,6 +37,7 @@ pub(crate) struct Process {
 fn validate_init(
     init: wire::InitProjection,
     server: &str,
+    declared_tools: usize,
     cwd: &Path,
     stderr_tail: &str,
 ) -> std::result::Result<ClaudeSessionEvent, ClaudeSessionError> {
@@ -49,10 +50,12 @@ fn validate_init(
         .mcp_servers
         .iter()
         .any(|entry| entry["name"] == server && entry["status"] == "connected")
-        || !init
-            .tools
-            .iter()
-            .any(|tool| tool.starts_with(&format!("mcp__{server}__")))
+        // A host that declared no tools has none to list; the server must still connect.
+        || (declared_tools > 0
+            && !init
+                .tools
+                .iter()
+                .any(|tool| tool.starts_with(&format!("mcp__{server}__"))))
     {
         return Err(ClaudeSessionError::Protocol(format!(
             "server {server} not connected: {:?}; stderr: {stderr_tail}",
@@ -118,6 +121,7 @@ pub(crate) async fn spawn(
         let _ = stdin.shutdown().await;
     });
     let server = config.server_name.clone();
+    let declared_tools = schemas.len();
     let schemas = Arc::new(schemas);
     let cwd = config.cwd.clone();
     let idle = config.idle_timeout;
@@ -235,7 +239,13 @@ pub(crate) async fn spawn(
                                 return;
                             }
                         };
-                    match validate_init(init, &server, &cwd, &stderr_tail(&reader_ring).await) {
+                    match validate_init(
+                        init,
+                        &server,
+                        declared_tools,
+                        &cwd,
+                        &stderr_tail(&reader_ring).await,
+                    ) {
                         Ok(event) => {
                             initialized = true;
                             let _ = events_tx.send(Ok(event));
@@ -357,16 +367,22 @@ mod tests {
         let mut init = init();
         init.api_key_source = "ANTHROPIC_API_KEY".into();
         assert!(matches!(
-            validate_init(init, "ob", Path::new("/tmp"), ""),
+            validate_init(init, "ob", 1, Path::new("/tmp"), ""),
             Err(ClaudeSessionError::NotSubscription { .. })
         ));
+    }
+    #[test]
+    fn init_accepts_a_connected_server_with_no_declared_tools() {
+        let mut init = init();
+        init.tools.retain(|tool| !tool.starts_with("mcp__ob__"));
+        assert!(validate_init(init, "ob", 0, Path::new("/tmp"), "").is_ok());
     }
     #[test]
     fn init_rejects_missing_server() {
         let mut init = init();
         init.mcp_servers.clear();
         assert!(
-            matches!(validate_init(init, "ob", Path::new("/tmp"), "stderr"), Err(ClaudeSessionError::Protocol(message)) if message.contains("stderr"))
+            matches!(validate_init(init, "ob", 1, Path::new("/tmp"), "stderr"), Err(ClaudeSessionError::Protocol(message)) if message.contains("stderr"))
         );
     }
 }

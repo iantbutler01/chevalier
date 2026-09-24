@@ -124,7 +124,7 @@ pub enum ClaudeSessionEvent {
 ```
 
 - `call.tool_use_id` is `_meta["claudecode/toolUseId"]` so ids match the CLI transcript; `call_id` is the control `request_id` the reply must echo.
-- `RateLimits` maps `rate_limit_info.unifiedWindows{name:{utilization,resetsAt}}` to `ProviderRateLimit{scope: Subscription, used_percent: round(utilization*100), window_minutes: {five_hour:300, seven_day:10080, else: 0}, resets_at_epoch_sec}`; without `unifiedWindows`, synthesize one window from `(rateLimitType, utilization, resetsAt)` when all three exist.
+- `RateLimits` maps `rate_limit_info.unifiedWindows{name:{utilization,resetsAt}}` to `ProviderRateLimit{scope: Session for five_hour else Subscription (the Codex split), used_percent: round(utilization*100), window_minutes: {five_hour:300, seven_day:10080, else: 0}, resets_at_epoch_sec}`; without `unifiedWindows`, synthesize one window from `(rateLimitType, utilization, resetsAt)` when all three exist.
 - `Usage` comes from `result.usage` only. `assistant.message.usage` is the `message_start` snapshot and undercounts output (wonderloom §3.2).
 - `list_price_usd` is `result.total_cost_usd`, a client-side estimate. It is labelled as such and must not be treated as spend.
 

@@ -99,7 +99,13 @@ pub(crate) fn map(output: &ClaudeOutput) -> Result<Vec<ClaudeSessionEvent>, Clau
 
 fn limit(name: &str, utilization: f64, reset: u64) -> ProviderRateLimit {
     ProviderRateLimit {
-        scope: ProviderRateLimitScope::Subscription,
+        // Same split as Codex: the rolling five-hour window is the session limit, longer
+        // windows are the subscription's.
+        scope: if name == "five_hour" {
+            ProviderRateLimitScope::Session
+        } else {
+            ProviderRateLimitScope::Subscription
+        },
         used_percent: (utilization * 100.0).round().max(0.0) as u32,
         window_minutes: match name {
             "five_hour" => 300,
@@ -132,6 +138,8 @@ mod tests {
         assert_eq!(windows.len(), 2);
         assert!(windows.iter().any(|window| window.window_minutes == 300));
         assert!(windows.iter().any(|window| window.window_minutes == 10080));
+        assert!(windows.iter().any(|window| window.window_minutes == 300
+            && window.scope == ProviderRateLimitScope::Session));
     }
     #[test]
     fn fallback_and_empty_windows() {
