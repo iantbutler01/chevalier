@@ -178,6 +178,11 @@ pub struct Runtime {
 
 #[napi]
 impl Runtime {
+    #[napi]
+    pub async fn claude_session(&self, config: serde_json::Value) -> napi::Result<crate::claude_session::ClaudeSession> {
+        let runtime = self.inner.lock().await.clone();
+        crate::claude_session::start(&runtime, config).await
+    }
     #[napi(constructor)]
     pub fn new(options: Option<RuntimeOptions>) -> Self {
         let (model, api_key) = match options {
@@ -244,17 +249,9 @@ impl Runtime {
         description: String,
         schema: serde_json::Value,
     ) -> napi::Result<()> {
-        let tool_fn = ToolFunction::Async(Box::new(move |_args| {
-            Box::pin(async move {
-                Err(EngineError::NonRetryable(
-                    "tool was registered schema-only; dispatch it host-side from the tool call"
-                        .to_string(),
-                ))
-            }) as BoxFuture<'static, EngineResult<String>>
-        }));
         let guard = self.inner.lock().await;
         guard
-            .register_tool_with_schema(name, description, schema, tool_fn)
+            .register_tool_schema(name, description, schema)
             .await
             .map_err(to_napi)
     }

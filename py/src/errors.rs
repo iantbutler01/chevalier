@@ -6,6 +6,15 @@ pyo3::create_exception!(chevalier, ChevalierError, PyException);
 
 pub fn error_code(error: &EngineError) -> &'static str {
     match error {
+        EngineError::ClaudeSession(error) => match error {
+            chevalier_core::claude_subscription::ClaudeSessionError::CliNotFound { .. } => "CLAUDE_CLI_NOT_FOUND",
+            chevalier_core::claude_subscription::ClaudeSessionError::CliTooOld { .. } => "CLAUDE_CLI_TOO_OLD",
+            chevalier_core::claude_subscription::ClaudeSessionError::NotLoggedIn => "CLAUDE_NOT_LOGGED_IN",
+            chevalier_core::claude_subscription::ClaudeSessionError::NotSubscription { .. } => "CLAUDE_NOT_SUBSCRIPTION",
+            chevalier_core::claude_subscription::ClaudeSessionError::Protocol(_) => "CLAUDE_PROTOCOL",
+            chevalier_core::claude_subscription::ClaudeSessionError::Idle { .. } => "CLAUDE_IDLE",
+            chevalier_core::claude_subscription::ClaudeSessionError::Exited { .. } => "CLAUDE_EXITED",
+        },
         EngineError::Inference(_) => "INFERENCE",
         EngineError::ContextLengthExceeded(_) => "CONTEXT_LENGTH_EXCEEDED",
         EngineError::RetriesExceeded(_) => "RETRIES_EXCEEDED",

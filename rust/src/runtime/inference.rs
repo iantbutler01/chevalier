@@ -161,6 +161,14 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
             })?;
 
             match key {
+                "effort" if provider == "claude-subscription" => {
+                    if !matches!(value, "low" | "medium" | "high" | "xhigh" | "max") {
+                        return Err(Error::NonRetryable(format!(
+                            "Invalid Claude subscription effort: {value}"
+                        )));
+                    }
+                    reasoning = Some(value.to_string());
+                }
                 "reasoning" | "reasoning_level" | "reasoning_effort" => {
                     reasoning = Some(value.to_string());
                 }
@@ -1674,6 +1682,8 @@ mod tests {
                     required: true,
                 }],
                 strict: None,
+                raw_schema: None,
+                schema_only: false,
                 parameters: ToolParametersSchema::from_json_schema(&serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1733,6 +1743,8 @@ mod tests {
                     required: true,
                 }],
                 strict: None,
+                raw_schema: None,
+                schema_only: false,
                 parameters: ToolParametersSchema::from_json_schema(&serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1893,6 +1905,8 @@ mod tests {
                     },
                 ],
                 strict: None,
+                raw_schema: None,
+                schema_only: false,
                 parameters: ToolParametersSchema::from_json_schema(&serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1975,6 +1989,8 @@ mod tests {
                 description: "Write a thread".to_string(),
                 fields: vec![],
                 strict: None,
+                raw_schema: None,
+                schema_only: false,
                 parameters: ToolParametersSchema::from_json_schema(&serde_json::json!({
                     "type": "object",
                     "properties": {

@@ -1,6 +1,6 @@
 # RFC 0004: Claude Subscription Session
 
-Status: Draft 2026-09-24. Wire contract verified live against Claude Code 2.1.281 on a Max subscription (evidence in §Evidence). Not implemented.
+Status: Implemented 2026-09-24 in Rust, napi and pyo3 (as-built notes in §As built). Wire contract verified live against Claude Code 2.1.281 and 2.1.282 on a Max subscription (evidence in §Evidence).
 
 ## Summary
 
@@ -274,6 +274,17 @@ Captured 2026-09-24 (raw transcripts, sanitized, in `rust/tests/fixtures/claude-
 - `rate_limit_event.rate_limit_info`: `{status:"allowed", rateLimitType:"five_hour", unifiedWindows:{five_hour:{utilization:0.04,…}, seven_day:{utilization:0.5,…}}, overageStatus:"rejected"}`.
 - A second user message during a pending tool call changed that turn's answer; `--resume=<session_id>` from a new process recalled the earlier tool result. Session transcripts live under `~/.claude/projects/<mangled cwd>/`.
 - Without `--strict-mcp-config`, a claude.ai connector (`claude.ai Claude Docs`) was loaded despite empty setting sources.
+
+## As built (2026-09-24)
+
+Deviations from the design above, accepted:
+
+- **`apiKeySource` arrives after the first user turn.** The CLI emits `system/init` only once a user message is queued, so rule 5 cannot be enforced before that write. The session instead preflights `claude auth status --json` before spawning (requires `loggedIn`, `authMethod == "claude.ai"`, `apiProvider == "firstParty"`; a Console or third-party login fails with a message naming the method), strips every API-key/provider variable from the child env, and still kills the session with `NotSubscription` if `system/init` reports anything but `"none"`.
+- **Schema-only marker.** Schema-only registration used to install a throwing handler, indistinguishable from a real one. `Runtime::register_tool_schema` now records `ToolSchemaInfo.schema_only`; both bindings' handler-less `tool()` use it.
+- **`host_dispatch_all` (config) / `hostDispatchAll` (TS).** Surfaces every call as `ToolCall`, including handler-backed tools such as MCP client tools, so a host that gates tools itself (OpenBracket) runs them through its own path and `Runtime::execute_tool_call`. Without it, handler-backed tools would bypass the host's guardians.
+- **Idle watchdog counts outstanding tool calls as activity.** It polls every 250 ms and fires only after `idle_timeout` with no stdout byte *and* no pending call; a host tool waiting on an approval for minutes is not a stall.
+- **`next_event(&self)` and `shutdown(&self)`** in addition to the consuming `close(self)`, so bindings can close while a receive is pending.
+- **Init decode.** `claude-codes` types decode every captured line, including `system/init` (the first fixture sanitization had flattened `memory_paths` to a list; the real shape is an object and the fixtures now keep it).
 
 ## Open questions
 

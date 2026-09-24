@@ -41,9 +41,12 @@ pub struct ToolSchemaInfo {
     pub fields: Vec<crate::parsers::FieldDescription>,
     pub strict: Option<bool>,
     pub parameters: ToolParametersSchema,
+    pub raw_schema: Option<serde_json::Value>,
+    pub schema_only: bool,
 }
 
 /// Runtime - Main execution environment for agentic functions
+#[derive(Clone)]
 pub struct Runtime {
     // Public configuration
     pub model: Option<String>,
@@ -294,11 +297,33 @@ impl Runtime {
             fields,
             strict: schema.get("strict").and_then(|value| value.as_bool()),
             parameters,
+            raw_schema: Some(schema),
+            schema_only: false,
         };
         let mut schemas = self.tool_schemas.write().await;
         schemas.insert(name, schema_info);
 
         Ok(())
+    }
+
+    pub async fn register_tool_schema(
+        &self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        schema: serde_json::Value,
+    ) -> Result<()> {
+        let name = name.into();
+        let handler = ToolFunction::Async(Box::new(|_| {
+            Box::pin(async {
+                Err(Error::NonRetryable(
+                    "tool was registered schema-only; dispatch it host-side from the tool call"
+                        .into(),
+                ))
+            })
+        }));
+        self.register_tool_with_schema(name.clone(), description, schema, handler)
+            .await?;
+        self.mark_tool_schema_only(&name).await
     }
 
     /// Unregister a tool and remove all associated metadata.
@@ -411,6 +436,8 @@ impl Runtime {
             fields: field_descriptions,
             strict: None,
             parameters,
+            raw_schema: None,
+            schema_only: false,
         };
         let mut schemas = self.tool_schemas.write().await;
         schemas.insert(tool_name.clone(), schema_info);
@@ -449,6 +476,27 @@ impl Runtime {
     pub async fn get_tool_schemas(&self) -> HashMap<String, ToolSchemaInfo> {
         let schemas = self.tool_schemas.read().await;
         schemas.clone()
+    }
+
+    #[cfg(feature = "claude-subscription")]
+    pub(crate) async fn claude_tool_names(&self) -> Vec<String> {
+        let filter = self.model_tool_names.read().await;
+        self.tool_order
+            .read()
+            .await
+            .iter()
+            .filter(|name| filter.as_ref().is_none_or(|names| names.contains(name)))
+            .cloned()
+            .collect()
+    }
+
+    async fn mark_tool_schema_only(&self, name: &str) -> Result<()> {
+        let mut schemas = self.tool_schemas.write().await;
+        schemas
+            .get_mut(name)
+            .ok_or_else(|| Error::ToolNotFound(name.into()))?
+            .schema_only = true;
+        Ok(())
     }
 
     pub async fn set_model_tool_names(&self, names: Option<Vec<String>>) -> Result<()> {
@@ -492,6 +540,11 @@ impl Runtime {
             .model
             .or_else(|| self.model.clone())
             .ok_or_else(|| Error::NonRetryable("No model specified".to_string()))?;
+        if crate::types::is_claude_subscription_model(&effective_model) {
+            return Err(Error::NonRetryable(
+                "claude-subscription models run through Runtime::claude_session".into(),
+            ));
+        }
 
         let effective_api_key = params.api_key.or_else(|| self.api_key.clone());
         let runtime_system_messages = self.system_messages.read().await.clone();
@@ -566,6 +619,11 @@ impl Runtime {
             .model
             .or_else(|| self.model.clone())
             .ok_or_else(|| Error::NonRetryable("No model specified".to_string()))?;
+        if crate::types::is_claude_subscription_model(&effective_model) {
+            return Err(Error::NonRetryable(
+                "claude-subscription models run through Runtime::claude_session".into(),
+            ));
+        }
 
         let effective_api_key = params.api_key.or_else(|| self.api_key.clone());
         let runtime_system_messages = self.system_messages.read().await.clone();

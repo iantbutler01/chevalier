@@ -72,6 +72,116 @@ export interface ToolDef {
      *  schema-only (host-dispatched) tool. */
     handler?: (args: any) => unknown | Promise<unknown>;
 }
+export interface ClaudeSessionConfig {
+    model: string;
+    systemPrompt?: string;
+    effort?: "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+    resume?: {
+        sessionId: string;
+        cwd: string;
+    };
+    cwd?: string;
+    cliPath?: string;
+    clientApp?: string;
+    serverName?: string;
+    /** Surface every call (including handler-backed and MCP tools) as a `toolCall` event for the host to gate and run. */
+    hostDispatchAll?: boolean;
+    idleTimeoutMs?: number;
+    maxTurns?: number;
+}
+export interface ClaudeToolCall {
+    toolUseId: string;
+    toolName: string;
+    args: unknown;
+}
+export type ClaudeToolContent = {
+    type: "text";
+    text: string;
+} | {
+    type: "image";
+    dataBase64: string;
+    mimeType: string;
+};
+export interface ClaudeToolOutput {
+    content: ClaudeToolContent[];
+    isError?: boolean;
+}
+export type ClaudeSessionEvent = {
+    type: "init";
+    sessionId: string;
+    cwd: string;
+    model: string;
+    cliVersion: string;
+} | {
+    type: "textDelta";
+    text: string;
+} | {
+    type: "thinkingDelta";
+    text: string;
+} | {
+    type: "assistantMessage";
+    text: string;
+} | {
+    type: "toolCall";
+    callId: string;
+    call: ClaudeToolCall;
+} | {
+    type: "toolExecuted";
+    call: ClaudeToolCall;
+    output: ClaudeToolOutput;
+} | {
+    type: "toolCancelled";
+    callId: string;
+} | {
+    type: "rateLimits";
+    data: ProviderRateLimit[];
+} | {
+    type: "apiRetry";
+    attempt: number;
+    delayMs: number;
+    error: string;
+} | {
+    type: "turnComplete";
+    usage: unknown;
+    listPriceUsd: number | null;
+    numTurns: number;
+    isError: boolean;
+    subtype: string;
+    result: string | null;
+};
+export type ClaudeSubscriptionStatus = {
+    status: "ready";
+    email: string | null;
+    subscription_type: string | null;
+} | {
+    status: "notLoggedIn";
+} | {
+    status: "cliNotFound";
+    probed: string[];
+} | {
+    status: "error";
+    message: string;
+};
+export interface ClaudeExitSummary {
+    status: string;
+    stderr_tail: string;
+}
+export declare class ClaudeSession {
+    readonly native: native.ClaudeSession;
+    constructor(native: native.ClaudeSession);
+    next(): Promise<ClaudeSessionEvent | null>;
+    send(turn: {
+        text: string;
+        images?: native.MediaPartInput[];
+    }): Promise<void>;
+    respondTool(callId: string, output: ClaudeToolOutput): Promise<void>;
+    interrupt(): Promise<void>;
+    close(): Promise<ClaudeExitSummary>;
+}
+export declare function claudeSubscriptionStatus(cliPath?: string): Promise<ClaudeSubscriptionStatus>;
+export declare function events(session: ClaudeSession, { signal }?: {
+    signal?: AbortSignal;
+}): AsyncGenerator<ClaudeSessionEvent>;
 export type ProviderRateLimitScope = "session" | "subscription";
 export interface ProviderRateLimit {
     scope: ProviderRateLimitScope;
@@ -103,6 +213,7 @@ export declare class Runtime {
     /** @internal access to the raw napi runtime */
     readonly native: native.Runtime;
     constructor(options?: RuntimeOptions);
+    claudeSession(config: ClaudeSessionConfig): Promise<ClaudeSession>;
     /** Non-streaming inference. Pass `output` (Zod) to get a typed, validated `value`. */
     run<T = unknown>(args?: RunArgs<T>): Promise<TypedRunResult<T>>;
     /** Streaming inference as an async iterator: `for await (const ev of rt.runStream(...))`.

@@ -276,6 +276,14 @@ pub struct Runtime {
 
 #[pymethods]
 impl Runtime {
+    fn claude_session<'py>(&self, py: Python<'py>, config: &Bound<'_, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let config = crate::claude_session::config(config)?;
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let runtime = inner.lock().await.clone();
+            runtime.claude_session(config).await.map(crate::claude_session::ClaudeSession::new).map_err(to_py_err)
+        })
+    }
     #[new]
     #[pyo3(signature = (options=None))]
     fn new(options: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
@@ -338,18 +346,10 @@ impl Runtime {
         let schema = value_from_python(schema)?;
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let function = ToolFunction::Async(Box::new(|_args| {
-                Box::pin(async {
-                    Err(EngineError::NonRetryable(
-                        "tool was registered schema-only; dispatch it host-side from the tool call"
-                            .to_string(),
-                    ))
-                }) as BoxFuture<'static, EngineResult<String>>
-            }));
             inner
                 .lock()
                 .await
-                .register_tool_with_schema(name, description, schema, function)
+                .register_tool_schema(name, description, schema)
                 .await
                 .map_err(to_py_err)
         })

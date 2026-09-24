@@ -7,6 +7,15 @@ use chevalier_core::error::Error as EngineError;
 /// Stable string code for each engine error variant — surfaced to JS.
 pub fn error_code(e: &EngineError) -> &'static str {
     match e {
+        EngineError::ClaudeSession(error) => match error {
+            chevalier_core::claude_subscription::ClaudeSessionError::CliNotFound { .. } => "CLAUDE_CLI_NOT_FOUND",
+            chevalier_core::claude_subscription::ClaudeSessionError::CliTooOld { .. } => "CLAUDE_CLI_TOO_OLD",
+            chevalier_core::claude_subscription::ClaudeSessionError::NotLoggedIn => "CLAUDE_NOT_LOGGED_IN",
+            chevalier_core::claude_subscription::ClaudeSessionError::NotSubscription { .. } => "CLAUDE_NOT_SUBSCRIPTION",
+            chevalier_core::claude_subscription::ClaudeSessionError::Protocol(_) => "CLAUDE_PROTOCOL",
+            chevalier_core::claude_subscription::ClaudeSessionError::Idle { .. } => "CLAUDE_IDLE",
+            chevalier_core::claude_subscription::ClaudeSessionError::Exited { .. } => "CLAUDE_EXITED",
+        },
         EngineError::Inference(_) => "INFERENCE",
         EngineError::ContextLengthExceeded(_) => "CONTEXT_LENGTH_EXCEEDED",
         EngineError::RetriesExceeded(_) => "RETRIES_EXCEEDED",

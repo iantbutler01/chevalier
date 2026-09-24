@@ -9,7 +9,10 @@ import cjs from "./index.js";
 export const {
   agentic,
   ChevalierError,
+  ClaudeSession,
+  claudeSubscriptionStatus,
   createVfsGatewayServer,
+  events,
   executeProgrammatic,
   McpClient,
   McpServer,

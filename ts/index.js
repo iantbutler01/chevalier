@@ -40,7 +40,9 @@ var __exportStar = (this && this.__exportStar) || function(m, exports) {
     for (var p in m) if (p !== "default" && !Object.prototype.hasOwnProperty.call(exports, p)) __createBinding(exports, m, p);
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.Runtime = exports.ChevalierError = exports.createVfsGatewayServer = exports.version = exports.vfsContentHash = exports.VfsContentHasher = exports.VfsStorage = exports.McpServer = exports.McpClient = void 0;
+exports.Runtime = exports.ClaudeSession = exports.ChevalierError = exports.createVfsGatewayServer = exports.version = exports.vfsContentHash = exports.VfsContentHasher = exports.VfsStorage = exports.McpServer = exports.McpClient = void 0;
+exports.claudeSubscriptionStatus = claudeSubscriptionStatus;
+exports.events = events;
 exports.agentic = agentic;
 const native = __importStar(require("./native.js"));
 const zod_to_json_schema_1 = require("zod-to-json-schema");
@@ -165,10 +167,92 @@ function toJsonSchema(s) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     return (0, zod_to_json_schema_1.zodToJsonSchema)(s);
 }
+class ClaudeSession {
+    constructor(native) {
+        this.native = native;
+    }
+    async next() {
+        try {
+            return await this.native.next();
+        }
+        catch (error) {
+            throw toChevalierError(error);
+        }
+    }
+    async send(turn) {
+        try {
+            await this.native.send(turn);
+        }
+        catch (error) {
+            throw toChevalierError(error);
+        }
+    }
+    async respondTool(callId, output) {
+        try {
+            await this.native.respondTool(callId, output);
+        }
+        catch (error) {
+            throw toChevalierError(error);
+        }
+    }
+    async interrupt() {
+        try {
+            await this.native.interrupt();
+        }
+        catch (error) {
+            throw toChevalierError(error);
+        }
+    }
+    async close() {
+        try {
+            return await this.native.close();
+        }
+        catch (error) {
+            throw toChevalierError(error);
+        }
+    }
+}
+exports.ClaudeSession = ClaudeSession;
+async function claudeSubscriptionStatus(cliPath) {
+    return native.claudeSubscriptionStatus(cliPath);
+}
+async function* events(session, { signal } = {}) {
+    let abort;
+    const aborted = new Promise((resolve) => {
+        abort = () => resolve(null);
+        signal?.addEventListener("abort", abort, { once: true });
+    });
+    try {
+        signal?.throwIfAborted();
+        for (;;) {
+            const event = await Promise.race([session.next(), aborted]);
+            signal?.throwIfAborted();
+            if (event === null)
+                return;
+            yield event;
+        }
+    }
+    catch (error) {
+        throw toChevalierError(error);
+    }
+    finally {
+        if (abort)
+            signal?.removeEventListener("abort", abort);
+        await session.close();
+    }
+}
 /** The Chevalier agent runtime. */
 class Runtime {
     constructor(options) {
         this.native = new native.Runtime(options);
+    }
+    async claudeSession(config) {
+        try {
+            return new ClaudeSession(await this.native.claudeSession(config));
+        }
+        catch (error) {
+            throw toChevalierError(error);
+        }
     }
     /** Non-streaming inference. Pass `output` (Zod) to get a typed, validated `value`. */
     async run(args = {}) {

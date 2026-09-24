@@ -11,6 +11,10 @@ use uuid::Uuid;
 
 use crate::error::{Error, Result};
 
+pub fn is_claude_subscription_model(model: &str) -> bool {
+    model.starts_with("claude-subscription:")
+}
+
 /// Format JSON to match Python's json.dumps default style (space after colon and comma)
 fn format_json_python_style(value: &serde_json::Value) -> String {
     match value {

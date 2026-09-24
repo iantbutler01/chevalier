@@ -35,6 +35,7 @@ fn run_params(
         output_schema,
         temperature,
         top_p,
+        allow_tool_calls: None,
         max_tokens,
         reasoning_effort: None,
         model: model.map(|s| s.to_string()),

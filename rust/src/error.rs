@@ -11,6 +11,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Main error type for Chevalier operations
 #[derive(Error, Debug)]
 pub enum Error {
+    #[cfg(feature = "claude-subscription")]
+    #[error(transparent)]
+    ClaudeSession(#[from] crate::claude_subscription::ClaudeSessionError),
     /// Retryable inference error (network issues, rate limits, 5xx errors)
     #[error("Inference error: {0}")]
     Inference(String),

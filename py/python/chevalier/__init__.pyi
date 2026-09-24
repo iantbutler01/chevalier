@@ -218,10 +218,89 @@ class StreamHandle:
     def next(self) -> Awaitable[Optional[ResponseStreamEvent]]: ...
     def close(self) -> None: ...
 
+class ClaudeSessionConfig(TypedDict, total=False):
+    model: Required[str]
+    system_prompt: str
+    effort: Literal["low", "medium", "high", "xhigh", "max", "ultra"]
+    resume: Dict[str, str]
+    cwd: str
+    cli_path: str
+    client_app: str
+    server_name: str
+    idle_timeout_ms: int
+    max_turns: int
+
+class ClaudeInitEvent(Dict[str, Any]):
+    type: Literal["init"]
+    sessionId: str
+    cwd: str
+    model: str
+    cliVersion: str
+
+class ClaudeTextDeltaEvent(Dict[str, Any]):
+    type: Literal["textDelta"]
+    text: str
+
+class ClaudeThinkingDeltaEvent(Dict[str, Any]):
+    type: Literal["thinkingDelta"]
+    text: str
+
+class ClaudeAssistantMessageEvent(Dict[str, Any]):
+    type: Literal["assistantMessage"]
+    text: str
+
+class ClaudeToolCallEvent(Dict[str, Any]):
+    type: Literal["toolCall"]
+    callId: str
+    call: Json
+
+class ClaudeToolExecutedEvent(Dict[str, Any]):
+    type: Literal["toolExecuted"]
+    call: Json
+    output: Json
+
+class ClaudeToolCancelledEvent(Dict[str, Any]):
+    type: Literal["toolCancelled"]
+    callId: str
+
+class ClaudeRateLimitsEvent(Dict[str, Any]):
+    type: Literal["rateLimits"]
+    data: List[Json]
+
+class ClaudeApiRetryEvent(Dict[str, Any]):
+    type: Literal["apiRetry"]
+    attempt: int
+    delayMs: int
+    error: str
+
+class ClaudeTurnCompleteEvent(Dict[str, Any]):
+    type: Literal["turnComplete"]
+    usage: Json
+    listPriceUsd: Optional[float]
+    numTurns: int
+    isError: bool
+    subtype: str
+    result: Optional[str]
+
+ClaudeSessionEvent: TypeAlias = Union[ClaudeInitEvent, ClaudeTextDeltaEvent, ClaudeThinkingDeltaEvent, ClaudeAssistantMessageEvent, ClaudeToolCallEvent, ClaudeToolExecutedEvent, ClaudeToolCancelledEvent, ClaudeRateLimitsEvent, ClaudeApiRetryEvent, ClaudeTurnCompleteEvent]
+
+@final
+class ClaudeSession:
+    def next(self) -> Awaitable[Optional[ClaudeSessionEvent]]: ...
+    def send(self, turn: Json) -> Awaitable[None]: ...
+    def respond_tool(self, call_id: str, output: Json) -> Awaitable[None]: ...
+    def interrupt(self) -> Awaitable[None]: ...
+    def close(self) -> Awaitable[Json]: ...
+    def __aiter__(self) -> ClaudeSession: ...
+    def __anext__(self) -> Awaitable[ClaudeSessionEvent]: ...
+
+def claude_subscription_status(cli_path: Optional[str] = ...) -> Awaitable[Json]: ...
+
 @final
 class Runtime:
     def __new__(cls, options: Optional[RuntimeOptions] = ...) -> Runtime: ...
     def run(self, options: RunOptions) -> Awaitable[AssistantResponse]: ...
+    def claude_session(self, config: ClaudeSessionConfig) -> Awaitable[ClaudeSession]: ...
     def tool(self, handler: AsyncToolHandler, *, name: Optional[str] = ..., description: Optional[str] = ...) -> Awaitable[None]: ...
     def register_tool_schema(self, name: str, description: str, schema: Json) -> Awaitable[None]: ...
     def execute_tool_call(self, tool_name: str, args: Json) -> Awaitable[str]: ...

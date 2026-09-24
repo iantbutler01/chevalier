@@ -151,6 +151,7 @@ async fn analyze_video(
             output_schema: None,
             temperature: None,
             top_p: None,
+            allow_tool_calls: None,
             max_tokens: None,
             reasoning_effort: None,
             model: None,   // use default from agentic macro
