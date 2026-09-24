@@ -284,6 +284,7 @@ Deviations from the design above, accepted:
 - **`host_dispatch_all` (config) / `hostDispatchAll` (TS).** Surfaces every call as `ToolCall`, including handler-backed tools such as MCP client tools, so a host that gates tools itself (OpenBracket) runs them through its own path and `Runtime::execute_tool_call`. Without it, handler-backed tools would bypass the host's guardians.
 - **Idle watchdog counts outstanding tool calls as activity.** It polls every 250 ms and fires only after `idle_timeout` with no stdout byte *and* no pending call; a host tool waiting on an approval for minutes is not a stall.
 - **`next_event(&self)` and `shutdown(&self)`** in addition to the consuming `close(self)`, so bindings can close while a receive is pending.
+- **`ResumeNotFound`.** A `--resume` whose transcript is gone makes the CLI print `No conversation found with session ID: …` and emit an error `result` before any `system/init`, then exit 1 (captured from 2.1.282). The session reports that as `ClaudeSessionError::ResumeNotFound` (`CLAUDE_RESUME_NOT_FOUND`) so hosts can start fresh instead of failing.
 - **Init decode.** `claude-codes` types decode every captured line, including `system/init` (the first fixture sanitization had flattened `memory_paths` to a list; the real shape is an object and the fixtures now keep it).
 
 ## Open questions

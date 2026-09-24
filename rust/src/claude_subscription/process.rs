@@ -122,6 +122,10 @@ pub(crate) async fn spawn(
     });
     let server = config.server_name.clone();
     let declared_tools = schemas.len();
+    let resume_id = config
+        .resume
+        .as_ref()
+        .map(|resume| resume.session_id.clone());
     let schemas = Arc::new(schemas);
     let cwd = config.cwd.clone();
     let idle = config.idle_timeout;
@@ -256,6 +260,18 @@ pub(crate) async fn spawn(
                             return;
                         }
                     }
+                }
+                // A --resume whose transcript is gone ends with an error result before init.
+                if !initialized
+                    && let (Some(session_id), ClaudeOutput::Result(_)) = (&resume_id, &typed)
+                {
+                    let _ = events_tx.send(Err(Error::ClaudeSession(
+                        ClaudeSessionError::ResumeNotFound {
+                            session_id: session_id.clone(),
+                        },
+                    )));
+                    let _ = reader_child.lock().await.start_kill();
+                    return;
                 }
                 if !initialized
                     && !matches!(

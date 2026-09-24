@@ -13,6 +13,7 @@ pub fn error_code(e: &EngineError) -> &'static str {
             chevalier_core::claude_subscription::ClaudeSessionError::NotLoggedIn => "CLAUDE_NOT_LOGGED_IN",
             chevalier_core::claude_subscription::ClaudeSessionError::NotSubscription { .. } => "CLAUDE_NOT_SUBSCRIPTION",
             chevalier_core::claude_subscription::ClaudeSessionError::Protocol(_) => "CLAUDE_PROTOCOL",
+            chevalier_core::claude_subscription::ClaudeSessionError::ResumeNotFound { .. } => "CLAUDE_RESUME_NOT_FOUND",
             chevalier_core::claude_subscription::ClaudeSessionError::Idle { .. } => "CLAUDE_IDLE",
             chevalier_core::claude_subscription::ClaudeSessionError::Exited { .. } => "CLAUDE_EXITED",
         },

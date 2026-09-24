@@ -32,6 +32,8 @@ pub enum ClaudeSessionError {
     NotSubscription { api_key_source: String },
     #[error("Claude protocol: {0}")]
     Protocol(String),
+    #[error("Claude has no saved session {session_id} to resume")]
+    ResumeNotFound { session_id: String },
     #[error("Claude session idle timeout; stderr: {stderr_tail}")]
     Idle { stderr_tail: String },
     #[error("Claude exited ({status}); stderr: {stderr_tail}")]

@@ -204,6 +204,34 @@ async fn host_dispatch_all_surfaces_handler_backed_tools() {
     session.close().await.unwrap();
 }
 #[tokio::test]
+async fn missing_resume_target_is_reported_as_such() {
+    let mut setup = config("resume-missing");
+    setup.resume = Some(chevalier::claude_subscription::ResumeTarget {
+        session_id: "00000000-0000-4000-8000-000000000000".into(),
+        cwd: setup.cwd.clone(),
+    });
+    let session = runtime().await.claude_session(setup).await.unwrap();
+    session
+        .send(UserTurn {
+            text: "continue".into(),
+            images: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(5), session.next_event())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            Error::ClaudeSession(ClaudeSessionError::ResumeNotFound { .. })
+        ),
+        "{error}"
+    );
+}
+#[tokio::test]
 async fn console_login_is_not_a_subscription() {
     // `auth status` runs outside the session cwd, so the fake learns its mode from a wrapper.
     let mut setup = config("console-login");

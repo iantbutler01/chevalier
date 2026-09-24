@@ -56,7 +56,7 @@ rl.on('line', line => {
     initialized = true;
     emit({ type: 'control_response', response: { subtype: 'success', request_id: msg.request_id } });
     if (mode === 'crash-before-init') process.exit(31);
-    if (mode === 'idle') return;
+    if (mode === 'idle' || mode === 'resume-missing') return;
     if (mode === 'garbage') { for (let i = 0; i < 21; i++) process.stdout.write('garbage\n'); return; }
     const next = JSON.parse(JSON.stringify(init));
     if (mode === 'api-key') next.apiKeySource = 'ANTHROPIC_API_KEY';
@@ -64,6 +64,12 @@ rl.on('line', line => {
     return;
   }
   if (mode === 'api-key') { console.error('user turn before subscription validation'); process.exit(35); }
+  if (msg.type === 'user' && mode === 'resume-missing') {
+    // Captured from claude 2.1.282 with --resume=<unknown id>: no init, an error result, exit 1.
+    process.stdout.write('No conversation found with session ID: 00000000-0000-4000-8000-000000000000\n');
+    emit({ ...result, subtype: 'error_during_execution', is_error: true, num_turns: 0, result: undefined });
+    process.exit(1);
+  }
   if (msg.type === 'user') {
     if (!pending) {
       pending = true;
