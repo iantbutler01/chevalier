@@ -250,7 +250,7 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
         model_part.to_string()
     };
 
-    let provider = if provider == "openai" && model_name.starts_with("gpt-6-astra") {
+    let provider = if provider == "openai" && crate::types::is_gpt6_model(&model_name) {
         "openai-responses".to_owned()
     } else {
         provider
@@ -495,7 +495,7 @@ fn generate_model_tool_schemas(
 /// Resolve provider key for model strings, including responses modifiers.
 fn resolve_provider_key(model: &str) -> String {
     if let Ok(parsed) = parse_model_string(model)
-        && parsed.model_name.starts_with("gpt-6-astra")
+        && crate::types::is_gpt6_model(&parsed.model_name)
         && parsed.provider == "openai-responses"
     {
         return parsed.provider;

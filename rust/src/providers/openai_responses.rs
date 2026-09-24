@@ -18,7 +18,9 @@ use crate::providers::{
 };
 use crate::retry::{RetryConfig, retry_with_backoff};
 use crate::schema::fix_tool_schema_for_provider;
-use crate::types::{AssistantResponse, Provider, ResponsePart, TokenUsage, ToolCall};
+use crate::types::{
+    AssistantResponse, Provider, ResponsePart, TokenUsage, ToolCall, is_gpt6_model,
+};
 use crate::utils::{
     ConversationMessage, parse_json_value_strict_str, parse_sse_stream,
     validate_image_input_supported,
@@ -158,7 +160,7 @@ impl OpenAIResponsesClient {
             "stream": stream,
         });
         // The GPT-6 family (Astra, Sol, Luna) rejects sampling parameters.
-        if model.starts_with("gpt-6-") {
+        if is_gpt6_model(model) {
             request.as_object_mut().unwrap().remove("temperature");
             request.as_object_mut().unwrap().remove("top_p");
         }
@@ -192,7 +194,7 @@ impl OpenAIResponsesClient {
             && !tools.is_empty()
         {
             request["tools"] = serde_json::json!(self.normalized_tools(tools));
-            if !model.starts_with("gpt-6-astra")
+            if !is_gpt6_model(model)
                 && let Some(tools) = request["tools"].as_array_mut()
             {
                 for tool in tools {
@@ -572,6 +574,27 @@ mod tests {
         assert_eq!(client.api_key, "test-key");
         assert_eq!(client.api_url, "https://api.openai.com/v1/responses");
         assert_eq!(client.provider, Provider::OpenAIResponses);
+    }
+
+    #[test]
+    fn gpt6_family_requests_keep_async_tools_and_drop_sampling() {
+        let tool = serde_json::json!({"type":"function","name":"lookup","description":"Look up","parameters":{"type":"object","properties":{}},"async":true});
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        for (model, gpt6) in [
+            ("gpt-6-astra", true),
+            ("gpt-6-sol", true),
+            ("gpt-6-luna", true),
+            ("gpt-5.5", false),
+        ] {
+            let client = OpenAIResponsesClient::new("test-key", model);
+            let mut config = GenerationConfig::new(model);
+            config.temperature = Some(0.7);
+            config.tools = Some(vec![tool.clone()]);
+            let body = client.build_request_body(&messages, &config, true).unwrap();
+            assert_eq!(body.get("temperature").is_none(), gpt6, "{model}");
+            assert_eq!(body.get("top_p").is_none(), gpt6, "{model}");
+            assert_eq!(body["tools"][0].get("async").is_some(), gpt6, "{model}");
+        }
     }
 
     #[test]

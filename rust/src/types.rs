@@ -80,7 +80,7 @@ impl Provider {
 
         let provider = match provider_str {
             "anthropic" | "kimi-coding" => Provider::Anthropic,
-            "openai" if model_name.starts_with("gpt-6-astra") => Provider::OpenAIResponses,
+            "openai" if is_gpt6_model(&model_name) => Provider::OpenAIResponses,
             "openai" => Provider::OpenAI,
             "openai-responses" | "openai-codex-responses" => Provider::OpenAIResponses,
             "bedrock" => Provider::Bedrock,
@@ -270,12 +270,18 @@ fn is_gemini_vision_model(model: &str) -> bool {
     model.contains("gemini")
 }
 
+/// The GPT-6 family (Astra, Sol, Luna) is Responses-only, rejects sampling
+/// parameters, and accepts asynchronous tool definitions.
+pub fn is_gpt6_model(model_name: &str) -> bool {
+    model_name.starts_with("gpt-6-")
+}
+
 fn is_openai_vision_model(model: &str) -> bool {
     model.starts_with("gpt-4o")
         || model.starts_with("gpt-4.1")
         || model.starts_with("gpt-4.5")
         || model.starts_with("gpt-5")
-        || model.starts_with("gpt-6-astra")
+        || is_gpt6_model(model)
         || model.starts_with("o3")
         || model.starts_with("o4")
 }
@@ -1685,7 +1691,14 @@ mod tests {
 
     #[test]
     fn test_provider_image_input_override() {
-        assert!(Provider::OpenAIResponses.supports_image_input("gpt-6-astra"));
+        for model in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+            assert!(Provider::OpenAIResponses.supports_image_input(model));
+            let (provider, name) = Provider::from_model_string(&format!("openai:{model}")).unwrap();
+            assert_eq!(
+                (provider, name.as_str()),
+                (Provider::OpenAIResponses, model)
+            );
+        }
         assert!(!Provider::OpenAIResponses.supports_image_input("gpt-6-astra@vision=false"));
         assert!(
             Provider::OpenRouter.supports_image_input("qwen/qwen2.5-vl-72b-instruct@vision=true")
