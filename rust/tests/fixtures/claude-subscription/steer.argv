@@ -1,0 +1,1 @@
+--output-format stream-json --verbose --input-format stream-json --max-turns 8 --model sonnet --allowedTools mcp__ob --tools  --setting-sources= --permission-mode default --include-partial-messages --strict-mcp-config --include-partial-messages

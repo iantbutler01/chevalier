@@ -1,0 +1,1 @@
+--output-format stream-json --verbose --input-format stream-json --max-turns 2 --model sonnet --resume=1543d0df-67f2-4918-8dfa-e70cafac684a --tools  --setting-sources= --permission-mode default --strict-mcp-config

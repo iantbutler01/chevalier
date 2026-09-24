@@ -1,0 +1,2 @@
+{"request_id": "uj8n9mm88b", "type": "control_request", "request": {"subtype": "initialize", "systemPrompt": [""]}}
+{"type": "user", "session_id": "", "message": {"role": "user", "content": [{"type": "text", "text": "What value did slow_lookup return earlier? One line."}]}, "parent_tool_use_id": null}

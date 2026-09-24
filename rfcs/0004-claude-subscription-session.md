@@ -116,6 +116,7 @@ pub enum ClaudeSessionEvent {
     AssistantMessage { text: String },       // complete assistant text for the message (for hosts that don't consume deltas)
     ToolCall { call_id: String, call: ToolCall },          // schema-only tool: host must respond_tool(call_id, ..)
     ToolExecuted { call: ToolCall, output: ToolOutput },   // handler-backed tool Chevalier already ran
+    ToolCancelled { call_id: String },       // CLI sent notifications/cancelled for an in-flight call (after interrupt); host aborts it
     RateLimits(Vec<ProviderRateLimit>),
     ApiRetry { attempt: u32, delay_ms: u64, error: String },
     TurnComplete { usage: TokenUsage, list_price_usd: Option<f64>, num_turns: u32, is_error: bool, subtype: String, result: Option<String> },
@@ -190,7 +191,7 @@ Reply (host → CLI):
 
 Calls can arrive concurrently (verified: two reads in flight together). Each is dispatched independently; replies may go out in any order. Other `mcp_message` methods (`ping`, `notifications/*`) get the JSON-RPC-correct empty reply. An unknown tool name returns `result.isError=true` with a text block, not a JSON-RPC error, so the model can recover.
 
-**4. Interrupt** (host → CLI): `{"type":"control_request","request_id":"<id>","request":{"subtype":"interrupt"}}`. The turn ends with a `result` whose `is_error` is true; that result is reported as `TurnComplete{is_error:true, subtype}` and the host decides meaning.
+**4. Interrupt** (host → CLI): `{"type":"control_request","request_id":"<id>","request":{"subtype":"interrupt"}}`. Captured sequence (`interrupt.*.jsonl`): the CLI sends `control_request/mcp_message` with `{"method":"notifications/cancelled","params":{"requestId":<jsonrpc id of the in-flight tools/call>,"reason":"…"}}`; the host acks it with `mcp_response {"jsonrpc":"2.0","result":{},"id":0}`, aborts that call (handler-backed: drop its future; schema-only: emit `ToolCancelled{call_id}` and ignore any later `respond_tool` for it); the CLI acks the interrupt with `control_response{response:{still_queued:[]}}`; the turn ends with `result{subtype:"error_during_execution", is_error:true}`, reported as `TurnComplete{is_error:true, subtype}`, and the host decides meaning.
 
 **5. CLI → host messages consumed:** `system/init`, `stream_event` (partial deltas; requires `--include-partial-messages`, added to argv when the host asks for deltas), `assistant`, `user` (tool-result echoes; ignored), `rate_limit_event`, `system/api_retry`, `result`, `control_response` (acks). Everything else is ignored after a `debug!`. More than 20 consecutive non-JSON stdout lines ⇒ `ClaudeSessionError::Protocol`.
 
@@ -265,7 +266,7 @@ Gates: `cargo test --all-features`, `cargo clippy --all-features -- -D warnings`
 
 ## Evidence
 
-Captured 2026-09-24 by driving `@anthropic-ai/claude-agent-sdk@0.3.281` through a tee wrapper around `claude` 2.1.281, logged in with `authMethod: claude.ai`, `subscriptionType: max`:
+Captured 2026-09-24 (raw transcripts, sanitized, in `rust/tests/fixtures/claude-subscription/{happy,steer,resume,interrupt}.{argv,stdin.jsonl,stdout.jsonl}`) by driving `@anthropic-ai/claude-agent-sdk@0.3.281` through a tee wrapper around `claude` 2.1.281, logged in with `authMethod: claude.ai`, `subscriptionType: max`:
 
 - argv: `--output-format stream-json --verbose --input-format stream-json --max-turns 8 --model sonnet --allowedTools mcp__ob --tools  --setting-sources= --permission-mode default` (+ `--resume=<id>` when resuming).
 - `system/init`: `apiKeySource: "none"`, `model: "claude-sonnet-5"`, `mcp_servers: [{name:"ob", status:"connected", source:"sdk"}]`.
