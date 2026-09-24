@@ -655,22 +655,12 @@ impl ObjectStoreClient for GcsObjectStoreClient {
         let client = self.async_client.clone();
         let object_url = self.object_media_url(&key);
         let auth = self.access_token_async().await?;
-        let response = send_with_retries_async(
+        read_object_with_retries_async(
             move || Ok(client.get(&object_url).bearer_auth(&auth)),
             "read",
+            &key,
         )
-        .await?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(VfsStorageError::Internal(format!(
-                "gcs read failed for {key}: {status} {body}"
-            )));
-        }
-        Ok(Some(response.bytes().await.map_err(internal)?.to_vec()))
+        .await
     }
 
     async fn get_object_range_async(
@@ -687,27 +677,17 @@ impl ObjectStoreClient for GcsObjectStoreClient {
             "bytes={offset}-{}",
             offset.saturating_add(length.saturating_sub(1))
         );
-        let response = send_with_retries_async(
+        read_object_with_retries_async(
             move || {
                 Ok(client
                     .get(&object_url)
                     .bearer_auth(&auth)
                     .header(reqwest::header::RANGE, range_header.clone()))
             },
-            "read-range",
+            "ranged read",
+            &key,
         )
-        .await?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if response.status() != StatusCode::PARTIAL_CONTENT && !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(VfsStorageError::Internal(format!(
-                "gcs ranged read failed for {key}: {status} {body}"
-            )));
-        }
-        Ok(Some(response.bytes().await.map_err(internal)?.to_vec()))
+        .await
     }
 
     async fn put_object_async(
@@ -1074,6 +1054,138 @@ where
     )))
 }
 
+/// Reads an object's bytes, `None` when it does not exist. The body is part of the attempt:
+/// a response can arrive and then stall past the client timeout mid-body, which reqwest
+/// reports as "error decoding response body", and one such pack read used to fail a whole
+/// `read_many` and the turn waiting on it. Send, status and body share one retry budget.
+async fn read_object_with_retries_async<F>(
+    build: F,
+    operation: &str,
+    key: &str,
+) -> VfsStorageResult<Option<Vec<u8>>>
+where
+    F: Fn() -> VfsStorageResult<AsyncRequestBuilder>,
+{
+    for attempt in 0..GCS_HTTP_MAX_ATTEMPTS {
+        let last = attempt + 1 == GCS_HTTP_MAX_ATTEMPTS;
+        let response = match build()?.send().await {
+            Ok(response) if !last && should_retry_status(response.status()) => {
+                tokio::time::sleep(retry_delay(attempt)).await;
+                continue;
+            }
+            Ok(response) => response,
+            Err(error) if !last && should_retry_error(&error) => {
+                tokio::time::sleep(retry_delay(attempt)).await;
+                continue;
+            }
+            Err(error) => {
+                return Err(VfsStorageError::Internal(format!(
+                    "gcs {operation} request failed for {key}: {error}"
+                )));
+            }
+        };
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(VfsStorageError::Internal(format!(
+                "gcs {operation} failed for {key}: {status} {body}"
+            )));
+        }
+        match response.bytes().await {
+            Ok(bytes) => return Ok(Some(bytes.to_vec())),
+            Err(error) if !last && should_retry_error(&error) => {
+                tokio::time::sleep(retry_delay(attempt)).await;
+            }
+            Err(error) => {
+                return Err(VfsStorageError::Internal(format!(
+                    "gcs {operation} body failed for {key}: {error}"
+                )));
+            }
+        }
+    }
+    unreachable!("the last attempt always returns")
+}
+
 fn internal<E: std::fmt::Display>(error: E) -> VfsStorageError {
     VfsStorageError::Internal(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    use super::*;
+
+    /// Serves `body`, but the first `stalls` connections send half of it and go quiet.
+    async fn stalling_server(body: &'static [u8], stalls: usize) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/object", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let seen = connections.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let index = seen.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut request = [0u8; 1024];
+                    let _ = socket.read(&mut request).await;
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    socket.write_all(head.as_bytes()).await.unwrap();
+                    if index < stalls {
+                        socket.write_all(&body[..body.len() / 2]).await.unwrap();
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    } else {
+                        socket.write_all(body).await.unwrap();
+                    }
+                });
+            }
+        });
+        (url, connections)
+    }
+
+    fn client() -> AsyncClient {
+        AsyncClient::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_body_that_stalls_partway_is_read_again() {
+        let (url, connections) = stalling_server(b"pack slot bytes", 1).await;
+        let client = client();
+        let bytes = read_object_with_retries_async(|| Ok(client.get(&url)), "ranged read", "pack")
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_deref(), Some(&b"pack slot bytes"[..]));
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_body_that_never_arrives_fails_after_the_budget() {
+        let (url, connections) = stalling_server(b"pack slot bytes", usize::MAX).await;
+        let client = client();
+        let error = read_object_with_retries_async(|| Ok(client.get(&url)), "read", "pack")
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("gcs read body failed for pack"),
+            "{error}"
+        );
+        assert_eq!(connections.load(Ordering::SeqCst), GCS_HTTP_MAX_ATTEMPTS);
+    }
 }
