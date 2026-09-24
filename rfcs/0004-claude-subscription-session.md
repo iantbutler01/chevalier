@@ -31,6 +31,7 @@ Source: Claude Code docs, *Legal and compliance → Authentication and credentia
 5. **Subscription or fail.** If the CLI reports `apiKeySource` other than `"none"` in `system/init`, or the environment would route to an API key, Bedrock, Vertex or Foundry, the session fails with `ClaudeSessionError::NotSubscription` before the first user turn. No silent paid fallback.
 6. **Honest identification.** The child environment sets `CLAUDE_AGENT_SDK_CLIENT_APP=<host app>` (from config). Chevalier does not impersonate the TS SDK (`CLAUDE_AGENT_SDK_VERSION` is never set) or the interactive CLI.
 7. **Branding.** Surfaces label this "Claude (subscription)"; "Claude Code" is not used as a product or feature name. Plain text may say a feature "runs Claude Code".
+8. **Black-box only.** The Consumer Terms forbid reducing the Services "to human-readable form". Chevalier never reads, unpacks or extracts from the `claude` binary or its bundle. Every wire fact comes from observing the stdin/stdout of the process Chevalier runs. The `claude-codes` crate's schema-extraction tooling and its `auth` feature (which relays the login flow through a PTY) are never used or copied.
 
 Rule-sensitive code (env builder, CLI resolution, status detection) lives in one module, `claude_subscription/policy.rs`, with a test per rule.
 
@@ -59,12 +60,12 @@ Rule-sensitive code (env builder, CLI resolution, status detection) lives in one
 |---|---|
 | `mod.rs` | `ClaudeSession`, `ClaudeSessionConfig`, `ClaudeSessionEvent`, public API |
 | `policy.rs` | CLI resolution, env builder, argv builder, auth-status detection (ToS rules 1–6) |
-| `wire.rs` | serde types for every message in §Wire contract; decode is lenient on unknown fields/types, strict on the fields we act on |
+| `wire.rs` | thin layer over `claude-codes` types (decode of every CLI message, `ControlResponse` encode) plus local types `claude-codes` lacks: the `initialize` request with `systemPrompt`, `sdkMcpServers`, `sdkMcpServerManifests`, and the tool-result `mcp_response` payload |
 | `process.rs` | spawn, stdio pumps, stderr ring, kill ladder |
 | `tools.rs` | manifest from `Runtime` schemas; `tools/call` dispatch (handler or host) |
 | `events.rs` | CLI message → `ClaudeSessionEvent` mapping |
 
-Feature-gated as `claude-subscription` (default on for `ts/` and `py/` builds). No new dependencies: tokio (`process`, `io-util`), serde_json, uuid, base64, tokio-util are already in `rust/Cargo.toml`.
+Feature-gated as `claude-subscription` (default on for `ts/` and `py/` builds). One new dependency: `claude-codes = { version = "=2.1.281", default-features = false, features = ["types"] }` (Apache-2.0, meawoppl/rust-code-agent-sdks). It supplies typed serde models of the CLI's stream-json and control messages and versions itself to the CLI release it was tested against. Types only: its clients, PTY login (`auth`) and schema tooling are not enabled. The pin is exact; a bump is a reviewed change that re-runs the fixture and live tests. It does not model the `initialize` fields this design sends, so those stay local in `wire.rs`. Everything else (tokio `process`/`io-util`, serde_json, uuid, base64, tokio-util) is already in `rust/Cargo.toml`.
 
 ### Model string
 
@@ -246,7 +247,7 @@ OpenBracket's own spec (`OpenBracket/specs/63-claude-subscription-runs.md`) owns
 ## Compatibility
 
 - Additive. Existing providers, `Runtime::run_stream` and bindings are unchanged.
-- The control protocol is the Agent SDK's internal contract, not a documented public API. It is pinned by captured fixtures and a minimum CLI version; a CLI release that changes it fails the fixture-replay tests and the live test before it reaches hosts.
+- The control protocol is the Agent SDK's internal contract, not a documented public API. It is pinned by captured fixtures, a minimum CLI version and the exact `claude-codes` version; a CLI release that changes it fails the fixture-replay tests and the live test before it reaches hosts. Drift detection is black-box (rule 8): replayed fixtures, the live test, and a hard failure on any CLI message shape Chevalier acts on but cannot decode.
 
 ## Validation
 
