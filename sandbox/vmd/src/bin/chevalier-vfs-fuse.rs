@@ -4,6 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
+use vmd_rs::fuse::fs::MountOwner;
 use vmd_rs::fuse::{
     DEFAULT_VFS_DRAIN_TIMEOUT, default_vfs_state_dir, mount_remote_vfs_fuse, unmount_fuse,
 };
@@ -23,6 +24,11 @@ struct Args {
     token_env: String,
     #[arg(long)]
     read_only: bool,
+    /// Guest account (name or `uid:gid`) the mount presents its entries as owned by, so a
+    /// root-started mount serves that user as its owner. Unset reports the stored owners.
+    /// Also read from CHEVALIER_VFS_OWNER.
+    #[arg(long)]
+    owner: Option<String>,
     #[arg(long)]
     mountpoint: Option<PathBuf>,
     /// Durable local state for this mount: the backing tree, the write-ahead log
@@ -63,6 +69,14 @@ async fn main() -> Result<()> {
         None => default_vfs_state_dir(&mountpoint)?,
     };
 
+    let owner = args
+        .owner
+        .or_else(|| std::env::var("CHEVALIER_VFS_OWNER").ok())
+        .as_deref()
+        .filter(|account| !account.trim().is_empty())
+        .map(MountOwner::resolve)
+        .transpose()?;
+
     let handle = mount_remote_vfs_fuse(
         args.endpoint.as_str(),
         token.as_str(),
@@ -71,6 +85,7 @@ async fn main() -> Result<()> {
         &mountpoint,
         &state_dir,
         read_only,
+        owner,
     )
     .await
     .with_context(|| format!("mount remote VFS at {}", mountpoint.display()))?;
