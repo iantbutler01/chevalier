@@ -42,6 +42,81 @@ const MOUNT_STATE_DIR: &str = "/run/chevalier/mounts";
 const MOUNT_SCRIPT_PATH: &str = "/etc/chevalier/mounts.sh";
 const MOUNT_UNIT_PATH: &str = "/etc/systemd/system/chevalier-mounts.service";
 const MOUNT_UNIT: &str = "[Unit]\nDescription=Chevalier shared mounts\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/sh /etc/chevalier/mounts.sh\n\n[Install]\nWantedBy=multi-user.target\n";
+const MOUNT_SCRIPT_NEXT_PATH: &str = "/etc/chevalier/mounts.sh.next";
+/// Swaps in `mounts.sh.next` when it differs from the running script and nothing uses the
+/// mounts; reports `mounts=unchanged|refreshed|deferred` on its last line. Mount daemons are
+/// stopped with SIGTERM, which drains their publication log before they unmount, and the
+/// nested mounts are released before the ones they sit in.
+const MOUNT_REFRESH_SCRIPT: &str = r#"set -u
+cur=/etc/chevalier/mounts.sh; next=/etc/chevalier/mounts.sh.next; state=/run/chevalier/mounts
+if [ -f "$cur" ] && cmp -s "$next" "$cur"; then rm -f "$next"; /bin/sh "$cur"; echo mounts=unchanged; exit 0; fi
+pids=""
+for marker in "$state"/*; do case "$marker" in *.log) continue;; esac; [ -f "$marker" ] && pids="$pids $(cat "$marker")"; done
+points=$(awk '$3 ~ /^fuse/ && $3 != "fusectl" {print length($2), $2}' /proc/mounts | sort -rn | cut -d' ' -f2-)
+busy=""
+for proc in /proc/[0-9]*; do
+  pid=${proc#/proc/}
+  case " $pids $$ " in *" $pid "*) continue;; esac
+  for link in "$proc/cwd" "$proc"/fd/*; do
+    target=$(readlink "$link" 2>/dev/null) || continue
+    for point in $points; do
+      case "$target" in "$point"|"$point"/*) busy="$pid"; break 3;; esac
+    done
+  done
+done
+if [ -n "$busy" ] && [ -f "$cur" ]; then rm -f "$next"; /bin/sh "$cur"; echo "mounts=deferred busy=$busy"; exit 0; fi
+for pid in $pids; do kill -TERM "$pid" 2>/dev/null || true; done
+for _ in $(seq 1 90); do alive=0; for pid in $pids; do kill -0 "$pid" 2>/dev/null && alive=1; done; [ "$alive" = 0 ] && break; sleep 1; done
+for point in $points; do mountpoint -q "$point" && umount -l "$point"; done
+rm -f "$state"/*
+mv "$next" "$cur"; chmod 600 "$cur"
+/bin/sh "$cur"
+echo mounts=refreshed
+"#;
+
+/// What an attach did to a guest's mounts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MountRefresh {
+    /// The caller passed no mounts; the guest's own script was replayed.
+    Replayed,
+    /// The guest already runs exactly these mounts.
+    Unchanged,
+    /// The guest's mounts were restarted from the new script.
+    Refreshed,
+    /// The mounts differ but a process is using them; left for a later attach.
+    Deferred,
+}
+
+impl MountRefresh {
+    fn from_report(stdout: &str) -> Option<Self> {
+        let last = stdout
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("mounts="))?;
+        match last
+            .trim_start_matches("mounts=")
+            .split_whitespace()
+            .next()?
+        {
+            "unchanged" => Some(Self::Unchanged),
+            "refreshed" => Some(Self::Refreshed),
+            "deferred" => Some(Self::Deferred),
+            _ => None,
+        }
+    }
+}
+
+/// The guest's boot-time mount script for `mounts`. Deterministic, so the same mounts
+/// always render the same bytes and a refresh can tell "unchanged" by comparing files.
+fn mount_script(mounts: &[RenderedMount]) -> String {
+    let mut script = String::from("set -e\n");
+    script.push_str(&format!("mkdir -p {MOUNT_STATE_DIR}\n"));
+    for mount in mounts {
+        script.push_str(&mount.launch_script());
+    }
+    script
+}
+
 /// Freestyle caps `exec-await` at five minutes of wall clock.
 const EXEC_AWAIT_MAX_MS: u64 = 300_000;
 /// Guest administration (units, mounts, poweroff) always runs as root regardless of
@@ -924,11 +999,7 @@ impl FreestyleControl {
                 ))),
             };
         }
-        let mut script = String::from("set -e\n");
-        script.push_str(&format!("mkdir -p {MOUNT_STATE_DIR}\n"));
-        for mount in mounts {
-            script.push_str(&mount.launch_script());
-        }
+        let script = mount_script(&mounts);
         self.write_file(vm_id, MOUNT_SCRIPT_PATH, script.into_bytes())
             .await?;
         self.write_file(vm_id, MOUNT_UNIT_PATH, MOUNT_UNIT.as_bytes().to_vec())
@@ -952,6 +1023,50 @@ impl FreestyleControl {
             None => Err(SandboxError::DaemonUnavailable(
                 "Freestyle mount bootstrap timed out".to_string(),
             )),
+        }
+    }
+
+    /// Attach with the mounts the caller wants now. A guest keeps the mount script it was
+    /// created with, so without this an attach replays whatever an older API configured
+    /// (its binary flags, environment, scopes) for the VM's whole life. The new script is
+    /// compared with the guest's: identical means a plain replay; different means the
+    /// guest's mounts are stopped and started from the new script, but only when no process
+    /// is using them. A busy guest keeps its current mounts and is refreshed on a later
+    /// attach, so no running command loses its files mid-task.
+    pub(crate) async fn refresh_configured_mounts(
+        &self,
+        vm_id: &str,
+        shared_mounts: &[SharedMount],
+    ) -> Result<MountRefresh> {
+        let mounts = self.resolve_mounts(shared_mounts)?;
+        if mounts.is_empty() {
+            self.ensure_configured_mounts(vm_id, &[]).await?;
+            return Ok(MountRefresh::Replayed);
+        }
+        self.write_file(
+            vm_id,
+            MOUNT_SCRIPT_NEXT_PATH,
+            mount_script(&mounts).into_bytes(),
+        )
+        .await?;
+        let result = self
+            .exec_await(
+                vm_id,
+                MOUNT_REFRESH_SCRIPT,
+                None,
+                Some(150_000),
+                None,
+                Some(ROOT_USER),
+            )
+            .await?;
+        let stdout = result.stdout.unwrap_or_default();
+        match (result.status_code, MountRefresh::from_report(&stdout)) {
+            (Some(0), Some(outcome)) => Ok(outcome),
+            _ => Err(SandboxError::InvalidResponse(format!(
+                "Freestyle mount refresh failed: {} {}",
+                stdout.trim(),
+                result.stderr.unwrap_or_default().trim()
+            ))),
         }
     }
 
@@ -1717,6 +1832,37 @@ mod tests {
     use super::*;
     use crate::{SharedMountAvailability, SharedMountContinuity};
     use serde_json::json;
+
+    #[test]
+    fn a_mount_refresh_reports_what_it_did() {
+        assert_eq!(
+            MountRefresh::from_report("mounted\nmounts=unchanged\n"),
+            Some(MountRefresh::Unchanged)
+        );
+        assert_eq!(
+            MountRefresh::from_report("mounts=deferred busy=4242\n"),
+            Some(MountRefresh::Deferred)
+        );
+        assert_eq!(
+            MountRefresh::from_report("mounts=refreshed"),
+            Some(MountRefresh::Refreshed)
+        );
+        assert_eq!(MountRefresh::from_report("sh: cmp: not found\n"), None);
+    }
+
+    #[test]
+    fn the_refresh_swaps_scripts_only_after_checking_nothing_uses_the_mounts() {
+        let busy_check = MOUNT_REFRESH_SCRIPT.find("busy=\"$pid\"").unwrap();
+        let deferred = MOUNT_REFRESH_SCRIPT.find("mounts=deferred").unwrap();
+        let stop = MOUNT_REFRESH_SCRIPT.find("kill -TERM").unwrap();
+        let swap = MOUNT_REFRESH_SCRIPT.find("mv \"$next\" \"$cur\"").unwrap();
+        assert!(busy_check < deferred && deferred < stop && stop < swap);
+        // Unchanged scripts are replayed before anything is inspected or stopped.
+        assert!(MOUNT_REFRESH_SCRIPT.find("mounts=unchanged").unwrap() < busy_check);
+        assert!(MOUNT_REFRESH_SCRIPT.contains(MOUNT_SCRIPT_NEXT_PATH));
+        assert!(MOUNT_REFRESH_SCRIPT.contains(MOUNT_SCRIPT_PATH));
+        assert!(MOUNT_REFRESH_SCRIPT.contains(MOUNT_STATE_DIR));
+    }
 
     #[test]
     fn persistent_computers_reject_expiration_and_plan_caps() {

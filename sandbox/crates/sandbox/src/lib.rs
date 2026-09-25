@@ -1286,7 +1286,10 @@ impl ManagedControl {
         }
     }
 
-    async fn ensure_configured_mounts(
+    /// Bring an attached sandbox's mounts to `shared_mounts` (see
+    /// `FreestyleControl::refresh_configured_mounts`); OpenComputer keeps its create-time
+    /// behaviour.
+    async fn refresh_configured_mounts(
         &self,
         sandbox_id: &str,
         shared_mounts: &[SharedMount],
@@ -1298,9 +1301,11 @@ impl ManagedControl {
                     .await
             }
             Self::Freestyle(control) => {
-                control
-                    .ensure_configured_mounts(sandbox_id, shared_mounts)
-                    .await
+                let outcome = control
+                    .refresh_configured_mounts(sandbox_id, shared_mounts)
+                    .await?;
+                tracing::info!(sandbox_id, ?outcome, "guest mounts on attach");
+                Ok(())
             }
         }
     }
@@ -4282,6 +4287,17 @@ impl Sandbox {
     }
 
     pub async fn attach_session(&self, session_id: &str) -> Result<Session> {
+        self.attach_session_with_mounts(session_id, &[]).await
+    }
+
+    /// `attach_session`, bringing a managed guest's mounts to `shared_mounts` when they
+    /// differ from what the guest runs (and nothing is using them). Empty replays the
+    /// guest's own mount script, as `attach_session` does.
+    pub async fn attach_session_with_mounts(
+        &self,
+        session_id: &str,
+        shared_mounts: &[SharedMount],
+    ) -> Result<Session> {
         let started = Instant::now();
         if let ControlBackend::Managed(control) = &self.inner.control_backend {
             let provider_session_id = self.managed_provider_session_id(session_id).await;
@@ -4300,7 +4316,9 @@ impl Sandbox {
             self.bind_managed_session_alias(session_id, &sandbox.id)
                 .await;
             control.ensure_running(&sandbox.id).await?;
-            control.ensure_configured_mounts(&sandbox.id, &[]).await?;
+            control
+                .refresh_configured_mounts(&sandbox.id, shared_mounts)
+                .await?;
             let session = Session::new_with_backend(
                 self.clone(),
                 session_id.to_string(),
