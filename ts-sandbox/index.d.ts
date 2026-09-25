@@ -223,6 +223,12 @@ export interface SandboxConnectOptions {
   provider?: string
   openComputer?: OpenComputerProviderOpts
   distributedControl?: DistributedControlOptions
+  /**
+   * Prepare the default image on every healthy endpoint before `connect` returns
+   * (default true). Hosts that place sessions lazily pass false so a cold image does
+   * not hold connection behind fleet-wide preparation.
+   */
+  prewarmOnStart?: boolean
 }
 
 export interface SessionCheckpointJs {

@@ -976,6 +976,10 @@ pub struct SandboxConnectOptions {
     pub provider: Option<String>,
     pub open_computer: Option<OpenComputerProviderOpts>,
     pub distributed_control: Option<DistributedControlOptions>,
+    /// Prepare the default image on every healthy endpoint before `connect` returns
+    /// (default true). Hosts that place sessions lazily pass false so a cold image does
+    /// not hold connection behind fleet-wide preparation.
+    pub prewarm_on_start: Option<bool>,
 }
 
 #[napi(object)]
@@ -1179,6 +1183,9 @@ impl Sandbox {
             }
             if let Some(ms) = o.connect_timeout_ms {
                 cfg.connect_timeout = Duration::from_millis(ms as u64);
+            }
+            if let Some(prewarm) = o.prewarm_on_start {
+                cfg.prewarm_on_start = prewarm;
             }
             if let Some(img) = o.default_image {
                 cfg.default_image = img;
