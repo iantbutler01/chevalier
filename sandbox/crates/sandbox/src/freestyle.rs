@@ -44,15 +44,16 @@ const MOUNT_UNIT_PATH: &str = "/etc/systemd/system/chevalier-mounts.service";
 const MOUNT_UNIT: &str = "[Unit]\nDescription=Chevalier shared mounts\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/sh /etc/chevalier/mounts.sh\n\n[Install]\nWantedBy=multi-user.target\n";
 const MOUNT_SCRIPT_NEXT_PATH: &str = "/etc/chevalier/mounts.sh.next";
 /// Swaps in `mounts.sh.next` when it differs from the running script and nothing uses the
-/// mounts; reports `mounts=unchanged|refreshed|deferred` on its last line. Mount daemons are
-/// stopped with SIGTERM, which drains their publication log before they unmount, and the
-/// nested mounts are released before the ones they sit in.
+/// mounts, and reports `mounts=unchanged|restart|deferred` on its last line. A changed
+/// script is applied by restarting the guest rather than remounting in place: mounts
+/// nest (the workspaces sit inside the Nym's read-only root), and a guest whose mounts
+/// came up in a different order cannot have them released cleanly while it runs.
 const MOUNT_REFRESH_SCRIPT: &str = r#"set -u
 cur=/etc/chevalier/mounts.sh; next=/etc/chevalier/mounts.sh.next; state=/run/chevalier/mounts
 if [ -f "$cur" ] && cmp -s "$next" "$cur"; then rm -f "$next"; /bin/sh "$cur"; echo mounts=unchanged; exit 0; fi
 pids=""
 for marker in "$state"/*; do case "$marker" in *.log) continue;; esac; [ -f "$marker" ] && pids="$pids $(cat "$marker")"; done
-points=$(awk '$3 ~ /^fuse/ && $3 != "fusectl" {print length($2), $2}' /proc/mounts | sort -rn | cut -d' ' -f2-)
+points=$(awk '$3 ~ /^fuse/ && $3 != "fusectl" {print $2}' /proc/mounts)
 busy=""
 for proc in /proc/[0-9]*; do
   pid=${proc#/proc/}
@@ -65,13 +66,8 @@ for proc in /proc/[0-9]*; do
   done
 done
 if [ -n "$busy" ] && [ -f "$cur" ]; then rm -f "$next"; /bin/sh "$cur"; echo "mounts=deferred busy=$busy"; exit 0; fi
-for pid in $pids; do kill -TERM "$pid" 2>/dev/null || true; done
-for _ in $(seq 1 90); do alive=0; for pid in $pids; do kill -0 "$pid" 2>/dev/null && alive=1; done; [ "$alive" = 0 ] && break; sleep 1; done
-for point in $points; do mountpoint -q "$point" && umount -l "$point"; done
-rm -f "$state"/*
 mv "$next" "$cur"; chmod 600 "$cur"
-/bin/sh "$cur"
-echo mounts=refreshed
+echo mounts=restart
 "#;
 
 /// What an attach did to a guest's mounts.
@@ -81,7 +77,7 @@ pub enum MountRefresh {
     Replayed,
     /// The guest already runs exactly these mounts.
     Unchanged,
-    /// The guest's mounts were restarted from the new script.
+    /// The new script was installed and the guest restarted to run it.
     Refreshed,
     /// The mounts differ but a process is using them; left for a later attach.
     Deferred,
@@ -99,7 +95,7 @@ impl MountRefresh {
             .next()?
         {
             "unchanged" => Some(Self::Unchanged),
-            "refreshed" => Some(Self::Refreshed),
+            "restart" => Some(Self::Refreshed),
             "deferred" => Some(Self::Deferred),
             _ => None,
         }
@@ -1060,14 +1056,39 @@ impl FreestyleControl {
             )
             .await?;
         let stdout = result.stdout.unwrap_or_default();
-        match (result.status_code, MountRefresh::from_report(&stdout)) {
-            (Some(0), Some(outcome)) => Ok(outcome),
-            _ => Err(SandboxError::InvalidResponse(format!(
-                "Freestyle mount refresh failed: {} {}",
-                stdout.trim(),
-                result.stderr.unwrap_or_default().trim()
-            ))),
+        let outcome = match (result.status_code, MountRefresh::from_report(&stdout)) {
+            (Some(0), Some(outcome)) => outcome,
+            _ => {
+                return Err(SandboxError::InvalidResponse(format!(
+                    "Freestyle mount refresh failed: {} {}",
+                    stdout.trim(),
+                    result.stderr.unwrap_or_default().trim()
+                )));
+            }
+        };
+        if outcome == MountRefresh::Refreshed {
+            // A guest poweroff lets systemd stop the mount daemons, which drain their
+            // publication logs; the boot then runs the new script in mount order.
+            let _ = self
+                .exec_await(
+                    vm_id,
+                    "systemctl poweroff --no-block",
+                    None,
+                    Some(10_000),
+                    None,
+                    Some(ROOT_USER),
+                )
+                .await;
+            if self
+                .wait_for_state(vm_id, FreestyleVmState::Stopped)
+                .await
+                .is_err()
+            {
+                self.vm_action(vm_id, FreestyleVmAction::Stop).await?;
+            }
+            self.ensure_running(vm_id).await?;
         }
+        Ok(outcome)
     }
 
     fn resolve_mounts(&self, shared_mounts: &[SharedMount]) -> Result<Vec<RenderedMount>> {
@@ -1370,7 +1391,9 @@ impl RenderedMount {
         exports.sort();
         let argv = shell_words_join(self.command.iter().map(String::as_str));
         format!(
-            "if [ ! -e {marker} ]; then\n  mkdir -p {mountpoint}\n  {exports}\n  export CHEVALIER_VFS_READ_ONLY={read_only}\n  nohup {argv} >{log} 2>&1 </dev/null &\n  echo $! > {marker}\nfi\n",
+            // Wait for this mount before the next starts: later mounts can sit inside
+            // this one, and one started first would be hidden beneath it.
+            "if [ ! -e {marker} ]; then\n  mkdir -p {mountpoint}\n  {exports}\n  export CHEVALIER_VFS_READ_ONLY={read_only}\n  nohup {argv} >{log} 2>&1 </dev/null &\n  pid=$!\n  echo $pid > {marker}\n  for _ in $(seq 1 240); do mountpoint -q {mountpoint} && break; kill -0 $pid 2>/dev/null || break; sleep 0.5; done\nfi\n",
             marker = shell_quote(&marker),
             mountpoint = shell_quote(&self.mountpoint),
             exports = if exports.is_empty() {
@@ -1844,7 +1867,7 @@ mod tests {
             Some(MountRefresh::Deferred)
         );
         assert_eq!(
-            MountRefresh::from_report("mounts=refreshed"),
+            MountRefresh::from_report("mounts=restart"),
             Some(MountRefresh::Refreshed)
         );
         assert_eq!(MountRefresh::from_report("sh: cmp: not found\n"), None);
@@ -1854,14 +1877,17 @@ mod tests {
     fn the_refresh_swaps_scripts_only_after_checking_nothing_uses_the_mounts() {
         let busy_check = MOUNT_REFRESH_SCRIPT.find("busy=\"$pid\"").unwrap();
         let deferred = MOUNT_REFRESH_SCRIPT.find("mounts=deferred").unwrap();
-        let stop = MOUNT_REFRESH_SCRIPT.find("kill -TERM").unwrap();
         let swap = MOUNT_REFRESH_SCRIPT.find("mv \"$next\" \"$cur\"").unwrap();
-        assert!(busy_check < deferred && deferred < stop && stop < swap);
-        // Unchanged scripts are replayed before anything is inspected or stopped.
+        let restart = MOUNT_REFRESH_SCRIPT.find("mounts=restart").unwrap();
+        assert!(busy_check < deferred && deferred < swap && swap < restart);
+        // Unchanged scripts are replayed before anything is inspected.
         assert!(MOUNT_REFRESH_SCRIPT.find("mounts=unchanged").unwrap() < busy_check);
         assert!(MOUNT_REFRESH_SCRIPT.contains(MOUNT_SCRIPT_NEXT_PATH));
         assert!(MOUNT_REFRESH_SCRIPT.contains(MOUNT_SCRIPT_PATH));
         assert!(MOUNT_REFRESH_SCRIPT.contains(MOUNT_STATE_DIR));
+        // Nothing is stopped or unmounted in place.
+        assert!(!MOUNT_REFRESH_SCRIPT.contains("kill -TERM"));
+        assert!(!MOUNT_REFRESH_SCRIPT.contains("umount"));
     }
 
     #[test]
@@ -2261,6 +2287,11 @@ mod tests {
         assert!(script.contains("export CHEVALIER_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN='tok'"));
         assert!(script.contains("export CHEVALIER_VFS_READ_ONLY=false"));
         assert!(script.contains("nohup 'sh' '-lc'"));
+        // The next mount starts only once this one is mounted (or its daemon has died), so
+        // a mount nested inside it lands on top of it rather than beneath it.
+        let launched = script.find("nohup").unwrap();
+        let waited = script.find("mountpoint -q '/mnt/nymfs' && break").unwrap();
+        assert!(launched < waited && waited < script.find("\nfi\n").unwrap());
     }
 
     #[test]
