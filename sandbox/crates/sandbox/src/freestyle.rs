@@ -1391,9 +1391,10 @@ impl RenderedMount {
         exports.sort();
         let argv = shell_words_join(self.command.iter().map(String::as_str));
         format!(
-            // Wait for this mount before the next starts: later mounts can sit inside
-            // this one, and one started first would be hidden beneath it.
-            "if [ ! -e {marker} ]; then\n  mkdir -p {mountpoint}\n  {exports}\n  export CHEVALIER_VFS_READ_ONLY={read_only}\n  nohup {argv} >{log} 2>&1 </dev/null &\n  pid=$!\n  echo $pid > {marker}\n  for _ in $(seq 1 240); do mountpoint -q {mountpoint} && break; kill -0 $pid 2>/dev/null || break; sleep 0.5; done\nfi\n",
+            // Wait for this mount before the next starts, whether this run launched it or
+            // a concurrent run (boot and an attach's replay) did: later mounts can sit
+            // inside this one, and one started first would be hidden beneath it.
+            "if [ ! -e {marker} ]; then\n  mkdir -p {mountpoint}\n  {exports}\n  export CHEVALIER_VFS_READ_ONLY={read_only}\n  nohup {argv} >{log} 2>&1 </dev/null &\n  echo $! > {marker}\nfi\npid=$(cat {marker} 2>/dev/null || echo 0)\nfor _ in $(seq 1 240); do mountpoint -q {mountpoint} && break; kill -0 \"$pid\" 2>/dev/null || break; sleep 0.5; done\n",
             marker = shell_quote(&marker),
             mountpoint = shell_quote(&self.mountpoint),
             exports = if exports.is_empty() {
@@ -2289,9 +2290,12 @@ mod tests {
         assert!(script.contains("nohup 'sh' '-lc'"));
         // The next mount starts only once this one is mounted (or its daemon has died), so
         // a mount nested inside it lands on top of it rather than beneath it.
-        let launched = script.find("nohup").unwrap();
+        // The wait sits after the launch block, so a run that finds the mount already
+        // launched by another run still waits for it before starting the next.
+        let launch_block_end = script.find("\nfi\n").unwrap();
         let waited = script.find("mountpoint -q '/mnt/nymfs' && break").unwrap();
-        assert!(launched < waited && waited < script.find("\nfi\n").unwrap());
+        assert!(script.find("nohup").unwrap() < launch_block_end && launch_block_end < waited);
+        assert!(script.contains("pid=$(cat '/run/chevalier/mounts/nymfs-root'"));
     }
 
     #[test]
