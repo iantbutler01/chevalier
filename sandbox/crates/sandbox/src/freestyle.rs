@@ -115,6 +115,12 @@ fn mount_script(mounts: &[RenderedMount]) -> String {
 
 /// Freestyle caps `exec-await` at five minutes of wall clock.
 const EXEC_AWAIT_MAX_MS: u64 = 300_000;
+/// How long the mount script waits for one mount to appear before starting the next.
+/// A fresh guest hydrates each read-only scope eagerly before mounting it, and a Nym
+/// root with tens of thousands of small files takes minutes; moving on early starts
+/// the nested mounts on the bare mountpoint, where the root later hides them. It sits
+/// just inside the exec cap the whole script runs under.
+const MOUNT_READY_WAIT_SECS: u64 = 280;
 /// Guest administration (units, mounts, poweroff) always runs as root regardless of
 /// the session user.
 const ROOT_USER: &str = "root";
@@ -982,7 +988,7 @@ impl FreestyleControl {
                     vm_id,
                     &format!("[ -f {MOUNT_SCRIPT_PATH} ] && /bin/sh {MOUNT_SCRIPT_PATH} || true"),
                     None,
-                    Some(120_000),
+                    Some(EXEC_AWAIT_MAX_MS),
                     None,
                     Some(ROOT_USER),
                 )
@@ -1007,7 +1013,7 @@ impl FreestyleControl {
                     "chmod 600 {MOUNT_SCRIPT_PATH} && systemctl daemon-reload && systemctl enable --now chevalier-mounts.service && systemctl is-active chevalier-mounts.service"
                 ),
                 None,
-                Some(120_000),
+                Some(EXEC_AWAIT_MAX_MS),
                 None, Some(ROOT_USER))
             .await?;
         match result.status_code {
@@ -1394,7 +1400,8 @@ impl RenderedMount {
             // Wait for this mount before the next starts, whether this run launched it or
             // a concurrent run (boot and an attach's replay) did: later mounts can sit
             // inside this one, and one started first would be hidden beneath it.
-            "if [ ! -e {marker} ]; then\n  mkdir -p {mountpoint}\n  {exports}\n  export CHEVALIER_VFS_READ_ONLY={read_only}\n  nohup {argv} >{log} 2>&1 </dev/null &\n  echo $! > {marker}\nfi\npid=$(cat {marker} 2>/dev/null || echo 0)\nfor _ in $(seq 1 240); do mountpoint -q {mountpoint} && break; kill -0 \"$pid\" 2>/dev/null || break; sleep 0.5; done\n",
+            "if [ ! -e {marker} ]; then\n  mkdir -p {mountpoint}\n  {exports}\n  export CHEVALIER_VFS_READ_ONLY={read_only}\n  nohup {argv} >{log} 2>&1 </dev/null &\n  echo $! > {marker}\nfi\npid=$(cat {marker} 2>/dev/null || echo 0)\nfor _ in $(seq 1 {polls}); do mountpoint -q {mountpoint} && break; kill -0 \"$pid\" 2>/dev/null || break; sleep 0.5; done\n",
+            polls = MOUNT_READY_WAIT_SECS * 2,
             marker = shell_quote(&marker),
             mountpoint = shell_quote(&self.mountpoint),
             exports = if exports.is_empty() {
