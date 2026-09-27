@@ -353,8 +353,8 @@ impl PublicationWatch {
                         scope = %status.scope_path,
                         pending_events = status.pending_events,
                         pending_payload_bytes = status.pending_payload_bytes,
-                        "vfs mount durable storage is exhausted; content mutations are refused \
-                         with ENOSPC until the publication backlog drains"
+                        "vfs mount backing free space is below its configured reserve; content mutations are refused \
+                         with ENOSPC until backing free space exceeds the reserve"
                     );
                 } else if status.storage_pressure_soft {
                     tracing::warn!(

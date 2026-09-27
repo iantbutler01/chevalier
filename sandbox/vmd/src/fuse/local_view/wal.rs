@@ -2058,6 +2058,23 @@ mod tests {
     }
 
     #[test]
+    fn default_storage_reserve_allows_small_host_filesystems() {
+        let limits = StoragePressureLimits::from_values(None, None);
+        assert!(!limits.is_hard(BackingFreeSpace {
+            fraction: 0.16,
+            bytes: 15 * 1024 * 1024 * 1024,
+        }));
+        assert!(limits.is_hard(BackingFreeSpace {
+            fraction: 0.01,
+            bytes: 512 * 1024 * 1024,
+        }));
+        assert!(limits.is_hard(BackingFreeSpace {
+            fraction: 0.004,
+            bytes: 32 * 1024 * 1024 * 1024,
+        }));
+    }
+
+    #[test]
     fn storage_pressure_limits_reject_invalid_values() {
         let limits = StoragePressureLimits::from_values(Some("1.5"), Some("not-bytes"));
         assert_eq!(

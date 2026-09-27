@@ -129,3 +129,7 @@ check using the production config renderers and pinned Envoy/CoreDNS versions. I
 answers/cache isolation, LAN TCP opt-in, and rejection from a neighboring default-policy VM. The test
 uses a process UID match in place of the production service-cgroup firewall match; Rust unit tests
 cover the cgroup rule construction. No host networking or running VM configuration is changed.
+
+### Workspace write reserve
+
+VMD refuses content mutations with `ENOSPC` when its backing filesystem has less than 1 GiB available or less than 0.5% available. `CHEVALIER_VMD_BACKING_FREE_BYTES_FLOOR` and `CHEVALIER_VMD_BACKING_FREE_FRACTION_FLOOR` override those defaults. These are host filesystem reserves, independent of the guest root and durable volume sizes. Guest `df` reports actual backing capacity; it does not subtract this reserve. A reserve violation can therefore block writes while `df` still shows free space. Publication backlog alone does not block writes, and draining an empty backlog cannot resolve a reserve violation.
