@@ -1,6 +1,7 @@
 // @dive-file: Distributed control-plane adapter for etcd + NATS routing, admission, and durable control-event publication.
 // @dive-rel: Consumed by crates/sandbox/src/lib.rs to keep facade APIs host-agnostic across local and distributed deployments.
 // @dive-rel: Mirrors node/control semantics emitted by vmd/src/registry.rs and vmd/src/control_bus.rs.
+use crate::placement::{NodeCapacity, ResourceDemand};
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -54,6 +55,7 @@ pub(crate) struct SessionRoute {
 
 #[derive(Clone, Debug)]
 pub(crate) struct NodeRoute {
+    pub capacity: Option<NodeCapacity>,
     pub node_id: String,
     pub endpoint: String,
     pub max_active_vms: Option<usize>,
@@ -162,6 +164,8 @@ struct SessionRouteRecord {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct NodeRecord {
+    #[serde(default)]
+    capacity: Option<NodeCapacity>,
     #[serde(default)]
     node_id: String,
     endpoint: String,
@@ -515,6 +519,8 @@ impl DistributedControlPlane {
         workspace_id: &str,
         tier_b_eligible: bool,
         required_mount_profiles: &[String],
+        demand: ResourceDemand,
+        excluded_endpoints: &[String],
     ) -> Result<NodeRoute> {
         let routes = self.list_node_routes().await?;
         if routes.is_empty() {
@@ -556,7 +562,7 @@ impl DistributedControlPlane {
         } else {
             true
         };
-        let eligible = eligible_routes_with_profile(
+        let mut eligible = eligible_routes_with_profile(
             &routes,
             &usage,
             self.cfg.required_storage_profile.as_deref(),
@@ -564,16 +570,24 @@ impl DistributedControlPlane {
             allow_tier_a_degraded,
             required_mount_profiles,
         );
+        let now_ms = unix_millis();
+        eligible.retain(|route| {
+            !endpoint_excluded(&route.endpoint, excluded_endpoints)
+                && capacity_rejection(route, demand, now_ms).is_none()
+        });
         if eligible.is_empty() {
             let mut details = Vec::new();
             for route in &routes {
-                let used = usage.get(&route.endpoint).copied().unwrap_or(0);
+                let used = route.capacity.as_ref().map_or_else(
+                    || usage.get(&route.endpoint).copied().unwrap_or(0),
+                    |capacity| capacity.active_vms,
+                );
                 let limit = route
                     .max_active_vms
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "unbounded".to_string());
                 details.push(format!(
-                    "{}@{} used={} limit={} storage_profile={} continuity_tier={} shared_mount_profiles={:?} degraded_mode={} admission_frozen={}",
+                    "{}@{} used={} limit={} storage_profile={} continuity_tier={} shared_mount_profiles={:?} degraded_mode={} admission_frozen={} capacity={}",
                     route.node_id,
                     route.endpoint,
                     used,
@@ -582,7 +596,8 @@ impl DistributedControlPlane {
                     route.continuity_tier,
                     route.shared_mount_profiles,
                     route.degraded_mode,
-                    route.admission_frozen
+                    route.admission_frozen,
+                    if endpoint_excluded(&route.endpoint, excluded_endpoints) { "worker rejected this request".into() } else { capacity_rejection(route, demand, now_ms).unwrap_or_else(|| "available".into()) }
                 ));
             }
             let required_profile = self
@@ -664,8 +679,17 @@ impl DistributedControlPlane {
             let b_rack = rack_usage.get(&b.rack).copied().unwrap_or(0);
             let a_total = usage.get(&a.endpoint).copied().unwrap_or(0);
             let b_total = usage.get(&b.endpoint).copied().unwrap_or(0);
-            a_workspace
-                .cmp(&b_workspace)
+            b.capacity
+                .as_ref()
+                .map(|capacity| capacity.headroom(demand))
+                .unwrap_or(0.0)
+                .total_cmp(
+                    &a.capacity
+                        .as_ref()
+                        .map(|capacity| capacity.headroom(demand))
+                        .unwrap_or(0.0),
+                )
+                .then(a_workspace.cmp(&b_workspace))
                 .then(a_zone.cmp(&b_zone))
                 .then(a_rack.cmp(&b_rack))
                 .then(a_total.cmp(&b_total))
@@ -683,6 +707,8 @@ impl DistributedControlPlane {
                     "tenant_id": tenant_id,
                     "workspace_id": workspace_id,
                     "selected_node_id": selected.node_id,
+                    "capacity": selected.capacity,
+                    "requested_resources": demand,
                     "selected_zone": selected.zone,
                     "selected_rack": selected.rack,
                     "selected_region": selected.region,
@@ -1598,6 +1624,7 @@ fn decode_node_route(key: &str, raw: &[u8]) -> Result<NodeRoute> {
             ));
         }
         return Ok(NodeRoute {
+            capacity: record.capacity,
             node_id,
             endpoint: record.endpoint,
             max_active_vms: record.max_active_vms,
@@ -1618,6 +1645,7 @@ fn decode_node_route(key: &str, raw: &[u8]) -> Result<NodeRoute> {
         .map_err(|err| SandboxError::InvalidResponse(format!("invalid node route value: {err}")))?;
     let node_id = key.rsplit('/').next().unwrap_or_default().to_string();
     Ok(NodeRoute {
+        capacity: None,
         node_id,
         endpoint,
         max_active_vms: None,
@@ -1739,6 +1767,17 @@ fn admission_budget_violation(
     None
 }
 
+fn endpoint_excluded(endpoint: &str, excluded: &[String]) -> bool {
+    crate::normalize_endpoint(endpoint).is_ok_and(|endpoint| excluded.contains(&endpoint))
+}
+
+fn capacity_rejection(route: &NodeRoute, demand: ResourceDemand, now_ms: u64) -> Option<String> {
+    match &route.capacity {
+        Some(capacity) => capacity.rejection(demand, now_ms),
+        None => Some("host capacity telemetry is unavailable; update the VM worker".into()),
+    }
+}
+
 fn eligible_routes_with_profile(
     routes: &[NodeRoute],
     usage: &HashMap<String, usize>,
@@ -1789,7 +1828,10 @@ fn eligible_routes_with_profile(
         if route_tier == CONTINUITY_TIER_B && route.degraded_mode {
             continue;
         }
-        let used = usage.get(&route.endpoint).copied().unwrap_or(0);
+        let used = route.capacity.as_ref().map_or_else(
+            || usage.get(&route.endpoint).copied().unwrap_or(0),
+            |capacity| capacity.active_vms,
+        );
         if route.max_active_vms.is_none_or(|limit| used < limit) {
             out.push(route.clone());
         }
@@ -2118,6 +2160,7 @@ mod tests {
         shared_mount_profiles: &[&str],
     ) -> NodeRoute {
         NodeRoute {
+            capacity: None,
             node_id: node_id.to_string(),
             endpoint: endpoint.to_string(),
             max_active_vms: None,
@@ -2158,10 +2201,169 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[ignore = "requires isolated etcd and NATS endpoints"]
+    async fn real_pressure_placement_uses_live_capacity_and_excludes_rejected_hosts() {
+        let id = Uuid::new_v4().simple().to_string();
+        let prefix = format!("/placement-test/{id}");
+        let stream_name = format!("PLACEMENT_{id}");
+        let cfg = DistributedControlConfig {
+            etcd_endpoints: vec![std::env::var("CHEVALIER_SANDBOX_TEST_ETCD_ENDPOINT").unwrap()],
+            nats_url: std::env::var("CHEVALIER_SANDBOX_TEST_NATS_URL").unwrap(),
+            etcd_prefix: prefix.clone(),
+            cluster_id: id.clone(),
+            nats_stream_name: stream_name.clone(),
+            nats_subject_prefix: format!("placement.{id}"),
+            nats_dead_letter_subject: format!("placement.{id}.dlq"),
+            ..DistributedControlConfig::default()
+        };
+        let plane = DistributedControlPlane::connect(cfg).await.unwrap();
+        let now = unix_millis();
+        let gib = crate::placement::GIB;
+        for (name, cpu, memory, disk, sampled) in [
+            ("disk-full", 128.0, 512 * gib, 15 * gib, now),
+            ("ram-full", 128.0, gib, 512 * gib, now),
+            ("cpu-busy", 0.5, 512 * gib, 512 * gib, now),
+            ("balanced", 16.0, 32 * gib, 128 * gib, now),
+            ("second", 8.0, 16 * gib, 64 * gib, now),
+            ("stale", 128.0, 512 * gib, 512 * gib, now - 60_000),
+        ] {
+            let record = json!({
+                "node_id": name, "endpoint": format!("http://{name}:8052"),
+                "max_active_vms": 4, "continuity_tier": "tier-a", "degraded_mode": true,
+                "capacity": { "active_vms": 0, "sampled_at_unix_ms": sampled,
+                    "cpu_available": cpu, "memory_available_bytes": memory, "disk_available_bytes": disk,
+                    "memory_reserve_bytes": gib, "disk_reserve_bytes": 10 * gib }
+            });
+            plane
+                .etcd
+                .lock()
+                .await
+                .put(
+                    format!("{}{name}", plane.nodes_prefix()),
+                    record.to_string(),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        plane.etcd.lock().await.put(format!("{}unknown", plane.nodes_prefix()), json!({
+            "node_id": "unknown", "endpoint": "http://unknown:8052", "continuity_tier": "tier-a", "degraded_mode": true
+        }).to_string(), None).await.unwrap();
+        for index in 0..6 {
+            plane
+                .put_session_route(
+                    session_route(
+                        &format!("stopped-{index}"),
+                        "http://balanced:8052",
+                        false,
+                        &[],
+                    ),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let demand = ResourceDemand::for_vm(2, 2048, 16, 16);
+        let first = plane
+            .select_node_for_session_with_eligibility(
+                "new",
+                "tenant-a",
+                "workspace-a",
+                false,
+                &[],
+                demand,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.node_id, "balanced");
+        let rejected = vec![first.endpoint];
+        let second = plane
+            .select_node_for_session_with_eligibility(
+                "new",
+                "tenant-a",
+                "workspace-a",
+                false,
+                &[],
+                demand,
+                &rejected,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.node_id, "second");
+        let rejected = vec![rejected[0].clone(), second.endpoint];
+        let failure = plane
+            .select_node_for_session_with_eligibility(
+                "new",
+                "tenant-a",
+                "workspace-a",
+                false,
+                &[],
+                demand,
+                &rejected,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(failure, SandboxError::ResourceExhausted(_)));
+        assert!(failure.to_string().contains("disk headroom"));
+        assert!(failure.to_string().contains("telemetry is unavailable"));
+        plane
+            .etcd
+            .lock()
+            .await
+            .delete(
+                prefix,
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+        plane.jetstream.delete_stream(stream_name).await.unwrap();
+    }
+
+    #[test]
+    fn node_wire_capacity_excludes_missing_stale_and_full_hosts() {
+        let mut payload = json!({
+            "node_id": "worker", "endpoint": "http://worker:8052",
+            "capacity": {
+                "active_vms": 0,
+                "sampled_at_unix_ms": 100_000,
+                "cpu_available": 12.0,
+                "memory_available_bytes": 32_u64 * crate::placement::GIB,
+                "disk_available_bytes": 15_u64 * crate::placement::GIB,
+                "memory_reserve_bytes": crate::placement::GIB,
+                "disk_reserve_bytes": 10_u64 * crate::placement::GIB
+            }
+        });
+        let demand = ResourceDemand::for_vm(2, 2048, 16, 16);
+        let decode = |value: &Value| {
+            decode_node_route("/nodes/worker", &serde_json::to_vec(value).unwrap()).unwrap()
+        };
+        assert!(
+            capacity_rejection(&decode(&payload), demand, 110_000)
+                .unwrap()
+                .contains("disk")
+        );
+        payload["capacity"]["disk_available_bytes"] = json!(100_u64 * crate::placement::GIB);
+        assert!(capacity_rejection(&decode(&payload), demand, 110_000).is_none());
+        assert!(
+            capacity_rejection(&decode(&payload), demand, 200_000)
+                .unwrap()
+                .contains("stale")
+        );
+        payload.as_object_mut().unwrap().remove("capacity");
+        assert!(
+            capacity_rejection(&decode(&payload), demand, 110_000)
+                .unwrap()
+                .contains("unavailable")
+        );
+    }
+
     #[test]
     fn eligible_routes_filters_nodes_at_capacity() {
         let routes = vec![
             NodeRoute {
+                capacity: None,
                 node_id: "node-a".to_string(),
                 endpoint: "http://node-a:8052".to_string(),
                 max_active_vms: Some(2),
@@ -2178,6 +2380,7 @@ mod tests {
                 rack: "rack-a".to_string(),
             },
             NodeRoute {
+                capacity: None,
                 node_id: "node-b".to_string(),
                 endpoint: "http://node-b:8052".to_string(),
                 max_active_vms: Some(1),
@@ -2194,6 +2397,7 @@ mod tests {
                 rack: "rack-b".to_string(),
             },
             NodeRoute {
+                capacity: None,
                 node_id: "node-c".to_string(),
                 endpoint: "http://node-c:8052".to_string(),
                 max_active_vms: None,
@@ -2230,6 +2434,7 @@ mod tests {
     fn eligible_routes_skips_admission_frozen_nodes() {
         let routes = vec![
             NodeRoute {
+                capacity: None,
                 node_id: "node-frozen".to_string(),
                 endpoint: "http://node-frozen:8052".to_string(),
                 max_active_vms: None,
@@ -2246,6 +2451,7 @@ mod tests {
                 rack: "rack-a".to_string(),
             },
             NodeRoute {
+                capacity: None,
                 node_id: "node-ready".to_string(),
                 endpoint: "http://node-ready:8052".to_string(),
                 max_active_vms: None,
@@ -2279,6 +2485,7 @@ mod tests {
     fn eligible_routes_filters_by_required_storage_profile() {
         let routes = vec![
             NodeRoute {
+                capacity: None,
                 node_id: "node-a".to_string(),
                 endpoint: "http://node-a:8052".to_string(),
                 max_active_vms: None,
@@ -2295,6 +2502,7 @@ mod tests {
                 rack: "rack-a".to_string(),
             },
             NodeRoute {
+                capacity: None,
                 node_id: "node-b".to_string(),
                 endpoint: "http://node-b:8052".to_string(),
                 max_active_vms: None,
@@ -2340,6 +2548,7 @@ mod tests {
     fn eligible_routes_enforces_tier_b_default_and_tier_a_degraded_policy() {
         let routes = vec![
             NodeRoute {
+                capacity: None,
                 node_id: "node-tier-b".to_string(),
                 endpoint: "http://node-tier-b:8052".to_string(),
                 max_active_vms: None,
@@ -2356,6 +2565,7 @@ mod tests {
                 rack: "rack-a".to_string(),
             },
             NodeRoute {
+                capacity: None,
                 node_id: "node-tier-a-degraded".to_string(),
                 endpoint: "http://node-tier-a-degraded:8052".to_string(),
                 max_active_vms: None,
@@ -2372,6 +2582,7 @@ mod tests {
                 rack: "rack-b".to_string(),
             },
             NodeRoute {
+                capacity: None,
                 node_id: "node-tier-a-invalid".to_string(),
                 endpoint: "http://node-tier-a-invalid:8052".to_string(),
                 max_active_vms: None,

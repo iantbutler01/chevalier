@@ -133,3 +133,17 @@ cover the cgroup rule construction. No host networking or running VM configurati
 ### Workspace write reserve
 
 VMD refuses content mutations with `ENOSPC` when its backing filesystem has less than 1 GiB available or less than 0.5% available. `CHEVALIER_VMD_BACKING_FREE_BYTES_FLOOR` and `CHEVALIER_VMD_BACKING_FREE_FRACTION_FLOOR` override those defaults. These are host filesystem reserves, independent of the guest root and durable volume sizes. Guest `df` reports actual backing capacity; it does not subtract this reserve. A reserve violation can therefore block writes while `df` still shows free space. Publication backlog alone does not block writes, and draining an empty backlog cannot resolve a reserve violation.
+
+### Distributed placement capacity
+
+Workers publish `capacity` in their leased etcd node record at least every 15 seconds. New session placement requires telemetry no older than 45 seconds; workers without valid telemetry are ineligible. Upgrade workers before upgrading distributed clients. Existing session bindings retain their owner; this policy does not migrate running VMs or change Kubernetes pod placement.
+
+`crates/sandbox/src/placement.rs` defines the shared admission contract. VMD samples available host RAM (bounded by Linux cgroup limits), effective CPU parallelism and one-minute load, and free space on its actual data filesystem. Running, paused, and creating VMs consume declared CPU/RAM capacity. Pending creations reserve disk budget until preparation/startup completes. Metrics cannot wait behind long VM operations: an unavailable sample excludes the worker until a fresh sample succeeds.
+
+Placement requires the requested CPU, RAM, root disk, and optional durable-volume capacity after reserves. RAM keeps the greater of 512 MiB or 5% for the host; disk keeps at least 10%, or the configured write reserve if larger. These admission margins deliberately exceed the final filesystem write guard. Sparse disk sizes are checked when admitting a VM; this does not permanently reserve all possible future growth or eliminate runtime write failures.
+
+Eligible hosts rank by the minimum of their available CPU/requested CPU, RAM/requested RAM, and disk/requested disk ratios, so abundance of one resource cannot hide a bottleneck in another. Workspace/zone/rack spreading and session hashing break ties. Slot limits use the worker's active count, not the number of retained session routes. Admission events include the measured capacity and request; exhausted placement reports each host's rejection reason.
+
+The worker rechecks under serialized admission and retains a reservation through preparation and startup. A tagged pre-creation capacity rejection makes the client try another eligible host, at most once per host and at most 32 alternate attempts. Other creation failures are not retried across hosts because a VM may already exist. Fork admission checks capacity before disturbing the parent.
+
+The ignored `real_pressure_placement_uses_live_capacity_and_excludes_rejected_hosts` test exercises placement against isolated etcd/NATS services. Set `CHEVALIER_SANDBOX_TEST_ETCD_ENDPOINT` and `CHEVALIER_SANDBOX_TEST_NATS_URL`, then run it with `cargo test -p chevalier-sandbox --features distributed-control --lib real_pressure_placement -- --ignored` from `sandbox/`.

@@ -1,6 +1,9 @@
 // @dive-file: Publishes node liveness and scheduling labels into etcd with lease-backed heartbeats.
 // @dive-rel: Emits node capability/placement metadata consumed by crates/sandbox/src/distributed.rs for placement decisions.
 // @dive-rel: Uses vmd/src/config.rs NodeRegistryConfig as the authoritative source for node identity and failure-domain labels.
+use crate::state::Manager;
+use chevalier_sandbox::placement::NodeCapacity;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -40,14 +43,17 @@ impl NodeRegistryHandle {
     }
 }
 
-pub async fn start(config: Option<NodeRegistryConfig>) -> Result<Option<NodeRegistryHandle>> {
+pub async fn start(
+    config: Option<NodeRegistryConfig>,
+    manager: Arc<Manager>,
+) -> Result<Option<NodeRegistryHandle>> {
     let Some(config) = config else {
         return Ok(None);
     };
 
     let key = registry_key(&config);
     let mut client = connect_client(&config).await?;
-    let mut registration = register_with_new_lease(&mut client, &config, &key)
+    let mut registration = register_with_new_lease(&mut client, &config, &key, &manager)
         .await
         .with_context(|| format!("initial node registry write for key {key}"))?;
 
@@ -70,6 +76,7 @@ pub async fn start(config: Option<NodeRegistryConfig>) -> Result<Option<NodeRegi
                             &task_config,
                             &task_key,
                             registration.lease_id,
+                            &manager,
                         ).await
                     }.await;
                     if let Err(err) = heartbeat_result {
@@ -84,6 +91,7 @@ pub async fn start(config: Option<NodeRegistryConfig>) -> Result<Option<NodeRegi
                                     &mut reconnected,
                                     &task_config,
                                     &task_key,
+                                    &manager,
                                 ).await {
                                     Ok(next_registration) => {
                                         client = reconnected;
@@ -148,13 +156,14 @@ async fn register_with_new_lease(
     client: &mut EtcdClient,
     config: &NodeRegistryConfig,
     key: &str,
+    manager: &Manager,
 ) -> Result<NodeRegistration> {
     let lease = client
         .lease_grant(config.ttl_secs, None)
         .await
         .context("grant lease for node heartbeat")?;
     let lease_id = lease.id();
-    write_node_record(client, config, key, lease_id).await?;
+    write_node_record(client, config, key, lease_id, manager).await?;
     let keepalive = start_node_registration_keepalive(client, lease_id).await?;
     Ok(NodeRegistration {
         lease_id,
@@ -167,11 +176,19 @@ async fn write_node_record(
     config: &NodeRegistryConfig,
     key: &str,
     lease_id: i64,
+    manager: &Manager,
 ) -> Result<()> {
+    let capacity = match manager.node_capacity().await {
+        Ok(capacity) => Some(capacity),
+        Err(error) => {
+            warn!(%error, "host capacity sampling failed; new placement is unavailable");
+            None
+        }
+    };
     client
         .put(
             key,
-            node_record_payload(config),
+            node_record_payload(config, capacity),
             Some(PutOptions::new().with_lease(lease_id)),
         )
         .await
@@ -217,8 +234,9 @@ async fn keep_node_registration_alive(registration: &mut NodeRegistration) -> Re
     Ok(())
 }
 
-fn node_record_payload(config: &NodeRegistryConfig) -> String {
+fn node_record_payload(config: &NodeRegistryConfig, capacity: Option<NodeCapacity>) -> String {
     json!({
+        "capacity": capacity,
         "node_id": config.node_id,
         "endpoint": config.advertise_endpoint,
         "max_active_vms": config.max_active_vms,
@@ -250,7 +268,7 @@ fn registry_key(config: &NodeRegistryConfig) -> String {
 
 fn heartbeat_interval(ttl_secs: i64) -> Duration {
     let ttl = ttl_secs.max(2) as u64;
-    let interval = (ttl / 2).max(1);
+    let interval = (ttl / 2).clamp(1, 15);
     Duration::from_secs(interval)
 }
 
@@ -297,11 +315,12 @@ mod tests {
     fn heartbeat_interval_uses_half_ttl_with_minimum() {
         assert_eq!(heartbeat_interval(30), Duration::from_secs(15));
         assert_eq!(heartbeat_interval(1), Duration::from_secs(1));
+        assert_eq!(heartbeat_interval(120), Duration::from_secs(15));
     }
 
     #[test]
     fn node_record_payload_preserves_scheduling_fields() {
-        let payload = node_record_payload(&test_config());
+        let payload = node_record_payload(&test_config(), None);
         let value: serde_json::Value = serde_json::from_str(&payload).expect("json payload");
 
         assert_eq!(value["node_id"], "node-a");

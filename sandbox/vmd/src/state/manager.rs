@@ -1,6 +1,7 @@
 // @dive-file: Core VM lifecycle manager handling create/start/stop/snapshot/fork flows and on-disk metadata invariants.
 // @dive-rel: Consumes policy limits from vmd/src/config.rs and enforces them on mutating VM operations.
 // @dive-rel: Implements fork CoW lineage behavior that underpins facade-level Session::fork semantics.
+use chevalier_sandbox::placement::{NodeCapacity, ResourceDemand};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -275,6 +276,8 @@ pub enum ManagerError {
     PciUnavailable(String),
     #[error("unsupported operation: {0}")]
     Unsupported(String),
+    #[error("host capacity unavailable: {0}")]
+    HostCapacity(String),
     #[error("capacity exceeded for {resource}: limit={limit} current={current}")]
     CapacityExceeded {
         resource: &'static str,
@@ -317,6 +320,34 @@ pub struct PendingSnapshot {
     pub canonical_ram_path: std::path::PathBuf,
 }
 
+fn metadata_demand(meta: &VmMetadata) -> ResourceDemand {
+    ResourceDemand::for_vm(
+        meta.resources.vcpu,
+        meta.resources.memory_mb,
+        meta.resources.disk_gb,
+        meta.durable_volume
+            .as_ref()
+            .map_or(0, |volume| volume.size_gb),
+    )
+}
+
+type CreationReservations = Arc<std::sync::Mutex<HashMap<String, ResourceDemand>>>;
+
+#[derive(Debug)]
+struct CapacityReservation {
+    id: String,
+    reservations: CreationReservations,
+}
+
+impl Drop for CapacityReservation {
+    fn drop(&mut self) {
+        self.reservations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.id);
+    }
+}
+
 pub struct Manager {
     cfg: Config,
     host_arch: String,
@@ -324,6 +355,7 @@ pub struct Manager {
     base_image_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
     vms: RwLock<HashMap<String, Arc<Vm>>>,
     vm_capacity_lock: Mutex<()>,
+    creation_reservations: CreationReservations,
     session_registry: RwLock<HashMap<String, String>>,
     snapshots: RwLock<HashMap<String, SnapshotRecord>>,
     volumes: RwLock<HashMap<String, DurableVolumeMetadata>>,
@@ -365,6 +397,7 @@ impl Manager {
             base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
             vm_capacity_lock: Mutex::new(()),
+            creation_reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_registry: RwLock::new(HashMap::new()),
             snapshots: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
@@ -1872,11 +1905,95 @@ impl Manager {
         count
     }
 
+    async fn allocation_snapshot(&self) -> anyhow::Result<(usize, ResourceDemand, ResourceDemand)> {
+        let reservations = self
+            .creation_reservations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let mut active_vms = reservations.len();
+        let mut committed = ResourceDemand::default();
+        let mut creating = ResourceDemand::default();
+        for demand in reservations.values() {
+            committed.cpu_cores += demand.cpu_cores;
+            committed.memory_bytes = committed.memory_bytes.saturating_add(demand.memory_bytes);
+            creating.disk_bytes = creating.disk_bytes.saturating_add(demand.disk_bytes);
+        }
+        let vms: Vec<_> = self
+            .vms
+            .read()
+            .await
+            .iter()
+            .map(|(id, vm)| (id.clone(), Arc::clone(vm)))
+            .collect();
+        for (id, vm) in vms {
+            if reservations.contains_key(&id) {
+                continue;
+            }
+            let inner = vm.try_lock().map_err(|_| {
+                anyhow!("VM state is changing; host capacity cannot yet be verified")
+            })?;
+            if matches!(
+                inner.metadata.state,
+                VmState::Running | VmState::Paused | VmState::Creating
+            ) {
+                active_vms += 1;
+                let demand = metadata_demand(&inner.metadata);
+                committed.cpu_cores += demand.cpu_cores;
+                committed.memory_bytes = committed.memory_bytes.saturating_add(demand.memory_bytes);
+                if inner.metadata.state == VmState::Creating {
+                    creating.disk_bytes = creating.disk_bytes.saturating_add(demand.disk_bytes);
+                }
+            }
+        }
+        Ok((active_vms, committed, creating))
+    }
+
+    pub async fn node_capacity(&self) -> anyhow::Result<NodeCapacity> {
+        let (active_vms, committed, creating) = self.allocation_snapshot().await?;
+        let mut capacity =
+            crate::capacity::sample(Path::new(&self.cfg.data_dir), committed, creating)?;
+        capacity.active_vms = active_vms;
+        Ok(capacity)
+    }
+
+    fn reserve_creation(&self, id: String, demand: ResourceDemand) -> CapacityReservation {
+        self.creation_reservations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(id.clone(), demand);
+        CapacityReservation {
+            id,
+            reservations: Arc::clone(&self.creation_reservations),
+        }
+    }
+
+    async fn enforce_host_capacity(&self, demand: ResourceDemand) -> ManagerResult<()> {
+        if self.cfg.node_registry.is_none() {
+            return Ok(());
+        }
+        let capacity = self
+            .node_capacity()
+            .await
+            .map_err(|error| ManagerError::HostCapacity(error.to_string()))?;
+        if let Some(reason) = capacity.rejection(demand, capacity.sampled_at_unix_ms) {
+            return Err(ManagerError::HostCapacity(reason));
+        }
+        Ok(())
+    }
+
     async fn enforce_create_vm_capacity(&self) -> ManagerResult<()> {
         let Some(limit) = self.cfg.max_active_vms else {
             return Ok(());
         };
-        let current = self.active_vm_count().await;
+        let current = if self.cfg.node_registry.is_some() {
+            self.allocation_snapshot()
+                .await
+                .map_err(|error| ManagerError::HostCapacity(error.to_string()))?
+                .0
+        } else {
+            self.active_vm_count().await
+        };
         if current >= limit {
             return Err(ManagerError::CapacityExceeded {
                 resource: "active_vms",
@@ -1887,33 +2004,20 @@ impl Manager {
         Ok(())
     }
 
-    async fn insert_creating_vm_with_capacity(&self, id: String, vm: Arc<Vm>) -> ManagerResult<()> {
-        // Serialize only the capacity decision and insertion. Snapshotting the VM
-        // references before awaiting their runtime locks keeps the global VM map
-        // available to observational reads while another VM is busy.
+    async fn insert_creating_vm_with_capacity(
+        &self,
+        id: String,
+        vm: Arc<Vm>,
+    ) -> ManagerResult<CapacityReservation> {
+        // Reserve before preparation and retain the reservation through startup,
+        // including the intermediate Stopped state before an automatic start.
         let _capacity_guard = self.vm_capacity_lock.lock().await;
-        if let Some(limit) = self.cfg.max_active_vms {
-            let existing_vms = self.vm_refs().await;
-            let mut current = 0usize;
-            for existing in existing_vms {
-                let inner = existing.lock().await;
-                if matches!(
-                    inner.metadata.state,
-                    VmState::Running | VmState::Paused | VmState::Creating
-                ) {
-                    current += 1;
-                }
-            }
-            if current >= limit {
-                return Err(ManagerError::CapacityExceeded {
-                    resource: "active_vms",
-                    limit,
-                    current,
-                });
-            }
-        }
+        let demand = metadata_demand(&vm.lock().await.metadata);
+        self.enforce_host_capacity(demand).await?;
+        self.enforce_create_vm_capacity().await?;
+        let reservation = self.reserve_creation(id.clone(), demand);
         self.vms.write().await.insert(id, vm);
-        Ok(())
+        Ok(reservation)
     }
 
     pub async fn create_vm(
@@ -1933,6 +2037,17 @@ impl Manager {
         }
         enforce_resource_bounds(&params.resources, self.resource_bounds)?;
         self.enforce_create_vm_capacity().await?;
+        self.enforce_host_capacity(ResourceDemand::for_vm(
+            params.resources.vcpu,
+            params.resources.memory_mb,
+            params.resources.disk_gb,
+            if params.storage_profile == "durable-data" {
+                params.volume_size_gb.unwrap_or(params.resources.disk_gb)
+            } else {
+                0
+            },
+        ))
+        .await?;
         let name = sanitize_name(&params.name);
         // @dive: Shared mounts are normalized before persistence so mount tags and host paths stay stable across restarts and forks.
         params.shared_mounts = normalize_shared_mounts(params.shared_mounts)?;
@@ -2102,14 +2217,17 @@ impl Manager {
 
         let runtime = VmRuntime::new(&vm_dir);
         let vm = Arc::new(Vm::new(meta.clone(), runtime, vm_dir.clone()));
-        if let Err(error) = self
+        let _capacity_reservation = match self
             .insert_creating_vm_with_capacity(id.clone(), vm.clone())
             .await
         {
-            self.release_pci_leases(&id, &meta.pci_devices).await;
-            let _ = remove_vm_dir_if_detached(&id, &vm_dir);
-            return Err(error);
-        }
+            Ok(reservation) => reservation,
+            Err(error) => {
+                self.release_pci_leases(&id, &meta.pci_devices).await;
+                let _ = remove_vm_dir_if_detached(&id, &vm_dir);
+                return Err(error);
+            }
+        };
         let mut vm_guard = vm.lock_owned().await;
 
         let create_result = match params.source.source_type {
@@ -2325,13 +2443,16 @@ impl Manager {
         };
         save_metadata(&vm_dir, &mut meta).map_err(ManagerError::Other)?;
         let vm = Arc::new(Vm::new(meta.clone(), runtime, vm_dir.clone()));
-        if let Err(error) = self
+        let _capacity_reservation = match self
             .insert_creating_vm_with_capacity(id.clone(), vm.clone())
             .await
         {
-            let _ = remove_vm_dir_if_detached(&id, &vm_dir);
-            return Err(error);
-        }
+            Ok(reservation) => reservation,
+            Err(error) => {
+                let _ = remove_vm_dir_if_detached(&id, &vm_dir);
+                return Err(error);
+            }
+        };
 
         emit_stage_progress(
             &progress,
@@ -2544,13 +2665,16 @@ impl Manager {
         };
         save_metadata(&vm_dir, &mut meta).map_err(ManagerError::Other)?;
         let vm = Arc::new(Vm::new(meta.clone(), runtime, vm_dir.clone()));
-        if let Err(error) = self
+        let _capacity_reservation = match self
             .insert_creating_vm_with_capacity(id.clone(), vm.clone())
             .await
         {
-            let _ = remove_vm_dir_if_detached(&id, &vm_dir);
-            return Err(error);
-        }
+            Ok(reservation) => reservation,
+            Err(error) => {
+                let _ = remove_vm_dir_if_detached(&id, &vm_dir);
+                return Err(error);
+            }
+        };
 
         emit_stage_progress(
             &progress,
@@ -2813,6 +2937,7 @@ impl Manager {
         parent_id: &str,
         params: ForkVmParams,
     ) -> ManagerResult<(VmMetadata, VmMetadata, String)> {
+        let _capacity_guard = self.vm_capacity_lock.lock().await;
         let parent_vm = self.vm_by_id(parent_id).await?;
 
         let parent_state = {
@@ -2835,6 +2960,9 @@ impl Manager {
             inner.runtime.state
         };
         let parent_was_running = matches!(parent_state, VmState::Running | VmState::Paused);
+        self.enforce_create_vm_capacity().await?;
+        let demand = metadata_demand(&parent_vm.lock().await.metadata);
+        self.enforce_host_capacity(demand).await?;
 
         if matches!(parent_state, VmState::Creating | VmState::Error) {
             return Err(ManagerError::InvalidState);
@@ -9510,6 +9638,7 @@ mod tests {
             base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
             vm_capacity_lock: Mutex::new(()),
+            creation_reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
             volume_operation_locks: Mutex::new(HashMap::new()),
@@ -9800,6 +9929,7 @@ mod tests {
             base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
             vm_capacity_lock: Mutex::new(()),
+            creation_reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
             volume_operation_locks: Mutex::new(HashMap::new()),
@@ -10001,6 +10131,7 @@ mod tests {
             base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
             vm_capacity_lock: Mutex::new(()),
+            creation_reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
             volume_operation_locks: Mutex::new(HashMap::new()),
@@ -10065,6 +10196,68 @@ mod tests {
             }
             other => panic!("unexpected error variant: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn capacity_reservation_survives_preparation_locks_and_startup_transition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = Manager::new(Config {
+            data_dir: tmp.path().to_string_lossy().to_string(),
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        let mut metadata = qemu_test_metadata("preparing");
+        metadata.state = VmState::Creating;
+        let dir = tmp.path().join("preparing");
+        fs::create_dir_all(&dir).unwrap();
+        let vm = Arc::new(Vm::new(metadata, VmRuntime::new(&dir), dir));
+        let reservation = manager
+            .insert_creating_vm_with_capacity("preparing".into(), Arc::clone(&vm))
+            .await
+            .unwrap();
+        let mut locked = vm.lock().await;
+        locked.metadata.state = VmState::Stopped;
+        let capacity = tokio::time::timeout(Duration::from_millis(100), manager.node_capacity())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(capacity.active_vms, 1);
+        drop(reservation);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), manager.node_capacity())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        drop(locked);
+        assert_eq!(manager.node_capacity().await.unwrap().active_vms, 0);
+    }
+
+    #[tokio::test]
+    async fn distributed_admission_rechecks_real_host_capacity_before_insertion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = Manager::new(Config {
+            data_dir: tmp.path().to_string_lossy().to_string(),
+            node_registry: Some(config::NodeRegistryConfig::defaults_for_listen(
+                "127.0.0.1:0",
+            )),
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        let mut metadata = qemu_test_metadata("oversized");
+        metadata.state = VmState::Creating;
+        metadata.resources.memory_mb = i32::MAX;
+        metadata.resources.vcpu = i32::MAX;
+        let dir = tmp.path().join("oversized");
+        fs::create_dir_all(&dir).unwrap();
+        let candidate = Arc::new(Vm::new(metadata, VmRuntime::new(&dir), dir));
+        let result = manager
+            .insert_creating_vm_with_capacity("oversized".into(), candidate)
+            .await;
+        assert!(matches!(result, Err(ManagerError::HostCapacity(_))));
+        assert!(manager.vms.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -10164,6 +10357,7 @@ mod tests {
             base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
             vm_capacity_lock: Mutex::new(()),
+            creation_reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
             volume_operation_locks: Mutex::new(HashMap::new()),
@@ -10287,6 +10481,7 @@ mod tests {
             base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
             vm_capacity_lock: Mutex::new(()),
+            creation_reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
             volume_operation_locks: Mutex::new(HashMap::new()),
@@ -10394,6 +10589,7 @@ mod tests {
             base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
             vm_capacity_lock: Mutex::new(()),
+            creation_reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
             volume_operation_locks: Mutex::new(HashMap::new()),
@@ -11420,6 +11616,7 @@ mod tests {
             base_image_locks: Mutex::new(HashMap::new()),
             vms: RwLock::new(HashMap::new()),
             vm_capacity_lock: Mutex::new(()),
+            creation_reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_registry: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
             volume_operation_locks: Mutex::new(HashMap::new()),

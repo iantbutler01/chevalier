@@ -77,7 +77,8 @@ pub async fn run_server(mut config: Config) -> Result<()> {
     let vm_health_reconciler_handle = health_reconciler::start(Arc::clone(&manager))
         .await
         .context("start vm health reconciler")?;
-    let registry_handle = start_node_registry(config.node_registry.clone()).await?;
+    let registry_handle =
+        start_node_registry(config.node_registry.clone(), Arc::clone(&manager)).await?;
     let partition_handle =
         start_partition_monitor(config.node_registry.as_ref(), config.control_bus.as_ref()).await?;
     let partition_gate = partition_handle.as_ref().map(|handle| handle.gate());
@@ -217,8 +218,9 @@ fn load_server_tls_config(cfg: &TlsServerConfig) -> Result<ServerTlsConfig> {
 
 async fn start_node_registry(
     node_registry: Option<NodeRegistryConfig>,
+    manager: Arc<Manager>,
 ) -> Result<Option<registry::NodeRegistryHandle>> {
-    registry::start(node_registry)
+    registry::start(node_registry, manager)
         .await
         .context("start node registry heartbeat task")
 }
@@ -2039,6 +2041,18 @@ fn status_from_error(err: ManagerError) -> Status {
         ManagerError::PciConflict(_) => Status::already_exists(err.to_string()),
         ManagerError::PciUnavailable(_) => Status::failed_precondition(err.to_string()),
         ManagerError::Unsupported(_) => Status::unimplemented(err.to_string()),
+        ManagerError::HostCapacity(_)
+        | ManagerError::CapacityExceeded {
+            resource: "active_vms",
+            ..
+        } => {
+            let mut status = Status::resource_exhausted(format!("{} retry_after_ms=2000", err));
+            status.metadata_mut().insert(
+                chevalier_sandbox::placement::ADMISSION_REJECTED_HEADER,
+                "true".parse().unwrap(),
+            );
+            status
+        }
         ManagerError::CapacityExceeded { .. } => {
             Status::resource_exhausted(format!("{} retry_after_ms=2000", err))
         }
@@ -2087,6 +2101,26 @@ fn sanitize_status_message(raw: &str) -> String {
 mod tests {
     use super::*;
     use tonic::metadata::MetadataValue;
+
+    #[test]
+    fn capacity_errors_identify_safe_admission_retries() {
+        let status = status_from_error(ManagerError::HostCapacity("disk headroom".into()));
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            status
+                .metadata()
+                .get(chevalier_sandbox::placement::ADMISSION_REJECTED_HEADER)
+                .unwrap(),
+            "true"
+        );
+        let status = status_from_error(ManagerError::Io(std::io::Error::from_raw_os_error(28)));
+        assert!(
+            status
+                .metadata()
+                .get(chevalier_sandbox::placement::ADMISSION_REJECTED_HEADER)
+                .is_none()
+        );
+    }
 
     #[test]
     fn extract_bearer_token_supports_authorization_header() {

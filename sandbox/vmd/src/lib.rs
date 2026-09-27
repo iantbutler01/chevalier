@@ -19,6 +19,7 @@ compile_error!("macos-macfuse and macos-no-mount are mutually exclusive");
 pub mod app;
 pub mod assets;
 pub mod bootstrap;
+mod capacity;
 pub mod config;
 pub mod control_bus;
 pub mod fuse;

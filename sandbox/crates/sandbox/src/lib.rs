@@ -30,6 +30,7 @@ use uuid::Uuid;
 mod distributed;
 mod freestyle;
 mod opencomputer;
+pub mod placement;
 pub mod slo;
 pub mod vfs;
 pub mod vm;
@@ -198,6 +199,12 @@ pub enum SandboxError {
     Unsupported(String),
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+}
+
+fn is_admission_rejection(error: &SandboxError) -> bool {
+    matches!(error, SandboxError::Grpc(status)
+        if status.code() == tonic::Code::ResourceExhausted
+        && status.metadata().get(placement::ADMISSION_REJECTED_HEADER).is_some_and(|value| value == "true"))
 }
 
 pub type Result<T> = std::result::Result<T, SandboxError>;
@@ -4166,18 +4173,36 @@ impl Sandbox {
             volume_size_gb: opts.volume_size_gb.unwrap_or_default(),
         };
 
-        let node_endpoint = self
-            .endpoint_for_new_session(
-                &session_id,
-                &tenant_id,
-                &workspace_id,
-                tier_b_eligible,
-                &required_mount_profiles,
-            )
-            .await?;
-        let warm_pool_key = warm_pool_key(&node_endpoint, image.as_str(), architecture.as_str());
-        let warm_pool_hit = self.warm_pool_contains_key(warm_pool_key.as_str()).await;
-        #[cfg(feature = "distributed-control")]
+        let mut rejected_endpoints = Vec::new();
+        let (node_endpoint, warm_pool_hit, vm) = loop {
+            let node_endpoint = self
+                .endpoint_for_new_session(
+                    &session_id,
+                    &tenant_id,
+                    &workspace_id,
+                    tier_b_eligible,
+                    &required_mount_profiles,
+                    placement::ResourceDemand::for_vm(
+                        resources.vcpu,
+                        resources.memory_mb,
+                        resources.disk_gb,
+                        if request.storage_profile == "durable-data" {
+                            if request.volume_size_gb > 0 {
+                                request.volume_size_gb
+                            } else {
+                                resources.disk_gb
+                            }
+                        } else {
+                            0
+                        },
+                    ),
+                    &rejected_endpoints,
+                )
+                .await?;
+            let warm_pool_key =
+                warm_pool_key(&node_endpoint, image.as_str(), architecture.as_str());
+            let warm_pool_hit = self.warm_pool_contains_key(warm_pool_key.as_str()).await;
+            #[cfg(feature = "distributed-control")]
         self.publish_control_command(
             "session.create",
             &session_id,
@@ -4195,27 +4220,18 @@ impl Sandbox {
         )
         .await?;
 
-        let mut client = self.vmd_client_for_endpoint(&node_endpoint).await?;
-        let request = if request.pci_device_ids.is_empty() {
-            self.request_with_auth(request)
-        } else {
-            self.request_with_pci_auth(request)?
-        };
-        let mut stream = client.create_vm(request).await?.into_inner();
-
-        let mut final_vm: Option<Vm> = None;
-        while let Some(update) = stream.message().await? {
-            if let Some(proto::vmd::v1::create_vm_stream_response::Event::Vm(vm)) = update.event {
-                // Some daemon builds keep the create stream open after emitting the terminal VM
-                // payload. Once we have that payload, waiting for EOF adds no value and can hang
-                // session creation indefinitely.
-                final_vm = Some(vm);
-                break;
+            match self
+                .create_vm_at_endpoint(&node_endpoint, request.clone())
+                .await
+            {
+                Ok(vm) => break (node_endpoint, warm_pool_hit, vm),
+                Err(error) if is_admission_rejection(&error) && rejected_endpoints.len() < 32 => {
+                    tracing::info!(endpoint = %node_endpoint, %error, "worker admission changed; trying another eligible host");
+                    rejected_endpoints.push(node_endpoint);
+                }
+                Err(error) => return Err(error),
             }
-        }
-
-        let vm = final_vm
-            .ok_or_else(|| SandboxError::InvalidResponse("create_vm stream missing VM".into()))?;
+        };
 
         let next_fence = self
             .bind_session_route(
@@ -5196,6 +5212,33 @@ impl Sandbox {
         Ok(endpoints)
     }
 
+    async fn create_vm_at_endpoint(
+        &self,
+        node_endpoint: &str,
+        request: CreateVmRequest,
+    ) -> Result<Vm> {
+        let mut client = self.vmd_client_for_endpoint(&node_endpoint).await?;
+        let request = if request.pci_device_ids.is_empty() {
+            self.request_with_auth(request)
+        } else {
+            self.request_with_pci_auth(request)?
+        };
+        let mut stream = client.create_vm(request).await?.into_inner();
+
+        let mut final_vm: Option<Vm> = None;
+        while let Some(update) = stream.message().await? {
+            if let Some(proto::vmd::v1::create_vm_stream_response::Event::Vm(vm)) = update.event {
+                // Some daemon builds keep the create stream open after emitting the terminal VM
+                // payload. Once we have that payload, waiting for EOF adds no value and can hang
+                // session creation indefinitely.
+                final_vm = Some(vm);
+                break;
+            }
+        }
+
+        final_vm.ok_or_else(|| SandboxError::InvalidResponse("create_vm stream missing VM".into()))
+    }
+
     async fn endpoint_for_new_session(
         &self,
         _session_id: &str,
@@ -5203,6 +5246,8 @@ impl Sandbox {
         _workspace_id: &str,
         _tier_b_eligible: bool,
         _required_mount_profiles: &[String],
+        _demand: placement::ResourceDemand,
+        excluded_endpoints: &[String],
     ) -> Result<String> {
         #[cfg(feature = "distributed-control")]
         if let ControlBackend::Distributed(control) = &self.inner.control_backend {
@@ -5212,6 +5257,12 @@ impl Sandbox {
                 .map(|route| route.endpoint)
                 .filter(|endpoint| !endpoint.trim().is_empty())
             {
+                let endpoint = normalize_endpoint(&endpoint)?;
+                if excluded_endpoints.contains(&endpoint) {
+                    return Err(SandboxError::ResourceExhausted(
+                        "the session's existing host rejected admission".into(),
+                    ));
+                }
                 return normalize_endpoint(&endpoint);
             }
             let node = control
@@ -5221,12 +5272,19 @@ impl Sandbox {
                     _workspace_id,
                     _tier_b_eligible,
                     _required_mount_profiles,
+                    _demand,
+                    excluded_endpoints,
                 )
                 .await?;
             return normalize_endpoint(&node.endpoint);
         }
 
         let _ = (_tier_b_eligible, _required_mount_profiles);
+        if !excluded_endpoints.is_empty() {
+            return Err(SandboxError::ResourceExhausted(
+                "the configured VM host rejected admission".into(),
+            ));
+        }
         for endpoint in self.candidate_endpoints().await? {
             if self.health_check_endpoint(&endpoint).await.is_ok() {
                 return Ok(endpoint);
@@ -7046,6 +7104,23 @@ mod tests {
         ));
     }
     use super::*;
+
+    #[test]
+    fn only_explicit_pre_creation_rejections_allow_another_host() {
+        let mut status = tonic::Status::resource_exhausted("admission refused");
+        assert!(!is_admission_rejection(&SandboxError::Grpc(status.clone())));
+        status.metadata_mut().insert(
+            placement::ADMISSION_REJECTED_HEADER,
+            "true".parse().unwrap(),
+        );
+        assert!(is_admission_rejection(&SandboxError::Grpc(status)));
+        let mut internal = tonic::Status::internal("creation failed after starting");
+        internal.metadata_mut().insert(
+            placement::ADMISSION_REJECTED_HEADER,
+            "true".parse().unwrap(),
+        );
+        assert!(!is_admission_rejection(&SandboxError::Grpc(internal)));
+    }
 
     #[test]
     fn normalize_endpoint_adds_http_scheme() {
