@@ -3749,7 +3749,12 @@ impl Session {
             return control.fork(self.sandbox.clone(), self, opts).await;
         }
 
-        self.sync_guest_filesystems().await?;
+        // Only a running guest has dirty page cache to flush before the fork point. Syncing
+        // runs a command, and exec wakes a stopped VM — turning a cold, snapshot-free fork of
+        // a stopped parent into a live one that needs a RAM snapshot.
+        if self.state().await? == proto::vmd::v1::VmState::Running as i32 {
+            self.sync_guest_filesystems().await?;
+        }
 
         let auto_start_child = opts.auto_start_child;
         let node_endpoint = self.resolve_session_endpoint().await?;
