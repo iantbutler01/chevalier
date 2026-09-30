@@ -584,6 +584,7 @@ mod tests {
             ("gpt-6-astra", true),
             ("gpt-6-sol", true),
             ("gpt-6-luna", true),
+            ("gpt-6.1-sol", true),
             ("gpt-5.5", false),
         ] {
             let client = OpenAIResponsesClient::new("test-key", model);

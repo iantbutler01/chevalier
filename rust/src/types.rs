@@ -268,16 +268,21 @@ fn is_claude_vision_model(model: &str) -> bool {
         || model.contains("claude-sonnet-4")
         || model.contains("claude-opus-4")
         || model.contains("claude-haiku-4")
+        || model.contains("claude-5")
+        || model.contains("claude-sonnet-5")
+        || model.contains("claude-opus-5")
+        || model.contains("claude-haiku-5")
+        || model.contains("claude-fable-5")
 }
 
 fn is_gemini_vision_model(model: &str) -> bool {
     model.contains("gemini")
 }
 
-/// The GPT-6 family (Astra, Sol, Luna) is Responses-only, rejects sampling
+/// The GPT-6 family (Astra, Sol, Luna, and point releases such as gpt-6.1-sol) is Responses-only, rejects sampling
 /// parameters, and accepts asynchronous tool definitions.
 pub fn is_gpt6_model(model_name: &str) -> bool {
-    model_name.starts_with("gpt-6-")
+    model_name.starts_with("gpt-6-") || model_name.starts_with("gpt-6.")
 }
 
 fn is_openai_vision_model(model: &str) -> bool {
@@ -1695,7 +1700,7 @@ mod tests {
 
     #[test]
     fn test_provider_image_input_override() {
-        for model in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+        for model in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"] {
             assert!(Provider::OpenAIResponses.supports_image_input(model));
             let (provider, name) = Provider::from_model_string(&format!("openai:{model}")).unwrap();
             assert_eq!(
@@ -1704,6 +1709,9 @@ mod tests {
             );
         }
         assert!(!Provider::OpenAIResponses.supports_image_input("gpt-6-astra@vision=false"));
+        for model in ["claude-sonnet-5", "claude-sonnet-5-5", "claude-fable-5", "claude-opus-4-8"] {
+            assert!(Provider::Anthropic.supports_image_input(model), "{model}");
+        }
         assert!(
             Provider::OpenRouter.supports_image_input("qwen/qwen2.5-vl-72b-instruct@vision=true")
         );
