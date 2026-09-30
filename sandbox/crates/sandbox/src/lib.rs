@@ -3450,14 +3450,29 @@ impl Session {
             ));
         }
 
-        let node_endpoint = self.resolve_session_endpoint().await?;
+        // Read the VM where it lives without starting it: endpoint resolution ensures the VM is
+        // running, which would boot a stopped VM on its old mounts only to stop it again below.
+        // Resolve (and possibly rebind) only when the recorded node does not answer.
+        let mut node_endpoint = self.current_node_endpoint().await;
         let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
-        let current = client
+        let current = match client
             .get_vm(self.sandbox.request_with_auth(GetVmRequest {
                 vm_id: self.vm_id.clone(),
             }))
-            .await?
-            .into_inner();
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(_) => {
+                node_endpoint = self.resolve_session_endpoint().await?;
+                client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
+                client
+                    .get_vm(self.sandbox.request_with_auth(GetVmRequest {
+                        vm_id: self.vm_id.clone(),
+                    }))
+                    .await?
+                    .into_inner()
+            }
+        };
         let matcher = vm::ManagedMountMatcher::new(
             shared_mounts.iter().map(|mount| mount.mount_tag.as_str()),
             std::iter::empty::<&str>(),
