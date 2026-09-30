@@ -3749,15 +3749,21 @@ impl Session {
             return control.fork(self.sandbox.clone(), self, opts).await;
         }
 
-        // Only a running guest has dirty page cache to flush before the fork point. Syncing
-        // runs a command, and exec wakes a stopped VM — turning a cold, snapshot-free fork of
-        // a stopped parent into a live one that needs a RAM snapshot.
-        if self.state().await? == proto::vmd::v1::VmState::Running as i32 {
+        // A stopped parent forks cold: shared copy-on-write disks, no RAM snapshot. Keep it
+        // stopped — both the guest filesystem sync (an exec) and endpoint resolution (which
+        // ensures the VM is running) would start it and turn the fork into a live one that needs
+        // a RAM snapshot. Its disk is already quiescent, and its node is the one it was stopped on.
+        let parent_running = self.state().await? == proto::vmd::v1::VmState::Running as i32;
+        if parent_running {
             self.sync_guest_filesystems().await?;
         }
 
         let auto_start_child = opts.auto_start_child;
-        let node_endpoint = self.resolve_session_endpoint().await?;
+        let node_endpoint = if parent_running {
+            self.resolve_session_endpoint().await?
+        } else {
+            self.current_node_endpoint().await
+        };
         let child_session_id = Uuid::new_v4().to_string();
         let ownership_fence = self.ownership_fence().await;
         let mut child_metadata = opts.child_metadata;
