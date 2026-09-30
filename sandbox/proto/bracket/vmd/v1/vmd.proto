@@ -372,6 +372,7 @@ message ForkVMRequest {
   string child_name = 2;
   Metadata child_metadata = 3;
   bool auto_start_child = 4;
+  string child_volume_owner_key = 5;
 }
 
 message ForkVMResponse {

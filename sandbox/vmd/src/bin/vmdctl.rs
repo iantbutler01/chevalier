@@ -118,6 +118,8 @@ enum Commands {
         #[arg(long)]
         auto_start_child: bool,
         #[arg(long)]
+        child_volume_owner_key: Option<String>,
+        #[arg(long)]
         json: bool,
     },
     StartVm {
@@ -283,6 +285,7 @@ async fn main() -> Result<()> {
                     child_name,
                     child_metadata,
                     auto_start_child,
+                    child_volume_owner_key,
                     json,
                 } => {
                     fork_vm(
@@ -291,6 +294,7 @@ async fn main() -> Result<()> {
                         child_name,
                         child_metadata,
                         auto_start_child,
+                        child_volume_owner_key,
                         json,
                         auth_header.as_ref(),
                     )
@@ -791,6 +795,7 @@ async fn fork_vm(
     child_name: Option<String>,
     child_metadata: Vec<String>,
     auto_start_child: bool,
+    child_volume_owner_key: Option<String>,
     json: bool,
     auth_header: Option<&MetadataValue<Ascii>>,
 ) -> Result<()> {
@@ -816,6 +821,7 @@ async fn fork_vm(
                     })
                 },
                 auto_start_child,
+                child_volume_owner_key: child_volume_owner_key.unwrap_or_default(),
             },
             auth_header,
         ))

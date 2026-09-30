@@ -2814,6 +2814,49 @@ impl Manager {
         params: ForkVmParams,
     ) -> ManagerResult<(VmMetadata, VmMetadata, String)> {
         let parent_vm = self.vm_by_id(parent_id).await?;
+        let child_id = Uuid::new_v4().to_string();
+        if let Some(owner_key) = params
+            .child_volume_owner_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+        {
+            Self::validate_volume_owner_key(owner_key)?;
+        }
+        let child_volume_keys = {
+            let inner = parent_vm.lock().await;
+            inner.metadata.durable_volume.as_ref().map(|_| {
+                let volume_id = params
+                    .child_metadata
+                    .get(META_SESSION_ID)
+                    .or_else(|| inner.metadata.metadata.get(META_SESSION_ID))
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|session_id| format!("fork:{session_id}"))
+                    .unwrap_or_else(|| format!("fork:{child_id}"));
+                let owner_key = params
+                    .child_volume_owner_key
+                    .as_deref()
+                    .filter(|key| !key.is_empty())
+                    .unwrap_or(&volume_id)
+                    .to_string();
+                (volume_id, owner_key)
+            })
+        };
+        if let Some((volume_id, owner_key)) = &child_volume_keys {
+            let volumes = self.volumes.read().await;
+            if volumes.contains_key(owner_key) {
+                return Err(ManagerError::Other(anyhow!(
+                    "durable child volume owner already exists: {owner_key}"
+                )));
+            }
+            if volumes
+                .values()
+                .any(|volume| volume.volume_id == *volume_id)
+            {
+                return Err(ManagerError::Other(anyhow!(
+                    "durable child volume ID already exists: {volume_id}"
+                )));
+            }
+        }
 
         let parent_state = {
             let inner = parent_vm.lock().await;
@@ -2917,7 +2960,6 @@ impl Manager {
             });
         }
 
-        let child_id = Uuid::new_v4().to_string();
         let fork_id = Uuid::new_v4().to_string();
         let (fork_durability_class, fork_restore_scope) =
             fork_snapshot_durability(self.cfg.storage_profile, parent_was_running);
@@ -2949,18 +2991,13 @@ impl Manager {
         child_metadata.remove(META_FORK_BASE_PATH);
         child_metadata.remove(META_EXEC_RESTORE_SNAPSHOT_ID);
         child_metadata.remove(META_EXEC_RESTORE_SNAPSHOT_NAME);
-        let child_durable_volume = parent_durable_volume.as_ref().map(|parent_volume| {
-            let child_owner_key = child_metadata
-                .get(META_SESSION_ID)
-                .filter(|value| !value.trim().is_empty())
-                .map(|session_id| format!("fork:{session_id}"))
-                .unwrap_or_else(|| format!("fork:{child_id}"));
-            DurableVolumeAttachment {
-                volume_id: child_owner_key.clone(),
-                owner_key: child_owner_key,
+        let child_durable_volume = parent_durable_volume.as_ref().zip(child_volume_keys).map(
+            |(parent_volume, (volume_id, owner_key))| DurableVolumeAttachment {
+                owner_key,
+                volume_id,
                 size_gb: parent_volume.size_gb,
-            }
-        });
+            },
+        );
 
         let child_dir = PathBuf::from(&self.cfg.data_dir).join(&child_id);
         let parent_disk = parent_vm.disk_path();
@@ -9457,13 +9494,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn fork_vm_stopped_parent_uses_shared_cow_backing() {
-        if !qemu_img_available() {
-            eprintln!("qemu-img unavailable; skipping fork CoW runtime test");
-            return;
-        }
+    static FORK_PROXY_BIN_LOCK: Mutex<()> = Mutex::const_new(());
 
+    async fn setup_stopped_fork_parent()
+    -> (tempfile::TempDir, Manager, String, DurableVolumeAttachment) {
         let test_arch = if cfg!(target_arch = "aarch64") {
             ARCH_ARM64
         } else {
@@ -9611,6 +9645,21 @@ mod tests {
             .await
             .insert(parent_id.clone(), parent_vm);
 
+        (tmp, manager, parent_id, parent_volume)
+    }
+
+    #[tokio::test]
+    async fn fork_vm_stopped_parent_uses_shared_cow_backing() {
+        if !qemu_img_available() {
+            eprintln!("qemu-img unavailable; skipping fork CoW runtime test");
+            return;
+        }
+        let _proxy_bin_guard = FORK_PROXY_BIN_LOCK.lock().await;
+
+        let (tmp, manager, parent_id, parent_volume) = setup_stopped_fork_parent().await;
+        let data_dir = tmp.path();
+        let parent_disk = data_dir.join(&parent_id).join("disk.qcow2");
+
         let mut child_meta_extra = HashMap::new();
         child_meta_extra.insert(
             "chevalier.session_id".to_string(),
@@ -9623,6 +9672,7 @@ mod tests {
                     child_name: Some("child".to_string()),
                     child_metadata: child_meta_extra,
                     auto_start_child: false,
+                    child_volume_owner_key: None,
                 },
             )
             .await
@@ -9710,6 +9760,105 @@ mod tests {
         assert_eq!(
             parent_volume_backing, child_volume_backing,
             "parent and child durable volumes must share an immutable CoW backing"
+        );
+
+        unsafe {
+            std::env::remove_var("PROXY_BIN");
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_vm_uses_caller_volume_owner_key() {
+        if !qemu_img_available() {
+            eprintln!("qemu-img unavailable; skipping fork CoW runtime test");
+            return;
+        }
+        let _proxy_bin_guard = FORK_PROXY_BIN_LOCK.lock().await;
+
+        let (_tmp, manager, parent_id, parent_volume) = setup_stopped_fork_parent().await;
+        let child_owner_key = "workspace:test:thread:child";
+        let (_, child, _) = manager
+            .fork_vm(
+                &parent_id,
+                ForkVmParams {
+                    child_name: Some("child".to_string()),
+                    child_metadata: HashMap::from([(
+                        META_SESSION_ID.to_string(),
+                        "child-session".to_string(),
+                    )]),
+                    auto_start_child: false,
+                    child_volume_owner_key: Some(child_owner_key.to_string()),
+                },
+            )
+            .await
+            .expect("fork with caller-owned child volume");
+
+        let child_volume = child.durable_volume.expect("child durable volume");
+        assert_eq!(child_volume.owner_key, child_owner_key);
+        assert_eq!(child_volume.volume_id, "fork:child-session");
+        let volumes = manager.volumes.read().await;
+        assert_eq!(
+            volumes
+                .get(child_owner_key)
+                .map(|volume| volume.volume_id.as_str()),
+            Some("fork:child-session")
+        );
+        assert_eq!(
+            volumes
+                .get(&parent_volume.owner_key)
+                .map(|volume| volume.volume_id.as_str()),
+            Some(parent_volume.volume_id.as_str())
+        );
+        drop(volumes);
+        let parent_vm = manager.vm_by_id(&parent_id).await.expect("parent VM");
+        assert_eq!(
+            parent_vm.lock().await.metadata.durable_volume.as_ref(),
+            Some(&parent_volume)
+        );
+
+        unsafe {
+            std::env::remove_var("PROXY_BIN");
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_vm_rejects_duplicate_child_volume_owner_key() {
+        if !qemu_img_available() {
+            eprintln!("qemu-img unavailable; skipping fork CoW runtime test");
+            return;
+        }
+        let _proxy_bin_guard = FORK_PROXY_BIN_LOCK.lock().await;
+
+        let (tmp, manager, parent_id, parent_volume) = setup_stopped_fork_parent().await;
+        let child_owner_key = "workspace:test:thread:existing";
+        manager
+            .ensure_durable_volume(child_owner_key, 1)
+            .await
+            .expect("create existing volume");
+        let error = manager
+            .fork_vm(
+                &parent_id,
+                ForkVmParams {
+                    child_name: Some("child".to_string()),
+                    child_metadata: HashMap::new(),
+                    auto_start_child: false,
+                    child_volume_owner_key: Some(child_owner_key.to_string()),
+                },
+            )
+            .await
+            .expect_err("duplicate child owner key must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("durable child volume owner already exists")
+        );
+        assert_eq!(manager.vms.read().await.len(), 1);
+        assert_eq!(manager.volumes.read().await.len(), 2);
+        assert!(tmp.path().join(&parent_id).join("disk.qcow2").exists());
+        let parent_vm = manager.vm_by_id(&parent_id).await.expect("parent VM");
+        assert_eq!(
+            parent_vm.lock().await.metadata.durable_volume.as_ref(),
+            Some(&parent_volume)
         );
 
         unsafe {
@@ -10224,6 +10373,7 @@ mod tests {
                     child_name: Some("child".to_string()),
                     child_metadata: HashMap::new(),
                     auto_start_child: false,
+                    child_volume_owner_key: None,
                 },
             )
             .await

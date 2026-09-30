@@ -774,6 +774,11 @@ impl VmdService for GrpcService {
             },
             child_metadata: req.child_metadata.map_or_else(HashMap::new, |m| m.entries),
             auto_start_child: req.auto_start_child,
+            child_volume_owner_key: if req.child_volume_owner_key.is_empty() {
+                None
+            } else {
+                Some(req.child_volume_owner_key)
+            },
         };
 
         let (parent_meta, child_meta, fork_id) = self

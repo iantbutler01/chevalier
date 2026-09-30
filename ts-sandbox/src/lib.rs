@@ -375,6 +375,7 @@ pub struct ForkOpts {
     pub child_name: Option<String>,
     pub child_metadata: Option<HashMap<String, String>>,
     pub auto_start_child: Option<bool>,
+    pub child_volume_owner_key: Option<String>,
 }
 
 impl From<ForkOpts> for ForkOptions {
@@ -383,6 +384,7 @@ impl From<ForkOpts> for ForkOptions {
             child_name: o.child_name,
             child_metadata: o.child_metadata.unwrap_or_default(),
             auto_start_child: o.auto_start_child.unwrap_or(true),
+            child_volume_owner_key: o.child_volume_owner_key,
         }
     }
 }
@@ -729,6 +731,7 @@ impl Session {
             child_name: None,
             child_metadata: HashMap::new(),
             auto_start_child: true,
+            child_volume_owner_key: None,
         });
         let r = self.inner.fork(opts).await.map_err(sb_err)?;
         Ok(Session { inner: r.child })

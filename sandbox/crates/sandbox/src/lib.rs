@@ -692,6 +692,7 @@ pub struct ForkOptions {
     pub child_name: Option<String>,
     pub child_metadata: HashMap<String, String>,
     pub auto_start_child: bool,
+    pub child_volume_owner_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3786,6 +3787,7 @@ impl Session {
                     entries: child_metadata,
                 }),
                 auto_start_child,
+                child_volume_owner_key: opts.child_volume_owner_key.unwrap_or_default(),
             }))
             .await?
             .into_inner();

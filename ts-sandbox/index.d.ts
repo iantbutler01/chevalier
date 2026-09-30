@@ -148,6 +148,7 @@ export interface ForkOpts {
   childName?: string
   childMetadata?: Record<string, string>
   autoStartChild?: boolean
+  childVolumeOwnerKey?: string
 }
 
 export interface HostPciDeviceJs {
