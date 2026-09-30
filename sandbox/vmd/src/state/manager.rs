@@ -1086,6 +1086,12 @@ impl Manager {
             .volumes_dir()
             .join(VOLUME_FORK_BASES_DIR_NAME)
             .join(fork_id);
+        if Self::is_backing_referenced(
+            &self.backing_chain_references().await,
+            &fork_root.join("base.qcow2"),
+        ) {
+            return;
+        }
         if let Err(error) = fs::remove_dir_all(&fork_root) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 warn!(
@@ -6197,6 +6203,52 @@ impl Manager {
         let _ = fs::remove_dir(fork_root);
     }
 
+    /// Every image some VM disk, durable volume or fork base still reads through its qcow2 backing
+    /// chain. A parent that is forked again moves its metadata to the newest base, whose own backing
+    /// file is the previous base — so metadata alone does not show which bases are still in use.
+    async fn backing_chain_references(&self) -> HashSet<PathBuf> {
+        let mut roots: Vec<PathBuf> = {
+            let guard = self.vms.read().await;
+            guard.values().map(|vm| vm.disk_path()).collect()
+        };
+        for dir in [
+            self.volumes_dir(),
+            self.fork_base_root(),
+            self.volumes_dir().join(VOLUME_FORK_BASES_DIR_NAME),
+        ] {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    roots.push(path.join("base.qcow2"));
+                } else if path.extension().is_some_and(|ext| ext == "qcow2") {
+                    roots.push(path);
+                }
+            }
+        }
+        let mut referenced = HashSet::new();
+        for root in roots {
+            let mut image = root;
+            for _ in 0..64 {
+                let Some(backing) = qcow2_backing_path(&image) else {
+                    break;
+                };
+                let key = fs::canonicalize(&backing).unwrap_or_else(|_| backing.clone());
+                if !referenced.insert(key) {
+                    break;
+                }
+                image = backing;
+            }
+        }
+        referenced
+    }
+
+    fn is_backing_referenced(referenced: &HashSet<PathBuf>, image: &Path) -> bool {
+        referenced.contains(&fs::canonicalize(image).unwrap_or_else(|_| image.to_path_buf()))
+    }
+
     async fn cleanup_fork_base_if_unreferenced(&self, fork_base_path: Option<String>) {
         let Some(path) = fork_base_path else {
             return;
@@ -6220,6 +6272,9 @@ impl Manager {
         }
 
         let base_path = PathBuf::from(path);
+        if Self::is_backing_referenced(&self.backing_chain_references().await, &base_path) {
+            return;
+        }
         let _ = fs::remove_file(&base_path);
         if let Some(parent) = base_path.parent() {
             let _ = fs::remove_dir(parent);
@@ -6292,6 +6347,7 @@ impl Manager {
             }
         }
 
+        let chain_references = self.backing_chain_references().await;
         let Ok(entries) = fs::read_dir(&fork_root) else {
             return;
         };
@@ -6300,7 +6356,9 @@ impl Manager {
             if !path.is_dir() {
                 continue;
             }
-            if referenced_roots.contains(&path) {
+            if referenced_roots.contains(&path)
+                || Self::is_backing_referenced(&chain_references, &path.join("base.qcow2"))
+            {
                 continue;
             }
             if let Err(err) = fs::remove_dir_all(&path) {
@@ -6317,6 +6375,31 @@ impl Manager {
         let guard = self.snapshots.read().await;
         guard.get(id).cloned().ok_or(ManagerError::SnapshotNotFound)
     }
+}
+
+/// The backing file a qcow2 image names in its header, resolved against the image's directory.
+fn qcow2_backing_path(image: &Path) -> Option<PathBuf> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(image).ok()?;
+    let mut header = [0u8; 20];
+    file.read_exact(&mut header).ok()?;
+    if header[0..4] != *b"QFI\xfb" {
+        return None;
+    }
+    let offset = u64::from_be_bytes(header[8..16].try_into().ok()?);
+    let size = u32::from_be_bytes(header[16..20].try_into().ok()?) as usize;
+    if offset == 0 || size == 0 || size > 4096 {
+        return None;
+    }
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut name = vec![0u8; size];
+    file.read_exact(&mut name).ok()?;
+    let name = PathBuf::from(String::from_utf8(name).ok()?);
+    Some(if name.is_absolute() {
+        name
+    } else {
+        image.parent()?.join(name)
+    })
 }
 
 /// Selects the QEMU `(machine, cpu)` pair for an amd64 guest.
@@ -9761,6 +9844,72 @@ mod tests {
             parent_volume_backing, child_volume_backing,
             "parent and child durable volumes must share an immutable CoW backing"
         );
+
+        unsafe {
+            std::env::remove_var("PROXY_BIN");
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_an_earlier_fork_keeps_the_parents_backing_chain() {
+        if !qemu_img_available() {
+            eprintln!("qemu-img unavailable; skipping fork CoW runtime test");
+            return;
+        }
+        let _proxy_bin_guard = FORK_PROXY_BIN_LOCK.lock().await;
+
+        let (tmp, manager, parent_id, parent_volume) = setup_stopped_fork_parent().await;
+        let fork = |session: &str| ForkVmParams {
+            child_name: Some(format!("child-{session}")),
+            child_metadata: HashMap::from([(META_SESSION_ID.to_string(), session.to_string())]),
+            auto_start_child: false,
+            child_volume_owner_key: None,
+        };
+        let (_, first, _) = manager
+            .fork_vm(&parent_id, fork("first"))
+            .await
+            .expect("first fork");
+        let (_, second, _) = manager
+            .fork_vm(&parent_id, fork("second"))
+            .await
+            .expect("second fork");
+
+        manager
+            .delete_vm(&first.id, false)
+            .await
+            .expect("delete first child");
+
+        // The parent (re-based by the second fork) and the second child read through both bases.
+        let chain_exists = |image: PathBuf| {
+            let mut image = image;
+            let mut depth = 0;
+            while let Some(backing) = qcow2_backing_path(&image) {
+                assert!(
+                    backing.exists(),
+                    "missing backing file {} of {}",
+                    backing.display(),
+                    image.display()
+                );
+                image = backing;
+                depth += 1;
+            }
+            depth
+        };
+        let parent_disk = tmp.path().join(&parent_id).join("disk.qcow2");
+        assert!(
+            chain_exists(parent_disk) >= 2,
+            "parent chain should span both fork bases"
+        );
+        assert!(chain_exists(tmp.path().join(&second.id).join("disk.qcow2")) >= 2);
+        let volumes = manager.volumes.read().await;
+        let parent_volume_path = manager.volume_disk_path(
+            &volumes
+                .get(&parent_volume.owner_key)
+                .expect("parent volume")
+                .volume_id,
+        );
+        drop(volumes);
+        chain_exists(parent_volume_path);
 
         unsafe {
             std::env::remove_var("PROXY_BIN");
