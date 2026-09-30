@@ -283,8 +283,7 @@ impl Runtime {
                 options.control = Some(control.clone());
                 control
             });
-        // Unbounded so the driver never parks on `send` waiting for the consumer.
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<StreamEvent, String>>();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamEvent, String>>(32);
         let task = tokio::spawn(async move {
             // `guard` must outlive `stream` (the engine's `impl Stream` return
             // captures the guard's lifetime under Rust 2024 rules).
@@ -293,7 +292,7 @@ impl Runtime {
             let mut stream = match result {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = tx.send(Err(format_error(&e)));
+                    let _ = tx.send(Err(format_error(&e))).await;
                     return;
                 }
             };
@@ -302,7 +301,7 @@ impl Runtime {
                     Ok(ev) => Ok(StreamEvent::from(ev)),
                     Err(e) => Err(format_error(&e)),
                 };
-                if tx.send(msg).is_err() {
+                if tx.send(msg).await.is_err() {
                     break; // consumer dropped the handle
                 }
             }

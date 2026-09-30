@@ -79,6 +79,11 @@ for await (const ev of rt.runStream({ prompt: "Write a haiku" })) {
 }
 ```
 
+Streaming uses a bounded native event queue so slow consumers cannot accumulate
+unlimited copies of growing tool arguments. Finish or close the stream before
+calling operations that need its runtime lock. Breaking a `for await` loop or
+aborting its signal closes the stream, including when the queue is full.
+
 ## Multi-turn & multimodal
 
 ```ts

@@ -1,17 +1,16 @@
 //! Streaming: a `StreamHandle` that yields engine `ResponseStreamEvent`s as a
 //! JS-friendly discriminated union. The Rust stream is driven by a spawned task
 //! that owns the runtime lock guard + the stream together (avoiding a
-//! self-referential struct), forwarding events over an *unbounded* channel so
-//! the driver never parks waiting for the consumer (which would pin the runtime
-//! lock). `close()` aborts the driver to release the lock + provider request
-//! promptly.
+//! self-referential struct). A bounded channel backpressures the provider when
+//! consumers are slow, preventing growing tool snapshots from accumulating.
+//! `close()` aborts even a blocked send, releasing the runtime lock and request.
 
 use std::sync::Arc;
 
 use chevalier_core::types::{ResponsePart, ResponseStreamEvent};
 use napi_derive::napi;
 use tokio::sync::Mutex;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 use tokio::task::AbortHandle;
 
 use crate::types::ToolCallJs;
@@ -106,7 +105,7 @@ impl From<ResponseStreamEvent> for StreamEvent {
 #[napi]
 pub struct StreamHandle {
     pub(crate) control: Option<chevalier_core::providers::responses_control::ResponsesControl>,
-    pub(crate) rx: Arc<Mutex<UnboundedReceiver<Result<StreamEvent, String>>>>,
+    pub(crate) rx: Arc<Mutex<Receiver<Result<StreamEvent, String>>>>,
     pub(crate) abort: AbortHandle,
 }
 
