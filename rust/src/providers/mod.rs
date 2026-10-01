@@ -128,6 +128,8 @@ pub struct GenerationConfig {
 
     /// Top-p sampling
     pub top_p: Option<f32>,
+    /// False disables native tool calls while retaining tool schemas (Chat Completions / Responses only).
+    pub allow_tool_calls: Option<bool>,
 
     /// Tool schemas (provider-specific format)
     pub tools: Option<Vec<serde_json::Value>>,
@@ -175,6 +177,7 @@ impl Default for GenerationConfig {
             max_tokens: Some(4096),
             temperature: None,
             top_p: None,
+            allow_tool_calls: None,
             tools: None,
             native_tools: false,
             reasoning_effort: None,

@@ -36,6 +36,12 @@ test("tool handler round-trip + schema introspection", async () => {
   assert.deepStrictEqual(seen, { a: 2, b: 3 });
   const schemas = await rt.getToolSchemas();
   assert.ok(schemas.some((s) => s.name === "add"));
+  await rt.setToolAsync("add", true);
+  assert.strictEqual((await rt.getToolSchemas()).find((s) => s.name === "add").async, true);
+  await rt.setToolAsync("add", false);
+  assert.strictEqual((await rt.getToolSchemas()).find((s) => s.name === "add").async, false);
+  assert.strictEqual(await rt.executeToolCall("add", { a: 4, b: 5 }), "9");
+  await rt.dispose();
 });
 
 test("vfs local round-trip", async () => {
@@ -1707,4 +1713,15 @@ test("dispose() releases registered tools (breaks handler↔runtime cycle)", asy
   assert.strictEqual((await rt.getToolSchemas()).length, 1);
   await rt.dispose();
   assert.strictEqual((await rt.getToolSchemas()).length, 0);
+});
+test('OpenRouter provider lists reject empty entries before making a request', async () => {
+  const rt = new Runtime({ model: 'openrouter:test@provider=fireworks,,baseten', apiKey: 'test' });
+  try {
+    await assert.rejects(rt.run({ prompt: 'test' }), /comma-separated list of nonempty provider slugs/);
+    await assert.rejects(async () => {
+      for await (const event of rt.runStream({ prompt: 'test' })) {}
+    }, /comma-separated list of nonempty provider slugs/);
+  } finally {
+    await rt.dispose();
+  }
 });

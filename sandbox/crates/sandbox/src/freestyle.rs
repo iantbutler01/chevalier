@@ -29,6 +29,10 @@ use crate::{
 const META_MANAGED_BY: &str = "chevalier.managed_by";
 const MANAGED_BY_VALUE: &str = "chevalier-sandbox";
 const META_SESSION_ID: &str = "chevalier.session_id";
+/// Freestyle drops a metadata value past this length instead of rejecting it,
+/// so anything longer has to be carried in pieces.
+const METADATA_VALUE_LIMIT: usize = 63;
+const META_SESSION_ID_TAIL: &str = "chevalier.session_id.tail";
 const META_NAME: &str = "chevalier.name";
 /// Guest-side marker directory: one file per mount tag records that the mount
 /// command was launched in this boot, so attach does not relaunch it.
@@ -38,8 +42,85 @@ const MOUNT_STATE_DIR: &str = "/run/chevalier/mounts";
 const MOUNT_SCRIPT_PATH: &str = "/etc/chevalier/mounts.sh";
 const MOUNT_UNIT_PATH: &str = "/etc/systemd/system/chevalier-mounts.service";
 const MOUNT_UNIT: &str = "[Unit]\nDescription=Chevalier shared mounts\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/sh /etc/chevalier/mounts.sh\n\n[Install]\nWantedBy=multi-user.target\n";
+const MOUNT_SCRIPT_NEXT_PATH: &str = "/etc/chevalier/mounts.sh.next";
+/// Swaps in `mounts.sh.next` when it differs from the running script and nothing uses the
+/// mounts, and reports `mounts=unchanged|restart|deferred` on its last line. A changed
+/// script is applied by restarting the guest rather than remounting in place: mounts
+/// nest (the workspaces sit inside the Nym's read-only root), and a guest whose mounts
+/// came up in a different order cannot have them released cleanly while it runs.
+const MOUNT_REFRESH_SCRIPT: &str = r#"set -u
+cur=/etc/chevalier/mounts.sh; next=/etc/chevalier/mounts.sh.next; state=/run/chevalier/mounts
+if [ -f "$cur" ] && cmp -s "$next" "$cur"; then rm -f "$next"; /bin/sh "$cur"; echo mounts=unchanged; exit 0; fi
+pids=""
+for marker in "$state"/*; do case "$marker" in *.log) continue;; esac; [ -f "$marker" ] && pids="$pids $(cat "$marker")"; done
+points=$(awk '$3 ~ /^fuse/ && $3 != "fusectl" {print $2}' /proc/mounts)
+busy=""
+for proc in /proc/[0-9]*; do
+  pid=${proc#/proc/}
+  case " $pids $$ " in *" $pid "*) continue;; esac
+  for link in "$proc/cwd" "$proc"/fd/*; do
+    target=$(readlink "$link" 2>/dev/null) || continue
+    for point in $points; do
+      case "$target" in "$point"|"$point"/*) busy="$pid"; break 3;; esac
+    done
+  done
+done
+if [ -n "$busy" ] && [ -f "$cur" ]; then rm -f "$next"; /bin/sh "$cur"; echo "mounts=deferred busy=$busy"; exit 0; fi
+mv "$next" "$cur"; chmod 600 "$cur"
+echo mounts=restart
+"#;
+
+/// What an attach did to a guest's mounts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MountRefresh {
+    /// The caller passed no mounts; the guest's own script was replayed.
+    Replayed,
+    /// The guest already runs exactly these mounts.
+    Unchanged,
+    /// The new script was installed and the guest restarted to run it.
+    Refreshed,
+    /// The mounts differ but a process is using them; left for a later attach.
+    Deferred,
+}
+
+impl MountRefresh {
+    fn from_report(stdout: &str) -> Option<Self> {
+        let last = stdout
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("mounts="))?;
+        match last
+            .trim_start_matches("mounts=")
+            .split_whitespace()
+            .next()?
+        {
+            "unchanged" => Some(Self::Unchanged),
+            "restart" => Some(Self::Refreshed),
+            "deferred" => Some(Self::Deferred),
+            _ => None,
+        }
+    }
+}
+
+/// The guest's boot-time mount script for `mounts`. Deterministic, so the same mounts
+/// always render the same bytes and a refresh can tell "unchanged" by comparing files.
+fn mount_script(mounts: &[RenderedMount]) -> String {
+    let mut script = String::from("set -e\n");
+    script.push_str(&format!("mkdir -p {MOUNT_STATE_DIR}\n"));
+    for mount in mounts {
+        script.push_str(&mount.launch_script());
+    }
+    script
+}
+
 /// Freestyle caps `exec-await` at five minutes of wall clock.
 const EXEC_AWAIT_MAX_MS: u64 = 300_000;
+/// How long the mount script waits for one mount to appear before starting the next.
+/// A fresh guest hydrates each read-only scope eagerly before mounting it, and a Nym
+/// root with tens of thousands of small files takes minutes; moving on early starts
+/// the nested mounts on the bare mountpoint, where the root later hides them. It sits
+/// just inside the exec cap the whole script runs under.
+const MOUNT_READY_WAIT_SECS: u64 = 280;
 /// Guest administration (units, mounts, poweroff) always runs as root regardless of
 /// the session user.
 const ROOT_USER: &str = "root";
@@ -56,10 +137,48 @@ pub(crate) struct FreestyleControl {
 pub(crate) struct FreestyleVm {
     pub id: String,
     pub state: FreestyleVmState,
+    #[serde(default, rename = "autoDeleteSeconds")]
+    auto_delete_seconds: Option<u64>,
+    #[serde(default, rename = "ttlSeconds")]
+    ttl_seconds: Option<u64>,
     #[serde(default)]
     pub metadata: HashMap<String, String>,
+    #[serde(default)]
+    pub slug: Option<String>,
     #[serde(default, rename = "displayName")]
     pub display_name: Option<String>,
+    /// The private networks this VM is on; at most one today. A VM record carries the
+    /// same list twice, under `vpcs` and under `networks` — reading one of them is
+    /// reading both, and reading both is a duplicate field.
+    #[serde(default)]
+    pub vpcs: Vec<FreestyleVmNetwork>,
+}
+
+/// One VM's place on a private network, as the API reports it.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct FreestyleVmNetwork {
+    #[serde(default)]
+    pub ipv4: Option<String>,
+    #[serde(default, rename = "vpcSlug")]
+    pub vpc_slug: Option<String>,
+    #[serde(default, rename = "vpcSlugAtAttach")]
+    pub vpc_slug_at_attach: Option<String>,
+}
+
+impl FreestyleVm {
+    /// The VM's IPv4 address on `vpc`, or on its only network when no slug is named.
+    /// A renamed network still answers to the slug it was attached under.
+    pub(crate) fn private_address(&self, vpc: Option<&str>) -> Option<String> {
+        self.vpcs
+            .iter()
+            .find(|network| {
+                vpc.is_none_or(|slug| {
+                    network.vpc_slug.as_deref() == Some(slug)
+                        || network.vpc_slug_at_attach.as_deref() == Some(slug)
+                })
+            })
+            .and_then(|network| network.ipv4.clone())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -100,6 +219,11 @@ impl FreestyleControl {
                     .to_string(),
             ));
         }
+        if cfg.require_persistent && cfg.auto_delete_secs.is_some() {
+            return Err(SandboxError::InvalidConfig(
+                "persistent Freestyle computers cannot set FREESTYLE_AUTO_DELETE_SECS".to_string(),
+            ));
+        }
         cfg.snapshot_id = cfg.snapshot_id.trim().to_string();
         cfg.preview_domain_suffix = cfg
             .preview_domain_suffix
@@ -136,29 +260,41 @@ impl FreestyleControl {
             .filter(|value| !value.is_empty())
             .or_else(|| (!self.cfg.snapshot_id.is_empty()).then(|| self.cfg.snapshot_id.clone()));
         metadata.insert(META_MANAGED_BY.to_string(), MANAGED_BY_VALUE.to_string());
+        if let Some(session_id) = metadata.get(META_SESSION_ID).cloned() {
+            store_session_id(&mut metadata, &session_id);
+        }
         let slug = metadata
             .get("chevalier.requested_session_id")
             .map(|value| session_slug(value));
         let display_name = metadata.get(META_NAME).cloned();
+        let mut effective_egress = egress_allowlist.or_else(|| self.cfg.egress_allowlist.clone());
+        if let Some(domains) = effective_egress.as_mut() {
+            domains.extend(self.cfg.required_egress_domains.iter().cloned());
+            domains.sort();
+            domains.dedup();
+        }
         let body = CreateVmBody {
-            reassign_slug: slug.is_some(),
+            reassign_slug: slug.is_some() && !self.cfg.require_persistent,
             snapshot_id,
             slug,
             display_name,
             metadata: metadata_within_limits(metadata),
-            firewall: FirewallSpec::for_egress(
-                egress_allowlist.or_else(|| self.cfg.egress_allowlist.clone()),
-            ),
-            tls: TlsSpec::for_egress_domains(self.cfg.egress_allowlist.as_deref()),
+            firewall: FirewallSpec::for_egress(effective_egress.clone()),
+            tls: TlsSpec::for_egress_domains(effective_egress.as_deref()),
             idle_timeout_seconds: self.cfg.idle_timeout_secs.map(|value| value as i64),
             auto_delete_seconds: self.cfg.auto_delete_secs.map(|value| value as i64),
             automatic_restart: Some(true),
+            networks: match self.private_network().await? {
+                Some(vpc) => vec![AttachNetworkBody { vpc, ipv4: true }],
+                None => Vec::new(),
+            },
         };
         let response = self
             .send(self.client.post(self.url("/v5/vms")).json(&body))
             .await?;
         let vm: FreestyleVm = decode_json(response, "create vm").await?;
         let bootstrap = async {
+            self.validate_retention(&vm)?;
             if let Some(resources) = resources {
                 self.resize(&vm.id, &resources).await?;
             }
@@ -174,7 +310,71 @@ impl FreestyleControl {
 
     pub(crate) async fn get_sandbox(&self, vm_id: &str) -> Result<FreestyleVm> {
         let response = self.send(self.client.get(self.vm_url(vm_id, ""))).await?;
-        decode_json(response, "get vm").await
+        let vm: FreestyleVm = decode_json(response, "get vm").await?;
+        if !self.in_configured_vpc(&vm) {
+            return Err(SandboxError::InvalidConfig(format!(
+                "Freestyle VM {} is outside the configured VPC",
+                vm.id
+            )));
+        }
+        Ok(vm)
+    }
+
+    fn in_configured_vpc(&self, vm: &FreestyleVm) -> bool {
+        self.cfg.vpc.as_deref().is_none_or(|vpc| {
+            vm.vpcs.iter().any(|network| {
+                network
+                    .vpc_slug
+                    .as_deref()
+                    .or(network.vpc_slug_at_attach.as_deref())
+                    == Some(vpc)
+            })
+        })
+    }
+
+    fn validate_retention(&self, vm: &FreestyleVm) -> Result<()> {
+        if self.cfg.require_persistent
+            && (vm.auto_delete_seconds.is_some() || vm.ttl_seconds.is_some())
+        {
+            return Err(SandboxError::InvalidConfig(format!(
+                "Freestyle VM {} has a deletion deadline; indefinite retention is required (check the account plan)",
+                vm.id,
+            )));
+        }
+        Ok(())
+    }
+
+    async fn ensure_retention(&self, vm_id: &str) -> Result<()> {
+        if !self.cfg.require_persistent {
+            return Ok(());
+        }
+        let response = self.send(self.client.patch(self.vm_url(vm_id, "")).json(
+            &serde_json::json!({
+                "autoDeleteSeconds": -1,
+                "ttlSeconds": -1,
+                "idleTimeoutSeconds": self.cfg.idle_timeout_secs.map_or(-1, |seconds| seconds as i64),
+            }),
+        )).await?;
+        let vm: FreestyleVm = decode_json(response, "set persistent retention").await?;
+        self.validate_retention(&vm)
+    }
+
+    async fn wait_for_state(&self, vm_id: &str, state: FreestyleVmState) -> Result<FreestyleVm> {
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                let vm = self.get_sandbox(vm_id).await?;
+                if vm.state == state {
+                    return Ok(vm);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            SandboxError::DaemonUnavailable(format!(
+                "Freestyle VM {vm_id} did not reach {state:?} within 120s"
+            ))
+        })?
     }
 
     pub(crate) async fn delete_sandbox(&self, vm_id: &str) -> Result<()> {
@@ -194,18 +394,47 @@ impl FreestyleControl {
     }
 
     pub(crate) async fn vm_action(&self, vm_id: &str, action: FreestyleVmAction) -> Result<i32> {
+        self.ensure_retention(vm_id).await?;
+        if action == FreestyleVmAction::Start {
+            self.ensure_required_egress(vm_id).await?;
+        }
+        let mut current = self.get_sandbox(vm_id).await?;
+        if current.state == FreestyleVmState::Pausing {
+            current = self.wait_for_state(vm_id, FreestyleVmState::Paused).await?;
+        }
+        if (action == FreestyleVmAction::Start && current.state == FreestyleVmState::Running)
+            || (action == FreestyleVmAction::Pause
+                && matches!(
+                    current.state,
+                    FreestyleVmState::Paused | FreestyleVmState::Stopped
+                ))
+            || (action == FreestyleVmAction::Stop && current.state == FreestyleVmState::Stopped)
+        {
+            return Ok(current.state.as_proto_state());
+        }
+        if current.state == FreestyleVmState::Starting {
+            let vm = self
+                .wait_for_state(vm_id, FreestyleVmState::Running)
+                .await?;
+            if action == FreestyleVmAction::Start {
+                return Ok(vm.state.as_proto_state());
+            }
+        }
         let vm = match action {
             FreestyleVmAction::Start => {
                 let response = self
                     .send(self.client.post(self.vm_url(vm_id, "/start")))
                     .await?;
-                decode_json::<FreestyleVm>(response, "start vm").await?
+                decode_json::<FreestyleVm>(response, "start vm").await?;
+                self.wait_for_state(vm_id, FreestyleVmState::Running)
+                    .await?
             }
             FreestyleVmAction::Pause => {
                 let response = self
                     .send(self.client.post(self.vm_url(vm_id, "/pause")))
                     .await?;
-                decode_json::<FreestyleVm>(response, "pause vm").await?
+                decode_json::<FreestyleVm>(response, "pause vm").await?;
+                self.wait_for_state(vm_id, FreestyleVmState::Paused).await?
             }
             FreestyleVmAction::Stop => {
                 // There is no stop endpoint: the guest powers itself off. The command
@@ -220,7 +449,8 @@ impl FreestyleControl {
                         Some(ROOT_USER),
                     )
                     .await;
-                self.get_sandbox(vm_id).await?
+                self.wait_for_state(vm_id, FreestyleVmState::Stopped)
+                    .await?
             }
         };
         Ok(vm.state.as_proto_state())
@@ -228,15 +458,9 @@ impl FreestyleControl {
 
     /// Resume a paused VM or boot a stopped one; a running VM is left alone.
     pub(crate) async fn ensure_running(&self, vm_id: &str) -> Result<()> {
-        let vm = self.get_sandbox(vm_id).await?;
-        match vm.state {
-            FreestyleVmState::Running | FreestyleVmState::Starting => Ok(()),
-            FreestyleVmState::Paused | FreestyleVmState::Pausing | FreestyleVmState::Stopped => {
-                self.vm_action(vm_id, FreestyleVmAction::Start)
-                    .await
-                    .map(|_| ())
-            }
-        }
+        self.vm_action(vm_id, FreestyleVmAction::Start)
+            .await
+            .map(|_| ())
     }
 
     pub(crate) async fn list_sessions(&self) -> Result<Vec<crate::SessionInfo>> {
@@ -253,7 +477,10 @@ impl FreestyleControl {
             let page: ListVmsResponse = decode_json(response, "list vms").await?;
             let count = page.vms.len();
             for vm in page.vms {
-                let Some(session_id) = vm.metadata.get(META_SESSION_ID).cloned() else {
+                if !self.in_configured_vpc(&vm) {
+                    continue;
+                }
+                let Some(session_id) = session_id_from_metadata(&vm.metadata) else {
                     continue;
                 };
                 sessions.push(crate::SessionInfo {
@@ -275,17 +502,46 @@ impl FreestyleControl {
 
     /// Find a VM by the logical session id the facade stamped into its metadata.
     pub(crate) async fn find_by_session_id(&self, session_id: &str) -> Result<Option<FreestyleVm>> {
+        let (head, _) = split_session_id(session_id);
         let response = self
             .send(self.client.get(self.url("/v5/vms")).query(&[
-                ("metadata", format!("{META_SESSION_ID}:{session_id}")),
+                ("metadata", format!("{META_SESSION_ID}:{head}")),
                 ("limit", "2".to_string()),
             ]))
             .await?;
         let page: ListVmsResponse = decode_json(response, "list vms").await?;
+        if let Some(vm) = page.vms.into_iter().find(|vm| {
+            self.in_configured_vpc(vm)
+                && session_id_from_metadata(&vm.metadata).as_deref() == Some(session_id)
+        }) {
+            return Ok(Some(vm));
+        }
+        self.find_by_session_slug(session_id).await
+    }
+
+    /// Freestyle drops a metadata value longer than 63 characters, silently, so
+    /// a session id shaped `nym-<uuid>-<uuid>` — 77 characters — never reaches
+    /// the metadata the lookup above searches. The slug does survive: it comes
+    /// from the same session id and is written before the cap applies. Without
+    /// this fallback a restarted process cannot recognise the VM it already
+    /// owns, so it abandons a running VM and builds another one.
+    async fn find_by_session_slug(&self, session_id: &str) -> Result<Option<FreestyleVm>> {
+        let slug = session_slug(session_id);
+        let response = self
+            .send(
+                self.client
+                    .get(self.url("/v5/vms"))
+                    .query(&[("slug", slug.as_str()), ("limit", "2")]),
+            )
+            .await?;
+        let page: ListVmsResponse = decode_json(response, "list vms").await?;
         Ok(page.vms.into_iter().find(|vm| {
-            vm.metadata
-                .get(META_SESSION_ID)
-                .is_some_and(|value| value == session_id)
+            self.in_configured_vpc(vm)
+                && vm.slug.as_deref() == Some(slug.as_str())
+                && vm
+                    .metadata
+                    .get(META_MANAGED_BY)
+                    .is_some_and(|value| value == MANAGED_BY_VALUE)
         }))
     }
 
@@ -615,6 +871,18 @@ impl FreestyleControl {
     }
 
     pub(crate) async fn delete_checkpoint(&self, checkpoint_id: &str) -> Result<()> {
+        // On Freestyle a checkpoint and a base image are the same kind of
+        // object in one namespace, so this endpoint will happily delete the
+        // image every sandbox boots from. A stale checkpoint record or a
+        // mistyped id would take the whole provider down until someone
+        // rebuilds the snapshot, so the configured base is not deletable
+        // through the checkpoint path at all. Deleting it is a deliberate
+        // operator act, not something a session can reach.
+        if !self.cfg.snapshot_id.is_empty() && checkpoint_id.trim() == self.cfg.snapshot_id {
+            return Err(SandboxError::InvalidConfig(format!(
+                "refusing to delete {checkpoint_id}: it is the configured base image"
+            )));
+        }
         let response = self
             .client
             .delete(self.url(&format!(
@@ -720,7 +988,7 @@ impl FreestyleControl {
                     vm_id,
                     &format!("[ -f {MOUNT_SCRIPT_PATH} ] && /bin/sh {MOUNT_SCRIPT_PATH} || true"),
                     None,
-                    Some(120_000),
+                    Some(EXEC_AWAIT_MAX_MS),
                     None,
                     Some(ROOT_USER),
                 )
@@ -733,11 +1001,7 @@ impl FreestyleControl {
                 ))),
             };
         }
-        let mut script = String::from("set -e\n");
-        script.push_str(&format!("mkdir -p {MOUNT_STATE_DIR}\n"));
-        for mount in mounts {
-            script.push_str(&mount.launch_script());
-        }
+        let script = mount_script(&mounts);
         self.write_file(vm_id, MOUNT_SCRIPT_PATH, script.into_bytes())
             .await?;
         self.write_file(vm_id, MOUNT_UNIT_PATH, MOUNT_UNIT.as_bytes().to_vec())
@@ -749,7 +1013,7 @@ impl FreestyleControl {
                     "chmod 600 {MOUNT_SCRIPT_PATH} && systemctl daemon-reload && systemctl enable --now chevalier-mounts.service && systemctl is-active chevalier-mounts.service"
                 ),
                 None,
-                Some(120_000),
+                Some(EXEC_AWAIT_MAX_MS),
                 None, Some(ROOT_USER))
             .await?;
         match result.status_code {
@@ -762,6 +1026,75 @@ impl FreestyleControl {
                 "Freestyle mount bootstrap timed out".to_string(),
             )),
         }
+    }
+
+    /// Attach with the mounts the caller wants now. A guest keeps the mount script it was
+    /// created with, so without this an attach replays whatever an older API configured
+    /// (its binary flags, environment, scopes) for the VM's whole life. The new script is
+    /// compared with the guest's: identical means a plain replay; different means the
+    /// guest's mounts are stopped and started from the new script, but only when no process
+    /// is using them. A busy guest keeps its current mounts and is refreshed on a later
+    /// attach, so no running command loses its files mid-task.
+    pub(crate) async fn refresh_configured_mounts(
+        &self,
+        vm_id: &str,
+        shared_mounts: &[SharedMount],
+    ) -> Result<MountRefresh> {
+        let mounts = self.resolve_mounts(shared_mounts)?;
+        if mounts.is_empty() {
+            self.ensure_configured_mounts(vm_id, &[]).await?;
+            return Ok(MountRefresh::Replayed);
+        }
+        self.write_file(
+            vm_id,
+            MOUNT_SCRIPT_NEXT_PATH,
+            mount_script(&mounts).into_bytes(),
+        )
+        .await?;
+        let result = self
+            .exec_await(
+                vm_id,
+                MOUNT_REFRESH_SCRIPT,
+                None,
+                Some(150_000),
+                None,
+                Some(ROOT_USER),
+            )
+            .await?;
+        let stdout = result.stdout.unwrap_or_default();
+        let outcome = match (result.status_code, MountRefresh::from_report(&stdout)) {
+            (Some(0), Some(outcome)) => outcome,
+            _ => {
+                return Err(SandboxError::InvalidResponse(format!(
+                    "Freestyle mount refresh failed: {} {}",
+                    stdout.trim(),
+                    result.stderr.unwrap_or_default().trim()
+                )));
+            }
+        };
+        if outcome == MountRefresh::Refreshed {
+            // A guest poweroff lets systemd stop the mount daemons, which drain their
+            // publication logs; the boot then runs the new script in mount order.
+            let _ = self
+                .exec_await(
+                    vm_id,
+                    "systemctl poweroff --no-block",
+                    None,
+                    Some(10_000),
+                    None,
+                    Some(ROOT_USER),
+                )
+                .await;
+            if self
+                .wait_for_state(vm_id, FreestyleVmState::Stopped)
+                .await
+                .is_err()
+            {
+                self.vm_action(vm_id, FreestyleVmAction::Stop).await?;
+            }
+            self.ensure_running(vm_id).await?;
+        }
+        Ok(outcome)
     }
 
     fn resolve_mounts(&self, shared_mounts: &[SharedMount]) -> Result<Vec<RenderedMount>> {
@@ -786,6 +1119,45 @@ impl FreestyleControl {
                     shared.mount_tag, shared.guest_path
                 ))
             })
+    }
+
+    /// Service endpoints are reconciled on reuse, because persistent VMs predate
+    /// newly required endpoints. No L3 Internet grant or wildcard is introduced.
+    async fn ensure_required_egress(&self, vm_id: &str) -> Result<()> {
+        for domain in &self.cfg.required_egress_domains {
+            let response = self
+                .send(
+                    self.client
+                        .get(self.url("/v5/tls"))
+                        .query(&[("domain", domain.as_str())]),
+                )
+                .await?;
+            let existing: ListTlsRulesResponse =
+                decode_json(response, "list egress tls rules").await?;
+            if existing.rules.iter().any(|rule| {
+                rule.domain == *domain
+                    && rule.source.vm_id.as_deref() == Some(vm_id)
+                    && rule.destination.public == Some(true)
+            }) {
+                continue;
+            }
+            let body = CreateTlsRuleBody {
+                action: "allow",
+                domain: domain.clone(),
+                source: TlsEndpoint {
+                    vm_id: Some(vm_id.to_string()),
+                    ..TlsEndpoint::default()
+                },
+                destination: TlsEndpoint::public(),
+                protocol: "http",
+                forward_auth: None,
+            };
+            let response = self
+                .send(self.client.post(self.url("/v5/tls")).json(&body))
+                .await?;
+            let _: TlsRule = decode_json(response, "create required egress tls rule").await?;
+        }
+        Ok(())
     }
 
     // ----- ingress / preview -----
@@ -830,13 +1202,82 @@ impl FreestyleControl {
         Ok(format!("https://{domain}"))
     }
 
+    /// The configured private network, created on first use. It is created with no rules
+    /// of its own — members cannot even reach each other — so joining it exposes nothing;
+    /// reaching a VM on it takes an explicit firewall rule naming a tunnel or a VM.
+    async fn private_network(&self) -> Result<Option<String>> {
+        let Some(slug) = self
+            .cfg
+            .vpc
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        let existing = self
+            .client
+            .get(self.url(&format!("/v5/vpcs/{}", urlencoding::encode(slug))))
+            .bearer_auth(&self.cfg.api_key)
+            .send()
+            .await
+            .map_err(|err| {
+                SandboxError::DaemonUnavailable(format!("Freestyle request failed: {err}"))
+            })?;
+        if existing.status().is_success() {
+            return Ok(Some(slug.to_string()));
+        }
+        if existing.status() != StatusCode::NOT_FOUND {
+            return Err(freestyle_response_error(existing).await);
+        }
+        let body = CreateVpcBody {
+            slug,
+            display_name: "Chevalier session VMs",
+            firewall: FirewallSpec { rules: Vec::new() },
+        };
+        match self
+            .send(self.client.post(self.url("/v5/vpcs")).json(&body))
+            .await
+        {
+            Ok(_) => Ok(Some(slug.to_string())),
+            // Another process created it between the probe and the create.
+            Err(error) => {
+                let recheck = self
+                    .send(
+                        self.client
+                            .get(self.url(&format!("/v5/vpcs/{}", urlencoding::encode(slug)))),
+                    )
+                    .await;
+                if recheck.is_ok() {
+                    Ok(Some(slug.to_string()))
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    /// The VM's address on the configured private network, when it is on one.
+    pub(crate) async fn private_address(&self, vm_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .get_sandbox(vm_id)
+            .await?
+            .private_address(self.cfg.vpc.as_deref()))
+    }
+
     fn preview_domain(&self, vm_id: &str, guest_port: u16) -> String {
         let label = vm_id
             .trim_start_matches("vm-")
             .replace(|c: char| !c.is_ascii_alphanumeric(), "");
         let label: String = label.chars().take(40).collect();
+        let prefix = &self.cfg.preview_domain_prefix;
+        let prefix = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{prefix}-")
+        };
         format!(
-            "nym-{label}-p{guest_port}.{}",
+            "{prefix}nym-{label}-p{guest_port}.{}",
             self.cfg.preview_domain_suffix
         )
     }
@@ -956,7 +1397,11 @@ impl RenderedMount {
         exports.sort();
         let argv = shell_words_join(self.command.iter().map(String::as_str));
         format!(
-            "if [ ! -e {marker} ]; then\n  mkdir -p {mountpoint}\n  {exports}\n  export CHEVALIER_VFS_READ_ONLY={read_only}\n  nohup {argv} >{log} 2>&1 </dev/null &\n  echo $! > {marker}\nfi\n",
+            // Wait for this mount before the next starts, whether this run launched it or
+            // a concurrent run (boot and an attach's replay) did: later mounts can sit
+            // inside this one, and one started first would be hidden beneath it.
+            "if [ ! -e {marker} ]; then\n  mkdir -p {mountpoint}\n  {exports}\n  export CHEVALIER_VFS_READ_ONLY={read_only}\n  nohup {argv} >{log} 2>&1 </dev/null &\n  echo $! > {marker}\nfi\npid=$(cat {marker} 2>/dev/null || echo 0)\nfor _ in $(seq 1 {polls}); do mountpoint -q {mountpoint} && break; kill -0 \"$pid\" 2>/dev/null || break; sleep 0.5; done\n",
+            polls = MOUNT_READY_WAIT_SECS * 2,
             marker = shell_quote(&marker),
             mountpoint = shell_quote(&self.mountpoint),
             exports = if exports.is_empty() {
@@ -1037,6 +1482,40 @@ fn session_slug(session_id: &str) -> String {
 
 /// Metadata is capped at 64 entries of 63-char keys/values; drop what cannot fit
 /// rather than failing the create.
+/// Split a session id at the platform's value limit, on a character boundary.
+fn split_session_id(session_id: &str) -> (&str, &str) {
+    if session_id.len() <= METADATA_VALUE_LIMIT {
+        return (session_id, "");
+    }
+    let mut cut = METADATA_VALUE_LIMIT;
+    while cut > 0 && !session_id.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    session_id.split_at(cut)
+}
+
+/// Record a session id across as many keys as the value limit demands. A Nym's
+/// id is 77 characters and used to be dropped whole, which left the VM
+/// unfindable by every lookup that reads this key back.
+fn store_session_id(metadata: &mut HashMap<String, String>, session_id: &str) {
+    let (head, tail) = split_session_id(session_id);
+    metadata.insert(META_SESSION_ID.to_string(), head.to_string());
+    if tail.is_empty() {
+        metadata.remove(META_SESSION_ID_TAIL);
+    } else {
+        metadata.insert(META_SESSION_ID_TAIL.to_string(), tail.to_string());
+    }
+}
+
+/// The session id a VM carries, rejoined from however many keys hold it.
+fn session_id_from_metadata(metadata: &HashMap<String, String>) -> Option<String> {
+    let head = metadata.get(META_SESSION_ID)?;
+    Some(match metadata.get(META_SESSION_ID_TAIL) {
+        Some(tail) => format!("{head}{tail}"),
+        None => head.clone(),
+    })
+}
+
 fn metadata_within_limits(metadata: HashMap<String, String>) -> HashMap<String, String> {
     let mut entries: Vec<(String, String)> = metadata
         .into_iter()
@@ -1070,6 +1549,23 @@ struct CreateVmBody {
     auto_delete_seconds: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     automatic_restart: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    networks: Vec<AttachNetworkBody>,
+}
+
+/// Join one private network at create, taking an auto-allocated IPv4 address on it.
+#[derive(Serialize)]
+struct AttachNetworkBody {
+    vpc: String,
+    ipv4: bool,
+}
+
+#[derive(Serialize)]
+struct CreateVpcBody<'a> {
+    slug: &'a str,
+    #[serde(rename = "displayName")]
+    display_name: &'a str,
+    firewall: FirewallSpec,
 }
 
 #[derive(Serialize)]
@@ -1129,7 +1625,7 @@ impl TlsSpec {
                 domain: domain.clone(),
                 source: TlsEndpoint::default(),
                 destination: TlsEndpoint::public(),
-                protocol: "tcp",
+                protocol: "http",
                 forward_auth: None,
             })
             .collect();
@@ -1187,6 +1683,8 @@ struct TlsRule {
     #[allow(dead_code)]
     id: String,
     domain: String,
+    #[serde(default)]
+    source: TlsEndpoint,
     destination: TlsEndpoint,
 }
 
@@ -1366,6 +1864,189 @@ mod tests {
     use crate::{SharedMountAvailability, SharedMountContinuity};
     use serde_json::json;
 
+    #[test]
+    fn a_mount_refresh_reports_what_it_did() {
+        assert_eq!(
+            MountRefresh::from_report("mounted\nmounts=unchanged\n"),
+            Some(MountRefresh::Unchanged)
+        );
+        assert_eq!(
+            MountRefresh::from_report("mounts=deferred busy=4242\n"),
+            Some(MountRefresh::Deferred)
+        );
+        assert_eq!(
+            MountRefresh::from_report("mounts=restart"),
+            Some(MountRefresh::Refreshed)
+        );
+        assert_eq!(MountRefresh::from_report("sh: cmp: not found\n"), None);
+    }
+
+    #[test]
+    fn the_refresh_swaps_scripts_only_after_checking_nothing_uses_the_mounts() {
+        let busy_check = MOUNT_REFRESH_SCRIPT.find("busy=\"$pid\"").unwrap();
+        let deferred = MOUNT_REFRESH_SCRIPT.find("mounts=deferred").unwrap();
+        let swap = MOUNT_REFRESH_SCRIPT.find("mv \"$next\" \"$cur\"").unwrap();
+        let restart = MOUNT_REFRESH_SCRIPT.find("mounts=restart").unwrap();
+        assert!(busy_check < deferred && deferred < swap && swap < restart);
+        // Unchanged scripts are replayed before anything is inspected.
+        assert!(MOUNT_REFRESH_SCRIPT.find("mounts=unchanged").unwrap() < busy_check);
+        assert!(MOUNT_REFRESH_SCRIPT.contains(MOUNT_SCRIPT_NEXT_PATH));
+        assert!(MOUNT_REFRESH_SCRIPT.contains(MOUNT_SCRIPT_PATH));
+        assert!(MOUNT_REFRESH_SCRIPT.contains(MOUNT_STATE_DIR));
+        // Nothing is stopped or unmounted in place.
+        assert!(!MOUNT_REFRESH_SCRIPT.contains("kill -TERM"));
+        assert!(!MOUNT_REFRESH_SCRIPT.contains("umount"));
+    }
+
+    #[test]
+    fn persistent_computers_reject_expiration_and_plan_caps() {
+        assert!(
+            FreestyleControl::new(FreestyleBackendConfig {
+                api_key: "test".into(),
+                require_persistent: true,
+                auto_delete_secs: Some(3600),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        let control = FreestyleControl::new(FreestyleBackendConfig {
+            api_key: "test".into(),
+            require_persistent: true,
+            ..Default::default()
+        })
+        .unwrap();
+        for deadline in [
+            json!({"autoDeleteSeconds": 0}),
+            json!({"autoDeleteSeconds": 3600}),
+            json!({"ttlSeconds": 7200}),
+        ] {
+            let mut record = json!({"id": "vm-test", "state": "running"});
+            record
+                .as_object_mut()
+                .unwrap()
+                .extend(deadline.as_object().unwrap().clone());
+            let vm = serde_json::from_value(record).unwrap();
+            assert!(control.validate_retention(&vm).is_err());
+        }
+        let vm = serde_json::from_value(json!({"id": "vm-test", "state": "paused"})).unwrap();
+        control.validate_retention(&vm).unwrap();
+    }
+
+    /// Only creates and mutates its own VM and network. Opt in with the named env var.
+    #[tokio::test]
+    async fn persistent_computer_live_lifecycle() {
+        if std::env::var("NYM_FREESTYLE_LIFECYCLE_LIVE").as_deref() != Ok("1") {
+            return;
+        }
+        use crate::{SandboxConfig, SandboxProviderConfig, SessionOptions};
+        use futures::FutureExt;
+        let slug = format!("nym-lifecycle-{}", Uuid::new_v4().simple());
+        let cfg = FreestyleBackendConfig {
+            api_key: std::env::var("FREESTYLE_API_KEY").expect("live API key"),
+            require_persistent: true,
+            snapshot_id: "nym-desktop".into(),
+            vpc: Some(slug.clone()),
+            ..Default::default()
+        };
+        let control = FreestyleControl::new(cfg.clone()).unwrap();
+        let sandbox_config = SandboxConfig {
+            provider: SandboxProviderConfig::Freestyle(cfg),
+            prewarm_on_start: false,
+            ..Default::default()
+        };
+        let sandbox = Sandbox::new(sandbox_config.clone()).await.unwrap();
+        let session = sandbox
+            .session(SessionOptions {
+                session_id: Some(slug.clone()),
+                name: Some(slug.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let vm_id = session.vm_id().to_string();
+        eprintln!("scratch VM {vm_id}, network {slug}");
+        let proof = std::panic::AssertUnwindSafe(async {
+            let marker = control.exec_await(&vm_id,
+                "echo persistent-computer > /root/nym-lifecycle-proof; cat /proc/sys/kernel/random/boot_id",
+                None, Some(30_000), None, Some(ROOT_USER)).await.unwrap();
+            assert_eq!(marker.status_code, Some(0));
+            let private_address = session.provider_private_address().await.unwrap();
+            assert!(private_address.is_some());
+            let preview = session.provider_preview_url(8080).await.unwrap();
+            let setup = control.exec_await(&vm_id,
+                "printf 'NYM_STREAMD_PROXY_TOKEN=lifecycle-proof\\n' > /home/nym/.config/nym-streamd/runtime.env; pkill -x streamd; for i in $(seq 1 30); do curl -fsS -H 'x-nym-streamd-token: lifecycle-proof' http://127.0.0.1:8080/api/local/health && exit 0; sleep 1; done; exit 1",
+                None, Some(45_000), None, Some(ROOT_USER)).await.unwrap();
+            assert_eq!(setup.status_code, Some(0), "stream setup: {:?}", setup.stderr);
+            let health = format!("{preview}/api/local/health");
+            let response = control.client.get(&health).header("x-nym-streamd-token", "lifecycle-proof").send().await.unwrap();
+            assert!(response.status().is_success(), "stream health: {}", response.status());
+
+            let paused = session.pause().await.unwrap();
+            assert_eq!(paused, crate::proto::vmd::v1::VmState::Paused as i32);
+            // A new process and passive attach must not wake the machine.
+            let fresh = Sandbox::new(sandbox_config.clone()).await.unwrap();
+            let passive = fresh.attach_session_passive(&vm_id).await.unwrap();
+            assert_eq!(passive.state().await.unwrap(), paused);
+            assert_eq!(passive.pause().await.unwrap(), paused);
+            let resumed = fresh.attach_session(&vm_id).await.unwrap();
+            assert_eq!(resumed.vm_id(), vm_id);
+            let output = control.exec_await(&vm_id,
+                "cat /root/nym-lifecycle-proof; cat /proc/sys/kernel/random/boot_id",
+                None, Some(30_000), None, Some(ROOT_USER)).await.unwrap();
+            assert_eq!(output.status_code, Some(0));
+            assert_eq!(output.stdout, Some(format!("persistent-computer\n{}", marker.stdout.unwrap())));
+            assert_eq!(resumed.provider_private_address().await.unwrap(), private_address);
+            assert_eq!(resumed.provider_preview_url(8080).await.unwrap(), preview);
+            assert!(control.client.get(&health).header("x-nym-streamd-token", "lifecycle-proof").send().await.unwrap().status().is_success());
+            // A retry cannot take the slug and leave another machine running.
+            let mut retry_config = sandbox_config.clone();
+            if let SandboxProviderConfig::Freestyle(config) = &mut retry_config.provider {
+                config.vpc = None;
+            }
+            let retry = Sandbox::new(retry_config).await.unwrap();
+            assert!(retry.session(SessionOptions {
+                session_id: Some(slug.clone()), ..Default::default()
+            }).await.is_err());
+            assert_eq!(control.find_by_session_id(&slug).await.unwrap().unwrap().id, vm_id);
+            // Remove old deployment deadlines before pausing an existing machine.
+            control.send(control.client.patch(control.vm_url(&vm_id, "")).json(
+                &json!({"autoDeleteSeconds": 3600, "idleTimeoutSeconds": 3600, "ttlSeconds": 7200})
+            )).await.unwrap();
+            resumed.pause().await.unwrap();
+            let vm = control.get_sandbox(&vm_id).await.unwrap();
+            assert_eq!(vm.state, FreestyleVmState::Paused);
+            assert_eq!(vm.auto_delete_seconds, None);
+            assert_eq!(vm.ttl_seconds, None);
+        }).catch_unwind().await;
+        control.delete_sandbox(&vm_id).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let response = control
+                    .client
+                    .delete(control.url(&format!("/v5/vpcs/{slug}")))
+                    .bearer_auth(&control.cfg.api_key)
+                    .send()
+                    .await
+                    .unwrap();
+                if response.status().is_success() {
+                    break;
+                }
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        })
+        .await
+        .expect("network reservations must release after VM deletion");
+        assert!(matches!(
+            control.get_sandbox(&vm_id).await,
+            Err(SandboxError::SessionNotFound(_))
+        ));
+        eprintln!("deleted scratch VM {vm_id} and network {slug}");
+        if let Err(panic) = proof {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     fn shared_mount() -> SharedMount {
         SharedMount {
             host_path: String::new(),
@@ -1406,6 +2087,7 @@ mod tests {
             idle_timeout_seconds: Some(900),
             auto_delete_seconds: None,
             automatic_restart: Some(true),
+            networks: Vec::new(),
         };
         assert_eq!(
             serde_json::to_value(body).unwrap(),
@@ -1422,6 +2104,74 @@ mod tests {
     }
 
     #[test]
+    fn create_body_joins_the_configured_private_network() {
+        let body = CreateVmBody {
+            snapshot_id: Some("sh-1".to_string()),
+            slug: None,
+            reassign_slug: false,
+            display_name: None,
+            metadata: HashMap::new(),
+            firewall: FirewallSpec::for_egress(None),
+            tls: TlsSpec::for_egress_domains(None),
+            idle_timeout_seconds: None,
+            auto_delete_seconds: None,
+            automatic_restart: Some(true),
+            networks: vec![AttachNetworkBody {
+                vpc: "nym-apps".to_string(),
+                ipv4: true,
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(body).unwrap()["networks"],
+            json!([{"vpc": "nym-apps", "ipv4": true}])
+        );
+    }
+
+    #[test]
+    fn private_address_reads_the_named_network_and_survives_a_rename() {
+        let vm: FreestyleVm = serde_json::from_value(json!({
+            "id": "vm-1",
+            "state": "running",
+            "vpcs": [{
+                "ipv4": "10.45.62.7",
+                "vpcSlug": "nym-apps-renamed",
+                "vpcSlugAtAttach": "nym-apps"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            vm.private_address(Some("nym-apps")).as_deref(),
+            Some("10.45.62.7")
+        );
+        assert_eq!(vm.private_address(None).as_deref(), Some("10.45.62.7"));
+        assert_eq!(vm.private_address(Some("other")), None);
+    }
+
+    #[test]
+    fn a_vm_record_carrying_both_network_spellings_still_decodes() {
+        // A create answer lists the attachments twice, as `vpcs` and as `networks`.
+        let vm: FreestyleVm = serde_json::from_value(json!({
+            "id": "vm-1",
+            "state": "running",
+            "vpcs": [{"ipv4": "10.45.62.8", "vpcSlug": "nym-apps", "vpcSlugAtAttach": "nym-apps"}],
+            "networks": [{"ipv4": "10.45.62.8", "vpcSlug": "nym-apps", "vpcSlugAtAttach": "nym-apps"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            vm.private_address(Some("nym-apps")).as_deref(),
+            Some("10.45.62.8")
+        );
+    }
+
+    #[test]
+    fn a_vm_on_no_private_network_has_no_private_address() {
+        let vm: FreestyleVm =
+            serde_json::from_value(json!({"id": "vm-1", "state": "running"})).unwrap();
+        assert_eq!(vm.private_address(Some("nym-apps")), None);
+        assert_eq!(vm.private_address(None), None);
+    }
+
+    #[test]
     fn egress_allowlist_closes_l3_and_opens_named_tls_sessions() {
         let allow = Some(vec![
             "api.openai.com".to_string(),
@@ -1432,6 +2182,7 @@ mod tests {
         let tls = TlsSpec::for_egress_domains(allow.as_deref()).unwrap();
         assert_eq!(tls.rules.len(), 1);
         assert_eq!(tls.rules[0].domain, "api.openai.com");
+        assert_eq!(tls.rules[0].protocol, "http", "tcp is public ingress only");
         assert_eq!(
             serde_json::to_value(&tls.rules[0]).unwrap()["destination"],
             json!({"public": true})
@@ -1448,6 +2199,67 @@ mod tests {
             detached_command("/bin/bash", "sleep 100")
                 .starts_with("nohup '/bin/bash' -lc 'sleep 100' >/dev/null")
         );
+    }
+
+    /// The registry has to survive a restart: a VM created for a session must
+    /// still be findable, and listable, by that session id afterwards.
+    #[test]
+    fn a_session_id_past_the_value_limit_round_trips_through_metadata() {
+        let session_id =
+            "nym-ef7704f6-9168-4218-b155-0dcc6c8adbaa-13530284-8050-482f-9c9b-cd7a20694330";
+        assert!(session_id.len() > METADATA_VALUE_LIMIT);
+
+        let mut metadata = HashMap::new();
+        store_session_id(&mut metadata, session_id);
+        let stored = metadata_within_limits(metadata);
+
+        assert!(
+            stored.contains_key(META_SESSION_ID) && stored.contains_key(META_SESSION_ID_TAIL),
+            "both halves must clear the platform limit"
+        );
+        assert_eq!(
+            session_id_from_metadata(&stored).as_deref(),
+            Some(session_id)
+        );
+    }
+
+    #[test]
+    fn a_short_session_id_stays_in_one_key() {
+        let mut metadata = HashMap::new();
+        store_session_id(&mut metadata, "session-1");
+        assert!(!metadata.contains_key(META_SESSION_ID_TAIL));
+        assert_eq!(
+            session_id_from_metadata(&metadata).as_deref(),
+            Some("session-1")
+        );
+    }
+
+    /// The reason attaching to an existing session had to gain a slug fallback:
+    /// a Nym's session id is longer than a Freestyle metadata value may be, and
+    /// the value is dropped rather than rejected, so the metadata lookup can
+    /// never match. The slug is derived from the same id before the cap.
+    #[test]
+    fn a_nym_session_id_is_too_long_for_metadata_but_survives_as_a_slug() {
+        let session_id = format!(
+            "nym-{}-{}",
+            "ef7704f6-9168-4218-b155-0dcc6c8adbaa", "13530284-8050-482f-9c9b-cd7a20694330"
+        );
+        assert!(
+            session_id.len() > 63,
+            "expected a session id past the metadata cap, got {}",
+            session_id.len()
+        );
+
+        let mut metadata = HashMap::new();
+        metadata.insert(META_SESSION_ID.to_string(), session_id.clone());
+        assert!(
+            metadata_within_limits(metadata).is_empty(),
+            "the session id is silently dropped from metadata"
+        );
+
+        let slug = session_slug(&session_id);
+        assert_eq!(slug.len(), 63);
+        assert!(session_id.to_lowercase().starts_with(&slug[..41]));
     }
 
     #[test]
@@ -1483,6 +2295,14 @@ mod tests {
         assert!(script.contains("export CHEVALIER_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN='tok'"));
         assert!(script.contains("export CHEVALIER_VFS_READ_ONLY=false"));
         assert!(script.contains("nohup 'sh' '-lc'"));
+        // The next mount starts only once this one is mounted (or its daemon has died), so
+        // a mount nested inside it lands on top of it rather than beneath it.
+        // The wait sits after the launch block, so a run that finds the mount already
+        // launched by another run still waits for it before starting the next.
+        let launch_block_end = script.find("\nfi\n").unwrap();
+        let waited = script.find("mountpoint -q '/mnt/nymfs' && break").unwrap();
+        assert!(script.find("nohup").unwrap() < launch_block_end && launch_block_end < waited);
+        assert!(script.contains("pid=$(cat '/run/chevalier/mounts/nymfs-root'"));
     }
 
     #[test]
@@ -1546,5 +2366,44 @@ mod tests {
             control.preview_domain("vm-0f3a-9b", 8080),
             "nym-0f3a9b-p8080.style.dev"
         );
+    }
+
+    #[test]
+    fn preview_domain_keeps_staging_inside_the_existing_wildcard() {
+        let control = FreestyleControl::new(FreestyleBackendConfig {
+            api_key: "k".into(),
+            preview_domain_prefix: "staging".into(),
+            preview_domain_suffix: "nyms.metonymous.ai".into(),
+            ..FreestyleBackendConfig::default()
+        })
+        .unwrap();
+        assert_eq!(
+            control.preview_domain("vm-0f3a-9b", 8080),
+            "staging-nym-0f3a9b-p8080.nyms.metonymous.ai"
+        );
+    }
+
+    /// A checkpoint and a base image share one namespace on Freestyle, so the
+    /// delete path must not be able to remove the image every sandbox boots
+    /// from - losing it takes the provider down until someone rebuilds it.
+    #[tokio::test]
+    async fn delete_checkpoint_refuses_the_configured_base_image() {
+        let control = FreestyleControl::new(FreestyleBackendConfig {
+            api_key: "k".to_string(),
+            snapshot_id: "nym-desktop".to_string(),
+            ..FreestyleBackendConfig::default()
+        })
+        .unwrap();
+
+        let error = control
+            .delete_checkpoint("nym-desktop")
+            .await
+            .expect_err("the base image must not be deletable as a checkpoint");
+        assert!(
+            matches!(error, SandboxError::InvalidConfig(_)),
+            "expected InvalidConfig, got {error:?}"
+        );
+        // Whitespace must not smuggle it past the guard.
+        assert!(control.delete_checkpoint("  nym-desktop  ").await.is_err());
     }
 }

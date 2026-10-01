@@ -42,6 +42,9 @@ pub struct GoogleAnthropicClient {
     region: String,
     token_provider: Arc<RwLock<Option<Arc<dyn gcp_auth::TokenProvider>>>>,
     thinking_budget: Option<u32>,
+    /// `@vision=` override for image-input support, or `None` to ask the
+    /// provider's capability table.
+    image_input: Option<bool>,
     trace_callback: Option<TraceCallback>,
 }
 
@@ -92,6 +95,7 @@ impl GoogleAnthropicClient {
             region: region.into(),
             token_provider: Arc::new(RwLock::new(None)),
             thinking_budget: None,
+            image_input: None,
             trace_callback: None,
         }
     }
@@ -115,6 +119,7 @@ impl GoogleAnthropicClient {
             region: region.into(),
             token_provider: Arc::new(RwLock::new(None)),
             thinking_budget: None,
+            image_input: None,
             trace_callback: None,
         }
     }
@@ -168,7 +173,12 @@ impl GoogleAnthropicClient {
         stream: bool,
     ) -> Result<serde_json::Value> {
         let model = config.effective_model(&self.model);
-        validate_image_input_supported(messages, Provider::GoogleAnthropic, model)?;
+        validate_image_input_supported(
+            messages,
+            Provider::GoogleAnthropic,
+            model,
+            self.image_input,
+        )?;
 
         // Extract system message if present
         let (system, messages) = self.extract_system_message(messages)?;
@@ -419,6 +429,15 @@ impl GoogleAnthropicClient {
 }
 
 #[cfg(feature = "google-adc")]
+impl GoogleAnthropicClient {
+    /// Override whether this model accepts image input, from the model
+    /// string's `@vision=` parameter.
+    pub fn with_image_input(mut self, image_input: Option<bool>) -> Self {
+        self.image_input = image_input;
+        self
+    }
+}
+
 #[async_trait]
 impl InferenceClient for GoogleAnthropicClient {
     async fn get_generation(

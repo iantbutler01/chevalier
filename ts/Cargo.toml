@@ -15,7 +15,7 @@ napi = { version = "3", default-features = false, features = ["napi8", "async", 
 napi-derive = "3"
 
 # Chevalier engine (core providers + Runtime + tools + types). vfs feature added in its phase.
-chevalier-core = { package = "chevalier", path = "../rust", features = ["mcp"] }
+chevalier-core = { package = "chevalier", path = "../rust", features = ["mcp", "claude-subscription"] }
 # Standalone MCP client/server.
 chevalier-mcp = { path = "../mcp", default-features = false, features = ["client", "server"] }
 # VFS storage (local + gateway; gcs/postgres/object-backed are a follow-up).

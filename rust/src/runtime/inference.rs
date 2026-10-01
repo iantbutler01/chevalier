@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
+use crate::providers::openrouter::{PerformanceThreshold, ProviderSort};
 use crate::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, KimiCodingAuthKind,
     KimiCodingProviderConfig, OAIClient, OpenAICodexResponsesClient, OpenAIResponsesClient,
@@ -82,9 +83,28 @@ struct ParsedModelString {
     provider: String,
     model_name: String,
     reasoning: Option<String>,
+    openrouter_providers: Option<Vec<String>>,
+    openrouter_ignored_providers: Option<Vec<String>>,
+    openrouter_provider_sort: Option<ProviderSort>,
+    openrouter_min_throughput: Option<PerformanceThreshold>,
+    openrouter_max_latency: Option<PerformanceThreshold>,
+    openrouter_cache_prefix: Option<String>,
     server_url: Option<String>,
     inline_api_key: Option<String>,
     prompt_cache_retention: Option<PromptCacheRetention>,
+    /// `@vision=` override for whether this model accepts image input.
+    image_input: Option<bool>,
+}
+
+fn parse_image_input(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        other => Err(Error::NonRetryable(format!(
+            "Unsupported @vision value '{}'. Expected true or false.",
+            other
+        ))),
+    }
 }
 
 fn parse_prompt_cache_retention(value: &str) -> Result<PromptCacheRetention> {
@@ -114,24 +134,125 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
     };
 
     let mut reasoning = None;
+    let mut openrouter_providers = None;
+    let mut openrouter_ignored_providers = None;
+    let mut openrouter_provider_sort = None;
+    let mut openrouter_min_throughput = None;
+    let mut openrouter_max_latency = None;
+    let mut openrouter_cache_prefix = None;
     let mut server_url = None;
     let mut inline_api_key = None;
     let mut prompt_cache_retention = None;
+    let mut image_input = None;
 
     let model_name = if model_part.contains('@') {
         let model_parts: Vec<&str> = model_part.split('@').collect();
 
+        // An unrecognized parameter is an error, never a silent drop: the model
+        // string is often set live from a config service, where a misspelled
+        // `@reasoning=` would otherwise run the model at its default effort and
+        // report success.
         for param in &model_parts[1..] {
-            if param.starts_with("reasoning=") {
-                reasoning = Some(param.strip_prefix("reasoning=").unwrap().to_string());
-            } else if param.starts_with("server_url=") {
-                server_url = Some(param.strip_prefix("server_url=").unwrap().to_string());
-            } else if param.starts_with("api_key=") {
-                inline_api_key = Some(param.strip_prefix("api_key=").unwrap().to_string());
-            } else if param.starts_with("cache=") {
-                prompt_cache_retention = Some(parse_prompt_cache_retention(
-                    param.strip_prefix("cache=").unwrap(),
-                )?);
+            let (key, value) = param.split_once('=').ok_or_else(|| {
+                Error::NonRetryable(format!(
+                    "Invalid model parameter '@{}' in '{}'. Expected '@name=value'.",
+                    param, model_str
+                ))
+            })?;
+
+            match key {
+                "effort" if provider == "claude-subscription" => {
+                    if !matches!(value, "low" | "medium" | "high" | "xhigh" | "max") {
+                        return Err(Error::NonRetryable(format!(
+                            "Invalid Claude subscription effort: {value}"
+                        )));
+                    }
+                    reasoning = Some(value.to_string());
+                }
+                "reasoning" | "reasoning_level" | "reasoning_effort" => {
+                    reasoning = Some(value.to_string());
+                }
+                // Host applications use endpoint identity to distinguish identical model names;
+                // server_url and the resolved credential determine the actual inference destination.
+                "endpoint" if provider == "custom-openai" && !value.is_empty() => {}
+                "server_url" => server_url = Some(value.to_string()),
+                "cache_prefix" => {
+                    if provider != "openrouter" || value.is_empty() {
+                        return Err(Error::NonRetryable("@cache_prefix requires OpenRouter chat completions and a nonempty literal prefix".into()));
+                    }
+                    openrouter_cache_prefix = Some(value.to_owned());
+                }
+                "provider_min_throughput" | "provider_max_latency" => {
+                    if provider != "openrouter" {
+                        return Err(Error::NonRetryable(format!(
+                            "@{key} requires openrouter chat completions"
+                        )));
+                    }
+                    let threshold = serde_json::from_str::<PerformanceThreshold>(value)
+                        .map_err(|error| Error::NonRetryable(format!("Invalid @{key}: {error}")))?;
+                    if key == "provider_min_throughput" {
+                        openrouter_min_throughput = Some(threshold);
+                    } else {
+                        openrouter_max_latency = Some(threshold);
+                    }
+                }
+                "provider_ignore" => {
+                    let ignored: Vec<String> = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|slug| !slug.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                    if provider != "openrouter" || ignored.is_empty() {
+                        return Err(Error::NonRetryable(
+                            "@provider_ignore requires OpenRouter chat completions and at least one provider slug".into(),
+                        ));
+                    }
+                    openrouter_ignored_providers = Some(ignored);
+                }
+                "provider_sort" if provider == "openrouter" => {
+                    openrouter_provider_sort = Some(
+                        serde_json::from_value(serde_json::json!(value)).map_err(|_| {
+                            Error::NonRetryable(
+                                "@provider_sort requires throughput, latency, or price".into(),
+                            )
+                        })?,
+                    );
+                }
+                "provider_sort" => {
+                    return Err(Error::NonRetryable(
+                        "@provider_sort requires openrouter chat completions".into(),
+                    ));
+                }
+                "provider" if provider == "openrouter" => {
+                    let providers: Vec<String> = value
+                        .split(',')
+                        .map(|slug| slug.trim().to_string())
+                        .collect();
+                    if providers.iter().any(String::is_empty) {
+                        return Err(Error::NonRetryable(
+                            "@provider requires a comma-separated list of nonempty provider slugs"
+                                .to_string(),
+                        ));
+                    }
+                    openrouter_providers = Some(providers);
+                }
+                "provider" => {
+                    return Err(Error::NonRetryable(
+                        "@provider requires openrouter chat completions".to_string(),
+                    ));
+                }
+                "api_key" => inline_api_key = Some(value.to_string()),
+                "cache" => prompt_cache_retention = Some(parse_prompt_cache_retention(value)?),
+                "vision" => image_input = Some(parse_image_input(value)?),
+                _ => {
+                    return Err(Error::NonRetryable(format!(
+                        "Unknown model parameter '@{}' in '{}'. Supported parameters: reasoning \
+                         (aliases reasoning_level, reasoning_effort), cache, vision, server_url, endpoint (custom-openai identity), \
+                         api_key, provider, provider_ignore, provider_sort, cache_prefix, provider_min_throughput, provider_max_latency (OpenRouter chat completions only).",
+                        key, model_str
+                    )));
+                }
             }
         }
 
@@ -140,7 +261,7 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
         model_part.to_string()
     };
 
-    let provider = if provider == "openai" && model_name.starts_with("gpt-6-astra") {
+    let provider = if provider == "openai" && crate::types::is_gpt6_model(&model_name) {
         "openai-responses".to_owned()
     } else {
         provider
@@ -149,9 +270,16 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
         provider,
         model_name,
         reasoning,
+        openrouter_providers,
+        openrouter_ignored_providers,
+        openrouter_provider_sort,
+        openrouter_min_throughput,
+        openrouter_max_latency,
+        openrouter_cache_prefix,
         server_url,
         inline_api_key,
         prompt_cache_retention,
+        image_input,
     })
 }
 
@@ -378,7 +506,7 @@ fn generate_model_tool_schemas(
 /// Resolve provider key for model strings, including responses modifiers.
 fn resolve_provider_key(model: &str) -> String {
     if let Ok(parsed) = parse_model_string(model)
-        && parsed.model_name.starts_with("gpt-6-astra")
+        && crate::types::is_gpt6_model(&parsed.model_name)
         && parsed.provider == "openai-responses"
     {
         return parsed.provider;
@@ -405,6 +533,7 @@ fn resolve_provider_key(model: &str) -> String {
 /// - `@cache=<value>` - OpenAI prompt cache retention (`in_memory` or `24h`)
 /// - `@vision=<true|false>` - image-input capability override consumed by `Provider::supports_image_input`
 /// - `@server_url=<url>` - custom API endpoint (required for `custom-openai`, optional for `openai`)
+/// - `@provider=<slug,...>` - ordered OpenRouter chat-completions allowlist; fallback within the list
 /// - `@api_key=<key>` - inline API key (overrides env var and `api_key` parameter)
 ///
 /// Examples:
@@ -435,6 +564,7 @@ fn create_inference_client_with_config(
     let server_url = parsed.server_url;
     let inline_api_key = parsed.inline_api_key;
     let model_name = parsed.model_name;
+    let image_input = parsed.image_input;
 
     // Resolve API key: @api_key= > api_key parameter > env var
     let key = if let Some(k) = inline_api_key {
@@ -507,7 +637,7 @@ fn create_inference_client_with_config(
                     )));
                 }
             }
-            Box::new(client)
+            Box::new(client.with_image_input(image_input))
         }
         "kimi-coding" => {
             let config = resolve_kimi_coding_config(key, server_url, provider_config);
@@ -527,7 +657,7 @@ fn create_inference_client_with_config(
             if config.auth_kind == KimiCodingAuthKind::OAuth {
                 client = client.with_bearer_auth();
             }
-            Box::new(client)
+            Box::new(client.with_image_input(image_input))
         }
         "openai" => {
             let mut client = OAIClient::new(key, model_name);
@@ -539,7 +669,7 @@ fn create_inference_client_with_config(
             if let Some(r) = reasoning {
                 client = client.with_reasoning(r);
             }
-            Box::new(client)
+            Box::new(client.with_image_input(image_input))
         }
         "openai-responses" => {
             let mut client = OpenAIResponsesClient::new(key, model_name);
@@ -549,7 +679,7 @@ fn create_inference_client_with_config(
             if let Some(r) = reasoning {
                 client = client.with_reasoning(r);
             }
-            Box::new(client)
+            Box::new(client.with_image_input(image_input))
         }
         "openai-codex-responses" => {
             let config = resolve_codex_subscription_config(key, server_url, provider_config)?;
@@ -557,21 +687,52 @@ fn create_inference_client_with_config(
             if let Some(r) = reasoning {
                 client = client.with_reasoning(r);
             }
-            Box::new(client)
+            Box::new(client.with_image_input(image_input))
         }
         "openrouter" => {
             let mut client = OpenRouterClient::new(key, model_name, None, None);
+            // `@server_url=` names the OpenRouter API base (for example the US-only
+            // `https://us.openrouter.ai/api/v1`); OPENROUTER_BASE_URL does the same for
+            // every call in the process.
+            if let Some(base) = server_url
+                .clone()
+                .or_else(|| std::env::var("OPENROUTER_BASE_URL").ok())
+            {
+                client = client.with_api_base(base);
+            }
+            if let Some(upstreams) = parsed.openrouter_providers {
+                client = client.with_upstream_providers(upstreams);
+            }
+            if let Some(ignored) = parsed.openrouter_ignored_providers {
+                client = client.with_ignored_providers(ignored);
+            }
+            if let Some(prefix) = parsed.openrouter_cache_prefix {
+                client = client.with_cache_prefix(prefix);
+            }
+            client = client.with_performance_preferences(
+                parsed.openrouter_min_throughput,
+                parsed.openrouter_max_latency,
+            );
+            if let Some(sort) = parsed.openrouter_provider_sort {
+                client = client.with_provider_sort(sort);
+            }
             if let Some(r) = reasoning {
                 client = client.with_reasoning(r);
             }
-            Box::new(client)
+            Box::new(client.with_image_input(image_input))
         }
         "openrouter-responses" => {
             let mut client = OpenRouterResponsesClient::new(key, model_name, None, None);
+            if let Some(base) = server_url
+                .clone()
+                .or_else(|| std::env::var("OPENROUTER_BASE_URL").ok())
+            {
+                client = client.with_api_base(base);
+            }
             if let Some(r) = reasoning {
                 client = client.with_reasoning(r);
             }
-            Box::new(client)
+            Box::new(client.with_image_input(image_input))
         }
         "google" | "google-gemini" | "google-genai" | "gemini" => {
             let mut client = GoogleGenAIClient::new(key, model_name);
@@ -580,7 +741,7 @@ fn create_inference_client_with_config(
             {
                 client = client.with_thinking_budget(budget);
             }
-            Box::new(client)
+            Box::new(client.with_image_input(image_input))
         }
         "custom-openai" => {
             let url = server_url.ok_or_else(|| {
@@ -592,7 +753,7 @@ fn create_inference_client_with_config(
             if let Some(r) = reasoning {
                 client = client.with_reasoning(r);
             }
-            Box::new(client)
+            Box::new(client.with_image_input(image_input))
         }
         _ => {
             return Err(Error::NonRetryable(format!(
@@ -750,6 +911,7 @@ pub async fn call_llm(
     history: Option<Vec<ConversationMessage>>,
     temperature: Option<f32>,
     top_p: Option<f32>,
+    allow_tool_calls: Option<bool>,
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
     timeout: Option<std::time::Duration>,
@@ -763,6 +925,21 @@ pub async fn call_llm(
     let client = create_inference_client_with_config(model, api_key, provider_config.as_ref())?;
     let parsed_model = parse_model_string(model)?;
     let provider_key = resolve_provider_key(model);
+    if allow_tool_calls == Some(false)
+        && !matches!(
+            provider_key.as_str(),
+            "openai"
+                | "openrouter"
+                | "custom-openai"
+                | "openai-responses"
+                | "openrouter-responses"
+                | "openai-codex-responses"
+        )
+    {
+        return Err(Error::NonRetryable(
+            "allow_tool_calls=false requires a Chat Completions or Responses provider".into(),
+        ));
+    }
     let message_provider = resolve_provider_for_caching(model);
 
     let messages =
@@ -805,6 +982,7 @@ pub async fn call_llm(
         max_tokens,
         temperature,
         top_p,
+        allow_tool_calls,
         tools: tool_schemas,
         native_tools: true, // Always true - we only support native tools
         reasoning_effort,
@@ -853,6 +1031,7 @@ pub async fn call_llm_stream(
     history: Option<Vec<ConversationMessage>>,
     temperature: Option<f32>,
     top_p: Option<f32>,
+    allow_tool_calls: Option<bool>,
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
     timeout: Option<std::time::Duration>,
@@ -867,6 +1046,21 @@ pub async fn call_llm_stream(
     let client = create_inference_client_with_config(model, api_key, provider_config.as_ref())?;
     let parsed_model = parse_model_string(model)?;
     let provider_key = resolve_provider_key(model);
+    if allow_tool_calls == Some(false)
+        && !matches!(
+            provider_key.as_str(),
+            "openai"
+                | "openrouter"
+                | "custom-openai"
+                | "openai-responses"
+                | "openrouter-responses"
+                | "openai-codex-responses"
+        )
+    {
+        return Err(Error::NonRetryable(
+            "allow_tool_calls=false requires a Chat Completions or Responses provider".into(),
+        ));
+    }
     let message_provider = resolve_provider_for_caching(model);
 
     let messages =
@@ -909,6 +1103,7 @@ pub async fn call_llm_stream(
         max_tokens,
         temperature,
         top_p,
+        allow_tool_calls,
         tools: tool_schemas,
         native_tools: true, // Always true - we only support native tools
         reasoning_effort,
@@ -1075,6 +1270,190 @@ mod tests {
     fn test_parse_model_string_rejects_invalid_cache_retention() {
         let result = parse_model_string("openai:gpt-5.1@cache=forever");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_model_string_rejects_unknown_parameter() {
+        let error = parse_model_string("openai:gpt-5.6-luna@reasonig=max")
+            .expect_err("a misspelled parameter must not be silently dropped");
+        let message = error.to_string();
+        assert!(message.contains("@reasonig"), "{message}");
+        assert!(message.contains("Supported parameters"), "{message}");
+    }
+
+    #[test]
+    fn custom_openai_endpoint_identity_preserves_wire_model_and_destination() {
+        let parsed = parse_model_string("custom-openai:shared-model@endpoint=host-a@server_url=http://localhost:8000/v1/chat/completions").unwrap();
+        assert_eq!(parsed.model_name, "shared-model");
+        assert_eq!(
+            parsed.server_url.as_deref(),
+            Some("http://localhost:8000/v1/chat/completions")
+        );
+        assert!(parse_model_string("custom-openai:shared-model@endpoint=").is_err());
+        assert!(parse_model_string("openai:shared-model@endpoint=host-a").is_err());
+    }
+
+    #[test]
+    fn test_parse_model_string_rejects_parameter_without_value() {
+        assert!(parse_model_string("openai:gpt-5.6-luna@reasoning").is_err());
+    }
+
+    #[test]
+    fn test_parse_model_string_accepts_reasoning_aliases() {
+        for spelling in ["reasoning", "reasoning_level", "reasoning_effort"] {
+            let parsed = parse_model_string(&format!("openai:gpt-5.6-luna@{spelling}=max"))
+                .unwrap_or_else(|error| panic!("@{spelling} should parse: {error}"));
+            assert_eq!(parsed.model_name, "gpt-5.6-luna");
+            assert_eq!(parsed.reasoning.as_deref(), Some("max"), "@{spelling}");
+        }
+    }
+
+    #[test]
+    fn test_parse_model_string_carries_vision_override() {
+        let parsed =
+            parse_model_string("openrouter:z-ai/glm-5.3-flash@vision=false@reasoning=high")
+                .unwrap();
+        assert_eq!(parsed.model_name, "z-ai/glm-5.3-flash");
+        assert_eq!(parsed.image_input, Some(false));
+        assert_eq!(parsed.reasoning.as_deref(), Some("high"));
+
+        let parsed = parse_model_string("openrouter:vendor/text-only@vision=true").unwrap();
+        assert_eq!(parsed.image_input, Some(true));
+
+        assert!(parse_model_string("openrouter:vendor/text-only@vision=maybe").is_err());
+    }
+
+    #[test]
+    fn openrouter_performance_preferences_validate_and_preserve_model_name() {
+        for key in ["provider_min_throughput", "provider_max_latency"] {
+            for value in ["40", "2.5", r#"{"p90":40,"p99":2.5}"#] {
+                let parsed =
+                    parse_model_string(&format!("openrouter:vendor/model@{key}={value}")).unwrap();
+                assert_eq!(parsed.model_name, "vendor/model");
+                let preference = if key == "provider_min_throughput" {
+                    parsed.openrouter_min_throughput
+                } else {
+                    parsed.openrouter_max_latency
+                };
+                assert_eq!(
+                    serde_json::to_value(preference.unwrap()).unwrap(),
+                    serde_json::from_str::<serde_json::Value>(value).unwrap()
+                );
+            }
+            for value in [
+                "",
+                "0",
+                "-1",
+                "null",
+                "[]",
+                "{}",
+                r#"{"p95":40}"#,
+                r#"{"p90":0}"#,
+                r#"{"p90":"40"}"#,
+            ] {
+                assert!(
+                    parse_model_string(&format!("openrouter:test@{key}={value}")).is_err(),
+                    "{key}={value}"
+                );
+            }
+            for route in ["openai:test", "openrouter:resp:test"] {
+                assert!(parse_model_string(&format!("{route}@{key}=40")).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn cache_prefix_is_literal_and_openrouter_only() {
+        let parsed = parse_model_string(
+            r#"openrouter:openai/gpt-5.6-luna@reasoning=high@cache_prefix={"out":"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.openrouter_cache_prefix.as_deref(), Some("{\"out\":"));
+        assert_eq!(parsed.model_name, "openai/gpt-5.6-luna");
+        for model in [
+            "openrouter:test@cache_prefix=",
+            "openai:test@cache_prefix=x",
+            "openrouter:resp:test@cache_prefix=x",
+        ] {
+            assert!(parse_model_string(model).is_err());
+        }
+    }
+
+    #[test]
+    fn provider_ignore_excludes_upstreams_alongside_sorting() {
+        let parsed = parse_model_string(
+            "openrouter:deepseek/deepseek-v4.1-flash@provider_sort=latency@provider_ignore=makora, chutes",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.openrouter_ignored_providers,
+            Some(vec!["makora".to_string(), "chutes".to_string()])
+        );
+        assert_eq!(parsed.openrouter_providers, None);
+        for model in [
+            "openrouter:test@provider_ignore=",
+            "openai:test@provider_ignore=makora",
+        ] {
+            assert!(parse_model_string(model).is_err());
+        }
+    }
+
+    #[test]
+    fn openrouter_sort_validates_values_and_route() {
+        for (name, sort) in [
+            ("throughput", ProviderSort::Throughput),
+            ("latency", ProviderSort::Latency),
+            ("price", ProviderSort::Price),
+        ] {
+            let parsed =
+                parse_model_string(&format!("openrouter:test@provider_sort={name}")).unwrap();
+            assert_eq!(parsed.openrouter_provider_sort, Some(sort));
+            assert_eq!(parsed.openrouter_providers, None);
+        }
+        for model in [
+            "openrouter:test@provider_sort=fast",
+            "openai:test@provider_sort=throughput",
+            "openrouter:resp:test@provider_sort=throughput",
+        ] {
+            assert!(parse_model_string(model).is_err(), "{model}");
+        }
+    }
+
+    #[test]
+    fn openrouter_pin_parses_and_rejects_unsupported_routes() {
+        let parsed = parse_model_string(
+            "openrouter:deepseek/deepseek-v4.1-flash@provider=fireworks@reasoning=high",
+        )
+        .unwrap();
+        assert_eq!(parsed.model_name, "deepseek/deepseek-v4.1-flash");
+        assert_eq!(
+            parsed.openrouter_providers,
+            Some(vec!["fireworks".to_string()])
+        );
+        assert_eq!(parsed.reasoning.as_deref(), Some("high"));
+        let parsed = parse_model_string(
+            "openrouter:test@provider= fireworks, deepseek, baseten @reasoning=high",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.openrouter_providers,
+            Some(vec![
+                "fireworks".into(),
+                "deepseek".into(),
+                "baseten".into()
+            ])
+        );
+        for model in [
+            "openrouter:test@provider=",
+            "openrouter:test@provider= ",
+            "openrouter:test@provider=fireworks,",
+            "openrouter:test@provider=,baseten",
+            "openrouter:test@provider=fireworks, ,baseten",
+            "openai:test@provider=fireworks",
+            "openrouter:resp:test@provider=fireworks",
+        ] {
+            assert!(parse_model_string(model).is_err(), "{model}");
+        }
     }
 
     #[tokio::test]
@@ -1254,6 +1633,49 @@ mod tests {
     }
 
     #[test]
+    fn model_visibility_filters_every_provider_without_removing_callable_tools() {
+        let mut tools = HashMap::new();
+        for name in ["read", "execute_code", "late_mcp_tool"] {
+            tools.insert(
+                name.to_string(),
+                ToolFunction::Sync(Box::new(|_| Ok("ok".to_string()))),
+            );
+        }
+        let visible = vec!["execute_code".to_string()];
+        for model in [
+            "anthropic:claude-3",
+            "openai:gpt-4",
+            "google:gemini-2.5-pro",
+            "openai-responses:gpt-6-astra",
+            "openai-codex-responses:gpt-6-astra",
+        ] {
+            let schemas = generate_model_tool_schemas(
+                &tools,
+                &HashMap::new(),
+                &sorted_order(&tools),
+                model,
+                Some(&visible),
+            )
+            .unwrap();
+            assert_eq!(schemas.len(), 1, "{model}");
+            assert!(schemas[0].to_string().contains("execute_code"), "{model}");
+            assert_eq!(
+                generate_model_tool_schemas(
+                    &tools,
+                    &HashMap::new(),
+                    &sorted_order(&tools),
+                    model,
+                    None
+                )
+                .unwrap()
+                .len(),
+                3
+            );
+        }
+        assert_eq!(tools.len(), 3);
+    }
+
+    #[test]
     fn test_generate_tool_schemas_anthropic() {
         let mut tools = HashMap::new();
         tools.insert(
@@ -1275,6 +1697,8 @@ mod tests {
                     required: true,
                 }],
                 strict: None,
+                raw_schema: None,
+                schema_only: false,
                 parameters: ToolParametersSchema::from_json_schema(&serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1334,6 +1758,8 @@ mod tests {
                     required: true,
                 }],
                 strict: None,
+                raw_schema: None,
+                schema_only: false,
                 parameters: ToolParametersSchema::from_json_schema(&serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1494,6 +1920,8 @@ mod tests {
                     },
                 ],
                 strict: None,
+                raw_schema: None,
+                schema_only: false,
                 parameters: ToolParametersSchema::from_json_schema(&serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1576,6 +2004,8 @@ mod tests {
                 description: "Write a thread".to_string(),
                 fields: vec![],
                 strict: None,
+                raw_schema: None,
+                schema_only: false,
                 parameters: ToolParametersSchema::from_json_schema(&serde_json::json!({
                     "type": "object",
                     "properties": {

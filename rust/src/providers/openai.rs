@@ -7,6 +7,7 @@
 //! - Streaming with delta-based tool call accumulation
 //! - Usage tracking with cache metrics
 
+use super::openrouter::{PerformanceThreshold, ProviderSort};
 use async_trait::async_trait;
 use futures::stream::{Stream, StreamExt};
 use reqwest::StatusCode;
@@ -32,8 +33,17 @@ pub struct OAIClient {
     reasoning: Option<String>,
     ranking_referer: Option<String>,
     ranking_title: Option<String>,
+    /// `@vision=` override for image-input support, or `None` to ask the
+    /// provider's capability table.
+    image_input: Option<bool>,
     trace_callback: Option<TraceCallback>,
     provider: Provider,
+    openrouter_providers: Option<Vec<String>>,
+    openrouter_ignored_providers: Option<Vec<String>>,
+    openrouter_provider_sort: Option<ProviderSort>,
+    openrouter_min_throughput: Option<PerformanceThreshold>,
+    openrouter_max_latency: Option<PerformanceThreshold>,
+    openrouter_cache_prefix: Option<String>,
 }
 
 impl Clone for OAIClient {
@@ -45,8 +55,15 @@ impl Clone for OAIClient {
             reasoning: self.reasoning.clone(),
             ranking_referer: self.ranking_referer.clone(),
             ranking_title: self.ranking_title.clone(),
+            image_input: self.image_input,
             trace_callback: self.trace_callback.clone(),
             provider: self.provider,
+            openrouter_providers: self.openrouter_providers.clone(),
+            openrouter_ignored_providers: self.openrouter_ignored_providers.clone(),
+            openrouter_provider_sort: self.openrouter_provider_sort,
+            openrouter_min_throughput: self.openrouter_min_throughput.clone(),
+            openrouter_max_latency: self.openrouter_max_latency.clone(),
+            openrouter_cache_prefix: self.openrouter_cache_prefix.clone(),
         }
     }
 }
@@ -89,8 +106,15 @@ impl OAIClient {
             reasoning: None,
             ranking_referer: None,
             ranking_title: None,
+            image_input: None,
             trace_callback: None,
             provider: Provider::OpenAI,
+            openrouter_providers: None,
+            openrouter_ignored_providers: None,
+            openrouter_provider_sort: None,
+            openrouter_min_throughput: None,
+            openrouter_max_latency: None,
+            openrouter_cache_prefix: None,
         }
     }
 
@@ -151,6 +175,36 @@ impl OAIClient {
         self
     }
 
+    pub(crate) fn with_openrouter_provider_sort(mut self, sort: ProviderSort) -> Self {
+        self.openrouter_provider_sort = Some(sort);
+        self
+    }
+
+    pub(crate) fn with_openrouter_performance_preferences(
+        mut self,
+        min_throughput: Option<PerformanceThreshold>,
+        max_latency: Option<PerformanceThreshold>,
+    ) -> Self {
+        self.openrouter_min_throughput = min_throughput;
+        self.openrouter_max_latency = max_latency;
+        self
+    }
+
+    pub(crate) fn with_openrouter_cache_prefix(mut self, prefix: String) -> Self {
+        self.openrouter_cache_prefix = Some(prefix);
+        self
+    }
+
+    pub(crate) fn with_openrouter_providers(mut self, providers: Vec<String>) -> Self {
+        self.openrouter_providers = Some(providers);
+        self
+    }
+
+    pub(crate) fn with_openrouter_ignored_providers(mut self, providers: Vec<String>) -> Self {
+        self.openrouter_ignored_providers = Some(providers);
+        self
+    }
+
     /// Build request body for OpenAI API
     fn build_request_body(
         &self,
@@ -159,7 +213,7 @@ impl OAIClient {
         stream: bool,
     ) -> Result<serde_json::Value> {
         let model = config.effective_model(&self.model);
-        validate_image_input_supported(messages, self.provider, model)?;
+        validate_image_input_supported(messages, self.provider, model, self.image_input)?;
 
         // Convert messages to provider format
         let formatted_messages = convert_messages_to_provider_format(messages, self.provider)?;
@@ -167,16 +221,81 @@ impl OAIClient {
         let mut request = serde_json::json!({
             "model": model,
             "messages": formatted_messages,
-            "max_completion_tokens": config.max_tokens.unwrap_or(4096),
             "temperature": config.temperature.unwrap_or(0.7),
             "top_p": config.top_p.unwrap_or(1.0),
             "stream": stream,
         });
 
+        // OpenRouter's parameter-aware routing recognizes max_tokens.
+        let token_limit_field = if matches!(self.provider, Provider::OpenRouter) {
+            "max_tokens"
+        } else {
+            "max_completion_tokens"
+        };
+        request[token_limit_field] = serde_json::json!(config.max_tokens.unwrap_or(4096));
+
         if matches!(self.provider, Provider::OpenAI)
             && let Some(retention) = config.prompt_cache_retention
         {
             request["prompt_cache_retention"] = serde_json::json!(retention.as_str());
+        }
+
+        if matches!(self.provider, Provider::OpenRouter)
+            && let Some(ref providers) = self.openrouter_providers
+        {
+            request["provider"] = serde_json::json!({
+                "order": providers,
+                "only": providers,
+                "allow_fallbacks": providers.len() > 1,
+                "require_parameters": true,
+            });
+        }
+
+        if matches!(self.provider, Provider::OpenRouter)
+            && let Some(ref ignored) = self.openrouter_ignored_providers
+        {
+            request["provider"]["ignore"] = serde_json::json!(ignored);
+        }
+
+        if matches!(self.provider, Provider::OpenRouter)
+            && let Some(sort) = self.openrouter_provider_sort
+        {
+            request["provider"]["sort"] = serde_json::json!(sort);
+        }
+
+        if matches!(self.provider, Provider::OpenRouter) {
+            if let Some(ref minimum) = self.openrouter_min_throughput {
+                request["provider"]["preferred_min_throughput"] = serde_json::json!(minimum);
+            }
+            if let Some(ref maximum) = self.openrouter_max_latency {
+                request["provider"]["preferred_max_latency"] = serde_json::json!(maximum);
+            }
+        }
+
+        if matches!(self.provider, Provider::OpenRouter)
+            && let Some(prefix) = &self.openrouter_cache_prefix
+        {
+            let message = request["messages"]
+                .as_array_mut()
+                .and_then(|messages| messages.last_mut())
+                .ok_or_else(|| {
+                    Error::NonRetryable("Cache prefix requires a final user message".into())
+                })?;
+            let content = message["content"]
+                .as_str()
+                .filter(|content| {
+                    message["role"] == "user" && !prefix.is_empty() && content.starts_with(prefix)
+                })
+                .ok_or_else(|| {
+                    Error::NonRetryable(
+                        "Final user message does not start with the configured cache prefix".into(),
+                    )
+                })?;
+            message["content"] = serde_json::json!([
+                {"type":"text", "text":prefix, "prompt_cache_breakpoint":{"mode":"explicit"}},
+                {"type":"text", "text": &content[prefix.len()..]}
+            ]);
+            request["prompt_cache_options"] = serde_json::json!({"mode":"explicit", "ttl":"30m"});
         }
 
         // Add stream_options for usage tracking when streaming
@@ -189,7 +308,11 @@ impl OAIClient {
             && !tools.is_empty()
         {
             request["tools"] = serde_json::json!(self.normalized_tools(tools));
-            request["tool_choice"] = serde_json::json!("auto");
+            request["tool_choice"] = serde_json::json!(if config.allow_tool_calls == Some(false) {
+                "none"
+            } else {
+                "auto"
+            });
         }
 
         // Add reasoning if configured (client-level, then config-level fallback)
@@ -246,7 +369,9 @@ impl OAIClient {
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
-            cache_write_input_tokens: 0,
+            cache_write_input_tokens: usage["prompt_tokens_details"]["cache_write_tokens"]
+                .as_u64()
+                .unwrap_or(0),
             reasoning_tokens: usage
                 .get("completion_tokens_details")
                 .and_then(|d| d.get("reasoning_tokens"))
@@ -325,6 +450,15 @@ impl OAIClient {
             Ok(response_text)
         })
         .await
+    }
+}
+
+impl OAIClient {
+    /// Override whether this model accepts image input, from the model
+    /// string's `@vision=` parameter.
+    pub fn with_image_input(mut self, image_input: Option<bool>) -> Self {
+        self.image_input = image_input;
+        self
     }
 }
 
@@ -464,6 +598,224 @@ mod tests {
     use crate::types::ChatMessage;
 
     #[test]
+    fn openrouter_pin_survives_clone_and_both_request_modes() {
+        let client = OAIClient::new("test-key", "deepseek/deepseek-v4.1-flash")
+            .with_provider(Provider::OpenRouter)
+            .with_openrouter_providers(vec!["fireworks".into()])
+            .clone();
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let config = GenerationConfig::new("deepseek/deepseek-v4.1-flash");
+        for stream in [false, true] {
+            let body = client
+                .build_request_body(&messages, &config, stream)
+                .unwrap();
+            assert_eq!(
+                body["provider"],
+                serde_json::json!({
+                    "order": ["fireworks"], "only": ["fireworks"], "allow_fallbacks": false, "require_parameters": true,
+                })
+            );
+            assert_eq!(body["max_tokens"], 4096);
+            assert!(body.get("max_completion_tokens").is_none());
+            let unpinned = OAIClient::new("test-key", "test")
+                .with_provider(Provider::OpenRouter)
+                .build_request_body(&messages, &config, stream)
+                .unwrap();
+            assert!(unpinned.get("provider").is_none());
+        }
+    }
+
+    #[test]
+    fn openrouter_provider_list_bounds_fallbacks_and_preserves_order() {
+        let client = OAIClient::new("test-key", "test")
+            .with_provider(Provider::OpenRouter)
+            .with_openrouter_providers(vec![
+                "fireworks".into(),
+                "deepseek".into(),
+                "baseten".into(),
+            ])
+            .clone();
+        for stream in [false, true] {
+            let body = client
+                .build_request_body(&[], &GenerationConfig::new("test"), stream)
+                .unwrap();
+            assert_eq!(
+                body["provider"],
+                serde_json::json!({
+                    "order": ["fireworks", "deepseek", "baseten"],
+                    "only": ["fireworks", "deepseek", "baseten"],
+                    "allow_fallbacks": true,
+                    "require_parameters": true,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn throughput_routing_keeps_all_providers_eligible_in_both_modes() {
+        let client = OAIClient::new("test-key", "test")
+            .with_provider(Provider::OpenRouter)
+            .with_openrouter_provider_sort(ProviderSort::Throughput)
+            .clone();
+        for stream in [false, true] {
+            let body = client
+                .build_request_body(&[], &GenerationConfig::new("test"), stream)
+                .unwrap();
+            assert_eq!(body["provider"], serde_json::json!({"sort": "throughput"}));
+        }
+    }
+
+    #[test]
+    fn performance_preferences_reach_streaming_and_nonstreaming_requests() {
+        let preferences = || {
+            (
+                serde_json::from_value(serde_json::json!({"p90":40})).unwrap(),
+                serde_json::from_value(serde_json::json!({"p90":2.5})).unwrap(),
+            )
+        };
+        for pinned in [false, true] {
+            let (minimum, maximum) = preferences();
+            let mut client = OAIClient::new("test-key", "test")
+                .with_provider(Provider::OpenRouter)
+                .with_openrouter_provider_sort(ProviderSort::Throughput)
+                .with_openrouter_performance_preferences(Some(minimum), Some(maximum))
+                .clone();
+            if pinned {
+                client =
+                    client.with_openrouter_providers(vec!["fireworks".into(), "baseten".into()]);
+            }
+            for stream in [false, true] {
+                let body = client
+                    .build_request_body(&[], &GenerationConfig::new("test"), stream)
+                    .unwrap();
+                assert_eq!(body["provider"]["sort"], "throughput");
+                assert_eq!(
+                    body["provider"]["preferred_min_throughput"],
+                    serde_json::json!({"p90":40})
+                );
+                assert_eq!(
+                    body["provider"]["preferred_max_latency"],
+                    serde_json::json!({"p90":2.5})
+                );
+                if pinned {
+                    assert_eq!(
+                        body["provider"]["only"],
+                        serde_json::json!(["fireworks", "baseten"])
+                    );
+                    assert_eq!(body["provider"]["allow_fallbacks"], true);
+                } else {
+                    assert!(body["provider"].get("only").is_none());
+                }
+            }
+        }
+        let (minimum, maximum) = preferences();
+        let body = OAIClient::new("test-key", "test")
+            .with_openrouter_performance_preferences(Some(minimum), Some(maximum))
+            .build_request_body(&[], &GenerationConfig::new("test"), false)
+            .unwrap();
+        assert!(body.get("provider").is_none());
+    }
+
+    #[test]
+    fn explicit_prefix_preserves_text_and_excludes_changing_candidate() {
+        let client = OAIClient::new("key", "openai/gpt-5.6-luna")
+            .with_provider(Provider::OpenRouter)
+            .with_openrouter_cache_prefix("{\"out\":".into())
+            .clone();
+        for stream in [false, true] {
+            for text in [r#"{"out":""}"#, r#"{"out":{"content":"你好"}}"#] {
+                let messages = vec![ConversationMessage::Chat(crate::types::ChatMessage::user(
+                    text,
+                ))];
+                let body = client
+                    .build_request_body(&messages, &GenerationConfig::default(), stream)
+                    .unwrap();
+                let blocks = body["messages"][0]["content"].as_array().unwrap();
+                assert_eq!(
+                    blocks
+                        .iter()
+                        .map(|b| b["text"].as_str().unwrap())
+                        .collect::<String>(),
+                    text
+                );
+                assert_eq!(blocks[0]["text"], "{\"out\":");
+                assert_eq!(blocks[0]["prompt_cache_breakpoint"]["mode"], "explicit");
+                assert!(blocks[1].get("prompt_cache_breakpoint").is_none());
+                assert_eq!(
+                    body["prompt_cache_options"],
+                    serde_json::json!({"mode":"explicit","ttl":"30m"})
+                );
+            }
+        }
+        for messages in [
+            vec![],
+            vec![ConversationMessage::Chat(crate::types::ChatMessage::user(
+                "other",
+            ))],
+            vec![ConversationMessage::Chat(
+                crate::types::ChatMessage::assistant(r#"{"out":""}"#),
+            )],
+        ] {
+            assert!(
+                client
+                    .build_request_body(&messages, &GenerationConfig::default(), true)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn cache_writes_are_reported_separately_from_reads() {
+        let usage = OAIClient::new("key", "model").parse_usage(&serde_json::json!({
+            "prompt_tokens":15000,"completion_tokens":400,
+            "prompt_tokens_details":{"cached_tokens":14000,"cache_write_tokens":500}
+        }));
+        assert_eq!(usage.cached_tokens, 14000);
+        assert_eq!(usage.cache_write_input_tokens, 500);
+    }
+
+    const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+
+    fn image_message() -> Vec<ConversationMessage> {
+        use crate::types::{MediaPart, MediaSource, MultimodalMessage};
+        vec![ConversationMessage::Multimodal(MultimodalMessage::user(
+            vec![
+                MediaPart::text("What color is this image?"),
+                MediaPart::image(MediaSource::base64(TINY_PNG, "image/png")),
+            ],
+        ))]
+    }
+
+    /// The model string's `@vision=` reaches dispatch even though the wire
+    /// model id no longer carries it.
+    #[test]
+    fn declared_image_input_reaches_request_building() {
+        let config = GenerationConfig::default();
+
+        let refused = OAIClient::new("test-key", "vendor/undocumented-vision-model")
+            .with_provider(Provider::OpenRouter)
+            .build_request_body(&image_message(), &config, false);
+        assert!(
+            refused.is_err(),
+            "an unknown model should be refused without an override"
+        );
+
+        OAIClient::new("test-key", "vendor/undocumented-vision-model")
+            .with_provider(Provider::OpenRouter)
+            .with_image_input(Some(true))
+            .build_request_body(&image_message(), &config, false)
+            .expect("@vision=true must reach the dispatch check");
+
+        let refused = OAIClient::new("test-key", "gpt-4o")
+            .with_image_input(Some(false))
+            .build_request_body(&image_message(), &config, false);
+        assert!(
+            refused.is_err(),
+            "@vision=false must refuse a model the table would have allowed"
+        );
+    }
+
+    #[test]
     fn test_client_creation() {
         let client = OAIClient::new("test-key", "gpt-4");
         assert_eq!(client.model, "gpt-4");
@@ -574,6 +926,39 @@ mod tests {
 
         assert!(body["tools"].is_array());
         assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn ignored_openrouter_providers_are_sent_with_the_sort() {
+        let client = OAIClient::new("test-key", "deepseek/deepseek-v4.1-flash")
+            .with_provider(Provider::OpenRouter)
+            .with_openrouter_ignored_providers(vec!["makora".into()])
+            .with_openrouter_provider_sort(ProviderSort::Latency);
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("hi"))];
+        let config = GenerationConfig::new("deepseek/deepseek-v4.1-flash");
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+        assert_eq!(body["provider"]["ignore"], serde_json::json!(["makora"]));
+        assert_eq!(body["provider"]["sort"], "latency");
+        assert!(body["provider"].get("only").is_none());
+    }
+
+    #[test]
+    fn disabled_tool_calls_retain_schemas_and_reasoning() {
+        let client = OAIClient::new("test-key", "gpt-5.6-luna").with_reasoning("high");
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Re-evaluate"))];
+        let tools = vec![serde_json::json!({"type":"function","function":{"name":"read"}})];
+        let mut config = GenerationConfig::new("gpt-5.6-luna").with_tools(tools.clone());
+        config.allow_tool_calls = Some(false);
+        for stream in [false, true] {
+            let body = client
+                .build_request_body(&messages, &config, stream)
+                .unwrap();
+            assert_eq!(body["tools"], serde_json::json!(tools));
+            assert_eq!(body["tool_choice"], "none");
+            assert_eq!(body["reasoning_effort"], "high");
+        }
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! iterators) are layered on in later phases.
 
 mod error;
+mod claude_session;
 mod mcp;
 mod messages;
 mod programmatic;
@@ -14,6 +15,7 @@ mod types;
 mod vfs;
 
 pub use mcp::{McpClient, McpServer, McpServerOptions};
+pub use claude_session::{ClaudeSession, claude_subscription_status};
 pub use messages::Message;
 pub use programmatic::{ProgrammaticExecution, programmatic_description};
 pub use runtime::{RunOptions, Runtime, RuntimeOptions};

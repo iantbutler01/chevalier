@@ -15,7 +15,7 @@ pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
 tokio = { version = "1.49", features = ["sync", "rt", "macros", "time"] }
 
 # Match the native TypeScript binding's Rust capabilities and package split.
-chevalier-core = { package = "chevalier", path = "../rust", features = ["mcp"] }
+chevalier-core = { package = "chevalier", path = "../rust", features = ["mcp", "claude-subscription"] }
 chevalier-mcp = { path = "../mcp", default-features = false, features = ["client", "server"] }
 chevalier-vfs = { path = "../vfs", default-features = false, features = ["tokio", "gateway"] }
 chevalier-vfs-hash = { path = "../hash" }

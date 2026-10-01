@@ -260,6 +260,7 @@ dependencies = [
  "bytes",
  "chevalier-macros",
  "chevalier-mcp",
+ "claude-codes",
  "eventsource-stream",
  "futures",
  "http",
@@ -368,6 +369,19 @@ dependencies = [
  "serde",
  "wasm-bindgen",
  "windows-link 0.2.1",
+]
+
+[[package]]
+name = "claude-codes"
+version = "2.1.281"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a671ff57fcb9fa6be2a08899e188830016aab493967cbd5e9ec7c461c3823027"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "uuid",
 ]
 
 [[package]]

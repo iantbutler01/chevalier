@@ -80,6 +80,7 @@ chevalier-sandbox = { version = "0.1.0", path = "../sandbox/crates/sandbox", opt
 chevalier-vfs = { version = "0.1.0", path = "../vfs", optional = true, default-features = false }
 tokio-util = { version = "0.7.19", features = ["rt"] }
 async-stream = "0.3.6"
+claude-codes = { version = "=2.1.281", default-features = false, features = ["types"], optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -88,7 +89,8 @@ tokio-websockets = { version = "0.10.1", features = ["server"] }
 
 [features]
 default = []
-full = ["bedrock", "templating", "telemetry", "google-adc", "mcp"]
+full = ["bedrock", "templating", "telemetry", "google-adc", "mcp", "claude-subscription"]
+claude-subscription = ["dep:claude-codes"]
 bedrock = ["aws-config", "aws-sdk-bedrockruntime"]
 templating = ["minijinja"]
 telemetry = ["opentelemetry", "opentelemetry_sdk"]

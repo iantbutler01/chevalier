@@ -178,7 +178,9 @@ function toJsonSchema(s: ZodType | object): unknown {
 
 export interface RuntimeOptions {
   /** Provider model string, e.g. `anthropic:claude-3-5-sonnet` or
-   *  `custom-openai:my-model@server_url=http://host:port/v1/chat/completions`. */
+   *  `custom-openai:my-model@server_url=http://host:port/v1/chat/completions`.
+   *  OpenRouter chat completions accepts `@provider=fireworks,deepseek,baseten` for an
+   *  ordered allowlist. A single provider disables fallbacks. */
   model?: string;
   apiKey?: string;
 }
@@ -191,6 +193,8 @@ export interface RunArgs<T = unknown> {
   system?: string;
   temperature?: number;
   topP?: number;
+  /** Chat Completions / Responses: false retains schemas but disables native tool calls. */
+  allowToolCalls?: boolean;
   maxTokens?: number;
   model?: string;
   apiKey?: string;
@@ -212,6 +216,94 @@ export interface ToolDef {
   /** Async handler. Non-string returns are JSON-stringified. Omit for a
    *  schema-only (host-dispatched) tool. */
   handler?: (args: any) => unknown | Promise<unknown>;
+}
+
+export interface ClaudeSessionConfig {
+  model: string;
+  systemPrompt?: string;
+  effort?: "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+  resume?: { sessionId: string; cwd: string };
+  cwd?: string;
+  cliPath?: string;
+  clientApp?: string;
+  serverName?: string;
+  /** Surface every call (including handler-backed and MCP tools) as a `toolCall` event for the host to gate and run. */
+  hostDispatchAll?: boolean;
+  idleTimeoutMs?: number;
+  maxTurns?: number;
+}
+
+export interface ClaudeToolCall { toolUseId: string; toolName: string; args: unknown }
+export type ClaudeToolContent = { type: "text"; text: string } | { type: "image"; dataBase64: string; mimeType: string };
+export interface ClaudeToolOutput { content: ClaudeToolContent[]; isError?: boolean }
+export type ClaudeSessionEvent =
+  | { type: "init"; sessionId: string; cwd: string; model: string; cliVersion: string }
+  | { type: "textDelta"; text: string }
+  | { type: "thinkingDelta"; text: string }
+  | { type: "assistantMessage"; text: string }
+  | { type: "toolCall"; callId: string; call: ClaudeToolCall }
+  | { type: "toolExecuted"; call: ClaudeToolCall; output: ClaudeToolOutput }
+  | { type: "toolCancelled"; callId: string }
+  | { type: "rateLimits"; data: ProviderRateLimit[] }
+  | { type: "apiRetry"; attempt: number; delayMs: number; error: string }
+  | { type: "turnComplete"; usage: unknown; listPriceUsd: number | null; numTurns: number; isError: boolean; subtype: string; result: string | null };
+
+export type ClaudeSubscriptionStatus =
+  | { status: "ready"; email: string | null; subscription_type: string | null }
+  | { status: "notLoggedIn" }
+  | { status: "cliNotFound"; probed: string[] }
+  | { status: "error"; message: string };
+
+export interface ClaudeExitSummary { status: string; stderr_tail: string }
+
+export class ClaudeSession {
+  constructor(readonly native: native.ClaudeSession) {}
+  async next(): Promise<ClaudeSessionEvent | null> {
+    try { return await this.native.next() as ClaudeSessionEvent | null; }
+    catch (error) { throw toChevalierError(error); }
+  }
+  async send(turn: { text: string; images?: native.MediaPartInput[] }): Promise<void> {
+    try { await this.native.send(turn); }
+    catch (error) { throw toChevalierError(error); }
+  }
+  async respondTool(callId: string, output: ClaudeToolOutput): Promise<void> {
+    try { await this.native.respondTool(callId, output); }
+    catch (error) { throw toChevalierError(error); }
+  }
+  async interrupt(): Promise<void> {
+    try { await this.native.interrupt(); }
+    catch (error) { throw toChevalierError(error); }
+  }
+  async close(): Promise<ClaudeExitSummary> {
+    try { return await this.native.close() as ClaudeExitSummary; }
+    catch (error) { throw toChevalierError(error); }
+  }
+}
+
+export async function claudeSubscriptionStatus(cliPath?: string): Promise<ClaudeSubscriptionStatus> {
+  return native.claudeSubscriptionStatus(cliPath) as Promise<ClaudeSubscriptionStatus>;
+}
+
+export async function* events(session: ClaudeSession, { signal }: { signal?: AbortSignal } = {}): AsyncGenerator<ClaudeSessionEvent> {
+  let abort: (() => void) | undefined;
+  const aborted = new Promise<null>((resolve) => {
+    abort = () => resolve(null);
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+  try {
+    signal?.throwIfAborted();
+    for (;;) {
+      const event = await Promise.race([session.next(), aborted]) as ClaudeSessionEvent | null;
+      signal?.throwIfAborted();
+      if (event === null) return;
+      yield event;
+    }
+  } catch (error) {
+    throw toChevalierError(error);
+  } finally {
+    if (abort) signal?.removeEventListener("abort", abort);
+    await session.close();
+  }
 }
 
 export type ProviderRateLimitScope = "session" | "subscription";
@@ -249,6 +341,11 @@ export class Runtime {
 
   constructor(options?: RuntimeOptions) {
     this.native = new native.Runtime(options);
+  }
+
+  async claudeSession(config: ClaudeSessionConfig): Promise<ClaudeSession> {
+    try { return new ClaudeSession(await this.native.claudeSession(config)); }
+    catch (error) { throw toChevalierError(error); }
   }
 
   /** Non-streaming inference. Pass `output` (Zod) to get a typed, validated `value`. */
@@ -345,6 +442,9 @@ export class Runtime {
   }
   setModelToolNames(names: string[] | null): Promise<void> {
     return this.native.setModelToolNames(names);
+  }
+  setToolAsync(name: string, asynchronous: boolean): Promise<void> {
+    return this.native.setToolAsync(name, asynchronous);
   }
   setSystemMessages(messages: native.Message[]): Promise<void> {
     return this.native.setSystemMessages(messages);

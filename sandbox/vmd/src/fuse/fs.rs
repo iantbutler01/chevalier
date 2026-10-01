@@ -1087,9 +1087,54 @@ pub struct RemoteFuseFs {
     tokio: Handle,
     uid: u32,
     gid: u32,
+    /// The account every entry is reported as owned by, when the mount serves a guest user
+    /// other than the root process that mounted it. `None` reports the backing tree's owners.
+    owner: Option<MountOwner>,
+}
+
+/// The guest account a mount presents its entries as owned by. The mounting process is
+/// root; with `default_permissions` the kernel checks every request against the reported
+/// owner and mode, so reporting the guest user as owner is what lets it read and write the
+/// mount the way it would its own home directory. Root still bypasses the checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MountOwner {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl MountOwner {
+    /// Resolves an account name (or `uid:gid`) in the guest's user database.
+    pub fn resolve(account: &str) -> anyhow::Result<Self> {
+        let account = account.trim();
+        if let Some((uid, gid)) = account.split_once(':') {
+            return Ok(Self {
+                uid: uid.parse()?,
+                gid: gid.parse()?,
+            });
+        }
+        let name = std::ffi::CString::new(account)?;
+        // SAFETY: getpwnam returns a pointer into static storage or null; the fields are
+        // copied out before any other passwd call can overwrite it.
+        let entry = unsafe { libc::getpwnam(name.as_ptr()) };
+        if entry.is_null() {
+            anyhow::bail!("no account named {account} to own the mount");
+        }
+        Ok(unsafe {
+            Self {
+                uid: (*entry).pw_uid,
+                gid: (*entry).pw_gid,
+            }
+        })
+    }
 }
 
 impl RemoteFuseFs {
+    /// Present every entry as owned by `owner` (see [`MountOwner`]).
+    pub fn with_owner(mut self, owner: Option<MountOwner>) -> Self {
+        self.owner = owner;
+        self
+    }
+
     /// Scratch-state-directory constructor for the in-crate unit tests, which
     /// drive callbacks directly without mounting. Production mounts go through
     /// [`RemoteFuseFs::new_for_mount`], which is handed the mount state
@@ -1111,6 +1156,7 @@ impl RemoteFuseFs {
             tokio,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
+            owner: None,
         }
     }
 
@@ -1172,6 +1218,7 @@ impl RemoteFuseFs {
             tokio,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
+            owner: None,
         })
     }
 
@@ -1244,6 +1291,11 @@ impl RemoteFuseFs {
             config.n_threads = Some(1);
             config.clone_fd = false;
         } else {
+            // The mount is made by root for the guest's own user (and for services
+            // running as other accounts), so the kernel must pass their requests through
+            // at all; `default_permissions` then applies the reported owner and mode to
+            // each one. A root mounter needs no `user_allow_other` in /etc/fuse.conf.
+            config.acl = fuser::SessionACL::All;
             // Package extraction issues large concurrent LOOKUP/CREATE bursts, and
             // every callback now runs to completion against local storage. Thirty-two
             // request threads keep those bursts from queueing behind one another
@@ -1335,8 +1387,8 @@ impl RemoteFuseFs {
             kind,
             perm: (mode & POSIX_MODE_MASK) as u16,
             nlink: metadata.link_count.min(u32::MAX as u64) as u32,
-            uid: metadata.uid,
-            gid: metadata.gid,
+            uid: self.owner.map_or(metadata.uid, |owner| owner.uid),
+            gid: self.owner.map_or(metadata.gid, |owner| owner.gid),
             rdev: 0,
             blksize: 4096,
             flags: 0,
@@ -1372,8 +1424,8 @@ impl RemoteFuseFs {
             kind: FileType::Directory,
             perm: if self.read_only { 0o555 } else { 0o755 },
             nlink: 2,
-            uid: self.uid,
-            gid: self.gid,
+            uid: self.owner.map_or(self.uid, |owner| owner.uid),
+            gid: self.owner.map_or(self.gid, |owner| owner.gid),
             rdev: 0,
             blksize: 4096,
             flags: 0,
@@ -1933,8 +1985,8 @@ mod tests {
     #[cfg(all(target_os = "macos", feature = "macos-fskit"))]
     use super::remote_file_open_flags;
     use super::{
-        ActiveAdvisoryLockFile, ActiveAdvisoryLocks, InodeTable, LockWaitCancellation, ROOT_INO,
-        RemoteFuseFs, active_advisory_lock_identities, combine_flush_and_lock_cleanup,
+        ActiveAdvisoryLockFile, ActiveAdvisoryLocks, InodeTable, LockWaitCancellation, MountOwner,
+        ROOT_INO, RemoteFuseFs, active_advisory_lock_identities, combine_flush_and_lock_cleanup,
         creation_mode, take_active_advisory_lock_file_id, take_active_posix_handle_locks,
     };
 
@@ -2442,6 +2494,72 @@ mod tests {
             read_only.attr_for_path("exact", &metadata, false).perm,
             0o3551
         );
+    }
+
+    #[test]
+    fn a_mount_owner_is_reported_for_every_entry_and_the_root() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let client =
+            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
+        let metadata = LocalMetadata {
+            kind: LocalKind::Directory,
+            size_bytes: 0,
+            blocks: 0,
+            mode: 0o040_755,
+            uid: 0,
+            gid: 0,
+            link_count: 2,
+            local_identity: "unix:1:43".to_string(),
+            backing_ino: 43,
+            link_target: None,
+            atime: LocalTimestamp::default(),
+            mtime: LocalTimestamp::default(),
+            ctime: LocalTimestamp::default(),
+        };
+        let unowned = RemoteFuseFs::new(
+            client.clone(),
+            false,
+            "test-scope",
+            runtime.handle().clone(),
+        );
+        assert_eq!(unowned.attr_for_path("dir", &metadata, false).uid, 0);
+
+        let nym = MountOwner {
+            uid: 1001,
+            gid: 1001,
+        };
+        let owned = RemoteFuseFs::new(client, false, "test-scope", runtime.handle().clone())
+            .with_owner(Some(nym));
+        let attr = owned.attr_for_path("dir", &metadata, false);
+        assert_eq!((attr.uid, attr.gid, attr.perm), (1001, 1001, 0o755));
+        let root = owned.root_attr();
+        assert_eq!((root.uid, root.gid), (1001, 1001));
+    }
+
+    #[test]
+    fn a_mount_owner_resolves_by_name_or_ids() {
+        assert_eq!(
+            MountOwner::resolve("1001:1002").unwrap(),
+            MountOwner {
+                uid: 1001,
+                gid: 1002
+            }
+        );
+        assert_eq!(
+            MountOwner::resolve("root").unwrap(),
+            MountOwner { uid: 0, gid: 0 }
+        );
+        assert!(MountOwner::resolve("no-such-account-here").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_mounts_serve_users_other_than_the_root_mounter() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let client =
+            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
+        let fs = RemoteFuseFs::new(client, true, "test-scope", runtime.handle().clone());
+        assert_eq!(fs.mount_options("nymfs").acl, fuser::SessionACL::All);
     }
 
     #[test]

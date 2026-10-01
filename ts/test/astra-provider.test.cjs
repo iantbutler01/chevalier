@@ -28,6 +28,28 @@ const items = [
   { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'lookup', arguments: '{}', async: true, caller: { type: 'direct' } },
 ];
 
+test('model tool visibility preserves callable tools and defaults late registrations to hidden', async (context) => {
+  const { model, requests } = await fixture(context, async ({ response, emit }) => {
+    emit({ type: 'response.output_text.delta', delta: 'done' });
+    emit({ type: 'response.completed', response: { id: 'visibility', output: [] } });
+    response.end();
+  });
+  const runtime = new Runtime({ model, apiKey: 'fixture' });
+  await runtime.tool({ name: 'read', schema: { type: 'object' }, handler: async () => 'profile data' });
+  await runtime.tool({ name: 'execute_code', schema: { type: 'object' }, async: true });
+  await runtime.setModelToolNames(['execute_code']);
+  await runtime.tool({ name: 'late_tool', schema: { type: 'object' }, handler: async () => 'late data' });
+  for await (const event of runtime.runStream({ prompt: 'start' })) {}
+  assert.deepEqual(requests[0].tools.map(tool => tool.name), ['execute_code']);
+  assert.equal(requests[0].tools[0].async, true);
+  assert.equal((await runtime.getToolSchemas()).length, 3);
+  assert.equal(await runtime.executeToolCall('read', {}), 'profile data');
+  assert.equal(await runtime.executeToolCall('late_tool', {}), 'late data');
+  await runtime.setModelToolNames(null);
+  for await (const event of runtime.runStream({ prompt: 'direct mode' })) {}
+  assert.deepEqual(requests[1].tools.map(tool => tool.name), ['read', 'execute_code', 'late_tool']);
+});
+
 test('PDF document input reaches Responses as a file rather than an image or placeholder', { timeout: 10000 }, async (context) => {
   const { model, requests } = await fixture(context, async ({ response, emit }) => {
     emit({ type: 'response.output_text.delta', delta: 'read' });

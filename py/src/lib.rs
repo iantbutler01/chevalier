@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 mod errors;
+mod claude_session;
 mod json;
 mod mcp;
 mod messages;
@@ -35,6 +36,8 @@ fn chevalier(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<types::RateLimitsStreamEvent>()?;
     module.add_class::<types::CompleteStreamEvent>()?;
     module.add_class::<runtime::Runtime>()?;
+    module.add_class::<claude_session::ClaudeSession>()?;
+    module.add_function(wrap_pyfunction!(claude_session::claude_subscription_status, module)?)?;
     module.add_class::<programmatic::ProgrammaticExecution>()?;
     module.add_function(wrap_pyfunction!(
         programmatic::programmatic_description,

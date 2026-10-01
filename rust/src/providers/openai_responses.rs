@@ -18,7 +18,9 @@ use crate::providers::{
 };
 use crate::retry::{RetryConfig, retry_with_backoff};
 use crate::schema::fix_tool_schema_for_provider;
-use crate::types::{AssistantResponse, Provider, ResponsePart, TokenUsage, ToolCall};
+use crate::types::{
+    AssistantResponse, Provider, ResponsePart, TokenUsage, ToolCall, is_gpt6_model,
+};
 use crate::utils::{
     ConversationMessage, parse_json_value_strict_str, parse_sse_stream,
     validate_image_input_supported,
@@ -34,6 +36,9 @@ pub struct OpenAIResponsesClient {
     reasoning: Option<String>,
     ranking_referer: Option<String>,
     ranking_title: Option<String>,
+    /// `@vision=` override for image-input support, or `None` to ask the
+    /// provider's capability table.
+    image_input: Option<bool>,
     trace_callback: Option<TraceCallback>,
     provider: Provider,
 }
@@ -47,6 +52,7 @@ impl Clone for OpenAIResponsesClient {
             reasoning: self.reasoning.clone(),
             ranking_referer: self.ranking_referer.clone(),
             ranking_title: self.ranking_title.clone(),
+            image_input: self.image_input,
             trace_callback: self.trace_callback.clone(),
             provider: self.provider,
         }
@@ -95,6 +101,7 @@ impl OpenAIResponsesClient {
             reasoning: None,
             ranking_referer: None,
             ranking_title: None,
+            image_input: None,
             trace_callback: None,
             provider: Provider::OpenAIResponses,
         }
@@ -135,7 +142,7 @@ impl OpenAIResponsesClient {
         stream: bool,
     ) -> Result<serde_json::Value> {
         let model = config.effective_model(&self.model);
-        validate_image_input_supported(messages, self.provider, model)?;
+        validate_image_input_supported(messages, self.provider, model, self.image_input)?;
 
         let (instructions, input_items) =
             crate::utils::message_conversion::responses_input_for_model(
@@ -152,7 +159,8 @@ impl OpenAIResponsesClient {
             "top_p": config.top_p.unwrap_or(1.0),
             "stream": stream,
         });
-        if model.starts_with("gpt-6-astra") {
+        // The GPT-6 family (Astra, Sol, Luna) rejects sampling parameters.
+        if is_gpt6_model(model) {
             request.as_object_mut().unwrap().remove("temperature");
             request.as_object_mut().unwrap().remove("top_p");
         }
@@ -186,7 +194,7 @@ impl OpenAIResponsesClient {
             && !tools.is_empty()
         {
             request["tools"] = serde_json::json!(self.normalized_tools(tools));
-            if !model.starts_with("gpt-6-astra")
+            if !is_gpt6_model(model)
                 && let Some(tools) = request["tools"].as_array_mut()
             {
                 for tool in tools {
@@ -195,7 +203,11 @@ impl OpenAIResponsesClient {
                     }
                 }
             }
-            request["tool_choice"] = serde_json::json!("auto");
+            request["tool_choice"] = serde_json::json!(if config.allow_tool_calls == Some(false) {
+                "none"
+            } else {
+                "auto"
+            });
         }
 
         if let Some(ref reasoning) = config.reasoning_effort.as_ref().or(self.reasoning.as_ref()) {
@@ -380,6 +392,15 @@ impl OpenAIResponsesClient {
     }
 }
 
+impl OpenAIResponsesClient {
+    /// Override whether this model accepts image input, from the model
+    /// string's `@vision=` parameter.
+    pub fn with_image_input(mut self, image_input: Option<bool>) -> Self {
+        self.image_input = image_input;
+        self
+    }
+}
+
 #[async_trait]
 impl InferenceClient for OpenAIResponsesClient {
     async fn get_generation(
@@ -557,6 +578,28 @@ mod tests {
         assert_eq!(client.api_key, "test-key");
         assert_eq!(client.api_url, "https://api.openai.com/v1/responses");
         assert_eq!(client.provider, Provider::OpenAIResponses);
+    }
+
+    #[test]
+    fn gpt6_family_requests_keep_async_tools_and_drop_sampling() {
+        let tool = serde_json::json!({"type":"function","name":"lookup","description":"Look up","parameters":{"type":"object","properties":{}},"async":true});
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        for (model, gpt6) in [
+            ("gpt-6-astra", true),
+            ("gpt-6-sol", true),
+            ("gpt-6-luna", true),
+            ("gpt-6.1-sol", true),
+            ("gpt-5.5", false),
+        ] {
+            let client = OpenAIResponsesClient::new("test-key", model);
+            let mut config = GenerationConfig::new(model);
+            config.temperature = Some(0.7);
+            config.tools = Some(vec![tool.clone()]);
+            let body = client.build_request_body(&messages, &config, true).unwrap();
+            assert_eq!(body.get("temperature").is_none(), gpt6, "{model}");
+            assert_eq!(body.get("top_p").is_none(), gpt6, "{model}");
+            assert_eq!(body["tools"][0].get("async").is_some(), gpt6, "{model}");
+        }
     }
 
     #[test]

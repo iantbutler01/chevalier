@@ -41,6 +41,8 @@ type ToolHandler = ThreadsafeFunction<
 pub struct RuntimeOptions {
     /// Provider model string, e.g. `anthropic:claude-3-5-sonnet` or
     /// `openai:gpt-4o@server_url=http://host:port/v1`.
+    /// OpenRouter chat completions accepts `@provider=fireworks,deepseek,baseten` for an
+    /// ordered allowlist. A single provider disables fallbacks.
     pub model: Option<String>,
     /// API key. Falls back to the provider's env var when omitted.
     pub api_key: Option<String>,
@@ -54,6 +56,7 @@ pub struct RunOptions {
     pub system: Option<String>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    pub allow_tool_calls: Option<bool>,
     pub max_tokens: Option<u32>,
     /// Override the runtime's model for this call.
     pub model: Option<String>,
@@ -90,6 +93,7 @@ impl RunOptions {
             output_schema: self.output_schema,
             temperature: self.temperature.map(|v| v as f32),
             top_p: self.top_p.map(|v| v as f32),
+            allow_tool_calls: self.allow_tool_calls,
             max_tokens: self.max_tokens,
             reasoning_effort: None,
             model: self.model,
@@ -174,6 +178,11 @@ pub struct Runtime {
 
 #[napi]
 impl Runtime {
+    #[napi]
+    pub async fn claude_session(&self, config: serde_json::Value) -> napi::Result<crate::claude_session::ClaudeSession> {
+        let runtime = self.inner.lock().await.clone();
+        crate::claude_session::start(&runtime, config).await
+    }
     #[napi(constructor)]
     pub fn new(options: Option<RuntimeOptions>) -> Self {
         let (model, api_key) = match options {
@@ -240,17 +249,9 @@ impl Runtime {
         description: String,
         schema: serde_json::Value,
     ) -> napi::Result<()> {
-        let tool_fn = ToolFunction::Async(Box::new(move |_args| {
-            Box::pin(async move {
-                Err(EngineError::NonRetryable(
-                    "tool was registered schema-only; dispatch it host-side from the tool call"
-                        .to_string(),
-                ))
-            }) as BoxFuture<'static, EngineResult<String>>
-        }));
         let guard = self.inner.lock().await;
         guard
-            .register_tool_with_schema(name, description, schema, tool_fn)
+            .register_tool_schema(name, description, schema)
             .await
             .map_err(to_napi)
     }

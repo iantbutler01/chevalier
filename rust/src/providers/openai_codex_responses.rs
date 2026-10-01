@@ -30,7 +30,7 @@ use crate::retry::{RetryConfig, retry_with_backoff};
 use crate::schema::fix_tool_schema_for_provider;
 use crate::types::{
     AssistantResponse, Provider, ProviderRateLimit, ProviderRateLimitScope, ResponsePart,
-    TokenUsage, ToolCall,
+    TokenUsage, ToolCall, is_gpt6_model,
 };
 use crate::utils::{
     ConversationMessage, parse_json_value_strict_str, parse_sse_stream,
@@ -84,6 +84,9 @@ pub struct OpenAICodexResponsesClient {
     transport: CodexSubscriptionTransport,
     sse_header_timeout: Duration,
     websocket_connect_timeout: Duration,
+    /// `@vision=` override for image-input support, or `None` to ask the
+    /// provider's capability table.
+    image_input: Option<bool>,
     trace_callback: Option<TraceCallback>,
 }
 
@@ -103,6 +106,7 @@ impl Clone for OpenAICodexResponsesClient {
             transport: self.transport,
             sse_header_timeout: self.sse_header_timeout,
             websocket_connect_timeout: self.websocket_connect_timeout,
+            image_input: self.image_input,
             trace_callback: self.trace_callback.clone(),
         }
     }
@@ -163,6 +167,7 @@ impl OpenAICodexResponsesClient {
             websocket_connect_timeout: config
                 .websocket_connect_timeout
                 .unwrap_or(DEFAULT_WEBSOCKET_CONNECT_TIMEOUT),
+            image_input: None,
             trace_callback: None,
         })
     }
@@ -195,7 +200,12 @@ impl OpenAICodexResponsesClient {
         stream: bool,
     ) -> Result<Value> {
         let model = config.effective_model(&self.model);
-        validate_image_input_supported(messages, Provider::OpenAIResponses, model)?;
+        validate_image_input_supported(
+            messages,
+            Provider::OpenAIResponses,
+            model,
+            self.image_input,
+        )?;
 
         let (instructions, input_items) =
             crate::utils::message_conversion::responses_input_for_model(
@@ -226,7 +236,7 @@ impl OpenAICodexResponsesClient {
         super::responses_control::apply_compaction(&mut request, config.responses.as_ref(), false);
 
         if let Some(temperature) = config.temperature
-            && !model.starts_with("gpt-6-astra")
+            && !is_gpt6_model(model)
         {
             request["temperature"] = serde_json::json!(temperature);
         }
@@ -235,7 +245,7 @@ impl OpenAICodexResponsesClient {
             && !tools.is_empty()
         {
             request["tools"] = serde_json::json!(self.normalized_tools(tools));
-            if !model.starts_with("gpt-6-astra")
+            if !is_gpt6_model(model)
                 && let Some(tools) = request["tools"].as_array_mut()
             {
                 for tool in tools {
@@ -244,7 +254,11 @@ impl OpenAICodexResponsesClient {
                     }
                 }
             }
-            request["tool_choice"] = serde_json::json!("auto");
+            request["tool_choice"] = serde_json::json!(if config.allow_tool_calls == Some(false) {
+                "none"
+            } else {
+                "auto"
+            });
         }
 
         if self.reasoning.is_some() || self.reasoning_summary.is_some() {
@@ -620,6 +634,15 @@ impl OpenAICodexResponsesClient {
                     .await
             }
         }
+    }
+}
+
+impl OpenAICodexResponsesClient {
+    /// Override whether this model accepts image input, from the model
+    /// string's `@vision=` parameter.
+    pub fn with_image_input(mut self, image_input: Option<bool>) -> Self {
+        self.image_input = image_input;
+        self
     }
 }
 
@@ -1191,6 +1214,29 @@ mod tests {
             "gpt-5.1-codex",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn gpt6_family_codex_requests_keep_async_tools_and_drop_temperature() {
+        let tool = serde_json::json!({"type":"function","name":"lookup","description":"Look up","parameters":{"type":"object","properties":{}},"async":true});
+        let messages = vec![ConversationMessage::Chat(crate::types::ChatMessage::user(
+            "Hello",
+        ))];
+        for (model, gpt6) in [
+            ("gpt-6-astra", true),
+            ("gpt-6-sol", true),
+            ("gpt-6-luna", true),
+            ("gpt-5.5", false),
+        ] {
+            let mut config = GenerationConfig::new(model);
+            config.temperature = Some(0.7);
+            config.tools = Some(vec![tool.clone()]);
+            let body = test_client()
+                .build_request_body(&messages, &config, true)
+                .unwrap();
+            assert_eq!(body.get("temperature").is_none(), gpt6, "{model}");
+            assert_eq!(body["tools"][0].get("async").is_some(), gpt6, "{model}");
+        }
     }
 
     #[test]

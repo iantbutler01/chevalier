@@ -457,6 +457,9 @@ pub struct GoogleGenAIClient {
     auth: GoogleAuth,
     api_url: String,
     thinking_budget: Option<u32>,
+    /// `@vision=` override for image-input support, or `None` to ask the
+    /// provider's capability table.
+    image_input: Option<bool>,
     trace_callback: Option<TraceCallback>,
 }
 
@@ -468,6 +471,7 @@ impl GoogleGenAIClient {
             auth: GoogleAuth::ApiKey(api_key.into()),
             api_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
             thinking_budget: None,
+            image_input: None,
             trace_callback: None,
         }
     }
@@ -523,6 +527,7 @@ impl GoogleGenAIClient {
                 loc, project, loc, model_str
             ),
             thinking_budget: None,
+            image_input: None,
             trace_callback: None,
         }
     }
@@ -549,6 +554,7 @@ impl GoogleGenAIClient {
                 loc, project, loc, model_str
             ),
             thinking_budget: None,
+            image_input: None,
             trace_callback: None,
         }
     }
@@ -880,7 +886,7 @@ impl GoogleGenAIClient {
         stream: bool,
     ) -> Result<serde_json::Value> {
         let model = config.effective_model(&self.model);
-        validate_image_input_supported(messages, Provider::GoogleGenAI, model)?;
+        validate_image_input_supported(messages, Provider::GoogleGenAI, model, self.image_input)?;
 
         // Extract system instruction if present
         let (system_instruction, messages) = self.extract_system_message(messages)?;
@@ -1310,6 +1316,15 @@ impl GoogleGenAIClient {
             response.json().await.map_err(Error::from)
         })
         .await
+    }
+}
+
+impl GoogleGenAIClient {
+    /// Override whether this model accepts image input, from the model
+    /// string's `@vision=` parameter.
+    pub fn with_image_input(mut self, image_input: Option<bool>) -> Self {
+        self.image_input = image_input;
+        self
     }
 }
 

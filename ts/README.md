@@ -37,6 +37,8 @@ A model string selects the provider, e.g. `anthropic:claude-3-5-sonnet`,
 `openai:gpt-4o`, `google-gemini:gemini-2.0-flash`,
 `openrouter:anthropic/claude-3.5-sonnet`. For an OpenAI-compatible server
 (vLLM, Ollama, …) use `custom-openai` with the **full** chat-completions URL:
+An optional nonempty `@endpoint=<id>` preserves the host application’s endpoint identity;
+it is not sent as part of the wire model name and does not override `@server_url`.
 
 ```ts
 const rt = new Runtime({
@@ -46,6 +48,22 @@ const rt = new Runtime({
 ```
 
 API keys come from `apiKey` or the provider's env var (`ANTHROPIC_API_KEY`, …).
+
+Pin an OpenRouter chat-completions upstream in the model string:
+
+```ts
+const rt = new Runtime({
+  model: "openrouter:deepseek/deepseek-v4.1-flash@provider=fireworks,deepseek,baseten@reasoning=high",
+});
+```
+
+`@provider=<slug,...>` parses a comma-separated list, trims whitespace, and
+rejects empty entries. The request sends that list as both `provider.order` and
+`provider.only`, with `require_parameters: true`. Multiple entries enable fallback
+within the list; a single entry disables fallback. Providers outside the list
+are never eligible. The same syntax works in a per-call `model` override.
+Omit it to retain OpenRouter's default routing. Other APIs, including OpenRouter
+Responses, reject this parameter. Fallback can reduce cache reuse.
 
 ## Tools
 
@@ -171,3 +189,31 @@ are published as `optionalDependencies`; `npm install` fetches the right one.
 ## License
 
 Apache-2.0
+
+### OpenRouter automatic routing
+
+Append `@provider_sort=throughput` to an OpenRouter chat model string to prefer
+faster upstream generation while retaining automatic fallback across providers:
+`openrouter:deepseek/deepseek-v4.1-flash@reasoning=medium@provider_sort=throughput`.
+The shared Rust runtime sends `provider: {"sort": "throughput"}`; it adds no
+provider allowlist. `latency` and `price` are also supported. Omitting the option
+retains OpenRouter's default routing. Throughput routing can select a more
+expensive provider than price-based routing.
+
+OpenRouter also accepts recent performance preferences through the shared model parser:
+`@provider_min_throughput={"p90":40}@provider_max_latency={"p90":2.5}`.
+These send `provider.preferred_min_throughput` (tokens/second) and
+`provider.preferred_max_latency` (seconds to first token). Each accepts a positive
+number or a nonempty object with `p50`, `p75`, `p90`, or `p99` positive values.
+They combine with `@provider_sort=throughput` and preserve automatic fallbacks.
+OpenRouter uses these as soft routing preferences, not per-request deadlines.
+
+For OpenRouter models supporting explicit prompt caching (such as GPT-5.6),
+`@cache_prefix={"out":` marks a cache boundary after that literal prefix in the
+final user message. The message must start with the configured prefix. The client
+splits it into two text blocks without changing the concatenated text, marks the
+first block, and requests explicit-only caching with a 30-minute TTL. Everything
+through that boundary is reusable; the changing suffix is not written to cache.
+This is opt-in and fails before sending if the final message does not match.
+
+For Chat Completions and Responses providers, pass `allowToolCalls: false` in run options to retain tool schemas while requesting text only (`tool_choice: "none"`). Omit it for normal automatic tool calling. Unsupported provider routes reject this option rather than silently allowing calls.

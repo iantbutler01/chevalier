@@ -148,6 +148,7 @@ export interface ForkOpts {
   childName?: string
   childMetadata?: Record<string, string>
   autoStartChild?: boolean
+  childVolumeOwnerKey?: string
 }
 
 export interface HostPciDeviceJs {
@@ -215,7 +216,6 @@ export interface SandboxConnectOptions {
   authToken?: string
   pciAccessToken?: string
   connectTimeoutMs?: number
-  prewarmOnStart?: boolean
   defaultImage?: string
   defaultArchitecture?: string
   defaultVcpu?: number
@@ -224,6 +224,12 @@ export interface SandboxConnectOptions {
   provider?: string
   openComputer?: OpenComputerProviderOpts
   distributedControl?: DistributedControlOptions
+  /**
+   * Prepare the default image on every healthy endpoint before `connect` returns
+   * (default true). Hosts that place sessions lazily pass false so a cold image does
+   * not hold connection behind fleet-wide preparation.
+   */
+  prewarmOnStart?: boolean
 }
 
 export interface SessionCheckpointJs {

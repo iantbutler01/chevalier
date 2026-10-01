@@ -103,6 +103,40 @@ test("requires explicit sandbox injection without provisioning or fallback", asy
   );
 });
 
+test("syntax failures identify the source line without dispatching earlier calls", async (t) => {
+  const { sandbox, children } = await fixture(t);
+  const signals = [];
+  const gracefulSandbox = {
+    startExec: async (options) => {
+      const session = await sandbox.startExec(options);
+      return { ...session, signal: async (signal) => { signals.push(signal); throw new Error("A completed syntax diagnostic must exit without signals"); } };
+    },
+  };
+  let dispatched = false;
+  await assert.rejects(
+    executeProgrammatic('text(await tools.read({}));\nconst command = "first\nsecond";', {
+      sandbox: gracefulSandbox,
+      tools,
+      dispatch: async () => { dispatched = true; },
+    }),
+    (error) => {
+      assert.match(error.message, /Invalid JavaScript in execute_code; no code or tools ran/);
+      assert.match(error.message, /execute_code:2/);
+      assert.match(error.message, /const command = "first/);
+      assert.match(error.message, /backticks or escaped newlines/);
+      assert.doesNotMatch(error.message, /termination|without signals/);
+      return true;
+    },
+  );
+  assert.equal(dispatched, false);
+  assert.deepEqual(signals, []);
+  assert.equal(children.size, 0);
+  const corrected = await executeProgrammatic('text(`first\nsecond`);', {
+    sandbox, tools, dispatch: async () => null,
+  });
+  assert.deepEqual(corrected.output, ['first\nsecond']);
+});
+
 test("uses selected execution environment and reaps the process after success", async (t) => {
   const { sandbox, root, children } = await fixture(t);
   const gracefulSandbox = {
@@ -191,6 +225,8 @@ for (const mode of ["cancel", "unawaited", "throw", "timeout"]) {
         ? "tools.read({});"
         : mode === "throw"
           ? "tools.read({}); throw new Error('broken');"
+          : mode === "timeout"
+            ? "tools.read({}); await new Promise(resolve => setTimeout(resolve, 20)); while (true) {}"
           : "await tools.read({});";
     const task = executeProgrammatic(code, {
       sandbox,
@@ -256,6 +292,19 @@ test("cancels CPU-bound code without blocking host and escalates ignored TERM", 
   await ready.promise;
   controller.abort();
   await failed;
+  assert.equal(children.size, 0);
+});
+
+test("nested waits outlive the code deadline and return their result", async (t) => {
+  const { sandbox, children } = await fixture(t);
+  const result = await executeProgrammatic("text(await tools.read({}));", {
+    sandbox, tools, timeoutMs: 200,
+    dispatch: async () => {
+      await new Promise(resolve => setTimeout(resolve, 700));
+      return "completed";
+    },
+  });
+  assert.deepEqual(result.output, ["completed"]);
   assert.equal(children.size, 0);
 });
 

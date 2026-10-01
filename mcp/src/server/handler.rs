@@ -252,8 +252,20 @@ impl ServerHandler for McpServer {
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = std::result::Result<CallToolResult, ErrorData>> + Send + '_ {
         async move {
+            let tool = request.name.to_string();
+            let started = std::time::Instant::now();
             let tcc = ToolCallContext::new(self, request, context);
-            self.tool_router.call(tcc).await
+            let result = self.tool_router.call(tcc).await;
+            // Under the host's own log target: an api log filter of `api=info`
+            // would otherwise drop this crate's lines.
+            tracing::info!(
+                target: "api::mcp_server",
+                tool,
+                handler_ms = started.elapsed().as_millis() as u64,
+                ok = result.is_ok(),
+                "mcp.server.call_tool"
+            );
+            result
         }
     }
 

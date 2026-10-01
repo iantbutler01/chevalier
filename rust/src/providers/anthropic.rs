@@ -49,6 +49,9 @@ pub struct AnthropicClient {
     /// `output_config.effort` level (low|medium|high|xhigh|max) for models
     /// that support it (Opus 4.5+/Sonnet 4.6/Fable).
     effort: Option<String>,
+    /// `@vision=` override for image-input support, or `None` to ask the
+    /// provider's capability table.
+    image_input: Option<bool>,
     trace_callback: Option<TraceCallback>,
 }
 
@@ -76,6 +79,7 @@ impl AnthropicClient {
             thinking_budget: None,
             adaptive_thinking: false,
             effort: None,
+            image_input: None,
             trace_callback: None,
         }
     }
@@ -130,7 +134,7 @@ impl AnthropicClient {
         stream: bool,
     ) -> Result<serde_json::Value> {
         let model = config.effective_model(&self.model);
-        validate_image_input_supported(messages, Provider::Anthropic, model)?;
+        validate_image_input_supported(messages, Provider::Anthropic, model, self.image_input)?;
 
         // Extract system message if present
         let (system, messages) = self.extract_system_message(messages)?;
@@ -463,6 +467,15 @@ impl AnthropicClient {
             response.json().await.map_err(Error::from)
         })
         .await
+    }
+}
+
+impl AnthropicClient {
+    /// Override whether this model accepts image input, from the model
+    /// string's `@vision=` parameter.
+    pub fn with_image_input(mut self, image_input: Option<bool>) -> Self {
+        self.image_input = image_input;
+        self
     }
 }
 

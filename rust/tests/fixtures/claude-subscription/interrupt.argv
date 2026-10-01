@@ -1,0 +1,1 @@
+--output-format stream-json --verbose --input-format stream-json --model sonnet --allowedTools mcp__ob --tools  --setting-sources= --permission-mode default --no-session-persistence --strict-mcp-config --include-partial-messages

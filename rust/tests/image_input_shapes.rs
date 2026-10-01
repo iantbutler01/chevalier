@@ -190,11 +190,26 @@ fn provider_capability_rejects_unknown_models() {
 
 #[test]
 fn image_input_validation_fails_before_provider_dispatch_for_unsupported_models() {
-    let error = validate_image_input_supported(&image_message(), Provider::OpenAI, "gpt-3.5-turbo")
-        .expect_err("image validation should reject non-vision models");
+    let error =
+        validate_image_input_supported(&image_message(), Provider::OpenAI, "gpt-3.5-turbo", None)
+            .expect_err("image validation should reject non-vision models");
 
     assert_eq!(
         error.to_string(),
         "Validation error: This Nym's current model cannot inspect images."
     );
+}
+
+#[test]
+fn declared_image_input_overrides_the_capability_table_in_both_directions() {
+    validate_image_input_supported(
+        &image_message(),
+        Provider::OpenRouter,
+        "vendor/undocumented-vision-model",
+        Some(true),
+    )
+    .expect("@vision=true must let images through a model the table does not know");
+
+    validate_image_input_supported(&image_message(), Provider::OpenAI, "gpt-4o", Some(false))
+        .expect_err("@vision=false must refuse images the table would have allowed");
 }

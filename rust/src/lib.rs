@@ -19,6 +19,8 @@
 // @dive-rel: Exposes optional protocol/runtime integrations such as MCP and sandbox behind features.
 // @dive-rel: Re-exports macros and convenience types consumed by downstream agent services.
 
+#[cfg(feature = "claude-subscription")]
+pub mod claude_subscription;
 pub mod error;
 pub mod retry;
 pub mod runtime;

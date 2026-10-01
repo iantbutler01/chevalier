@@ -796,6 +796,7 @@ dependencies = [
  "chevalier-mcp",
  "chevalier-sandbox",
  "chevalier-vfs",
+ "claude-codes",
  "eventsource-stream",
  "futures",
  "gcp_auth",
@@ -930,6 +931,19 @@ dependencies = [
  "glob",
  "libc",
  "libloading",
+]
+
+[[package]]
+name = "claude-codes"
+version = "2.1.281"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a671ff57fcb9fa6be2a08899e188830016aab493967cbd5e9ec7c461c3823027"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "uuid",
 ]
 
 [[package]]

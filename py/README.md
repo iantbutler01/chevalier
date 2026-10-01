@@ -29,6 +29,23 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+Pin an OpenRouter chat-completions upstream with the same model string used by
+the JavaScript/TypeScript binding:
+
+```python
+runtime = Runtime({
+    "model": "openrouter:deepseek/deepseek-v4.1-flash@provider=fireworks,deepseek,baseten@reasoning=high",
+})
+```
+
+`@provider=<slug,...>` parses a comma-separated list, trims whitespace, and
+rejects empty entries. The request sends that list as both `provider.order` and
+`provider.only`, with `require_parameters: true`. Multiple entries enable fallback
+within the list; a single entry disables fallback. Providers outside the list
+are never eligible. The same syntax works in a per-call `model` override.
+Omit it to retain OpenRouter's default routing. Other APIs, including OpenRouter
+Responses, reject this parameter. Fallback can reduce cache reuse.
+
 `Runtime.run()` returns the Rust runtime's canonical `AssistantResponse`. Its ordered
 `output` contains `TextResponsePart`, `ReasoningResponsePart`, `ToolResponsePart`,
 and `SignatureResponsePart` values; `text()`, `reasoning()`, `tool_calls()`, and
@@ -151,3 +168,31 @@ The separate sandbox binding also exposes distributed-control connection options
 Docker/snapshot/macOS/Windows session source types, `workspace_root`, durable-volume
 resizing, session resource updates, shared-mount reconfiguration, and desktop
 open/close operations. All forward to the existing Rust sandbox client.
+
+### OpenRouter automatic routing
+
+Append `@provider_sort=throughput` to an OpenRouter chat model string to prefer
+faster upstream generation while retaining automatic fallback across providers:
+`openrouter:deepseek/deepseek-v4.1-flash@reasoning=medium@provider_sort=throughput`.
+The shared Rust runtime sends `provider: {"sort": "throughput"}`; it adds no
+provider allowlist. `latency` and `price` are also supported. Omitting the option
+retains OpenRouter's default routing. Throughput routing can select a more
+expensive provider than price-based routing.
+
+OpenRouter also accepts recent performance preferences through the shared model parser:
+`@provider_min_throughput={"p90":40}@provider_max_latency={"p90":2.5}`.
+These send `provider.preferred_min_throughput` (tokens/second) and
+`provider.preferred_max_latency` (seconds to first token). Each accepts a positive
+number or a nonempty object with `p50`, `p75`, `p90`, or `p99` positive values.
+They combine with `@provider_sort=throughput` and preserve automatic fallbacks.
+OpenRouter uses these as soft routing preferences, not per-request deadlines.
+
+For OpenRouter models supporting explicit prompt caching (such as GPT-5.6),
+`@cache_prefix={"out":` marks a cache boundary after that literal prefix in the
+final user message. The message must start with the configured prefix. The client
+splits it into two text blocks without changing the concatenated text, marks the
+first block, and requests explicit-only caching with a 30-minute TTL. Everything
+through that boundary is reusable; the changing suffix is not written to cache.
+This is opt-in and fails before sending if the final message does not match.
+
+For Chat Completions and Responses providers, set `"allow_tool_calls": False` in run options to retain tool schemas while requesting text only (`tool_choice: "none"`). Omit it for normal automatic tool calling. Unsupported provider routes reject this option rather than silently allowing calls.

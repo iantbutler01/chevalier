@@ -445,6 +445,7 @@ pub async fn mount_vfs_fuse(
         &mountpoint,
         state_dir.root(),
         mount.read_only,
+        None,
     )
     .await
 }
@@ -556,6 +557,7 @@ pub async fn mount_remote_vfs_fuse(
     mountpoint: &Path,
     state_dir: &Path,
     read_only: bool,
+    owner: Option<super::fs::MountOwner>,
 ) -> Result<FuseHandle> {
     if !REMOTE_FUSE_MOUNT_SUPPORTED {
         bail!("vfs fuse mounts require Linux or a macOS build with macos-fskit");
@@ -577,7 +579,8 @@ pub async fn mount_remote_vfs_fuse(
         scope_path,
         Arc::clone(&local.view),
         Handle::current(),
-    )?;
+    )?
+    .with_owner(owner);
     tokio::fs::create_dir_all(&mountpoint)
         .await
         .with_context(|| format!("create fuse mountpoint {}", mountpoint.display()))?;

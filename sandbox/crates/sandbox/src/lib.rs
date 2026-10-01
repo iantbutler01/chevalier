@@ -280,10 +280,22 @@ pub struct FreestyleBackendConfig {
     pub snapshot_id: String,
     /// Suffix for preview hostnames; `style.dev` names are claimed on first use.
     pub preview_domain_suffix: String,
+    /// Optional deployment namespace inside the hostname label.
+    #[serde(default)]
+    pub preview_domain_prefix: String,
     /// A `POST /v5/tls/forward-auth` configuration id to attach to every preview rule.
     pub forward_auth_id: Option<String>,
+    /// Private network every session VM joins, by slug. The network is created when it
+    /// does not exist yet, with no rules of its own, so a VM on it is reachable only
+    /// from whatever a firewall rule names — a tunnel, or another VM. `None` leaves
+    /// sessions off every private network, reachable only through preview URLs.
+    #[serde(default)]
+    pub vpc: Option<String>,
     /// Pause after this many seconds without network activity; `None` never pauses.
     pub idle_timeout_secs: Option<u64>,
+    /// Require indefinite VM retention, including on accounts with plan retention caps.
+    #[serde(default)]
+    pub require_persistent: bool,
     /// Delete a VM once it has sat stopped/paused this long; `None` keeps it. Never 0 for
     /// sessions: Freestyle refuses to pause an ephemeral VM, so idle pause would fail.
     pub auto_delete_secs: Option<u64>,
@@ -292,6 +304,8 @@ pub struct FreestyleBackendConfig {
     /// Guest user for exec and shells; `None` is the image default (uid 1000, else root).
     pub linux_user: Option<String>,
     pub egress_allowlist: Option<Vec<String>>,
+    /// Exact service endpoints retained when a persistent VM is reused.
+    pub required_egress_domains: Vec<String>,
     /// Shared-mount launch templates keyed by mount tag, guest path, or backend profile.
     pub shared_mounts: HashMap<String, ManagedMountConfig>,
 }
@@ -303,12 +317,16 @@ impl Default for FreestyleBackendConfig {
             api_key: String::new(),
             snapshot_id: String::new(),
             preview_domain_suffix: "style.dev".to_string(),
+            preview_domain_prefix: String::new(),
             forward_auth_id: None,
+            vpc: None,
             idle_timeout_secs: None,
+            require_persistent: false,
             auto_delete_secs: None,
             snapshot_auto_delete_secs: None,
             linux_user: None,
             egress_allowlist: None,
+            required_egress_domains: Vec::new(),
             shared_mounts: HashMap::new(),
         }
     }
@@ -345,6 +363,10 @@ impl FreestyleBackendConfig {
         cfg.forward_auth_id = std::env::var("FREESTYLE_FORWARD_AUTH_ID")
             .ok()
             .filter(|value| !value.trim().is_empty());
+        cfg.vpc = std::env::var("FREESTYLE_VPC")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         cfg.linux_user = std::env::var("FREESTYLE_LINUX_USER")
             .ok()
             .filter(|value| !value.trim().is_empty());
@@ -677,6 +699,7 @@ pub struct ForkOptions {
     pub child_name: Option<String>,
     pub child_metadata: HashMap<String, String>,
     pub auto_start_child: bool,
+    pub child_volume_owner_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1271,7 +1294,10 @@ impl ManagedControl {
         }
     }
 
-    async fn ensure_configured_mounts(
+    /// Bring an attached sandbox's mounts to `shared_mounts` (see
+    /// `FreestyleControl::refresh_configured_mounts`); OpenComputer keeps its create-time
+    /// behaviour.
+    async fn refresh_configured_mounts(
         &self,
         sandbox_id: &str,
         shared_mounts: &[SharedMount],
@@ -1283,9 +1309,11 @@ impl ManagedControl {
                     .await
             }
             Self::Freestyle(control) => {
-                control
-                    .ensure_configured_mounts(sandbox_id, shared_mounts)
-                    .await
+                let outcome = control
+                    .refresh_configured_mounts(sandbox_id, shared_mounts)
+                    .await?;
+                tracing::info!(sandbox_id, ?outcome, "guest mounts on attach");
+                Ok(())
             }
         }
     }
@@ -1424,6 +1452,15 @@ impl ManagedControl {
                 Ok(format!("https://{preview}"))
             }
             Self::Freestyle(control) => control.preview_url(sandbox_id, guest_port).await,
+        }
+    }
+
+    /// The sandbox's address on the private network it was created in, when it has one.
+    /// Callers on that network reach the guest directly at it, with no public hostname.
+    async fn private_address(&self, sandbox_id: &str) -> Result<Option<String>> {
+        match self {
+            Self::OpenComputer(_) => Ok(None),
+            Self::Freestyle(control) => control.private_address(sandbox_id).await,
         }
     }
 
@@ -3243,6 +3280,15 @@ impl Session {
         ))
     }
 
+    /// The VM's address on its provider-side private network, when it is on one. `None`
+    /// means there is no private path to this session and callers must use a preview URL.
+    pub async fn provider_private_address(&self) -> Result<Option<String>> {
+        if let ControlBackend::Managed(control) = &self.sandbox.inner.control_backend {
+            return control.private_address(&self.vm_id).await;
+        }
+        Ok(None)
+    }
+
     pub async fn open_desktop(&self) -> Result<SessionDesktopTarget> {
         if matches!(
             &self.sandbox.inner.control_backend,
@@ -3447,14 +3493,29 @@ impl Session {
             ));
         }
 
-        let node_endpoint = self.resolve_session_endpoint().await?;
+        // Read the VM where it lives without starting it: endpoint resolution ensures the VM is
+        // running, which would boot a stopped VM on its old mounts only to stop it again below.
+        // Resolve (and possibly rebind) only when the recorded node does not answer.
+        let mut node_endpoint = self.current_node_endpoint().await;
         let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
-        let current = client
+        let current = match client
             .get_vm(self.sandbox.request_with_auth(GetVmRequest {
                 vm_id: self.vm_id.clone(),
             }))
-            .await?
-            .into_inner();
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(_) => {
+                node_endpoint = self.resolve_session_endpoint().await?;
+                client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
+                client
+                    .get_vm(self.sandbox.request_with_auth(GetVmRequest {
+                        vm_id: self.vm_id.clone(),
+                    }))
+                    .await?
+                    .into_inner()
+            }
+        };
         let matcher = vm::ManagedMountMatcher::new(
             shared_mounts.iter().map(|mount| mount.mount_tag.as_str()),
             std::iter::empty::<&str>(),
@@ -3746,10 +3807,21 @@ impl Session {
             return control.fork(self.sandbox.clone(), self, opts).await;
         }
 
-        self.sync_guest_filesystems().await?;
+        // A stopped parent forks cold: shared copy-on-write disks, no RAM snapshot. Keep it
+        // stopped — both the guest filesystem sync (an exec) and endpoint resolution (which
+        // ensures the VM is running) would start it and turn the fork into a live one that needs
+        // a RAM snapshot. Its disk is already quiescent, and its node is the one it was stopped on.
+        let parent_running = self.state().await? == proto::vmd::v1::VmState::Running as i32;
+        if parent_running {
+            self.sync_guest_filesystems().await?;
+        }
 
         let auto_start_child = opts.auto_start_child;
-        let node_endpoint = self.resolve_session_endpoint().await?;
+        let node_endpoint = if parent_running {
+            self.resolve_session_endpoint().await?
+        } else {
+            self.current_node_endpoint().await
+        };
         let child_session_id = Uuid::new_v4().to_string();
         let ownership_fence = self.ownership_fence().await;
         let mut child_metadata = opts.child_metadata;
@@ -3784,6 +3856,7 @@ impl Session {
                     entries: child_metadata,
                 }),
                 auto_start_child,
+                child_volume_owner_key: opts.child_volume_owner_key.unwrap_or_default(),
             }))
             .await?
             .into_inner();
@@ -4294,6 +4367,17 @@ impl Sandbox {
     }
 
     pub async fn attach_session(&self, session_id: &str) -> Result<Session> {
+        self.attach_session_with_mounts(session_id, &[]).await
+    }
+
+    /// `attach_session`, bringing a managed guest's mounts to `shared_mounts` when they
+    /// differ from what the guest runs (and nothing is using them). Empty replays the
+    /// guest's own mount script, as `attach_session` does.
+    pub async fn attach_session_with_mounts(
+        &self,
+        session_id: &str,
+        shared_mounts: &[SharedMount],
+    ) -> Result<Session> {
         let started = Instant::now();
         if let ControlBackend::Managed(control) = &self.inner.control_backend {
             let provider_session_id = self.managed_provider_session_id(session_id).await;
@@ -4312,7 +4396,9 @@ impl Sandbox {
             self.bind_managed_session_alias(session_id, &sandbox.id)
                 .await;
             control.ensure_running(&sandbox.id).await?;
-            control.ensure_configured_mounts(&sandbox.id, &[]).await?;
+            control
+                .refresh_configured_mounts(&sandbox.id, shared_mounts)
+                .await?;
             let session = Session::new_with_backend(
                 self.clone(),
                 session_id.to_string(),
@@ -4411,6 +4497,27 @@ impl Sandbox {
     /// start, or discard; ordinary `attach_session` retains its ready-to-execute contract.
     pub async fn attach_session_passive(&self, session_id: &str) -> Result<Session> {
         let started = Instant::now();
+        if let ControlBackend::Managed(ManagedControl::Freestyle(control)) =
+            &self.inner.control_backend
+        {
+            let provider_id = self.managed_provider_session_id(session_id).await;
+            let vm = match control.get_sandbox(&provider_id).await {
+                Ok(vm) => vm,
+                Err(SandboxError::SessionNotFound(_)) if provider_id == session_id => control
+                    .find_by_session_id(session_id)
+                    .await?
+                    .ok_or_else(|| SandboxError::SessionNotFound(session_id.to_string()))?,
+                Err(error) => return Err(error),
+            };
+            return Ok(Session::new_with_backend(
+                self.clone(),
+                session_id.to_string(),
+                vm.id,
+                control.api_url().to_string(),
+                None,
+                Vec::new(),
+            ));
+        }
         if matches!(&self.inner.control_backend, ControlBackend::Managed(_)) {
             return self.attach_session(session_id).await;
         }
@@ -6306,10 +6413,10 @@ impl Sandbox {
         // from opening one TCP connection per file before the first connects.
         let cache_key = ready_key(endpoint, vm_id);
         let mut channels = self.inner.portproxy_channels.lock().await;
-        if let Some(entry) = channels.get(&cache_key) {
-            if entry.endpoint == rpc_endpoint {
-                return Arc::clone(entry);
-            }
+        if let Some(entry) = channels.get(&cache_key)
+            && entry.endpoint == rpc_endpoint
+        {
+            return Arc::clone(entry);
         }
         let entry = Arc::new(PortproxyChannelEntry {
             endpoint: rpc_endpoint.to_string(),

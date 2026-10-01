@@ -1119,6 +1119,12 @@ impl Manager {
             .volumes_dir()
             .join(VOLUME_FORK_BASES_DIR_NAME)
             .join(fork_id);
+        if Self::is_backing_referenced(
+            &self.backing_chain_references().await,
+            &fork_root.join("base.qcow2"),
+        ) {
+            return;
+        }
         if let Err(error) = fs::remove_dir_all(&fork_root) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 warn!(
@@ -2939,6 +2945,49 @@ impl Manager {
     ) -> ManagerResult<(VmMetadata, VmMetadata, String)> {
         let _capacity_guard = self.vm_capacity_lock.lock().await;
         let parent_vm = self.vm_by_id(parent_id).await?;
+        let child_id = Uuid::new_v4().to_string();
+        if let Some(owner_key) = params
+            .child_volume_owner_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+        {
+            Self::validate_volume_owner_key(owner_key)?;
+        }
+        let child_volume_keys = {
+            let inner = parent_vm.lock().await;
+            inner.metadata.durable_volume.as_ref().map(|_| {
+                let volume_id = params
+                    .child_metadata
+                    .get(META_SESSION_ID)
+                    .or_else(|| inner.metadata.metadata.get(META_SESSION_ID))
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|session_id| format!("fork:{session_id}"))
+                    .unwrap_or_else(|| format!("fork:{child_id}"));
+                let owner_key = params
+                    .child_volume_owner_key
+                    .as_deref()
+                    .filter(|key| !key.is_empty())
+                    .unwrap_or(&volume_id)
+                    .to_string();
+                (volume_id, owner_key)
+            })
+        };
+        if let Some((volume_id, owner_key)) = &child_volume_keys {
+            let volumes = self.volumes.read().await;
+            if volumes.contains_key(owner_key) {
+                return Err(ManagerError::Other(anyhow!(
+                    "durable child volume owner already exists: {owner_key}"
+                )));
+            }
+            if volumes
+                .values()
+                .any(|volume| volume.volume_id == *volume_id)
+            {
+                return Err(ManagerError::Other(anyhow!(
+                    "durable child volume ID already exists: {volume_id}"
+                )));
+            }
+        }
 
         let parent_state = {
             let inner = parent_vm.lock().await;
@@ -3045,7 +3094,6 @@ impl Manager {
             });
         }
 
-        let child_id = Uuid::new_v4().to_string();
         let fork_id = Uuid::new_v4().to_string();
         let (fork_durability_class, fork_restore_scope) =
             fork_snapshot_durability(self.cfg.storage_profile, parent_was_running);
@@ -3077,18 +3125,13 @@ impl Manager {
         child_metadata.remove(META_FORK_BASE_PATH);
         child_metadata.remove(META_EXEC_RESTORE_SNAPSHOT_ID);
         child_metadata.remove(META_EXEC_RESTORE_SNAPSHOT_NAME);
-        let child_durable_volume = parent_durable_volume.as_ref().map(|parent_volume| {
-            let child_owner_key = child_metadata
-                .get(META_SESSION_ID)
-                .filter(|value| !value.trim().is_empty())
-                .map(|session_id| format!("fork:{session_id}"))
-                .unwrap_or_else(|| format!("fork:{child_id}"));
-            DurableVolumeAttachment {
-                volume_id: child_owner_key.clone(),
-                owner_key: child_owner_key,
+        let child_durable_volume = parent_durable_volume.as_ref().zip(child_volume_keys).map(
+            |(parent_volume, (volume_id, owner_key))| DurableVolumeAttachment {
+                owner_key,
+                volume_id,
                 size_gb: parent_volume.size_gb,
-            }
-        });
+            },
+        );
 
         let child_dir = PathBuf::from(&self.cfg.data_dir).join(&child_id);
         let parent_disk = parent_vm.disk_path();
@@ -3227,7 +3270,7 @@ impl Manager {
                         .map(map_bootstrap_shared_mount)
                         .collect(),
                     network: Some(map_bootstrap_network(&child_meta)),
-                    http_proxy_url: None,
+                    http_proxy_url: self.cfg.guest_network.http_proxy_url(),
                     portproxy_auth_token: child_meta
                         .metadata
                         .get(META_PORTPROXY_AUTH_TOKEN)
@@ -3430,7 +3473,7 @@ impl Manager {
                         .map(map_bootstrap_shared_mount)
                         .collect(),
                     network: Some(map_bootstrap_network(&child_meta)),
-                    http_proxy_url: None,
+                    http_proxy_url: self.cfg.guest_network.http_proxy_url(),
                     portproxy_auth_token: child_meta
                         .metadata
                         .get(META_PORTPROXY_AUTH_TOKEN)
@@ -4746,7 +4789,7 @@ impl Manager {
                     network: tap_spec
                         .as_ref()
                         .map(|_| map_bootstrap_network(&meta_snapshot)),
-                    http_proxy_url: None,
+                    http_proxy_url: cfg.guest_network.http_proxy_url(),
                     portproxy_auth_token: meta_snapshot
                         .metadata
                         .get(META_PORTPROXY_AUTH_TOKEN)
@@ -6143,7 +6186,7 @@ impl Manager {
                 .map(map_bootstrap_shared_mount)
                 .collect(),
             network: Some(map_bootstrap_network(&guard.metadata)),
-            http_proxy_url: None,
+            http_proxy_url: self.cfg.guest_network.http_proxy_url(),
             portproxy_auth_token: guard
                 .metadata
                 .metadata
@@ -6288,6 +6331,52 @@ impl Manager {
         let _ = fs::remove_dir(fork_root);
     }
 
+    /// Every image some VM disk, durable volume or fork base still reads through its qcow2 backing
+    /// chain. A parent that is forked again moves its metadata to the newest base, whose own backing
+    /// file is the previous base — so metadata alone does not show which bases are still in use.
+    async fn backing_chain_references(&self) -> HashSet<PathBuf> {
+        let mut roots: Vec<PathBuf> = {
+            let guard = self.vms.read().await;
+            guard.values().map(|vm| vm.disk_path()).collect()
+        };
+        for dir in [
+            self.volumes_dir(),
+            self.fork_base_root(),
+            self.volumes_dir().join(VOLUME_FORK_BASES_DIR_NAME),
+        ] {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    roots.push(path.join("base.qcow2"));
+                } else if path.extension().is_some_and(|ext| ext == "qcow2") {
+                    roots.push(path);
+                }
+            }
+        }
+        let mut referenced = HashSet::new();
+        for root in roots {
+            let mut image = root;
+            for _ in 0..64 {
+                let Some(backing) = qcow2_backing_path(&image) else {
+                    break;
+                };
+                let key = fs::canonicalize(&backing).unwrap_or_else(|_| backing.clone());
+                if !referenced.insert(key) {
+                    break;
+                }
+                image = backing;
+            }
+        }
+        referenced
+    }
+
+    fn is_backing_referenced(referenced: &HashSet<PathBuf>, image: &Path) -> bool {
+        referenced.contains(&fs::canonicalize(image).unwrap_or_else(|_| image.to_path_buf()))
+    }
+
     async fn cleanup_fork_base_if_unreferenced(&self, fork_base_path: Option<String>) {
         let Some(path) = fork_base_path else {
             return;
@@ -6311,6 +6400,9 @@ impl Manager {
         }
 
         let base_path = PathBuf::from(path);
+        if Self::is_backing_referenced(&self.backing_chain_references().await, &base_path) {
+            return;
+        }
         let _ = fs::remove_file(&base_path);
         if let Some(parent) = base_path.parent() {
             let _ = fs::remove_dir(parent);
@@ -6383,6 +6475,7 @@ impl Manager {
             }
         }
 
+        let chain_references = self.backing_chain_references().await;
         let Ok(entries) = fs::read_dir(&fork_root) else {
             return;
         };
@@ -6391,7 +6484,9 @@ impl Manager {
             if !path.is_dir() {
                 continue;
             }
-            if referenced_roots.contains(&path) {
+            if referenced_roots.contains(&path)
+                || Self::is_backing_referenced(&chain_references, &path.join("base.qcow2"))
+            {
                 continue;
             }
             if let Err(err) = fs::remove_dir_all(&path) {
@@ -6408,6 +6503,31 @@ impl Manager {
         let guard = self.snapshots.read().await;
         guard.get(id).cloned().ok_or(ManagerError::SnapshotNotFound)
     }
+}
+
+/// The backing file a qcow2 image names in its header, resolved against the image's directory.
+fn qcow2_backing_path(image: &Path) -> Option<PathBuf> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(image).ok()?;
+    let mut header = [0u8; 20];
+    file.read_exact(&mut header).ok()?;
+    if header[0..4] != *b"QFI\xfb" {
+        return None;
+    }
+    let offset = u64::from_be_bytes(header[8..16].try_into().ok()?);
+    let size = u32::from_be_bytes(header[16..20].try_into().ok()?) as usize;
+    if offset == 0 || size == 0 || size > 4096 {
+        return None;
+    }
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut name = vec![0u8; size];
+    file.read_exact(&mut name).ok()?;
+    let name = PathBuf::from(String::from_utf8(name).ok()?);
+    Some(if name.is_absolute() {
+        name
+    } else {
+        image.parent()?.join(name)
+    })
 }
 
 /// Selects the QEMU `(machine, cpu)` pair for an amd64 guest.
@@ -9585,13 +9705,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn fork_vm_stopped_parent_uses_shared_cow_backing() {
-        if !qemu_img_available() {
-            eprintln!("qemu-img unavailable; skipping fork CoW runtime test");
-            return;
-        }
+    static FORK_PROXY_BIN_LOCK: Mutex<()> = Mutex::const_new(());
 
+    async fn setup_stopped_fork_parent()
+    -> (tempfile::TempDir, Manager, String, DurableVolumeAttachment) {
         let test_arch = if cfg!(target_arch = "aarch64") {
             ARCH_ARM64
         } else {
@@ -9740,6 +9857,21 @@ mod tests {
             .await
             .insert(parent_id.clone(), parent_vm);
 
+        (tmp, manager, parent_id, parent_volume)
+    }
+
+    #[tokio::test]
+    async fn fork_vm_stopped_parent_uses_shared_cow_backing() {
+        if !qemu_img_available() {
+            eprintln!("qemu-img unavailable; skipping fork CoW runtime test");
+            return;
+        }
+        let _proxy_bin_guard = FORK_PROXY_BIN_LOCK.lock().await;
+
+        let (tmp, manager, parent_id, parent_volume) = setup_stopped_fork_parent().await;
+        let data_dir = tmp.path();
+        let parent_disk = data_dir.join(&parent_id).join("disk.qcow2");
+
         let mut child_meta_extra = HashMap::new();
         child_meta_extra.insert(
             "chevalier.session_id".to_string(),
@@ -9752,6 +9884,7 @@ mod tests {
                     child_name: Some("child".to_string()),
                     child_metadata: child_meta_extra,
                     auto_start_child: false,
+                    child_volume_owner_key: None,
                 },
             )
             .await
@@ -9839,6 +9972,171 @@ mod tests {
         assert_eq!(
             parent_volume_backing, child_volume_backing,
             "parent and child durable volumes must share an immutable CoW backing"
+        );
+
+        unsafe {
+            std::env::remove_var("PROXY_BIN");
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_an_earlier_fork_keeps_the_parents_backing_chain() {
+        if !qemu_img_available() {
+            eprintln!("qemu-img unavailable; skipping fork CoW runtime test");
+            return;
+        }
+        let _proxy_bin_guard = FORK_PROXY_BIN_LOCK.lock().await;
+
+        let (tmp, manager, parent_id, parent_volume) = setup_stopped_fork_parent().await;
+        let fork = |session: &str| ForkVmParams {
+            child_name: Some(format!("child-{session}")),
+            child_metadata: HashMap::from([(META_SESSION_ID.to_string(), session.to_string())]),
+            auto_start_child: false,
+            child_volume_owner_key: None,
+        };
+        let (_, first, _) = manager
+            .fork_vm(&parent_id, fork("first"))
+            .await
+            .expect("first fork");
+        let (_, second, _) = manager
+            .fork_vm(&parent_id, fork("second"))
+            .await
+            .expect("second fork");
+
+        manager
+            .delete_vm(&first.id, false)
+            .await
+            .expect("delete first child");
+
+        // The parent (re-based by the second fork) and the second child read through both bases.
+        let chain_exists = |image: PathBuf| {
+            let mut image = image;
+            let mut depth = 0;
+            while let Some(backing) = qcow2_backing_path(&image) {
+                assert!(
+                    backing.exists(),
+                    "missing backing file {} of {}",
+                    backing.display(),
+                    image.display()
+                );
+                image = backing;
+                depth += 1;
+            }
+            depth
+        };
+        let parent_disk = tmp.path().join(&parent_id).join("disk.qcow2");
+        assert!(
+            chain_exists(parent_disk) >= 2,
+            "parent chain should span both fork bases"
+        );
+        assert!(chain_exists(tmp.path().join(&second.id).join("disk.qcow2")) >= 2);
+        let volumes = manager.volumes.read().await;
+        let parent_volume_path = manager.volume_disk_path(
+            &volumes
+                .get(&parent_volume.owner_key)
+                .expect("parent volume")
+                .volume_id,
+        );
+        drop(volumes);
+        chain_exists(parent_volume_path);
+
+        unsafe {
+            std::env::remove_var("PROXY_BIN");
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_vm_uses_caller_volume_owner_key() {
+        if !qemu_img_available() {
+            eprintln!("qemu-img unavailable; skipping fork CoW runtime test");
+            return;
+        }
+        let _proxy_bin_guard = FORK_PROXY_BIN_LOCK.lock().await;
+
+        let (_tmp, manager, parent_id, parent_volume) = setup_stopped_fork_parent().await;
+        let child_owner_key = "workspace:test:thread:child";
+        let (_, child, _) = manager
+            .fork_vm(
+                &parent_id,
+                ForkVmParams {
+                    child_name: Some("child".to_string()),
+                    child_metadata: HashMap::from([(
+                        META_SESSION_ID.to_string(),
+                        "child-session".to_string(),
+                    )]),
+                    auto_start_child: false,
+                    child_volume_owner_key: Some(child_owner_key.to_string()),
+                },
+            )
+            .await
+            .expect("fork with caller-owned child volume");
+
+        let child_volume = child.durable_volume.expect("child durable volume");
+        assert_eq!(child_volume.owner_key, child_owner_key);
+        assert_eq!(child_volume.volume_id, "fork:child-session");
+        let volumes = manager.volumes.read().await;
+        assert_eq!(
+            volumes
+                .get(child_owner_key)
+                .map(|volume| volume.volume_id.as_str()),
+            Some("fork:child-session")
+        );
+        assert_eq!(
+            volumes
+                .get(&parent_volume.owner_key)
+                .map(|volume| volume.volume_id.as_str()),
+            Some(parent_volume.volume_id.as_str())
+        );
+        drop(volumes);
+        let parent_vm = manager.vm_by_id(&parent_id).await.expect("parent VM");
+        assert_eq!(
+            parent_vm.lock().await.metadata.durable_volume.as_ref(),
+            Some(&parent_volume)
+        );
+
+        unsafe {
+            std::env::remove_var("PROXY_BIN");
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_vm_rejects_duplicate_child_volume_owner_key() {
+        if !qemu_img_available() {
+            eprintln!("qemu-img unavailable; skipping fork CoW runtime test");
+            return;
+        }
+        let _proxy_bin_guard = FORK_PROXY_BIN_LOCK.lock().await;
+
+        let (tmp, manager, parent_id, parent_volume) = setup_stopped_fork_parent().await;
+        let child_owner_key = "workspace:test:thread:existing";
+        manager
+            .ensure_durable_volume(child_owner_key, 1)
+            .await
+            .expect("create existing volume");
+        let error = manager
+            .fork_vm(
+                &parent_id,
+                ForkVmParams {
+                    child_name: Some("child".to_string()),
+                    child_metadata: HashMap::new(),
+                    auto_start_child: false,
+                    child_volume_owner_key: Some(child_owner_key.to_string()),
+                },
+            )
+            .await
+            .expect_err("duplicate child owner key must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("durable child volume owner already exists")
+        );
+        assert_eq!(manager.vms.read().await.len(), 1);
+        assert_eq!(manager.volumes.read().await.len(), 2);
+        assert!(tmp.path().join(&parent_id).join("disk.qcow2").exists());
+        let parent_vm = manager.vm_by_id(&parent_id).await.expect("parent VM");
+        assert_eq!(
+            parent_vm.lock().await.metadata.durable_volume.as_ref(),
+            Some(&parent_volume)
         );
 
         unsafe {
@@ -10418,6 +10716,7 @@ mod tests {
                     child_name: Some("child".to_string()),
                     child_metadata: HashMap::new(),
                     auto_start_child: false,
+                    child_volume_owner_key: None,
                 },
             )
             .await

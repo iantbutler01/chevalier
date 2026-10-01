@@ -598,6 +598,7 @@ pub struct ForkVmParams {
     pub child_name: Option<String>,
     pub child_metadata: HashMap<String, String>,
     pub auto_start_child: bool,
+    pub child_volume_owner_key: Option<String>,
 }
 
 pub mod iso8601 {

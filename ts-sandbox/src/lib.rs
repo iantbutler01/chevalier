@@ -375,6 +375,7 @@ pub struct ForkOpts {
     pub child_name: Option<String>,
     pub child_metadata: Option<HashMap<String, String>>,
     pub auto_start_child: Option<bool>,
+    pub child_volume_owner_key: Option<String>,
 }
 
 impl From<ForkOpts> for ForkOptions {
@@ -383,6 +384,7 @@ impl From<ForkOpts> for ForkOptions {
             child_name: o.child_name,
             child_metadata: o.child_metadata.unwrap_or_default(),
             auto_start_child: o.auto_start_child.unwrap_or(true),
+            child_volume_owner_key: o.child_volume_owner_key,
         }
     }
 }
@@ -729,6 +731,7 @@ impl Session {
             child_name: None,
             child_metadata: HashMap::new(),
             auto_start_child: true,
+            child_volume_owner_key: None,
         });
         let r = self.inner.fork(opts).await.map_err(sb_err)?;
         Ok(Session { inner: r.child })
@@ -968,7 +971,6 @@ pub struct SandboxConnectOptions {
     pub auth_token: Option<String>,
     pub pci_access_token: Option<String>,
     pub connect_timeout_ms: Option<f64>,
-    pub prewarm_on_start: Option<bool>,
     pub default_image: Option<String>,
     pub default_architecture: Option<String>,
     pub default_vcpu: Option<u32>,
@@ -977,6 +979,10 @@ pub struct SandboxConnectOptions {
     pub provider: Option<String>,
     pub open_computer: Option<OpenComputerProviderOpts>,
     pub distributed_control: Option<DistributedControlOptions>,
+    /// Prepare the default image on every healthy endpoint before `connect` returns
+    /// (default true). Hosts that place sessions lazily pass false so a cold image does
+    /// not hold connection behind fleet-wide preparation.
+    pub prewarm_on_start: Option<bool>,
 }
 
 #[napi(object)]
