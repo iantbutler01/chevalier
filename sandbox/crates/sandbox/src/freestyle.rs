@@ -48,9 +48,11 @@ const MOUNT_SCRIPT_NEXT_PATH: &str = "/etc/chevalier/mounts.sh.next";
 /// script is applied by restarting the guest rather than remounting in place: mounts
 /// nest (the workspaces sit inside the Nym's read-only root), and a guest whose mounts
 /// came up in a different order cannot have them released cleanly while it runs.
+/// Replay gets ten seconds; `--foreground` times out the shell without killing a
+/// mount daemon that is still hydrating. A nonzero result reports mounts not ready.
 const MOUNT_REFRESH_SCRIPT: &str = r#"set -u
 cur=/etc/chevalier/mounts.sh; next=/etc/chevalier/mounts.sh.next; state=/run/chevalier/mounts
-if [ -f "$cur" ] && cmp -s "$next" "$cur"; then rm -f "$next"; /bin/sh "$cur"; echo mounts=unchanged; exit 0; fi
+if [ -f "$cur" ] && cmp -s "$next" "$cur"; then rm -f "$next"; timeout --foreground -k 1 10 /bin/sh "$cur" || { echo mounts=not-ready; exit 1; }; echo mounts=unchanged; exit 0; fi
 pids=""
 for marker in "$state"/*; do case "$marker" in *.log) continue;; esac; [ -f "$marker" ] && pids="$pids $(cat "$marker")"; done
 points=$(awk '$3 ~ /^fuse/ && $3 != "fusectl" {print $2}' /proc/mounts)
@@ -65,7 +67,7 @@ for proc in /proc/[0-9]*; do
     done
   done
 done
-if [ -n "$busy" ] && [ -f "$cur" ]; then rm -f "$next"; /bin/sh "$cur"; echo "mounts=deferred busy=$busy"; exit 0; fi
+if [ -n "$busy" ] && [ -f "$cur" ]; then rm -f "$next"; timeout --foreground -k 1 10 /bin/sh "$cur" || { echo mounts=not-ready; exit 1; }; echo "mounts=deferred busy=$busy"; exit 0; fi
 mv "$next" "$cur"; chmod 600 "$cur"
 echo mounts=restart
 "#;
@@ -106,7 +108,10 @@ impl MountRefresh {
 /// always render the same bytes and a refresh can tell "unchanged" by comparing files.
 fn mount_script(mounts: &[RenderedMount]) -> String {
     let mut script = String::from("set -e\n");
-    script.push_str(&format!("mkdir -p {MOUNT_STATE_DIR}\n"));
+    // Boot and attach share markers. Daemons close fd 9 so they do not retain this lock.
+    script.push_str(&format!(
+        "mkdir -p {MOUNT_STATE_DIR}\nexec 9>{MOUNT_STATE_DIR}/.lock\nflock -w 8 9 || exit 1\n"
+    ));
     for mount in mounts {
         script.push_str(&mount.launch_script());
     }
@@ -986,9 +991,9 @@ impl FreestyleControl {
             let result = self
                 .exec_await(
                     vm_id,
-                    &format!("[ -f {MOUNT_SCRIPT_PATH} ] && /bin/sh {MOUNT_SCRIPT_PATH} || true"),
+                    &format!("if [ -f {MOUNT_SCRIPT_PATH} ]; then timeout --foreground -k 1 10 /bin/sh {MOUNT_SCRIPT_PATH}; fi"),
                     None,
-                    Some(EXEC_AWAIT_MAX_MS),
+                    Some(15_000),
                     None,
                     Some(ROOT_USER),
                 )
@@ -996,8 +1001,8 @@ impl FreestyleControl {
             return match result.status_code {
                 Some(0) => Ok(()),
                 _ => Err(SandboxError::InvalidResponse(format!(
-                    "Freestyle mount replay failed: {}",
-                    result.stderr.unwrap_or_default().trim()
+                    "Freestyle mount replay not ready (status {:?})",
+                    result.status_code
                 ))),
             };
         }
@@ -1054,9 +1059,12 @@ impl FreestyleControl {
         let result = self
             .exec_await(
                 vm_id,
-                MOUNT_REFRESH_SCRIPT,
+                &format!(
+                    "timeout --foreground -k 1 12 sh -c {}",
+                    shell_quote(MOUNT_REFRESH_SCRIPT)
+                ),
                 None,
-                Some(150_000),
+                Some(15_000),
                 None,
                 Some(ROOT_USER),
             )
@@ -1066,9 +1074,8 @@ impl FreestyleControl {
             (Some(0), Some(outcome)) => outcome,
             _ => {
                 return Err(SandboxError::InvalidResponse(format!(
-                    "Freestyle mount refresh failed: {} {}",
-                    stdout.trim(),
-                    result.stderr.unwrap_or_default().trim()
+                    "Freestyle mount refresh not ready (status {:?})",
+                    result.status_code
                 )));
             }
         };
@@ -1386,7 +1393,8 @@ impl RenderedMount {
         }
     }
 
-    /// Shell lines that start this mount's daemon once per boot and record it.
+    /// Start a missing daemon or replace one whose mounted filesystem was detached.
+    /// A live daemon with no prior mount log is still hydrating and keeps its wait.
     fn launch_script(&self) -> String {
         let marker = format!("{MOUNT_STATE_DIR}/{}", sanitize_tag(&self.mount_tag));
         let mut exports = self
@@ -1400,7 +1408,33 @@ impl RenderedMount {
             // Wait for this mount before the next starts, whether this run launched it or
             // a concurrent run (boot and an attach's replay) did: later mounts can sit
             // inside this one, and one started first would be hidden beneath it.
-            "if [ ! -e {marker} ]; then\n  mkdir -p {mountpoint}\n  {exports}\n  export CHEVALIER_VFS_READ_ONLY={read_only}\n  nohup {argv} >{log} 2>&1 </dev/null &\n  echo $! > {marker}\nfi\npid=$(cat {marker} 2>/dev/null || echo 0)\nfor _ in $(seq 1 {polls}); do mountpoint -q {mountpoint} && break; kill -0 \"$pid\" 2>/dev/null || break; sleep 0.5; done\n",
+            r#"if ! timeout -k 1 1 mountpoint -q {mountpoint}; then
+  pid=$(cat {marker} 2>/dev/null || true)
+  case "$pid" in ''|*[!0-9]*) pid=0;; esac
+  if [ "$pid" -gt 1 ]; then
+    if ! kill -0 "$pid" 2>/dev/null; then
+      rm -f {marker}
+    elif sed 's/\x1b\[[0-9;]*m//g' {log} 2>/dev/null | grep -Fq -- {mounted_log}; then
+      kill -TERM "$pid" 2>/dev/null || true
+      kill -KILL "$pid" 2>/dev/null || true
+      rm -f {marker}
+    fi
+  else
+    rm -f {marker}
+  fi
+fi
+if [ ! -e {marker} ]; then
+  timeout -k 1 2 mkdir -p {mountpoint}
+  {exports}
+  export CHEVALIER_VFS_READ_ONLY={read_only}
+  nohup {argv} >{log} 2>&1 </dev/null 9>&- &
+  echo $! > {marker}
+fi
+pid=$(cat {marker} 2>/dev/null || echo 0)
+for _ in $(seq 1 {polls}); do timeout -k 1 1 mountpoint -q {mountpoint} && break; kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+timeout -k 1 1 mountpoint -q {mountpoint} || {{ echo mount=not-ready >&2; exit 1; }}
+"#,
+            mounted_log = shell_quote(&format!("fuser::session: Mounting {}", self.mountpoint)),
             polls = MOUNT_READY_WAIT_SECS * 2,
             marker = shell_quote(&marker),
             mountpoint = shell_quote(&self.mountpoint),
@@ -2299,7 +2333,7 @@ mod tests {
         // a mount nested inside it lands on top of it rather than beneath it.
         // The wait sits after the launch block, so a run that finds the mount already
         // launched by another run still waits for it before starting the next.
-        let launch_block_end = script.find("\nfi\n").unwrap();
+        let launch_block_end = script.rfind("\nfi\n").unwrap();
         let waited = script.find("mountpoint -q '/mnt/nymfs' && break").unwrap();
         assert!(script.find("nohup").unwrap() < launch_block_end && launch_block_end < waited);
         assert!(script.contains("pid=$(cat '/run/chevalier/mounts/nymfs-root'"));
@@ -2407,3 +2441,7 @@ mod tests {
         assert!(control.delete_checkpoint("  nym-desktop  ").await.is_err());
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "freestyle_mount_tests.rs"]
+mod mount_tests;
