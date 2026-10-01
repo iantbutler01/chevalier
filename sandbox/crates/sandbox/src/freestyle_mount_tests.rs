@@ -1,154 +1,16 @@
-//! Execute the rendered guest scripts with real processes and a controlled mount probe.
+//! Execute the rendered guest scripts with real processes against a fake mount table
+//! (`/proc/self/mountinfo`, `/proc/mounts`) and a `mountpoint` whose answer the test
+//! controls, so each test decides what a mount looks like without root or FUSE.
 use super::*;
-use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+use std::{fs, os::unix::fs::PermissionsExt, process::Command, time::Instant};
 
-fn run_case(mounted_before: bool) {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let point = format!("{root}/point");
-    fs::write(
-        dir.path().join("mountpoint"),
-        "#!/bin/sh\n[ -f \"$2.ready\" ]\n",
-    )
-    .unwrap();
-    fs::set_permissions(
-        dir.path().join("mountpoint"),
-        fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
-    let mount = RenderedMount {
-        mount_tag: "test".into(),
-        mountpoint: point.clone(),
-        command: vec![
-            "sh".into(),
-            "-c".into(),
-            format!("touch {point}.ready; exec sleep 60"),
-        ],
-        env: HashMap::new(),
-        read_only: false,
-    };
-    let script = mount_script(&[mount]).replace(MOUNT_STATE_DIR, &format!("{root}/state"));
-    fs::write(dir.path().join("mounts.sh"), script).unwrap();
-    let setup = format!(
-        r#"
-set -eu
-export PATH={root}:$PATH
-mkdir -p {root}/state
-sleep 60 &
-old=$!
-echo "$old" > {root}/state/test
-trap 'kill "$old" $(cat {root}/state/test) 2>/dev/null || true' EXIT
-"#
-    );
-    let scenario = if mounted_before {
-        format!(
-            r#"
-printf '\033[2mfuser::session\033[0m\033[2m:\033[0m Mounting {point}\n' > {root}/state/test.log
-timeout --foreground -k 1 3 sh {root}/mounts.sh
-new=$(cat {root}/state/test)
-[ "$new" != "$old" ]
-[ -f {point}.ready ]
-! kill -0 "$old" 2>/dev/null
-# A daemon must not retain the script lock after its launching shell exits.
-timeout --foreground -k 1 3 sh {root}/mounts.sh
-[ "$(cat {root}/state/test)" = "$new" ]
-"#
-        )
-    } else {
-        format!(
-            r#"
-echo hydrating > {root}/state/test.log
-set +e
-timeout --foreground -k 1 0.2 sh {root}/mounts.sh
-status=$?
-set -e
-[ "$status" = 124 ]
-[ "$(cat {root}/state/test)" = "$old" ]
-kill -0 "$old"
-[ ! -f {point}.ready ]
-sh {root}/mounts.sh &
-boot=$!
-sleep 0.1
-set +e
-timeout --foreground -k 1 0.2 sh {root}/mounts.sh
-status=$?
-set -e
-[ "$status" = 124 ]
-kill -0 "$old"
-kill -0 "$boot"
-kill "$boot"
-"#
-        )
-    };
-    let output = Command::new("bash")
-        .args(["-c", &(setup + &scenario)])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
+/// What a deployed guest holds today: `mount_script` at chevalier origin/main `0b265d1f`,
+/// rendered for `nym_mounts()`.
+const DEPLOYED_SCRIPT: &str = include_str!("freestyle_mount_fixture_deployed.sh");
 
-#[test]
-fn detached_mounted_daemon_is_replaced() {
-    run_case(true);
-}
-
-#[test]
-fn attach_deadline_preserves_a_hydrating_daemon() {
-    run_case(false);
-}
-
-async fn admin(control: &FreestyleControl, vm: &str, command: &str) -> String {
-    let result = control
-        .exec_await(vm, command, None, Some(60_000), None, Some(ROOT_USER))
-        .await
-        .expect("scratch administration");
-    assert_eq!(
-        result.status_code,
-        Some(0),
-        "scratch command failed: {}",
-        result.stderr.unwrap_or_default()
-    );
-    result.stdout.unwrap_or_default()
-}
-
-#[tokio::test]
-#[ignore = "requires an explicitly provisioned disposable NYM_MOUNT_SCRATCH_VM"]
-async fn scratch_vm_nested_mount_heals_and_hydration_survives_attach() {
-    let vm = std::env::var("NYM_MOUNT_SCRATCH_VM").expect("scratch VM id");
-    let mut cfg = FreestyleBackendConfig {
-        api_key: std::env::var("FREESTYLE_API_KEY").expect("ops key"),
-        linux_user: Some("nym".into()),
-        ..Default::default()
-    };
-    let control = FreestyleControl::new(cfg.clone()).unwrap();
-    let record = control.get_sandbox(&vm).await.unwrap();
-    assert!(
-        record
-            .slug
-            .as_deref()
-            .unwrap_or_default()
-            .starts_with("nym-lane-b-scratch-"),
-        "only the lane scratch VM is allowed"
-    );
-    control
-        .write_file(
-            &vm,
-            "/tmp/lane-b-vfs.py",
-            include_bytes!("freestyle_mount_fixture.py").to_vec(),
-        )
-        .await
-        .unwrap();
-    admin(
-        &control,
-        &vm,
-        "nohup python3 /tmp/lane-b-vfs.py >/tmp/lane-b-vfs.log 2>&1 </dev/null &",
-    )
-    .await;
+/// A Nym computer's four mounts, as the fixture was rendered from: the read-only root
+/// with the workspaces nested inside it.
+fn nym_mounts() -> Vec<RenderedMount> {
     let mount = |tag: &str, point: &str, read_only| RenderedMount {
         mount_tag: tag.into(),
         mountpoint: point.into(),
@@ -173,114 +35,366 @@ async fn scratch_vm_nested_mount_heals_and_hydration_survives_attach() {
             point.into(),
         ],
     };
-    let mut mounts = vec![
+    vec![
         mount("root", "/nym", true),
         mount("shared", "/nym/vm/mounts/shared", false),
         mount("task", "/nym/vm/mounts/task", false),
         mount("skills", "/nym/vm/mounts/skills", true),
-    ];
-    control
-        .write_file(&vm, MOUNT_SCRIPT_PATH, mount_script(&mounts).into_bytes())
-        .await
-        .unwrap();
-    admin(&control, &vm, &format!("sh {MOUNT_SCRIPT_PATH}")).await;
-    let old = admin(&control, &vm, "cat /run/chevalier/mounts/task; umount -l /nym/vm/mounts/task; kill -0 $(cat /run/chevalier/mounts/task)").await;
-    let shared_mounts: Vec<SharedMount> = mounts
-        .iter()
-        .map(|mount| {
-            let mut template =
-                ManagedMountConfig::command(&mount.mountpoint, mount.command.clone());
-            template.env = mount.env.clone();
-            template.read_only = Some(mount.read_only);
-            cfg.shared_mounts.insert(mount.mount_tag.clone(), template);
-            SharedMount {
-                host_path: String::new(),
-                guest_path: mount.mountpoint.clone(),
-                mount_tag: mount.mount_tag.clone(),
-                read_only: mount.read_only,
-                availability: Default::default(),
-                continuity: Default::default(),
-                backend_profile: "vfs".into(),
-                vfs_endpoint: String::new(),
-                vfs_scope_path: String::new(),
-            }
-        })
-        .collect();
-    let sandbox = Sandbox::new(crate::SandboxConfig {
-        provider: crate::SandboxProviderConfig::Freestyle(cfg),
-        prewarm_on_start: false,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
-    let start = std::time::Instant::now();
-    let session = match sandbox
-        .attach_session_with_mounts(&vm, &shared_mounts)
-        .await
-    {
-        Ok(session) => session,
-        Err(error) => {
-            println!("{}", admin(&control, &vm, "for p in /run/chevalier/mounts/*; do echo FILE=$p; tail -8 $p; done; findmnt | grep /nym || true").await);
-            panic!("heal scratch attach: {error:?}");
+    ]
+}
+
+/// A guest filesystem in a temporary directory. `localize` points a rendered script at
+/// it; `run` executes bash with the fake `mountpoint` (and any other fakes) first on PATH.
+struct Guest {
+    _dir: tempfile::TempDir,
+    root: String,
+}
+
+impl Guest {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().to_string();
+        for sub in ["bin", "etc", "run/mounts", "proc/1"] {
+            fs::create_dir_all(dir.path().join(sub)).unwrap();
         }
-    };
-    let elapsed = start.elapsed();
-    assert!(elapsed < std::time::Duration::from_secs(45));
-    let new = admin(
-        &control,
-        &vm,
-        "cat /run/chevalier/mounts/task; mountpoint -q /nym/vm/mounts/task",
-    )
-    .await;
-    assert_ne!(old.trim(), new.trim());
-    let mut exec = session
-        .exec(
-            "test -d /nym/vm/mounts/shared && test -d /nym/vm/mounts/task && printf lane-b-exec-ok",
-            ExecOptions::default(),
-        )
-        .await
-        .unwrap();
-    let mut output = Vec::new();
-    let mut exit = None;
-    while let Some(event) = exec.events.next().await {
-        match event.unwrap() {
-            ExecEvent::Stdout(bytes) => output.extend(bytes),
-            ExecEvent::Stderr(bytes) => eprintln!("{}", String::from_utf8_lossy(&bytes)),
-            ExecEvent::Exit(code) => {
-                exit = Some(code);
-                break;
-            }
-            _ => {}
-        }
+        fs::write(dir.path().join("mountinfo"), "").unwrap();
+        fs::write(dir.path().join("proc-mounts"), "").unwrap();
+        // One process for the busy scan to inspect; it uses none of the mounts.
+        std::os::unix::fs::symlink("/", dir.path().join("proc/1/cwd")).unwrap();
+        let guest = Self { _dir: dir, root };
+        // The probe the script before this fix relied on: it stats the mountpoint, so on a
+        // FUSE root whose daemon does not answer it blocks (`hang`).
+        guest.fake(
+            "mountpoint",
+            &format!(
+                "[ -e {root}/hang ] && exec sleep 30\n[ -f {root}/mountinfo ] && grep -q \" $2 \" {root}/mountinfo\n",
+                root = guest.root
+            ),
+        );
+        guest
     }
-    assert_eq!(exit, Some(0));
-    assert_eq!(String::from_utf8(output).unwrap(), "lane-b-exec-ok");
-    println!(
-        "scratch={vm} orphan_pid={} healed_pid={} attach_ms={} exec_exit=0",
-        old.trim(),
-        new.trim(),
-        elapsed.as_millis()
+
+    fn fake(&self, name: &str, body: &str) {
+        let path = format!("{}/bin/{name}", self.root);
+        fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn localize(&self, text: &str) -> String {
+        text.replace("/nym", &format!("{}/nym", self.root))
+            .replace(
+                "/run/chevalier/mounts",
+                &format!("{}/run/mounts", self.root),
+            )
+            .replace("/etc/chevalier", &format!("{}/etc", self.root))
+            .replace("/proc/self/mountinfo", &format!("{}/mountinfo", self.root))
+            .replace("/proc/mounts", &format!("{}/proc-mounts", self.root))
+            .replace("/proc/[0-9]*", &format!("{}/proc/[0-9]*", self.root))
+    }
+
+    /// Runs `scenario` under bash. Helpers: `mi PATH` adds PATH to the mount table,
+    /// `daemon TAG` starts a stand-in daemon recorded under TAG's marker,
+    /// `mounted_log TAG PATH` gives TAG's daemon a log saying it mounted PATH (coloured, as
+    /// real guest logs are). Every process recorded under a marker is killed on exit.
+    fn run(&self, scenario: &str) -> std::process::Output {
+        let root = &self.root;
+        let script = format!(
+            r#"set -eu
+export PATH={root}/bin:$PATH
+cd {root}
+started=""
+trap 'for p in $started $(cat {root}/run/mounts/* 2>/dev/null); do kill "$p" 2>/dev/null || true; done' EXIT
+mi() {{ echo "36 25 0:99 / $1 rw,relatime shared:1 - fuse.test test rw" >> {root}/mountinfo; echo "test $1 fuse.test rw 0 0" >> {root}/proc-mounts; }}
+daemon() {{ sleep 60 >/dev/null 2>&1 & started="$started $!"; echo $! > {root}/run/mounts/$1; }}
+mounted_log() {{ printf '\033[2mfuser::session\033[0m\033[2m:\033[0m Mounting %s\n' "$2" > {root}/run/mounts/$1.log; }}
+{scenario}"#
+        );
+        Command::new("bash").args(["-c", &script]).output().unwrap()
+    }
+}
+
+fn assert_success(output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    mounts.push(mount("slow", "/nym/vm/mounts/slow", true));
-    control
-        .write_file(&vm, MOUNT_SCRIPT_PATH, mount_script(&mounts).into_bytes())
-        .await
-        .unwrap();
-    admin(
-        &control,
-        &vm,
-        &format!("nohup sh {MOUNT_SCRIPT_PATH} >/tmp/lane-b-boot.log 2>&1 </dev/null &"),
+}
+
+/// One mount at `{root}/point` whose stand-in daemon "mounts" by adding itself to the
+/// mount table and then serves forever.
+fn single_mount_script(guest: &Guest) -> String {
+    let point = format!("{}/point", guest.root);
+    let mount = RenderedMount {
+        mount_tag: "test".into(),
+        mountpoint: point.clone(),
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "echo '36 25 0:99 / {point} rw - fuse.test test rw' >> {}/mountinfo; exec sleep 60",
+                guest.root
+            ),
+        ],
+        env: HashMap::new(),
+        read_only: false,
+    };
+    let script = guest.localize(&mount_script(&[mount]));
+    fs::write(format!("{}/mounts.sh", guest.root), &script).unwrap();
+    point
+}
+
+#[test]
+fn a_detached_mount_with_a_live_mounted_daemon_is_replaced() {
+    let guest = Guest::new();
+    let point = single_mount_script(&guest);
+    assert_success(&guest.run(&format!(
+        r#"
+daemon test; old=$(cat run/mounts/test)
+mounted_log test {point}
+timeout --foreground -k 1 3 sh mounts.sh
+new=$(cat run/mounts/test)
+[ "$new" != "$old" ]
+grep -q " {point} " mountinfo
+! kill -0 "$old" 2>/dev/null
+# A daemon must not retain the script lock after its launching shell exits.
+timeout --foreground -k 1 3 sh mounts.sh
+[ "$(cat run/mounts/test)" = "$new" ]
+"#
+    )));
+}
+
+#[test]
+fn attach_deadline_preserves_a_hydrating_daemon() {
+    let guest = Guest::new();
+    let _point = single_mount_script(&guest);
+    assert_success(&guest.run(
+        r#"
+daemon test; old=$(cat run/mounts/test)
+echo hydrating > run/mounts/test.log
+set +e
+timeout --foreground -k 1 0.5 sh mounts.sh
+status=$?
+set -e
+[ "$status" = 124 ]
+[ "$(cat run/mounts/test)" = "$old" ]
+kill -0 "$old"
+sh mounts.sh &
+boot=$!
+sleep 0.1
+set +e
+timeout --foreground -k 1 0.5 sh mounts.sh
+status=$?
+set -e
+[ "$status" = 124 ]
+kill -0 "$old"
+kill -0 "$boot"
+kill "$boot"
+"#,
+    ));
+}
+
+/// Review finding: a FUSE root whose daemon is slow to answer made a stat-based probe time
+/// out, and the script then read "not mounted" and SIGKILLed a healthy daemon.
+#[test]
+fn a_mount_whose_probe_hangs_is_not_killed() {
+    let guest = Guest::new();
+    let point = single_mount_script(&guest);
+    assert_success(&guest.run(&format!(
+        r#"
+daemon test; old=$(cat run/mounts/test)
+mounted_log test {point}
+mi {point}
+touch hang
+set +e
+timeout --foreground -k 1 5 sh mounts.sh
+status=$?
+set -e
+echo "mount script status=$status"
+[ "$(cat run/mounts/test)" = "$old" ] || {{ echo "marker replaced: the healthy daemon was swapped out"; exit 1; }}
+kill -0 "$old" || {{ echo "the healthy daemon was killed"; exit 1; }}
+[ "$status" = 0 ]
+"#
+    )));
+}
+
+/// A mount table the script cannot read says nothing about the mount: nothing is killed.
+#[test]
+fn an_unreadable_mount_table_kills_nothing() {
+    let guest = Guest::new();
+    let point = single_mount_script(&guest);
+    assert_success(&guest.run(&format!(
+        r#"
+daemon test; old=$(cat run/mounts/test)
+mounted_log test {point}
+rm mountinfo
+set +e
+timeout --foreground -k 1 2 sh mounts.sh
+status=$?
+set -e
+echo "mount script status=$status"
+[ "$(cat run/mounts/test)" = "$old" ] || {{ echo "marker replaced: the daemon was swapped out"; exit 1; }}
+kill -0 "$old" || {{ echo "the daemon was killed"; exit 1; }}
+[ "$status" != 0 ]
+"#
+    )));
+}
+
+/// Writes the guest's current script and the attach's next one, starts a live stand-in
+/// daemon for every Nym mount, and lists each mount as mounted.
+fn nym_guest(current: &str, next: &str) -> Guest {
+    let guest = Guest::new();
+    fs::write(
+        format!("{}/etc/mounts.sh", guest.root),
+        guest.localize(current),
     )
-    .await;
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    let start = std::time::Instant::now();
-    assert!(sandbox.attach_session(&vm).await.is_err());
-    let elapsed = start.elapsed();
-    assert!(elapsed < std::time::Duration::from_secs(45));
-    let pid = admin(&control, &vm, "cat /run/chevalier/mounts/slow; kill -0 $(cat /run/chevalier/mounts/slow); ! grep -q ' Mounting ' /run/chevalier/mounts/slow.log").await;
-    println!(
-        "scratch={vm} hydrating_pid={} attach_not_ready_ms={} daemon_alive=true",
-        pid.trim(),
-        elapsed.as_millis()
+    .unwrap();
+    fs::write(
+        format!("{}/etc/mounts.sh.next", guest.root),
+        guest.localize(next),
+    )
+    .unwrap();
+    guest
+}
+
+const NYM_DAEMONS: &str = r#"
+for mount in root:nym shared:nym/vm/mounts/shared task:nym/vm/mounts/task skills:nym/vm/mounts/skills; do
+  daemon "${mount%%:*}"
+  mi "$PWD/${mount#*:}"
+  mounted_log "${mount%%:*}" "$PWD/${mount#*:}"
+done
+pids() { cat run/mounts/root run/mounts/shared run/mounts/task run/mounts/skills | tr '\n' ' '; }
+before=$(pids)
+refresh() { sh -c "$(cat refresh.sh)"; }
+"#;
+
+fn write_refresh(guest: &Guest) {
+    fs::write(
+        format!("{}/refresh.sh", guest.root),
+        guest.localize(&mount_refresh_command()),
+    )
+    .unwrap();
+}
+
+/// Review finding: every deployed guest holds the script before this change, so a byte
+/// comparison would restart every idle computer on its first attach. The same mounts are
+/// updated in place: no restart, no daemon touched, and the next attach self-heals.
+#[test]
+fn a_guest_on_the_deployed_script_is_updated_in_place_and_then_self_heals() {
+    let mounts = nym_mounts();
+    let guest = nym_guest(DEPLOYED_SCRIPT, &mount_script(&mounts));
+    write_refresh(&guest);
+    let installed = guest.localize(&mount_script(&mounts));
+    let root = &guest.root;
+    let output = guest.run(&format!(
+        r#"{NYM_DAEMONS}
+out=$(refresh)
+echo "$out"
+[ "$(echo "$out" | tail -1)" = mounts=updated ]
+[ "$(pids)" = "$before" ]
+[ ! -e etc/mounts.sh.next ]
+# The next attach: the task mount is detached while its daemon lives on.
+old_task=$(cat run/mounts/task)
+mounted_log task {root}/nym/vm/mounts/task
+grep -v " {root}/nym/vm/mounts/task " mountinfo > mountinfo.new; mv mountinfo.new mountinfo
+cp etc/mounts.sh etc/mounts.sh.next
+set +e
+out=$(refresh)
+set -e
+echo "$out"
+! kill -0 "$old_task" 2>/dev/null
+[ "$(cat run/mounts/task)" != "$old_task" ]
+"#
+    ));
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(format!("{root}/etc/mounts.sh")).unwrap(),
+        installed
     );
+}
+
+/// Mounts that genuinely differ still take the restart, as before.
+#[test]
+fn different_mounts_still_restart_the_guest() {
+    let mut mounts = nym_mounts();
+    mounts[2]
+        .env
+        .insert("CHEVALIER_VFS_CACHE".into(), "large".into());
+    let guest = nym_guest(DEPLOYED_SCRIPT, &mount_script(&mounts));
+    write_refresh(&guest);
+    assert_success(&guest.run(&format!(
+        r#"{NYM_DAEMONS}
+out=$(refresh)
+echo "$out"
+[ "$(echo "$out" | tail -1)" = mounts=restart ]
+"#
+    )));
+}
+
+/// Review finding: the busy scan ran inside the refresh's outer bound with no bound of its
+/// own, so a slow scan on a busy guest let the outer timeout kill a healthy attach before
+/// it reported. A scan that cannot finish counts as busy: nothing restarts, and the
+/// guest's current mounts are confirmed within the replay budget.
+#[test]
+fn a_slow_busy_scan_leaves_a_healthy_attach_ready() {
+    let mut mounts = nym_mounts();
+    mounts[2]
+        .env
+        .insert("CHEVALIER_VFS_CACHE".into(), "large".into());
+    let guest = nym_guest(DEPLOYED_SCRIPT, &mount_script(&mounts));
+    write_refresh(&guest);
+    guest.fake("readlink", "exec sleep 100\n");
+    let started = Instant::now();
+    let output = guest.run(&format!(
+        r#"{NYM_DAEMONS}
+set +e
+out=$(refresh)
+status=$?
+set -e
+echo "refresh status=$status report=$out"
+[ "$(echo "$out" | tail -1)" = "mounts=deferred busy=unknown" ]
+[ "$(pids)" = "$before" ]
+"#
+    ));
+    assert_success(&output);
+    assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
+}
+
+mod switch {
+    use super::*;
+
+    /// The kill switch renders exactly what guests run today, so turning self-heal off
+    /// changes no guest's script.
+    #[test]
+    fn the_switched_off_script_is_what_guests_run_today() {
+        assert_eq!(
+            GuestMountScript::Legacy.render(&nym_mounts()),
+            DEPLOYED_SCRIPT
+        );
+    }
+
+    /// Turning the switch off on a self-healing guest is an in-place update too.
+    #[test]
+    fn switching_self_heal_off_updates_the_guest_in_place() {
+        let mounts = nym_mounts();
+        let guest = nym_guest(
+            &GuestMountScript::SelfHealing.render(&mounts),
+            &GuestMountScript::Legacy.render(&mounts),
+        );
+        write_refresh(&guest);
+        assert_success(&guest.run(&format!(
+            r#"{NYM_DAEMONS}
+out=$(refresh)
+echo "$out"
+[ "$(echo "$out" | tail -1)" = mounts=updated ]
+[ "$(pids)" = "$before" ]
+"#
+        )));
+        assert_eq!(
+            fs::read_to_string(format!("{}/etc/mounts.sh", guest.root)).unwrap(),
+            guest.localize(DEPLOYED_SCRIPT)
+        );
+    }
 }

@@ -4,6 +4,8 @@
 // @dive-rel: public v5 OpenAPI spec (https://api.freestyle.sh/openapi.json).
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine;
 use bytes::Bytes;
@@ -21,7 +23,7 @@ use crate::proto::bracket::portproxy::v1::DirectoryEntry;
 use crate::{
     ExecEvent, ExecHandle, ExecInput, ExecOptions, ForkOptions, ForkResult, FreestyleBackendConfig,
     ManagedMountConfig, Result, Sandbox, SandboxError, Session, SharedMount, ShellEvent,
-    ShellHandle, ShellInput, ShellOptions, render_shared_mount_template,
+    ShellHandle, ShellInput, ShellOptions,
 };
 
 #[path = "freestyle_guest_mounts.rs"]
@@ -50,6 +52,9 @@ const EXEC_AWAIT_DEFAULT_MS: u64 = 30_000;
 pub(crate) struct FreestyleControl {
     cfg: FreestyleBackendConfig,
     client: Client,
+    /// Whether guests get `GuestMountScript::SelfHealing` (the default) or `Legacy`. Shared
+    /// by every clone, so the switch reaches whichever copy runs the next attach.
+    mount_self_heal: Arc<AtomicBool>,
 }
 
 /// The subset of a Freestyle VM record the facade acts on.
@@ -156,6 +161,7 @@ impl FreestyleControl {
         Ok(Self {
             cfg,
             client: Client::new(),
+            mount_self_heal: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -906,9 +912,9 @@ impl FreestyleControl {
             let result = self
                 .exec_await(
                     vm_id,
-                    &format!("if [ -f {MOUNT_SCRIPT_PATH} ]; then timeout --foreground -k 1 10 /bin/sh {MOUNT_SCRIPT_PATH}; fi"),
+                    &mount_replay_command(),
                     None,
-                    Some(15_000),
+                    Some(MOUNT_REPLAY_EXEC_MS),
                     None,
                     Some(ROOT_USER),
                 )
@@ -921,7 +927,7 @@ impl FreestyleControl {
                 ))),
             };
         }
-        let script = mount_script(&mounts);
+        let script = self.guest_mount_script().render(&mounts);
         self.write_file(vm_id, MOUNT_SCRIPT_PATH, script.into_bytes())
             .await?;
         self.write_file(vm_id, MOUNT_UNIT_PATH, MOUNT_UNIT.as_bytes().to_vec())
@@ -948,13 +954,27 @@ impl FreestyleControl {
         }
     }
 
+    /// Chooses the script later creates and attaches give guests; see `GuestMountScript`.
+    pub(crate) fn set_mount_self_heal(&self, enabled: bool) {
+        self.mount_self_heal.store(enabled, Ordering::Relaxed);
+    }
+
+    fn guest_mount_script(&self) -> GuestMountScript {
+        if self.mount_self_heal.load(Ordering::Relaxed) {
+            GuestMountScript::SelfHealing
+        } else {
+            GuestMountScript::Legacy
+        }
+    }
+
     /// Attach with the mounts the caller wants now. A guest keeps the mount script it was
     /// created with, so without this an attach replays whatever an older API configured
     /// (its binary flags, environment, scopes) for the VM's whole life. The new script is
-    /// compared with the guest's: identical means a plain replay; different means the
-    /// guest's mounts are stopped and started from the new script, but only when no process
-    /// is using them. A busy guest keeps its current mounts and is refreshed on a later
-    /// attach, so no running command loses its files mid-task.
+    /// compared with the guest's: identical means a plain replay; launching the same mounts
+    /// differently means an in-place update; different mounts means the guest's mounts are
+    /// stopped and started from the new script, but only when no process is using them. A
+    /// busy guest keeps its current mounts and is refreshed on a later attach, so no
+    /// running command loses its files mid-task. See `mount_refresh_script`.
     pub(crate) async fn refresh_configured_mounts(
         &self,
         vm_id: &str,
@@ -968,18 +988,15 @@ impl FreestyleControl {
         self.write_file(
             vm_id,
             MOUNT_SCRIPT_NEXT_PATH,
-            mount_script(&mounts).into_bytes(),
+            self.guest_mount_script().render(&mounts).into_bytes(),
         )
         .await?;
         let result = self
             .exec_await(
                 vm_id,
-                &format!(
-                    "timeout --foreground -k 1 12 sh -c {}",
-                    shell_quote(MOUNT_REFRESH_SCRIPT)
-                ),
+                &mount_refresh_command(),
                 None,
-                Some(15_000),
+                Some(MOUNT_REFRESH_EXEC_MS),
                 None,
                 Some(ROOT_USER),
             )
@@ -2108,7 +2125,7 @@ mod tests {
         // The wait sits after the launch block, so a run that finds the mount already
         // launched by another run still waits for it before starting the next.
         let launch_block_end = script.rfind("\nfi\n").unwrap();
-        let waited = script.find("mountpoint -q '/mnt/nymfs' && break").unwrap();
+        let waited = script.find("mount_state '/mnt/nymfs' && break").unwrap();
         assert!(script.find("nohup").unwrap() < launch_block_end && launch_block_end < waited);
         assert!(script.contains("pid=$(cat '/run/chevalier/mounts/nymfs-root'"));
     }
@@ -2219,3 +2236,7 @@ mod tests {
 #[cfg(all(test, target_os = "linux"))]
 #[path = "freestyle_mount_tests.rs"]
 mod mount_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "freestyle_mount_scratch.rs"]
+mod mount_scratch;

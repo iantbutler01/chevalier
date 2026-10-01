@@ -4366,6 +4366,17 @@ impl Sandbox {
         Ok(session)
     }
 
+    /// Whether Freestyle guests run the self-healing mount script (the default) or the
+    /// script they ran before it. Takes effect at the next create or attach; a guest is
+    /// moved between the two in place, never restarted. Other providers ignore it.
+    pub fn set_mount_self_heal(&self, enabled: bool) {
+        if let ControlBackend::Managed(ManagedControl::Freestyle(control)) =
+            &self.inner.control_backend
+        {
+            control.set_mount_self_heal(enabled);
+        }
+    }
+
     pub async fn attach_session(&self, session_id: &str) -> Result<Session> {
         self.attach_session_with_mounts(session_id, &[]).await
     }
