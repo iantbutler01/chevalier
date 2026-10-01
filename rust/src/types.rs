@@ -1709,7 +1709,12 @@ mod tests {
             );
         }
         assert!(!Provider::OpenAIResponses.supports_image_input("gpt-6-astra@vision=false"));
-        for model in ["claude-sonnet-5", "claude-sonnet-5-5", "claude-fable-5", "claude-opus-4-8"] {
+        for model in [
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-fable-5",
+            "claude-opus-4-8",
+        ] {
             assert!(Provider::Anthropic.supports_image_input(model), "{model}");
         }
         assert!(

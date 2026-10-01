@@ -53,6 +53,7 @@ class SessionOpts(TypedDict, total=False):
     volume_size_gb: int
 
 class ForkOpts(TypedDict, total=False):
+    child_volume_owner_key: str
     child_name: str
     child_metadata: Dict[str, str]
     auto_start_child: bool

@@ -210,6 +210,7 @@ impl Session {
             .map(Into::into)
             .unwrap_or(ForkOptions {
                 child_name: None,
+                child_volume_owner_key: None,
                 child_metadata: HashMap::new(),
                 auto_start_child: true,
             });

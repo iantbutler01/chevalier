@@ -192,6 +192,8 @@ impl From<SessionOpts> for chevalier_sandbox::SessionOptions {
 #[derive(Default, Deserialize)]
 pub struct ForkOpts {
     #[serde(default)]
+    pub child_volume_owner_key: Option<String>,
+    #[serde(default)]
     pub child_name: Option<String>,
     #[serde(default)]
     pub child_metadata: Option<HashMap<String, String>>,
@@ -203,6 +205,7 @@ impl From<ForkOpts> for ForkOptions {
     fn from(options: ForkOpts) -> Self {
         Self {
             child_name: options.child_name,
+            child_volume_owner_key: options.child_volume_owner_key,
             child_metadata: options.child_metadata.unwrap_or_default(),
             auto_start_child: options.auto_start_child.unwrap_or(true),
         }
