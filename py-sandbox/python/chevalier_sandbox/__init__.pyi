@@ -57,6 +57,12 @@ class ForkOpts(TypedDict, total=False):
     child_name: str
     child_metadata: Dict[str, str]
     auto_start_child: bool
+    child_shared_mounts: List[SharedMountOpts]
+    clone_mount_state: List[MountStateCloneOpts]
+
+class MountStateCloneOpts(TypedDict):
+    from_mount_tag: str
+    to_mount_tag: str
 
 class SessionSnapshotOpts(TypedDict, total=False):
     label: str

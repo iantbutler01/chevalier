@@ -32,6 +32,8 @@ use crate::assets::portproxy;
 use crate::bootstrap;
 use crate::config::{self, Config};
 use crate::fuse;
+use crate::fuse::local_view::MountStateLayout;
+use crate::fuse::local_view::mount::{MountLocalViewOptions, clone_mount_state};
 use crate::guest::macos_vz;
 use crate::guest::windows_qemu;
 use crate::guest_exec_probe::{
@@ -3133,6 +3135,38 @@ impl Manager {
             },
         );
 
+        let child_shared_mounts = match params.child_shared_mounts.clone() {
+            Some(mounts) => normalize_shared_mounts(mounts)?,
+            None => parent_shared_mounts.clone(),
+        };
+        // Replica clones name a parent mount and a fuse-backed child mount, and need a stopped parent: a
+        // running one is resumed before the clone would run, so its replica would be copied while it
+        // changes. Checked here, before any disk work, so a bad request leaves nothing to roll back.
+        if !params.clone_mount_state.is_empty() && parent_was_running {
+            return Err(ManagerError::Unsupported(
+                "cloning mount state requires a stopped parent VM".to_string(),
+            ));
+        }
+        let mut mount_clones = Vec::with_capacity(params.clone_mount_state.len());
+        for (from_tag, to_tag) in &params.clone_mount_state {
+            if !parent_shared_mounts
+                .iter()
+                .any(|mount| &mount.mount_tag == from_tag)
+            {
+                return Err(ManagerError::Other(anyhow!(
+                    "cannot clone mount state: the parent has no mount tagged {from_tag:?}"
+                )));
+            }
+            let Some(target) = child_shared_mounts
+                .iter()
+                .find(|mount| &mount.mount_tag == to_tag && mount.is_fuse_backed())
+            else {
+                return Err(ManagerError::Other(anyhow!(
+                    "cannot clone mount state: the child has no VFS mount tagged {to_tag:?}"
+                )));
+            };
+            mount_clones.push((from_tag.clone(), target.clone()));
+        }
         let child_dir = PathBuf::from(&self.cfg.data_dir).join(&child_id);
         let parent_disk = parent_vm.disk_path();
 
@@ -3158,7 +3192,7 @@ impl Manager {
             },
             metadata: child_metadata,
             snapshots: child_restore_snapshot.clone().into_iter().collect(),
-            shared_mounts: parent_shared_mounts,
+            shared_mounts: child_shared_mounts,
             pci_devices: Vec::new(),
             durable_volume: child_durable_volume.clone(),
             boot_incoming_ram_path: String::new(),
@@ -3581,6 +3615,47 @@ impl Manager {
                     snapshot,
                 },
             );
+        }
+
+        // Every launch takes the runtime-teardown guard, so holding it keeps the parent stopped -- and its
+        // replica still -- for the whole copy.
+        let _parent_launch = if mount_clones.is_empty() {
+            None
+        } else {
+            let guard = parent_vm.lock_runtime_teardown().await;
+            if !matches!(parent_vm.lock().await.runtime.state, VmState::Stopped) {
+                let _ = self.delete_vm(&child_id, true).await;
+                return Err(ManagerError::Other(anyhow!(
+                    "the parent VM started before its replica could be cloned"
+                )));
+            }
+            Some(guard)
+        };
+        for (from_tag, target) in mount_clones {
+            let parent_layout = MountStateLayout::for_mount(&parent_vm.dir, &from_tag);
+            let child_layout = MountStateLayout::for_mount(
+                &PathBuf::from(&self.cfg.data_dir).join(&child_id),
+                &target.mount_tag,
+            );
+            let options = MountLocalViewOptions {
+                layout: child_layout,
+                scope_path: target.vfs_scope_path.clone(),
+                endpoint: target.vfs_endpoint.clone(),
+                mount_tag: target.mount_tag.clone(),
+                read_only: false,
+                tokio: tokio::runtime::Handle::current(),
+            };
+            let cloned =
+                tokio::task::spawn_blocking(move || clone_mount_state(&parent_layout, options))
+                    .await
+                    .map_err(|error| anyhow!("fork replica clone task failed: {error}"))
+                    .and_then(|result| result);
+            if let Err(error) = cloned {
+                warn!(child_id = %child_id, mount_tag = %target.mount_tag, error = %error, "fork replica clone failed; removing the child");
+                let _ = self.delete_vm(&child_id, true).await;
+                return Err(ManagerError::Other(error));
+            }
+            info!(child_id = %child_id, from_tag = %from_tag, to_tag = %target.mount_tag, "cloned the parent replica into the fork");
         }
 
         let child_after = if params.auto_start_child {
@@ -9885,6 +9960,8 @@ mod tests {
                     child_metadata: child_meta_extra,
                     auto_start_child: false,
                     child_volume_owner_key: None,
+                    child_shared_mounts: None,
+                    clone_mount_state: Vec::new(),
                 },
             )
             .await
@@ -9993,6 +10070,8 @@ mod tests {
             child_metadata: HashMap::from([(META_SESSION_ID.to_string(), session.to_string())]),
             auto_start_child: false,
             child_volume_owner_key: None,
+            child_shared_mounts: None,
+            clone_mount_state: Vec::new(),
         };
         let (_, first, _) = manager
             .fork_vm(&parent_id, fork("first"))
@@ -10066,6 +10145,8 @@ mod tests {
                     )]),
                     auto_start_child: false,
                     child_volume_owner_key: Some(child_owner_key.to_string()),
+                    child_shared_mounts: None,
+                    clone_mount_state: Vec::new(),
                 },
             )
             .await
@@ -10121,6 +10202,8 @@ mod tests {
                     child_metadata: HashMap::new(),
                     auto_start_child: false,
                     child_volume_owner_key: Some(child_owner_key.to_string()),
+                    child_shared_mounts: None,
+                    clone_mount_state: Vec::new(),
                 },
             )
             .await
@@ -10717,6 +10800,8 @@ mod tests {
                     child_metadata: HashMap::new(),
                     auto_start_child: false,
                     child_volume_owner_key: None,
+                    child_shared_mounts: None,
+                    clone_mount_state: Vec::new(),
                 },
             )
             .await

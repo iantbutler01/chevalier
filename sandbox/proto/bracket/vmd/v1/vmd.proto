@@ -373,6 +373,17 @@ message ForkVMRequest {
   Metadata child_metadata = 3;
   bool auto_start_child = 4;
   string child_volume_owner_key = 5;
+  // The child's own shared mounts (replacing the parent's) and, per mount, the parent
+  // mount-local replica it starts from. A cloned replica is re-keyed to the child's scope,
+  // tag and endpoint with a fresh epoch and an empty log, so the child mounts it without
+  // hydrating. The parent's replica must be fully published.
+  repeated SharedMount child_shared_mounts = 6;
+  repeated MountStateClone clone_mount_state = 7;
+}
+
+message MountStateClone {
+  string from_mount_tag = 1;
+  string to_mount_tag = 2;
 }
 
 message ForkVMResponse {

@@ -376,6 +376,16 @@ pub struct ForkOpts {
     pub child_metadata: Option<HashMap<String, String>>,
     pub auto_start_child: Option<bool>,
     pub child_volume_owner_key: Option<String>,
+    /// The child's own shared mounts (replacing the parent's).
+    pub child_shared_mounts: Option<Vec<SharedMountOpts>>,
+    /// Parent replicas the child starts from instead of hydrating them over the network.
+    pub clone_mount_state: Option<Vec<MountStateCloneOpts>>,
+}
+
+#[napi(object)]
+pub struct MountStateCloneOpts {
+    pub from_mount_tag: String,
+    pub to_mount_tag: String,
 }
 
 impl From<ForkOpts> for ForkOptions {
@@ -385,6 +395,18 @@ impl From<ForkOpts> for ForkOptions {
             child_metadata: o.child_metadata.unwrap_or_default(),
             auto_start_child: o.auto_start_child.unwrap_or(true),
             child_volume_owner_key: o.child_volume_owner_key,
+            child_shared_mounts: o.child_shared_mounts.map(|mounts| {
+                mounts
+                    .into_iter()
+                    .map(SharedMountOpts::into_shared_mount)
+                    .collect()
+            }),
+            clone_mount_state: o
+                .clone_mount_state
+                .unwrap_or_default()
+                .into_iter()
+                .map(|clone| (clone.from_mount_tag, clone.to_mount_tag))
+                .collect(),
         }
     }
 }
@@ -732,6 +754,8 @@ impl Session {
             child_metadata: HashMap::new(),
             auto_start_child: true,
             child_volume_owner_key: None,
+            child_shared_mounts: None,
+            clone_mount_state: Vec::new(),
         });
         let r = self.inner.fork(opts).await.map_err(sb_err)?;
         Ok(Session { inner: r.child })

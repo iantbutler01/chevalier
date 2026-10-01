@@ -87,6 +87,8 @@ const DEFAULT_PORTPROXY_WRITE_FILE_RPC_TIMEOUT: Duration = Duration::from_secs(1
 const VMD_DELETE_TIMEOUT: Duration = Duration::from_secs(60);
 const VMD_VM_START_TIMEOUT: Duration = Duration::from_secs(600);
 const VMD_VM_STOP_TIMEOUT: Duration = Duration::from_secs(150);
+/// A fork that clones a parent's mount-local replica copies its whole backing tree.
+const VMD_FORK_CLONE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// A graceful restart is a guest shutdown (vmd waits up to its 180 s graceful-stop
 /// budget) followed by a fresh boot. The ordinary control-plane request timeout is a
@@ -700,6 +702,10 @@ pub struct ForkOptions {
     pub child_metadata: HashMap<String, String>,
     pub auto_start_child: bool,
     pub child_volume_owner_key: Option<String>,
+    /// The child's own shared mounts; `None` keeps the parent's.
+    pub child_shared_mounts: Option<Vec<SharedMount>>,
+    /// `(parent mount tag, child mount tag)` replicas the child starts from instead of hydrating.
+    pub clone_mount_state: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3847,17 +3853,46 @@ impl Session {
         #[cfg(not(feature = "distributed-control"))]
         let _ = &ownership_fence;
 
-        let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
+        // Cloning a parent replica copies its backing tree on the host, which takes minutes for a
+        // large workspace; the ordinary control-plane deadline would abandon the RPC mid-copy.
+        let fork_timeout = if opts.clone_mount_state.is_empty() {
+            self.sandbox.inner.cfg.connect_timeout
+        } else {
+            VMD_FORK_CLONE_TIMEOUT
+        };
+        let child_shared_mounts = opts.child_shared_mounts.clone();
+        let mut client = self
+            .sandbox
+            .vmd_client_for_endpoint_with_timeout(&node_endpoint, fork_timeout)
+            .await?;
         let response = client
-            .fork_vm(self.sandbox.request_with_auth(ForkVmRequest {
-                parent_vm_id: self.vm_id.clone(),
-                child_name: opts.child_name.unwrap_or_default(),
-                child_metadata: Some(Metadata {
-                    entries: child_metadata,
+            .fork_vm(
+                self.sandbox.request_with_auth(ForkVmRequest {
+                    parent_vm_id: self.vm_id.clone(),
+                    child_name: opts.child_name.unwrap_or_default(),
+                    child_metadata: Some(Metadata {
+                        entries: child_metadata,
+                    }),
+                    auto_start_child,
+                    child_volume_owner_key: opts.child_volume_owner_key.unwrap_or_default(),
+                    child_shared_mounts: opts
+                        .child_shared_mounts
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(proto_shared_mount)
+                        .collect(),
+                    clone_mount_state: opts
+                        .clone_mount_state
+                        .into_iter()
+                        .map(
+                            |(from_mount_tag, to_mount_tag)| proto::vmd::v1::MountStateClone {
+                                from_mount_tag,
+                                to_mount_tag,
+                            },
+                        )
+                        .collect(),
                 }),
-                auto_start_child,
-                child_volume_owner_key: opts.child_volume_owner_key.unwrap_or_default(),
-            }))
+            )
             .await?
             .into_inner();
 
@@ -3896,7 +3931,7 @@ impl Session {
             vm_id: child_vm.id,
             node_endpoint: Arc::new(Mutex::new(node_endpoint)),
             ownership_fence: Arc::new(Mutex::new(child_fence)),
-            shared_mounts: self.shared_mounts.clone(),
+            shared_mounts: child_shared_mounts.map_or_else(|| self.shared_mounts.clone(), Arc::new),
             desktop_forward: Arc::new(Mutex::new(None)),
         };
 

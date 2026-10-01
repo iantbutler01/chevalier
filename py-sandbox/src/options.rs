@@ -199,6 +199,18 @@ pub struct ForkOpts {
     pub child_metadata: Option<HashMap<String, String>>,
     #[serde(default)]
     pub auto_start_child: Option<bool>,
+    /// The child's own shared mounts (replacing the parent's).
+    #[serde(default)]
+    pub child_shared_mounts: Option<Vec<SharedMountOpts>>,
+    /// Parent replicas the child starts from instead of hydrating them over the network.
+    #[serde(default)]
+    pub clone_mount_state: Option<Vec<MountStateCloneOpts>>,
+}
+
+#[derive(Deserialize)]
+pub struct MountStateCloneOpts {
+    pub from_mount_tag: String,
+    pub to_mount_tag: String,
 }
 
 impl From<ForkOpts> for ForkOptions {
@@ -208,6 +220,18 @@ impl From<ForkOpts> for ForkOptions {
             child_volume_owner_key: options.child_volume_owner_key,
             child_metadata: options.child_metadata.unwrap_or_default(),
             auto_start_child: options.auto_start_child.unwrap_or(true),
+            child_shared_mounts: options.child_shared_mounts.map(|mounts| {
+                mounts
+                    .into_iter()
+                    .map(SharedMountOpts::into_shared_mount)
+                    .collect()
+            }),
+            clone_mount_state: options
+                .clone_mount_state
+                .unwrap_or_default()
+                .into_iter()
+                .map(|clone| (clone.from_mount_tag, clone.to_mount_tag))
+                .collect(),
         }
     }
 }

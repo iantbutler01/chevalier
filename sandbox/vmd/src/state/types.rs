@@ -599,6 +599,10 @@ pub struct ForkVmParams {
     pub child_metadata: HashMap<String, String>,
     pub auto_start_child: bool,
     pub child_volume_owner_key: Option<String>,
+    /// The child's own shared mounts; `None` keeps the parent's.
+    pub child_shared_mounts: Option<Vec<SharedMountSpec>>,
+    /// Parent mount tag -> child mount tag replicas to clone (see `ForkVMRequest`).
+    pub clone_mount_state: Vec<(String, String)>,
 }
 
 pub mod iso8601 {

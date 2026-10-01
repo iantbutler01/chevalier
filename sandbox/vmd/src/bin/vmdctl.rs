@@ -822,6 +822,9 @@ async fn fork_vm(
                 },
                 auto_start_child,
                 child_volume_owner_key: child_volume_owner_key.unwrap_or_default(),
+                // The child keeps the parent's mounts and hydrates them; replica clones are an API-only path.
+                child_shared_mounts: Vec::new(),
+                clone_mount_state: Vec::new(),
             },
             auth_header,
         ))

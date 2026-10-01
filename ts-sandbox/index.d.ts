@@ -149,6 +149,10 @@ export interface ForkOpts {
   childMetadata?: Record<string, string>
   autoStartChild?: boolean
   childVolumeOwnerKey?: string
+  /** The child's own shared mounts (replacing the parent's). */
+  childSharedMounts?: Array<SharedMountOpts>
+  /** Parent replicas the child starts from instead of hydrating them over the network. */
+  cloneMountState?: Array<MountStateCloneOpts>
 }
 
 export interface HostPciDeviceJs {
@@ -174,6 +178,11 @@ export interface HostPciFunctionJs {
 export interface HostPciInventoryJs {
   enabled: boolean
   devices: Array<HostPciDeviceJs>
+}
+
+export interface MountStateCloneOpts {
+  fromMountTag: string
+  toMountTag: string
 }
 
 export interface OpenComputerMountOpts {

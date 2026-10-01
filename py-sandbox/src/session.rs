@@ -213,6 +213,8 @@ impl Session {
                 child_volume_owner_key: None,
                 child_metadata: HashMap::new(),
                 auto_start_child: true,
+                child_shared_mounts: None,
+                clone_mount_state: Vec::new(),
             });
         let session = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {

@@ -781,6 +781,21 @@ impl VmdService for GrpcService {
             } else {
                 Some(req.child_volume_owner_key)
             },
+            child_shared_mounts: if req.child_shared_mounts.is_empty() {
+                None
+            } else {
+                Some(
+                    req.child_shared_mounts
+                        .into_iter()
+                        .map(shared_mount_spec)
+                        .collect(),
+                )
+            },
+            clone_mount_state: req
+                .clone_mount_state
+                .into_iter()
+                .map(|clone| (clone.from_mount_tag, clone.to_mount_tag))
+                .collect(),
         };
 
         let (parent_meta, child_meta, fork_id) = self

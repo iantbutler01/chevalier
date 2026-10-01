@@ -1551,7 +1551,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::{MountLocalView, MountLocalViewOptions, backing_handle_flags};
+    use super::{MountLocalView, MountLocalViewOptions, backing_handle_flags, clone_mount_state};
     use crate::fuse::local_view::MountStateLayout;
     use crate::fuse::local_view::types::{
         MountMutation, MountOwnerRecord, PayloadSource, PayloadStorage,
@@ -1620,6 +1620,147 @@ mod tests {
                 .downcast_ref::<std::io::Error>()
                 .and_then(|error| error.raw_os_error()),
             Some(libc::EBADF)
+        );
+    }
+
+    fn scoped_options(
+        root: &Path,
+        scope: &str,
+        tag: &str,
+        tokio: &tokio::runtime::Handle,
+    ) -> MountLocalViewOptions {
+        MountLocalViewOptions {
+            layout: MountStateLayout::new(root),
+            scope_path: scope.to_string(),
+            endpoint: "http://127.0.0.1:1".to_string(),
+            mount_tag: tag.to_string(),
+            read_only: false,
+            tokio: tokio.clone(),
+        }
+    }
+
+    fn write_parent_file(view: &MountLocalView, path: &str, bytes: &[u8]) {
+        let (file, _) = view
+            .create_file(path, 0o644, libc::O_RDWR)
+            .expect("create parent file");
+        view.write(&file, bytes, 0).expect("write parent file");
+        view.flush_handle(&file).expect("seal parent file");
+    }
+
+    fn owner_record(root: &Path) -> MountOwnerRecord {
+        serde_json::from_str(
+            fs::read_to_string(MountStateLayout::new(root).owner_path())
+                .expect("read owner record")
+                .trim(),
+        )
+        .expect("decode owner record")
+    }
+
+    #[test]
+    fn a_published_replica_clones_into_a_fork_that_mounts_without_hydrating() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parent_root = temp.path().join("parent");
+        let child_root = temp.path().join("child");
+        {
+            let opened = MountLocalView::open(scoped_options(
+                &parent_root,
+                "thread-parent/workspace",
+                "parent-tag",
+                runtime.handle(),
+            ))
+            .expect("open parent");
+            let view = opened.view;
+            write_parent_file(&view, "notes.txt", b"carried into the fork");
+            let wal = view.wal().expect("writable WAL");
+            wal.acknowledge(
+                wal.last_appended_sequence(),
+                7,
+                view.tree().tree_generation(),
+            )
+            .expect("publish every parent event");
+        }
+
+        clone_mount_state(
+            &MountStateLayout::new(&parent_root),
+            scoped_options(
+                &child_root,
+                "thread-child/workspace",
+                "child-tag",
+                runtime.handle(),
+            ),
+        )
+        .expect("clone the published parent replica");
+
+        let parent_owner = owner_record(&parent_root);
+        let child_owner = owner_record(&child_root);
+        assert_ne!(child_owner.epoch, parent_owner.epoch);
+        assert_eq!(child_owner.scope_path, "thread-child/workspace");
+        assert_eq!(child_owner.mount_tag, "child-tag");
+        let reopened = MountLocalView::open(scoped_options(
+            &child_root,
+            "thread-child/workspace",
+            "child-tag",
+            runtime.handle(),
+        ))
+        .expect("mount the fork");
+        assert!(
+            !reopened.needs_hydration,
+            "a cloned replica must never re-hydrate"
+        );
+        assert_eq!(
+            fs::read(reopened.view.tree().resolve("notes.txt").expect("resolve"))
+                .expect("cloned file"),
+            b"carried into the fork"
+        );
+        assert_eq!(reopened.recovery.committed_unacknowledged, 0);
+        assert_eq!(owner_record(&child_root).epoch, child_owner.epoch);
+
+        // The parent is untouched and still mounts under its own identity.
+        drop(reopened);
+        let parent = MountLocalView::open(scoped_options(
+            &parent_root,
+            "thread-parent/workspace",
+            "parent-tag",
+            runtime.handle(),
+        ))
+        .expect("reopen parent");
+        assert!(!parent.needs_hydration);
+        assert_eq!(owner_record(&parent_root).epoch, parent_owner.epoch);
+    }
+
+    #[test]
+    fn an_unpublished_replica_is_never_cloned() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parent_root = temp.path().join("parent");
+        let child_root = temp.path().join("child");
+        {
+            let opened = MountLocalView::open(scoped_options(
+                &parent_root,
+                "thread-parent/workspace",
+                "parent-tag",
+                runtime.handle(),
+            ))
+            .expect("open parent");
+            write_parent_file(&opened.view, "pending.txt", b"never published");
+        }
+
+        let error = clone_mount_state(
+            &MountStateLayout::new(&parent_root),
+            scoped_options(
+                &child_root,
+                "thread-child/workspace",
+                "child-tag",
+                runtime.handle(),
+            ),
+        )
+        .expect_err("an unpublished parent must not be cloned");
+        assert!(error.to_string().contains("unpublished"), "{error:#}");
+        assert!(
+            MountStateLayout::new(&child_root)
+                .is_empty()
+                .expect("inspect child")
         );
     }
 
@@ -1731,5 +1872,75 @@ mod tests {
             Err(error) => error,
         };
         assert!(format!("{error:#}").contains("verify mount event"));
+    }
+}
+
+/// Start a forked VM's replica from its parent's instead of hydrating it over the network.
+///
+/// The parent's backing tree is copied into `child` (cloned where the filesystem supports
+/// reflinks) and then opened once under the child's own scope, endpoint and tag. That open mints
+/// a fresh owner record and epoch, creates an empty WAL and writes a checkpoint, so the child's
+/// first real mount takes the recovery path and trusts the tree rather than hydrating. The
+/// parent's replica must be fully published: anything still in its WAL would be in the child's
+/// tree but never reach the child's server scope.
+pub(crate) fn clone_mount_state(
+    parent: &MountStateLayout,
+    child: MountLocalViewOptions,
+) -> Result<()> {
+    let owner_path = parent.owner_path();
+    let owner: MountOwnerRecord = serde_json::from_str(
+        std::fs::read_to_string(&owner_path)
+            .with_context(|| format!("read parent mount owner record {}", owner_path.display()))?
+            .trim(),
+    )
+    .with_context(|| format!("decode parent mount owner record {}", owner_path.display()))?;
+    {
+        let wal = MountWal::open(parent, Some(&owner.epoch))
+            .with_context(|| format!("open parent mount WAL in {}", parent.root().display()))?;
+        let state = wal.recovery_state()?;
+        if !state.committed_unacknowledged.is_empty() || !state.unresolved_prepares.is_empty() {
+            bail!(
+                "parent mount {} has {} unpublished and {} unresolved events; refusing to clone it",
+                parent.root().display(),
+                state.committed_unacknowledged.len(),
+                state.unresolved_prepares.len()
+            );
+        }
+    }
+    if !child.layout.is_empty()? {
+        bail!(
+            "fork mount state {} already exists; refusing to overwrite it",
+            child.layout.root().display()
+        );
+    }
+    child.layout.ensure()?;
+    let source = parent.tree_dir();
+    let target = child.layout.tree_dir();
+    // Reflink/clonefile where the filesystem has it (XFS, btrfs, APFS), a byte copy otherwise.
+    #[cfg(target_os = "macos")]
+    const CLONE_FLAG: &str = "-c";
+    #[cfg(not(target_os = "macos"))]
+    const CLONE_FLAG: &str = "--reflink=auto";
+    let status = std::process::Command::new("cp")
+        .arg("-a")
+        .arg(CLONE_FLAG)
+        .arg(format!("{}/.", source.display()))
+        .arg(&target)
+        .status()
+        .context("run cp for the fork replica")?;
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(child.layout.root());
+        bail!(
+            "copying the parent replica {} to {} failed ({status})",
+            source.display(),
+            target.display()
+        );
+    }
+    match MountLocalView::open(child) {
+        Ok(opened) => {
+            drop(opened);
+            Ok(())
+        }
+        Err(error) => Err(error.context("seed the forked replica's owner, WAL and checkpoint")),
     }
 }

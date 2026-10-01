@@ -1811,6 +1811,8 @@ async fn tierb_restore_marker_rehydrates_and_resumes_under_failover_rebind() {
             auto_start_child: false,
             child_metadata: HashMap::new(),
             child_volume_owner_key: None,
+            child_shared_mounts: None,
+            clone_mount_state: Vec::new(),
         })
         .await
         .expect("fork child should create restore marker from snapshot");
