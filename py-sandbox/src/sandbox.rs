@@ -44,6 +44,9 @@ impl Sandbox {
         if let Some(token) = options.pci_access_token {
             config.pci_access_token = Some(token);
         }
+        if let Some(prewarm_on_start) = options.prewarm_on_start {
+            config.prewarm_on_start = prewarm_on_start;
+        }
         if let Some(milliseconds) = options.connect_timeout_ms {
             config.connect_timeout = Duration::from_millis(milliseconds as u64);
         }

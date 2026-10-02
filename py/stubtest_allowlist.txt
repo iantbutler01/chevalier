@@ -1,5 +1,6 @@
 chevalier.AnthropicCacheConfig
 chevalier.AsyncToolHandler
+chevalier.ClaudeSessionConfig
 chevalier.CodexSubscriptionConfigInput
 chevalier.GatewayOptions
 chevalier.Json

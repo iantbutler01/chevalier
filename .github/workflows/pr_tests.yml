@@ -109,7 +109,7 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install "maturin[patchelf]" mypy pytest
+          pip install "maturin[patchelf]" mypy pytest pytest-asyncio
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Build and install package

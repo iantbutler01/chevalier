@@ -4,7 +4,7 @@ use std::{
     env,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use tokio::process::Command;
@@ -168,6 +168,30 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn concurrent_version_checks_share_one_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("claude-version-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let cli = root.join("claude");
+        let count = root.join("probes");
+        std::fs::write(
+            &cli,
+            format!(
+                "#!/bin/sh\necho probe >> '{}'\nsleep 0.1\necho '2.1.281 (Claude Code)'\n",
+                count.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let results = futures::future::join_all((0..16).map(|_| version(&cli))).await;
+        assert!(results.iter().all(Result::is_ok));
+        let probes = std::fs::read_to_string(&count).unwrap().lines().count();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(probes, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn old_cli_is_rejected() {
         use std::os::unix::fs::PermissionsExt;
         let path = std::env::temp_dir().join(format!("claude-old-{}", uuid::Uuid::new_v4()));
@@ -282,14 +306,23 @@ pub(crate) fn argv(config: &ClaudeSessionConfig) -> Vec<String> {
 }
 
 pub(crate) async fn version(cli: &Path) -> Result<String, ClaudeSessionError> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(version) = cache.lock().unwrap().get(cli).cloned() {
-        return Ok(version);
-    }
+    type VersionProbe = Arc<tokio::sync::OnceCell<String>>;
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, VersionProbe>>> = OnceLock::new();
+    let probe = CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .entry(cli.to_path_buf())
+        .or_default()
+        .clone();
+    probe.get_or_try_init(|| probe_version(cli)).await.cloned()
+}
+
+async fn probe_version(cli: &Path) -> Result<String, ClaudeSessionError> {
     let output = tokio::time::timeout(
         Duration::from_secs(5),
         Command::new(cli)
+            .kill_on_drop(true)
             .arg("--version")
             .env_clear()
             .envs(spawn_env("chevalier"))
@@ -313,10 +346,6 @@ pub(crate) async fn version(cli: &Path) -> Result<String, ClaudeSessionError> {
             });
         }
     }
-    cache
-        .lock()
-        .unwrap()
-        .insert(cli.to_path_buf(), found.clone());
     Ok(found)
 }
 

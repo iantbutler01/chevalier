@@ -114,6 +114,7 @@ class SessionDesktopTarget(TypedDict, total=False):
     view_only: Required[bool]
 
 class SandboxConnectOptions(TypedDict, total=False):
+    prewarm_on_start: bool
     distributed_control: DistributedControlOptions
     auth_token: str
     pci_access_token: str

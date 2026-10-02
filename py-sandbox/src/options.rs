@@ -222,6 +222,8 @@ pub struct SessionSnapshotOpts {
 
 #[derive(Default, Deserialize)]
 pub struct SandboxConnectOptions {
+    #[serde(default)]
+    pub prewarm_on_start: Option<bool>,
     pub distributed_control: Option<DistributedControlOptions>,
     #[serde(default)]
     pub auth_token: Option<String>,

@@ -201,6 +201,17 @@ def assert_binding_parity(
 def test_core_binding_matches_typescript_capabilities_with_typed_rust_responses():
     typed_response_exports = {
         "AssistantResponse",
+        "ClaudeSessionEvent",
+        "ClaudeInitEvent",
+        "ClaudeTextDeltaEvent",
+        "ClaudeThinkingDeltaEvent",
+        "ClaudeAssistantMessageEvent",
+        "ClaudeToolCallEvent",
+        "ClaudeToolExecutedEvent",
+        "ClaudeToolCancelledEvent",
+        "ClaudeRateLimitsEvent",
+        "ClaudeApiRetryEvent",
+        "ClaudeTurnCompleteEvent",
         "CompleteStreamEvent",
         "OutputStreamEvent",
         "ProviderRateLimit",
