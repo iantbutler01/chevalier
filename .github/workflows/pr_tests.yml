@@ -1,12 +1,13 @@
 name: CI
-
-on:
-  pull_request:
+"on":
+  pull_request: null
   push:
-    branches: [main]
-
+    branches:
+      - main
+    tags:
+      - v*
+  workflow_dispatch: null
 jobs:
-  # Rust tests for rust crate
   rust-test:
     name: Rust Tests
     runs-on: ubuntu-latest
@@ -16,22 +17,16 @@ jobs:
         uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            rust/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/**/Cargo.lock') }}
+          workspaces: rust
+          cache-bin: false
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Run tests
         working-directory: rust
         run: cargo test --all-features
-
   rust-clippy:
     name: Rust Clippy
     runs-on: ubuntu-latest
@@ -41,22 +36,16 @@ jobs:
         uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            rust/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/**/Cargo.lock') }}
+          workspaces: rust
+          cache-bin: false
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Run clippy
         working-directory: rust
         run: cargo clippy --all-features -- -D warnings
-
   rust-fmt:
     name: Rust Format
     runs-on: ubuntu-latest
@@ -69,8 +58,6 @@ jobs:
       - name: Check formatting
         working-directory: rust
         run: cargo fmt --all -- --check
-
-  # Python binding packages build independently, matching the TypeScript split.
   python-build:
     name: Python Build Tests
     runs-on: ubuntu-latest
@@ -85,6 +72,13 @@ jobs:
           python-version: "3.12"
       - name: Install maturin
         run: pip install "maturin[patchelf]"
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |-
+            py
+            py-sandbox
+          cache-bin: false
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Build Python package
@@ -93,8 +87,7 @@ jobs:
       - name: Build Python sandbox package
         working-directory: py-sandbox
         run: maturin build --release
-
-  # Offline tests drive the built extensions through real HTTP, MCP, and filesystem boundaries.
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
   python-integration:
     name: Python Binding Integration Tests
     runs-on: ubuntu-latest
@@ -116,18 +109,25 @@ jobs:
           python -m venv .venv
           source .venv/bin/activate
           pip install "maturin[patchelf]" mypy pytest pytest-asyncio
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |-
+            py
+            py-sandbox
+          cache-bin: false
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Build and install package
         working-directory: py
         run: |
           source ../.venv/bin/activate
-          maturin develop --release
+          maturin develop
       - name: Build and install sandbox package
         working-directory: py-sandbox
         run: |
           source ../.venv/bin/activate
-          maturin develop --release
+          maturin develop
       - name: Run integration tests
         run: |
           source .venv/bin/activate
@@ -138,3 +138,6 @@ jobs:
           python -m mypy.stubtest chevalier --ignore-missing-stub --allowlist py/stubtest_allowlist.txt
           python -m mypy.stubtest chevalier_sandbox --ignore-missing-stub --allowlist py-sandbox/stubtest_allowlist.txt
           python -m mypy --strict integration_tests/typecheck/python_response_contract.py
+concurrency:
+  group: chevalier-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}

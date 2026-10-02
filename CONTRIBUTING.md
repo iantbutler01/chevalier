@@ -78,3 +78,16 @@ If you're unsure whether something aligns, feel free to open an issue first to d
 ## License
 
 By contributing, you agree that your contributions will be licensed under the Apache-2.0 license.
+
+## Continuous Integration
+
+Ordinary pull requests and pushes to `main` run Rust tests, Clippy, formatting,
+Python binding integration and type-contract checks, and the Linux TypeScript binding
+checks. Python integration uses development builds; release wheel compilation and the
+full native artifact platform matrix run on `v*` tags or manual workflow dispatch.
+Use manual dispatch before release when changing platform-specific native code.
+
+Rust dependency caches cover each actual Cargo workspace and are keyed by the pinned
+toolchain and dependency inputs. npm caches use the binding lockfiles. New pushes
+cancel superseded branch checks; tagged release builds are preserved. Check workflow
+changes locally with `actionlint` before pushing.
