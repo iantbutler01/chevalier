@@ -5,6 +5,7 @@ chevalier_sandbox.ForkOpts
 chevalier_sandbox.HostPciDevice
 chevalier_sandbox.HostPciFunction
 chevalier_sandbox.HostPciInventory
+chevalier_sandbox.MountStateCloneOpts
 chevalier_sandbox.OpenComputerMountOpts
 chevalier_sandbox.OpenComputerProviderOpts
 chevalier_sandbox.PciDeviceAction

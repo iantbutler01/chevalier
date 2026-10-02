@@ -17,6 +17,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{Barrier, Mutex, Notify, mpsc};
 
+const EXECUTION_DEADLINE: Duration = Duration::from_secs(2);
+const HOST_WAIT: Duration = Duration::from_secs(3);
+
 struct ProcessSandbox {
     exited: Arc<AtomicBool>,
     identity: String,
@@ -111,9 +114,9 @@ impl ProgrammaticSandbox for ProcessSandbox {
                     child.wait().await.unwrap()
                 }
             };
+            exited.store(true, Ordering::SeqCst);
             let _ = output_task.await;
             let _ = error_task.await;
-            exited.store(true, Ordering::SeqCst);
             let _ = sender.send(ProgrammaticEvent::Exit {
                 code: status.code().unwrap_or(-1),
             });
@@ -147,7 +150,7 @@ impl ProgrammaticDispatcher for Dispatcher {
             }
             "deny" => Err(Error::NonRetryable("Host approval denied".into())),
             "slow" => {
-                tokio::time::sleep(Duration::from_millis(900)).await;
+                tokio::time::sleep(HOST_WAIT).await;
                 Ok(json!("finished"))
             }
             "wait" => {
@@ -234,13 +237,13 @@ async fn caller_cancellation_settles_dispatch_and_reaps_process_before_return() 
         dispatcher.clone(),
         ProgrammaticOptions {
             cancel: cancel.clone(),
-            timeout: Duration::from_millis(300),
+            timeout: EXECUTION_DEADLINE,
             ..Default::default()
         },
     );
     let cancellation = async {
         dispatcher.entered.notified().await;
-        tokio::time::sleep(Duration::from_millis(900)).await;
+        tokio::time::sleep(HOST_WAIT).await;
         cancel.cancel();
     };
     let (result, ()) = tokio::time::timeout(Duration::from_secs(8), async {
@@ -262,7 +265,7 @@ async fn nested_wait_outlives_execution_deadline_then_returns_its_result() {
         sandbox.clone(),
         dispatcher,
         ProgrammaticOptions {
-            timeout: Duration::from_millis(300),
+            timeout: EXECUTION_DEADLINE,
             ..Default::default()
         },
     )
@@ -283,7 +286,7 @@ async fn deadline_terminates_a_silent_process() {
             sandbox.clone(),
             dispatcher,
             ProgrammaticOptions {
-                timeout: Duration::from_millis(300),
+                timeout: EXECUTION_DEADLINE,
                 ..Default::default()
             },
         ),
@@ -300,7 +303,7 @@ async fn pending_tool_does_not_hide_a_blocked_javascript_event_loop() {
     let result = execute_programmatic(
         "const waiting = tools.wait({}); await new Promise(resolve => setTimeout(resolve, 20)); while (true) {}",
         &tools, sandbox.clone(), dispatcher.clone(),
-        ProgrammaticOptions { timeout: Duration::from_millis(300), ..Default::default() },
+        ProgrammaticOptions { timeout: EXECUTION_DEADLINE, ..Default::default() },
     ).await;
     assert!(result.unwrap_err().to_string().contains("timed out"));
     assert!(dispatcher.cancelled.load(Ordering::SeqCst));
@@ -316,7 +319,7 @@ async fn deadline_resumes_after_nested_tool_completion() {
         sandbox.clone(),
         dispatcher,
         ProgrammaticOptions {
-            timeout: Duration::from_millis(300),
+            timeout: EXECUTION_DEADLINE,
             ..Default::default()
         },
     )
