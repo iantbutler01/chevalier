@@ -386,10 +386,17 @@ impl OAIClient {
         body: serde_json::Value,
         timeout: Option<std::time::Duration>,
     ) -> Result<reqwest::Response> {
-        let client = reqwest::Client::new();
+        let timeout = timeout.unwrap_or(std::time::Duration::from_secs(180));
+        let client = if body.get("stream").and_then(serde_json::Value::as_bool) == Some(true) {
+            reqwest::Client::builder()
+                .connect_timeout(timeout)
+                .read_timeout(timeout)
+                .build()?
+        } else {
+            reqwest::Client::builder().timeout(timeout).build()?
+        };
         let mut req = client
             .post(&self.api_url)
-            .timeout(timeout.unwrap_or(std::time::Duration::from_secs(180)))
             .header("Content-Type", "application/json")
             .json(&body);
 
@@ -596,6 +603,60 @@ impl InferenceClient for OAIClient {
 mod tests {
     use super::*;
     use crate::types::ChatMessage;
+
+    async fn timed_response_server(
+        gap: std::time::Duration,
+        chunks: usize,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\nx", chunks + 1).as_bytes()).await.unwrap();
+            for _ in 0..chunks {
+                tokio::time::sleep(gap).await;
+                if socket.write_all(b"x").await.is_err() {
+                    break;
+                }
+            }
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn streaming_timeout_allows_active_body_beyond_request_deadline() {
+        let (url, server) = timed_response_server(std::time::Duration::from_millis(100), 8).await;
+        let response = OAIClient::new("", "test")
+            .with_api_url(url)
+            .make_request(
+                serde_json::json!({"stream": true}),
+                Some(std::time::Duration::from_millis(500)),
+            )
+            .await
+            .unwrap();
+        let body = response.text().await;
+        server.await.unwrap();
+        assert_eq!(body.unwrap(), "xxxxxxxxx");
+    }
+
+    #[tokio::test]
+    async fn streaming_timeout_still_rejects_an_idle_body() {
+        let (url, server) = timed_response_server(std::time::Duration::from_secs(2), 1).await;
+        let response = OAIClient::new("", "test")
+            .with_api_url(url)
+            .make_request(
+                serde_json::json!({"stream": true}),
+                Some(std::time::Duration::from_millis(500)),
+            )
+            .await
+            .unwrap();
+        let error = response.text().await.unwrap_err();
+        server.abort();
+        assert!(error.is_timeout(), "{error:?}");
+    }
 
     #[test]
     fn openrouter_pin_survives_clone_and_both_request_modes() {
