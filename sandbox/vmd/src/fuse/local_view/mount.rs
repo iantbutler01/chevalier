@@ -1546,12 +1546,82 @@ pub(crate) fn default_state_dir_for_mountpoint(mountpoint: &Path) -> Result<Moun
     ))
 }
 
+/// Start a forked VM's replica from its parent's instead of hydrating it over the network.
+///
+/// The parent's backing tree is copied into `child` (cloned where the filesystem supports
+/// reflinks) and then opened once under the child's own scope, endpoint and tag. That open mints
+/// a fresh owner record and epoch, creates an empty WAL and writes a checkpoint, so the child's
+/// first real mount takes the recovery path and trusts the tree rather than hydrating. The
+/// parent's replica must be fully published: anything still in its WAL would be in the child's
+/// tree but never reach the child's server scope.
+pub(crate) fn clone_mount_state(
+    parent: &MountStateLayout,
+    child: MountLocalViewOptions,
+) -> Result<()> {
+    let owner_path = parent.owner_path();
+    let owner: MountOwnerRecord = serde_json::from_str(
+        std::fs::read_to_string(&owner_path)
+            .with_context(|| format!("read parent mount owner record {}", owner_path.display()))?
+            .trim(),
+    )
+    .with_context(|| format!("decode parent mount owner record {}", owner_path.display()))?;
+    {
+        let wal = MountWal::open(parent, Some(&owner.epoch))
+            .with_context(|| format!("open parent mount WAL in {}", parent.root().display()))?;
+        let state = wal.recovery_state()?;
+        if !state.committed_unacknowledged.is_empty() || !state.unresolved_prepares.is_empty() {
+            bail!(
+                "parent mount {} has {} unpublished and {} unresolved events; refusing to clone it",
+                parent.root().display(),
+                state.committed_unacknowledged.len(),
+                state.unresolved_prepares.len()
+            );
+        }
+    }
+    if !child.layout.is_empty()? {
+        bail!(
+            "fork mount state {} already exists; refusing to overwrite it",
+            child.layout.root().display()
+        );
+    }
+    child.layout.ensure()?;
+    let source = parent.tree_dir();
+    let target = child.layout.tree_dir();
+    // Reflink/clonefile where the filesystem has it (XFS, btrfs, APFS), a byte copy otherwise.
+    #[cfg(target_os = "macos")]
+    const CLONE_FLAG: &str = "-c";
+    #[cfg(not(target_os = "macos"))]
+    const CLONE_FLAG: &str = "--reflink=auto";
+    let status = std::process::Command::new("cp")
+        .arg("-a")
+        .arg(CLONE_FLAG)
+        .arg(format!("{}/.", source.display()))
+        .arg(&target)
+        .status()
+        .context("run cp for the fork replica")?;
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(child.layout.root());
+        bail!(
+            "copying the parent replica {} to {} failed ({status})",
+            source.display(),
+            target.display()
+        );
+    }
+    match MountLocalView::open(child) {
+        Ok(opened) => {
+            drop(opened);
+            Ok(())
+        }
+        Err(error) => Err(error.context("seed the forked replica's owner, WAL and checkpoint")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::{MountLocalView, MountLocalViewOptions, backing_handle_flags, clone_mount_state};
+    use super::{MountLocalView, MountLocalViewOptions, clone_mount_state};
     use crate::fuse::local_view::MountStateLayout;
     use crate::fuse::local_view::types::{
         MountMutation, MountOwnerRecord, PayloadSource, PayloadStorage,
@@ -1571,6 +1641,8 @@ mod tests {
     #[cfg(all(target_os = "macos", feature = "macos-fskit"))]
     #[test]
     fn fskit_uses_read_write_backing_handles_with_permission_fallbacks() {
+        use super::backing_handle_flags;
+
         assert_eq!(
             backing_handle_flags(libc::O_RDONLY) & libc::O_ACCMODE,
             libc::O_RDWR
@@ -1872,75 +1944,5 @@ mod tests {
             Err(error) => error,
         };
         assert!(format!("{error:#}").contains("verify mount event"));
-    }
-}
-
-/// Start a forked VM's replica from its parent's instead of hydrating it over the network.
-///
-/// The parent's backing tree is copied into `child` (cloned where the filesystem supports
-/// reflinks) and then opened once under the child's own scope, endpoint and tag. That open mints
-/// a fresh owner record and epoch, creates an empty WAL and writes a checkpoint, so the child's
-/// first real mount takes the recovery path and trusts the tree rather than hydrating. The
-/// parent's replica must be fully published: anything still in its WAL would be in the child's
-/// tree but never reach the child's server scope.
-pub(crate) fn clone_mount_state(
-    parent: &MountStateLayout,
-    child: MountLocalViewOptions,
-) -> Result<()> {
-    let owner_path = parent.owner_path();
-    let owner: MountOwnerRecord = serde_json::from_str(
-        std::fs::read_to_string(&owner_path)
-            .with_context(|| format!("read parent mount owner record {}", owner_path.display()))?
-            .trim(),
-    )
-    .with_context(|| format!("decode parent mount owner record {}", owner_path.display()))?;
-    {
-        let wal = MountWal::open(parent, Some(&owner.epoch))
-            .with_context(|| format!("open parent mount WAL in {}", parent.root().display()))?;
-        let state = wal.recovery_state()?;
-        if !state.committed_unacknowledged.is_empty() || !state.unresolved_prepares.is_empty() {
-            bail!(
-                "parent mount {} has {} unpublished and {} unresolved events; refusing to clone it",
-                parent.root().display(),
-                state.committed_unacknowledged.len(),
-                state.unresolved_prepares.len()
-            );
-        }
-    }
-    if !child.layout.is_empty()? {
-        bail!(
-            "fork mount state {} already exists; refusing to overwrite it",
-            child.layout.root().display()
-        );
-    }
-    child.layout.ensure()?;
-    let source = parent.tree_dir();
-    let target = child.layout.tree_dir();
-    // Reflink/clonefile where the filesystem has it (XFS, btrfs, APFS), a byte copy otherwise.
-    #[cfg(target_os = "macos")]
-    const CLONE_FLAG: &str = "-c";
-    #[cfg(not(target_os = "macos"))]
-    const CLONE_FLAG: &str = "--reflink=auto";
-    let status = std::process::Command::new("cp")
-        .arg("-a")
-        .arg(CLONE_FLAG)
-        .arg(format!("{}/.", source.display()))
-        .arg(&target)
-        .status()
-        .context("run cp for the fork replica")?;
-    if !status.success() {
-        let _ = std::fs::remove_dir_all(child.layout.root());
-        bail!(
-            "copying the parent replica {} to {} failed ({status})",
-            source.display(),
-            target.display()
-        );
-    }
-    match MountLocalView::open(child) {
-        Ok(opened) => {
-            drop(opened);
-            Ok(())
-        }
-        Err(error) => Err(error.context("seed the forked replica's owner, WAL and checkpoint")),
     }
 }
