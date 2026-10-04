@@ -228,6 +228,15 @@ fn is_degenerate_empty_object_schema(schema: &Value) -> bool {
 
 fn make_schema_nullable(schema: &mut Value) {
     if let Value::Object(map) = schema {
+        // Widening `type` alone leaves enum/const and composed constraints rejecting null.
+        if ["enum", "const", "anyOf", "oneOf", "allOf", "not", "if"]
+            .iter()
+            .any(|key| map.contains_key(*key))
+        {
+            let original = std::mem::take(schema);
+            *schema = serde_json::json!({"anyOf": [original, {"type": "null"}]});
+            return;
+        }
         match map.get_mut("type") {
             Some(Value::String(kind)) => {
                 if kind != "null" {
