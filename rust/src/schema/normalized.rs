@@ -131,7 +131,8 @@ impl ToolParametersSchema {
                         .collect(),
                 ),
             );
-        } else if matches!(self.schema_type, Some(SchemaType::Object)) {
+        } else if !self.required.is_empty() || matches!(self.schema_type, Some(SchemaType::Object))
+        {
             map.insert(
                 "required".to_string(),
                 Value::Array(
@@ -508,5 +509,18 @@ mod tests {
         let parsed = ToolParametersSchema::from_json_schema(&raw).unwrap();
         assert_eq!(parsed.schema_type, Some(SchemaType::String));
         assert!(parsed.any_of.is_empty());
+    }
+
+    #[test]
+    fn preserves_required_in_untyped_alternatives() {
+        let raw = json!({
+            "type": "object",
+            "properties": {"instruction": {"type": "string"}, "script": {"type": "string"}},
+            "anyOf": [{"required": ["instruction"]}, {"required": ["script"]}]
+        });
+        let round_tripped = ToolParametersSchema::from_json_schema(&raw)
+            .unwrap()
+            .to_json_schema();
+        assert_eq!(round_tripped["anyOf"], raw["anyOf"]);
     }
 }
