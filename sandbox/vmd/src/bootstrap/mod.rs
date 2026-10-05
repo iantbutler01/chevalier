@@ -183,7 +183,11 @@ fn build_init_script(
 ) -> String {
     let host_value = shell_escape(hostname);
     let network_setup = build_network_setup_script(network);
-    let proxy_setup = build_proxy_setup_script(http_proxy_url);
+    // A tap guest's TCP is captured by TPROXY into its Envoy listener, which already applies the
+    // egress policy. The guest proxy address belongs to slirp user networking and does not exist
+    // on a tap network, so a client configured with it (git, pip, apt, npm) has its connection
+    // reset; tap guests get the managed proxy files removed instead.
+    let proxy_setup = build_proxy_setup_script(http_proxy_url.filter(|_| network.is_none()));
     let portproxy_auth_setup = build_portproxy_auth_setup_script(portproxy_auth_token);
     let durable_volume_setup = build_durable_volume_setup_script(durable_volume);
     format!(
@@ -1553,6 +1557,27 @@ mod tests {
         assert!(script.contains("rm -f /etc/chevalier/proxy.env"));
         assert!(script.contains("rm -f /etc/profile.d/chevalier-proxy.sh"));
         assert!(script.contains("rm -f /etc/apt/apt.conf.d/90chevalier-proxy"));
+        assert!(script.contains("rm -f /root/.config/pip/pip.conf"));
+    }
+
+    #[test]
+    fn init_script_removes_managed_proxy_files_on_a_tap_network() {
+        let network = NetworkConfig {
+            mac_address: "02:00:00:00:00:10".to_string(),
+            address_cidr: "198.18.0.2/30".to_string(),
+            gateway: "198.18.0.1".to_string(),
+            dns: "198.18.0.1".to_string(),
+        };
+        let script = build_init_script(
+            "vm-test",
+            Some(&network),
+            Some("http://10.0.2.100:3128"),
+            None,
+            false,
+        );
+        assert!(!script.contains("10.0.2.100"));
+        assert!(script.contains("managed guest proxy disabled; removing managed proxy files"));
+        assert!(script.contains("rm -f /root/.gitconfig"));
         assert!(script.contains("rm -f /root/.config/pip/pip.conf"));
     }
 
