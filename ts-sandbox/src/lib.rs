@@ -29,7 +29,27 @@ use napi_derive::napi;
 use tokio::sync::Mutex;
 
 fn sb_err(e: SandboxError) -> napi::Error {
-    napi::Error::new(napi::Status::GenericFailure, format!("Sandbox: {e}"))
+    napi::Error::new(
+        napi::Status::GenericFailure,
+        format!("Sandbox: {}", message_with_causes(&e)),
+    )
+}
+
+/// tonic renders every connection failure as a bare "transport error"; whether
+/// the daemon refused, reset, timed out or failed DNS lives only in the source
+/// chain, so append each cause the message does not already carry.
+fn message_with_causes(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !message.contains(&cause_text) {
+            message.push_str(": ");
+            message.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    message
 }
 
 // ---------------- exec streaming ----------------
