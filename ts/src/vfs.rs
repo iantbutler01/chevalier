@@ -581,6 +581,50 @@ impl VfsStorage {
         to_json(result)
     }
 
+    /// Append a host-local staged tail at `offset` to the stored file.
+    /// `options.ifMatch` must name the content hash of the stored `offset`-byte
+    /// base; `expectedContentHash` names the full resulting file. Conflicts
+    /// whose cause is the base size or the full hash carry the
+    /// `append base mismatch` / `append content hash mismatch` markers.
+    // Runtime-only capability used by the gateway's streamed-append path, kept
+    // out of the generated `VfsStorage` declaration for the same reason as
+    // `write_many_base64`: wrappers that implement the structural storage type
+    // stay valid, and the gateway falls back to a server-side construction for
+    // stores that do not expose it.
+    #[napi(skip_typescript)]
+    pub async fn append_from_file(
+        &self,
+        path: String,
+        tail_path: String,
+        offset: BigInt,
+        expected_content_hash: String,
+        options: Option<Value>,
+    ) -> napi::Result<serde_json::Value> {
+        let (signed, offset, lossless) = offset.get_u64();
+        if signed || !lossless {
+            return Err(invalid_options_err(
+                "invalid VFS append: offset must be a non-negative u64",
+            ));
+        }
+        let precondition = precondition_from_options(options.as_ref())?.ok_or_else(|| {
+            invalid_options_err("invalid VFS append: ifMatch must name the base content hash")
+        })?;
+        let write_options = write_options_from_options(options.as_ref())?;
+        let result = self
+            .inner
+            .append_from_local_file(
+                &path,
+                PathBuf::from(tail_path).as_path(),
+                offset,
+                &expected_content_hash,
+                precondition,
+                write_options,
+            )
+            .await
+            .map_err(vfs_err)?;
+        to_json(result)
+    }
+
     /// Prime the local content-hash cache from durably stored witnesses.
     ///
     /// The cache is per-process, so a restart otherwise forces the next scan to

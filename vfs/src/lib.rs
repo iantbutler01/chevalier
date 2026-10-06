@@ -247,6 +247,40 @@ impl VfsStorageWritePrecondition {
     }
 }
 
+/// Marker carried by every conflict whose cause is that the stored file is not
+/// the `offset`-byte base an append was computed against. Gateways match it to
+/// answer with a precise 409 instead of a generic precondition failure.
+pub const APPEND_BASE_MISMATCH: &str = "append base mismatch";
+
+/// Marker carried by the conflict raised when base + tail does not hash to the
+/// full-file hash the appender declared.
+pub const APPEND_CONTENT_HASH_MISMATCH: &str = "append content hash mismatch";
+
+pub fn append_base_mismatch(path: &str, stored_size: u64, offset: u64) -> VfsStorageError {
+    VfsStorageError::Conflict(format!(
+        "{APPEND_BASE_MISMATCH} for {path}: stored size {stored_size} does not equal append offset {offset}"
+    ))
+}
+
+pub fn append_content_hash_mismatch(path: &str) -> VfsStorageError {
+    VfsStorageError::Conflict(format!("{APPEND_CONTENT_HASH_MISMATCH} for {path}"))
+}
+
+/// The base content hash an append is conditioned on. An append without a
+/// content fingerprint has no base to extend, so it is a malformed request
+/// rather than a conflict.
+pub fn append_base_fingerprint(
+    path: &str,
+    precondition: &VfsStorageWritePrecondition,
+) -> VfsStorageResult<String> {
+    match precondition.effective_predicate() {
+        Some(VfsStorageCasPredicate::ContentFingerprint { fingerprint }) => Ok(fingerprint),
+        _ => Err(VfsStorageError::BadRequest(format!(
+            "append to {path} requires a content_fingerprint precondition naming the base content hash"
+        ))),
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct VfsStorageMetadataFields {
     pub include_object_state: bool,
@@ -533,6 +567,78 @@ pub trait OptimizedVfsStorage: Send + Sync {
             )));
         }
         self.write_with_options(path, Bytes::from(bytes), precondition, options)
+            .await
+    }
+
+    /// Publish a file that only grew: append the host-local `tail_path` bytes
+    /// at `offset` to the stored file and commit the result as one ordinary
+    /// content change.
+    ///
+    /// `precondition` must carry a `content_fingerprint` predicate naming the
+    /// hash of the stored `offset`-byte base; the stored file must be exactly
+    /// `offset` bytes long (otherwise [`append_base_mismatch`]); and the hash
+    /// of base + tail must equal `expected_content_hash` (otherwise
+    /// [`append_content_hash_mismatch`]). Every rejection leaves the stored
+    /// file unchanged. The result reports the full-file hash, exactly as a
+    /// whole-file write of the same bytes would.
+    ///
+    /// This default is a server-side read-modify-write for backends that
+    /// cannot extend an object in place: it reads the base, verifies it,
+    /// and republishes base + tail under the caller's precondition, so a
+    /// concurrent writer still loses the CAS. It saves the network transfer of
+    /// the base, not the backend's storage cost. Backends with a native
+    /// in-place append override it.
+    async fn append_from_local_file(
+        &self,
+        path: &str,
+        tail_path: &Path,
+        offset: u64,
+        expected_content_hash: &str,
+        precondition: VfsStorageWritePrecondition,
+        options: Option<VfsStorageWriteOptions>,
+    ) -> VfsStorageResult<VfsStorageWriteResult> {
+        let base_hash = append_base_fingerprint(path, &precondition)?;
+        let tail = std::fs::read(tail_path).map_err(|error| {
+            VfsStorageError::Internal(format!("read staged VFS append tail: {error}"))
+        })?;
+        let base = match self.read(path).await {
+            Ok(bytes) => bytes,
+            Err(VfsStorageError::NotFound(_)) => {
+                return Err(VfsStorageError::Conflict(format!(
+                    "append precondition failed for {path}: no stored file"
+                )));
+            }
+            Err(error) => return Err(error),
+        };
+        let current_hash = pack::hex_hash(&base);
+        if current_hash != base_hash {
+            // A retried append whose first attempt committed: the stored file
+            // already is the requested result. Mirror whole-file writes, which
+            // complete such an exact replay as an unchanged success.
+            if current_hash == expected_content_hash
+                && base.len() as u64 == offset.saturating_add(tail.len() as u64)
+            {
+                return Ok(VfsStorageWriteResult {
+                    path: path.to_string(),
+                    content_hash: current_hash.clone(),
+                    previous_hash: Some(current_hash),
+                    changed: false,
+                });
+            }
+            return Err(VfsStorageError::Conflict(format!(
+                "append precondition failed for {path}"
+            )));
+        }
+        if base.len() as u64 != offset {
+            return Err(append_base_mismatch(path, base.len() as u64, offset));
+        }
+        let mut full = Vec::with_capacity(base.len() + tail.len());
+        full.extend_from_slice(&base);
+        full.extend_from_slice(&tail);
+        if pack::hex_hash(&full) != expected_content_hash {
+            return Err(append_content_hash_mismatch(path));
+        }
+        self.write_with_options(path, Bytes::from(full), Some(precondition), options)
             .await
     }
 

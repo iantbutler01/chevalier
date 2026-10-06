@@ -1417,6 +1417,41 @@ impl OptimizedVfsStorage for LocalVfsStorage {
         .await
     }
 
+    /// In-place append: the base bytes are read once to verify the base hash
+    /// and to carry the hash state into the tail, and are never rewritten. The
+    /// tail is written at `offset` into the existing inode only after the full
+    /// result has been verified, so a rejected append changes nothing.
+    async fn append_from_local_file(
+        &self,
+        path: &str,
+        tail_path: &Path,
+        offset: u64,
+        expected_content_hash: &str,
+        precondition: VfsStorageWritePrecondition,
+        options: Option<VfsStorageWriteOptions>,
+    ) -> VfsStorageResult<VfsStorageWriteResult> {
+        let base_hash = crate::append_base_fingerprint(path, &precondition)?;
+        let path = path.to_string();
+        let tail_path = tail_path.to_path_buf();
+        let expected_content_hash = expected_content_hash.to_string();
+        let _locks = self.lock_write_paths([path.clone()]).await;
+        self.run_blocking(move |storage| {
+            append_in_place(
+                &storage,
+                AppendRequest {
+                    path: &path,
+                    tail_path: &tail_path,
+                    offset,
+                    base_hash: &base_hash,
+                    expected_content_hash: &expected_content_hash,
+                    precondition: &precondition,
+                    options: options.as_ref(),
+                },
+            )
+        })
+        .await
+    }
+
     async fn write_many_atomic(
         &self,
         writes: Vec<VfsStorageWrite>,
@@ -2572,6 +2607,165 @@ fn install_staged_file_preserving_identity(
     }
 }
 
+struct AppendRequest<'a> {
+    path: &'a str,
+    tail_path: &'a Path,
+    offset: u64,
+    base_hash: &'a str,
+    expected_content_hash: &'a str,
+    precondition: &'a VfsStorageWritePrecondition,
+    options: Option<&'a VfsStorageWriteOptions>,
+}
+
+/// Extend one stored regular file in place, in O(tail) writes.
+///
+/// The base is read once, to verify its hash and to carry the hash state into
+/// the tail; it is never rewritten. The full-file hash is verified before the
+/// first tail byte is written, so every rejection leaves the file untouched.
+///
+/// Visibility: the caller holds the path's write lock, and every in-process
+/// read, stat and range read takes its read lock, so nothing served by this
+/// storage observes the file mid-append. An out-of-process reader of the host
+/// directory can see the base plus a prefix of the tail while the write is in
+/// flight -- never altered base bytes. A failure after the first tail byte
+/// truncates back to `offset`. Both windows are narrower than a whole-file
+/// rewrite of the same inode, which truncates to zero before copying (identity
+/// is preserved on purpose; see `install_staged_file_preserving_identity`).
+fn append_in_place(
+    storage: &LocalVfsStorage,
+    request: AppendRequest<'_>,
+) -> VfsStorageResult<VfsStorageWriteResult> {
+    let AppendRequest {
+        path,
+        tail_path,
+        offset,
+        base_hash,
+        expected_content_hash,
+        precondition,
+        options,
+    } = request;
+    let precondition_failed =
+        || VfsStorageError::Conflict(format!("local vfs append precondition failed for {path}"));
+    let abs_path = storage.abs_path(path)?;
+    storage.assert_no_symlink_ancestor(&abs_path)?;
+    storage.assert_expected_file_id(path, precondition)?;
+    let mut tail = open_regular_file(tail_path)?;
+    let tail_len = tail
+        .metadata()
+        .map_err(|error| VfsStorageError::Internal(error.to_string()))?
+        .len();
+    let appended_len = offset.checked_add(tail_len).ok_or_else(|| {
+        VfsStorageError::BadRequest(format!("append to {path} overflows the file size"))
+    })?;
+    let existing = match fs::symlink_metadata(&abs_path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return Err(precondition_failed()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(precondition_failed());
+        }
+        Err(error) => return Err(VfsStorageError::Internal(error.to_string())),
+    };
+    let replay = || -> VfsStorageResult<VfsStorageWriteResult> {
+        // A retried append whose first attempt committed: the stored file
+        // already is the requested result. Complete it the way whole-file
+        // writes complete an exact replay -- re-assert durability and mode,
+        // report an unchanged success.
+        let replay = ExactWriteReplay {
+            path: path.to_string(),
+            destination: abs_path.clone(),
+            content_hash: expected_content_hash.to_string(),
+            requested_options: options.cloned(),
+        };
+        complete_exact_write_replays(storage, &[replay])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| VfsStorageError::Internal("append replay returned no result".into()))
+    };
+
+    if existing.len() != offset {
+        let current_hash = storage.hash_file_for_metadata(&abs_path, &existing, None)?;
+        if existing.len() == appended_len && current_hash.as_deref() == Some(expected_content_hash)
+        {
+            return replay();
+        }
+        if current_hash.as_deref() == Some(base_hash) {
+            return Err(crate::append_base_mismatch(path, existing.len(), offset));
+        }
+        return Err(precondition_failed());
+    }
+
+    let mut base = open_regular_file(&abs_path)?;
+    let opened = base
+        .metadata()
+        .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+    if !metadata_identity_matches(&existing, &opened) || opened.len() != offset {
+        return Err(precondition_failed());
+    }
+    let mut hasher = chevalier_vfs_hash::ContentHasher::new();
+    #[cfg(test)]
+    storage.hash_read_count.fetch_add(1, AtomicOrdering::SeqCst);
+    if hash_reader_into(&mut (&mut base).take(offset), &mut hasher)? != offset {
+        return Err(precondition_failed());
+    }
+    let current_hash = hasher.digest();
+    if current_hash != base_hash {
+        if tail_len == 0 && current_hash == expected_content_hash {
+            return replay();
+        }
+        return Err(precondition_failed());
+    }
+    if hash_reader_into(&mut (&mut tail).take(tail_len), &mut hasher)? != tail_len {
+        return Err(VfsStorageError::Internal(format!(
+            "staged VFS append tail for {path} changed while it was hashed"
+        )));
+    }
+    let content_hash = hasher.finalize();
+    if content_hash != expected_content_hash {
+        return Err(crate::append_content_hash_mismatch(path));
+    }
+
+    let previous_mode = if options.is_some() {
+        existing_regular_file_mode(&abs_path)?
+    } else {
+        None
+    };
+    let mut target = open_existing_regular_file_for_rewrite(&abs_path, &existing)?;
+    let written = (|| -> VfsStorageResult<()> {
+        tail.seek(SeekFrom::Start(0))
+            .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+        target
+            .seek(SeekFrom::Start(offset))
+            .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+        let copied = std::io::copy(&mut (&mut tail).take(tail_len), &mut target)
+            .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+        if copied != tail_len {
+            return Err(VfsStorageError::Internal(format!(
+                "staged VFS append tail for {path} shrank while it was written"
+            )));
+        }
+        apply_write_options(&abs_path, options, previous_mode)?;
+        storage.sync_file(&target, &abs_path)
+    })();
+    if let Err(error) = written {
+        // Restore the verified base. Best effort: the original error is what
+        // the caller must see, and the base bytes were never touched.
+        let _ = target.set_len(offset).and_then(|()| target.sync_all());
+        storage.invalidate_hash(&abs_path);
+        return Err(error);
+    }
+    let metadata = target
+        .metadata()
+        .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
+    storage.invalidate_hash_identity(&existing);
+    storage.remember_written_hash(&abs_path, &metadata, content_hash.clone());
+    Ok(VfsStorageWriteResult {
+        path: path.to_string(),
+        changed: content_hash != base_hash,
+        previous_hash: Some(base_hash.to_string()),
+        content_hash,
+    })
+}
+
 fn open_regular_file_write_only(path: &Path) -> std::io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.write(true);
@@ -2985,17 +3179,27 @@ fn hash_open_file(file: &mut fs::File) -> VfsStorageResult<String> {
     // the machine's cores instead of one -- that is what turns hashing from the
     // bottleneck into something the disk outruns.
     let mut hasher = chevalier_vfs_hash::ContentHasher::new();
+    hash_reader_into(file, &mut hasher)?;
+    Ok(hasher.finalize())
+}
+
+/// Feed `reader` to EOF into `hasher`; returns the number of bytes absorbed.
+fn hash_reader_into(
+    reader: &mut impl Read,
+    hasher: &mut chevalier_vfs_hash::ContentHasher,
+) -> VfsStorageResult<u64> {
     let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut total = 0_u64;
     loop {
-        let read = file
+        let read = reader
             .read(&mut buffer)
             .map_err(|error| VfsStorageError::Internal(error.to_string()))?;
         if read == 0 {
-            break;
+            return Ok(total);
         }
         hasher.update(&buffer[..read]);
+        total += read as u64;
     }
-    Ok(hasher.finalize())
 }
 
 fn open_regular_file(path: &Path) -> VfsStorageResult<fs::File> {
@@ -6917,6 +7121,318 @@ mod tests {
             fs::read(dir.path().join("large.bin")).expect("read after rejection"),
             payload
         );
+    }
+
+    fn stage_tail(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, bytes).expect("stage append tail");
+        path
+    }
+
+    fn appended(base: &[u8], tail: &[u8]) -> Vec<u8> {
+        [base, tail].concat()
+    }
+
+    #[tokio::test]
+    async fn local_append_extends_the_same_inode_reading_the_base_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staging = tempfile::tempdir().expect("staging");
+        let storage = LocalVfsStorage::new(dir.path());
+        let base: Vec<u8> = (0..3 * 1024 * 1024 + 17).map(|i| (i % 251) as u8).collect();
+        let written = storage
+            .write("logs/run.log", Bytes::from(base.clone()), None)
+            .await
+            .expect("base write");
+        let before = storage.stat("logs/run.log").await.unwrap().unwrap();
+        let tail = b"line 1\nline 2\n".repeat(1000);
+        let full = appended(&base, &tail);
+        let expected = hex_hash(&full);
+        let hash_reads = storage.hash_read_count();
+
+        let result = storage
+            .append_from_local_file(
+                "logs/run.log",
+                &stage_tail(staging.path(), "tail", &tail),
+                base.len() as u64,
+                &expected,
+                VfsStorageWritePrecondition::content_fingerprint(written.content_hash.clone()),
+                None,
+            )
+            .await
+            .expect("append");
+
+        assert_eq!(result.content_hash, expected);
+        assert_eq!(result.previous_hash, Some(written.content_hash));
+        assert!(result.changed);
+        assert_eq!(storage.hash_read_count() - hash_reads, 1, "one base pass");
+        assert_eq!(fs::read(dir.path().join("logs/run.log")).unwrap(), full);
+        let after = storage.stat("logs/run.log").await.unwrap().unwrap();
+        assert_eq!(after.content_hash.as_deref(), Some(expected.as_str()));
+        assert_eq!(after.size_bytes, full.len() as u64);
+        assert_eq!(after.file_id, before.file_id, "append keeps inode identity");
+        assert_eq!(
+            storage.hash_read_count() - hash_reads,
+            1,
+            "the appended hash is a trusted write, not re-read on stat"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_append_rejections_leave_the_file_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staging = tempfile::tempdir().expect("staging");
+        let storage = LocalVfsStorage::new(dir.path());
+        let base = b"0123456789".to_vec();
+        let base_hash = storage
+            .write("app.log", Bytes::from(base.clone()), None)
+            .await
+            .expect("base")
+            .content_hash;
+        let tail_path = stage_tail(staging.path(), "tail", b"tail");
+        let expected = hex_hash(&appended(&base, b"tail"));
+        let assert_unchanged = |label: &str| {
+            assert_eq!(
+                fs::read(dir.path().join("app.log")).unwrap(),
+                base,
+                "{label} must not modify the stored file"
+            );
+        };
+
+        let stale_base = storage
+            .append_from_local_file(
+                "app.log",
+                &tail_path,
+                10,
+                &expected,
+                VfsStorageWritePrecondition::content_fingerprint(hex_hash(b"other")),
+                None,
+            )
+            .await
+            .expect_err("stale base hash");
+        assert!(
+            matches!(stale_base, VfsStorageError::Conflict(_)),
+            "{stale_base:?}"
+        );
+        assert_unchanged("a stale base hash");
+
+        let wrong_offset = storage
+            .append_from_local_file(
+                "app.log",
+                &tail_path,
+                8,
+                &expected,
+                VfsStorageWritePrecondition::content_fingerprint(base_hash.clone()),
+                None,
+            )
+            .await
+            .expect_err("offset disagrees with stored size");
+        assert!(
+            matches!(&wrong_offset, VfsStorageError::Conflict(message)
+                if message.contains(crate::APPEND_BASE_MISMATCH) && message.contains("stored size 10")),
+            "{wrong_offset:?}"
+        );
+        assert_unchanged("a wrong offset");
+
+        let wrong_full_hash = storage
+            .append_from_local_file(
+                "app.log",
+                &tail_path,
+                10,
+                &hex_hash(b"not the result"),
+                VfsStorageWritePrecondition::content_fingerprint(base_hash.clone()),
+                None,
+            )
+            .await
+            .expect_err("full hash mismatch");
+        assert!(
+            matches!(&wrong_full_hash, VfsStorageError::Conflict(message)
+                if message.contains(crate::APPEND_CONTENT_HASH_MISMATCH)),
+            "{wrong_full_hash:?}"
+        );
+        assert_unchanged("a wrong full-file hash");
+        assert_eq!(
+            storage.stat("app.log").await.unwrap().unwrap().content_hash,
+            Some(base_hash.clone())
+        );
+
+        for precondition in [
+            VfsStorageWritePrecondition::absent(),
+            VfsStorageWritePrecondition {
+                expected_file_id: Some("unix:1:2:3:4".to_string()),
+                ..VfsStorageWritePrecondition::default()
+            },
+        ] {
+            let malformed = storage
+                .append_from_local_file("app.log", &tail_path, 10, &expected, precondition, None)
+                .await
+                .expect_err("append without a base fingerprint");
+            assert!(
+                matches!(malformed, VfsStorageError::BadRequest(_)),
+                "{malformed:?}"
+            );
+        }
+        assert_unchanged("a malformed append");
+
+        let missing = storage
+            .append_from_local_file(
+                "missing.log",
+                &tail_path,
+                0,
+                &hex_hash(b"tail"),
+                VfsStorageWritePrecondition::content_fingerprint(hex_hash(b"")),
+                None,
+            )
+            .await
+            .expect_err("no base file");
+        assert!(
+            matches!(missing, VfsStorageError::Conflict(_)),
+            "{missing:?}"
+        );
+        assert!(!dir.path().join("missing.log").exists());
+    }
+
+    #[tokio::test]
+    async fn local_append_retry_after_commit_is_an_unchanged_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staging = tempfile::tempdir().expect("staging");
+        let storage = LocalVfsStorage::new(dir.path());
+        let base_hash = storage
+            .write("retry.log", Bytes::from_static(b"base"), None)
+            .await
+            .unwrap()
+            .content_hash;
+        let tail_path = stage_tail(staging.path(), "tail", b"+tail");
+        let expected = hex_hash(b"base+tail");
+        let append = || {
+            storage.append_from_local_file(
+                "retry.log",
+                &tail_path,
+                4,
+                &expected,
+                VfsStorageWritePrecondition::content_fingerprint(base_hash.clone()),
+                None,
+            )
+        };
+
+        let first = append().await.expect("first append");
+        assert!(first.changed);
+        let retry = append().await.expect("retried append replays");
+        assert!(!retry.changed);
+        assert_eq!(retry.content_hash, expected);
+        assert_eq!(
+            fs::read(dir.path().join("retry.log")).unwrap(),
+            b"base+tail"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_append_extends_a_read_only_file_and_keeps_its_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staging = tempfile::tempdir().expect("staging");
+        let storage = LocalVfsStorage::new(dir.path());
+        let base_hash = storage
+            .write("ro.log", Bytes::from_static(b"frozen"), None)
+            .await
+            .unwrap()
+            .content_hash;
+        storage.set_mode("ro.log", 0o444).await.expect("chmod");
+
+        storage
+            .append_from_local_file(
+                "ro.log",
+                &stage_tail(staging.path(), "tail", b" more"),
+                6,
+                &hex_hash(b"frozen more"),
+                VfsStorageWritePrecondition::content_fingerprint(base_hash),
+                None,
+            )
+            .await
+            .expect("append to a 0444 file, as an open guest handle could");
+        assert_eq!(fs::read(dir.path().join("ro.log")).unwrap(), b"frozen more");
+        assert_eq!(path_mode(&dir.path().join("ro.log")), 0o444);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn local_append_is_never_observed_partially_and_races_resolve_to_one_winner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staging = tempfile::tempdir().expect("staging");
+        let storage = LocalVfsStorage::new(dir.path());
+        let base = vec![b'b'; 1024 * 1024];
+        let base_hash = storage
+            .write("race.log", Bytes::from(base.clone()), None)
+            .await
+            .unwrap()
+            .content_hash;
+        let left_tail = vec![b'L'; 8 * 1024 * 1024];
+        let right_tail = vec![b'R'; 8 * 1024 * 1024 + 1];
+        let left_full = appended(&base, &left_tail);
+        let right_full = appended(&base, &right_tail);
+        let left_path = stage_tail(staging.path(), "left", &left_tail);
+        let right_path = stage_tail(staging.path(), "right", &right_tail);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let storage = storage.clone();
+            let stop = stop.clone();
+            let (base, left_full, right_full) =
+                (base.clone(), left_full.clone(), right_full.clone());
+            tokio::spawn(async move {
+                let mut observed = 0_usize;
+                while !stop.load(AtomicBoolOrdering::SeqCst) {
+                    let bytes = storage.read("race.log").await.expect("read");
+                    assert!(
+                        bytes[..] == base[..]
+                            || bytes[..] == left_full[..]
+                            || bytes[..] == right_full[..],
+                        "observed a partial append of {} bytes",
+                        bytes.len()
+                    );
+                    observed += 1;
+                    tokio::task::yield_now().await;
+                }
+                observed
+            })
+        };
+
+        let precondition = VfsStorageWritePrecondition::content_fingerprint(base_hash);
+        let (left_hash, right_hash) = (hex_hash(&left_full), hex_hash(&right_full));
+        let (left, right) = tokio::join!(
+            storage.append_from_local_file(
+                "race.log",
+                &left_path,
+                base.len() as u64,
+                &left_hash,
+                precondition.clone(),
+                None,
+            ),
+            storage.append_from_local_file(
+                "race.log",
+                &right_path,
+                base.len() as u64,
+                &right_hash,
+                precondition,
+                None,
+            ),
+        );
+        stop.store(true, AtomicBoolOrdering::SeqCst);
+        assert!(reader.await.expect("reader task") > 0);
+
+        assert_eq!(
+            [left.is_ok(), right.is_ok()]
+                .iter()
+                .filter(|ok| **ok)
+                .count(),
+            1,
+            "exactly one append wins: {left:?} / {right:?}"
+        );
+        let loser = if left.is_ok() { &right } else { &left };
+        assert!(
+            matches!(loser, Err(VfsStorageError::Conflict(_))),
+            "{loser:?}"
+        );
+        let stored = fs::read(dir.path().join("race.log")).unwrap();
+        assert_eq!(stored, if left.is_ok() { left_full } else { right_full });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -2477,4 +2477,82 @@ mod tests {
         assert!(matches!(err, VfsStorageError::Conflict(_)));
         assert_eq!(&storage.read("notes/a.md").await.unwrap()[..], b"alpha");
     }
+
+    #[tokio::test]
+    async fn object_storage_append_republishes_base_plus_tail_under_the_base_cas() {
+        let (storage, _dir) = object_storage();
+        let staging = tempfile::tempdir().expect("staging");
+        let tail_path = staging.path().join("tail");
+        std::fs::write(&tail_path, b" + tail").expect("stage tail");
+        let base_hash = storage
+            .write("logs/a.log", Bytes::from_static(b"base"), None)
+            .await
+            .expect("base")
+            .content_hash;
+        let expected = hex_hash(b"base + tail");
+        let append = |offset: u64, expected: String, base: String| {
+            let tail_path = tail_path.clone();
+            let storage = &storage;
+            async move {
+                storage
+                    .append_from_local_file(
+                        "logs/a.log",
+                        &tail_path,
+                        offset,
+                        &expected,
+                        VfsStorageWritePrecondition::content_fingerprint(base),
+                        None,
+                    )
+                    .await
+            }
+        };
+
+        let stale = append(4, expected.clone(), hex_hash(b"other")).await;
+        assert!(
+            matches!(stale, Err(VfsStorageError::Conflict(_))),
+            "{stale:?}"
+        );
+        let wrong_offset = append(3, expected.clone(), base_hash.clone()).await;
+        assert!(
+            matches!(&wrong_offset, Err(VfsStorageError::Conflict(message))
+                if message.contains(crate::APPEND_BASE_MISMATCH)),
+            "{wrong_offset:?}"
+        );
+        let wrong_hash = append(4, hex_hash(b"nope"), base_hash.clone()).await;
+        assert!(
+            matches!(&wrong_hash, Err(VfsStorageError::Conflict(message))
+                if message.contains(crate::APPEND_CONTENT_HASH_MISMATCH)),
+            "{wrong_hash:?}"
+        );
+        assert_eq!(&storage.read("logs/a.log").await.unwrap()[..], b"base");
+
+        let result = append(4, expected.clone(), base_hash.clone())
+            .await
+            .expect("append");
+        assert_eq!(result.content_hash, expected);
+        assert_eq!(result.previous_hash, Some(base_hash.clone()));
+        assert!(result.changed);
+        assert_eq!(
+            &storage.read("logs/a.log").await.unwrap()[..],
+            b"base + tail"
+        );
+        assert_eq!(
+            storage
+                .stat("logs/a.log")
+                .await
+                .unwrap()
+                .unwrap()
+                .content_hash,
+            Some(expected.clone())
+        );
+
+        let retry = append(4, expected.clone(), base_hash)
+            .await
+            .expect("replay");
+        assert!(!retry.changed);
+        assert_eq!(
+            &storage.read("logs/a.log").await.unwrap()[..],
+            b"base + tail"
+        );
+    }
 }

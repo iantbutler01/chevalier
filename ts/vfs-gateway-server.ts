@@ -33,6 +33,14 @@
 //                                           protocol, not a separate HTTP 412 path.
 //                                           Fingerprint is `contentHash`: SHA-256 hex
 //                                           of the current logical file bytes.
+//                                           Streamed (`x-chevalier-vfs-stream-upload: 1`)
+//                                           bodies are verified against
+//                                           `x-chevalier-vfs-expected-content-sha256`.
+//                                           `x-chevalier-vfs-append-offset: N` makes the
+//                                           body the tail after an N-byte base named by
+//                                           the content_fingerprint precondition; the
+//                                           expected hash still names the full file.
+//                                           Base size != N -> 409 "append base mismatch".
 //   - DELETE {owner}/file?path=&return_metadata=true -> 200 {previous}; same precondition
 //   - PUT/DELETE {owner}/dir?path=       -> 2xx
 //   - PUT  {owner}/symlink?path=&target= -> 2xx
@@ -43,7 +51,9 @@
 //   DTOs are snake_case; `kind` is exactly "file" | "directory"; errors map
 //   404->NotFound, 400->BadRequest, 409->Conflict (vfs/src/gateway.rs:1016).
 import { createHash, randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { mkdtemp, open, readFile, rm } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { VfsContentHasher } from "./native.js";
@@ -58,6 +68,18 @@ const EXECUTABLE_HEADER = "x-chevalier-vfs-executable";
 const MODE_HEADER = "x-chevalier-vfs-mode";
 const EXPECTED_CONTENT_HASH_HEADER = "x-chevalier-vfs-expected-content-sha256";
 const STREAM_UPLOAD_HEADER = "x-chevalier-vfs-stream-upload";
+/** Decimal byte length of the stored base a streamed upload extends. Present
+ *  only on appends: the body is then the tail `[offset, offset + len)`, the
+ *  content_fingerprint precondition names the base hash, and the expected
+ *  content hash names the FULL resulting file. */
+const APPEND_OFFSET_HEADER = "x-chevalier-vfs-append-offset";
+/** Conflict markers shared with the vfs crate (`APPEND_BASE_MISMATCH`,
+ *  `APPEND_CONTENT_HASH_MISMATCH`), kept verbatim in 409 bodies so an appender
+ *  can tell a moved base from a bad tail. */
+const APPEND_BASE_MISMATCH = "append base mismatch";
+const APPEND_CONTENT_HASH_MISMATCH = "append content hash mismatch";
+/** Chunk size for the server-side append construction's base copy. */
+const APPEND_BASE_COPY_CHUNK_BYTES = 8 * 1024 * 1024;
 const RANGE_FINGERPRINT_HEADER = "x-chevalier-vfs-range-fingerprint";
 const NAMESPACE_REVISION_HEADER = "x-chevalier-vfs-namespace-revision";
 const LEASE_MODE_HEADER = "x-chevalier-vfs-lease-mode";
@@ -990,18 +1012,28 @@ type StreamingBase64Write = Omit<StreamingWrite, "body"> & {
   body_base64: string;
 };
 
+type StreamingWriteOptions = {
+  ifMatch?: string | null;
+  expectedFileId?: string | null;
+  executable?: boolean;
+  mode?: number;
+};
+
 type StreamingVfsStorage = VfsStorage & {
   readRange?: (path: string, offset: bigint, length: number) => Promise<Buffer>;
   writeFromFile?: (
     path: string,
     sourcePath: string,
     expectedContentHash: string,
-    options?: {
-      ifMatch?: string | null;
-      expectedFileId?: string | null;
-      executable?: boolean;
-      mode?: number;
-    } | null,
+    options?: StreamingWriteOptions | null,
+  ) => Promise<unknown>;
+  /** Native in-place append (`VfsStorage.appendFromFile`, runtime-only). */
+  appendFromFile?: (
+    path: string,
+    tailPath: string,
+    offset: bigint,
+    expectedContentHash: string,
+    options?: StreamingWriteOptions | null,
   ) => Promise<unknown>;
   writeMany?: (writes: StreamingWrite[]) => Promise<StreamingWriteManyResult[]>;
   writeManyBase64?: (writes: StreamingBase64Write[]) => Promise<StreamingWriteManyResult[]>;
@@ -1355,9 +1387,23 @@ export function createVfsGatewayServer(
         const precondition = requestPrecondition(req, q);
         const expectedFileId = requestExpectedFileId(req);
         const writeOptions = requestWriteOptions(req);
-        const failed = await enforceFingerprintPrecondition(store, relPath, precondition);
+        const streamed = req.headers.get(STREAM_UPLOAD_HEADER) === "1";
+        const appendOffset = requestAppendOffset(req);
+        if (appendOffset instanceof Response) return appendOffset;
+        if (appendOffset !== null) {
+          if (!streamed) {
+            return errorResponse(400, `${APPEND_OFFSET_HEADER} requires ${STREAM_UPLOAD_HEADER}: 1`);
+          }
+          if (!precondition.present || precondition.predicate.kind !== "content_fingerprint") {
+            return errorResponse(
+              400,
+              `${APPEND_OFFSET_HEADER} requires a content_fingerprint precondition naming the base content hash`,
+            );
+          }
+        }
+        const failed = await enforceFingerprintPrecondition(store, relPath, precondition, appendOffset);
         if (failed !== null) return failed;
-        if (req.headers.get(STREAM_UPLOAD_HEADER) === "1") {
+        if (streamed) {
           const expectedHash = req.headers.get(EXPECTED_CONTENT_HASH_HEADER)?.trim().toLowerCase() ?? "";
           if (!/^[a-f0-9]{64}$/.test(expectedHash)) {
             return errorResponse(400, `${EXPECTED_CONTENT_HASH_HEADER} must be a 64-character content digest`);
@@ -1371,7 +1417,9 @@ export function createVfsGatewayServer(
             // Must be the same digest the storage layer computes (BLAKE3, see
             // pack::hex_hash). This verifies the client's declared hash, so a
             // mismatch in algorithm would fail every upload's integrity check.
-            const hasher = new VfsContentHasher();
+            // An append body is only the tail; its declared hash names the
+            // full file, which the storage append verifies against base + tail.
+            const hasher = appendOffset === null ? new VfsContentHasher() : null;
             let received = 0;
             try {
               const reader = req.body?.getReader();
@@ -1380,20 +1428,8 @@ export function createVfsGatewayServer(
                   const { done, value } = await reader.read();
                   if (done) break;
                   if (value.byteLength === 0) continue;
-                  hasher.update(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
-                  let offset = 0;
-                  while (offset < value.byteLength) {
-                    const { bytesWritten } = await staged.write(
-                      value,
-                      offset,
-                      value.byteLength - offset,
-                      null,
-                    );
-                    if (bytesWritten === 0) {
-                      throw new Error(`streamed upload made no write progress for ${relPath}`);
-                    }
-                    offset += bytesWritten;
-                  }
+                  hasher?.update(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
+                  await writeFully(staged, value, relPath);
                   received += value.byteLength;
                 }
               }
@@ -1404,7 +1440,7 @@ export function createVfsGatewayServer(
             if (declaredLength !== null && received !== declaredLength) {
               return errorResponse(400, `streamed upload length mismatch for ${relPath}`);
             }
-            if (hasher.digest() !== expectedHash) {
+            if (hasher !== null && hasher.digest() !== expectedHash) {
               return errorResponse(409, `streamed upload hash mismatch for ${relPath}`);
             }
             const streamingStore = store as StreamingVfsStorage;
@@ -1414,9 +1450,16 @@ export function createVfsGatewayServer(
             };
             const publication = await publications.transact(ownerId, async () => {
               const result =
-                typeof streamingStore.writeFromFile === "function"
-                  ? await streamingStore.writeFromFile(relPath, stagedPath, expectedHash, options)
-                  : await store.write(relPath, await readFile(stagedPath), options);
+                appendOffset === null
+                  ? await installStagedFile(streamingStore, relPath, stagedPath, expectedHash, options)
+                  : await appendStagedTail(streamingStore, {
+                      path: relPath,
+                      tailPath: stagedPath,
+                      offset: appendOffset,
+                      expectedHash,
+                      options,
+                      scratchDir: stagedDir,
+                    });
               const value = result as {
                 content_hash?: string;
                 contentHash?: string;
@@ -2706,9 +2749,125 @@ function conflictResponseFromStoreError(error: unknown, path: string): Response 
     message.includes("status=409") ||
     /\bconflict:/i.test(message)
   ) {
-    return errorResponse(409, `precondition failed for ${path}`);
+    const appendCause = [APPEND_BASE_MISMATCH, APPEND_CONTENT_HASH_MISMATCH].find((marker) =>
+      message.includes(marker),
+    );
+    return errorResponse(
+      409,
+      appendCause === undefined
+        ? `precondition failed for ${path}`
+        : message.slice(message.indexOf(appendCause)),
+    );
   }
   return null;
+}
+
+/** `null` when the request is not an append; a 400 when the header is present
+ *  but is not a safe non-negative decimal integer. */
+function requestAppendOffset(req: Request): number | null | Response {
+  const raw = req.headers.get(APPEND_OFFSET_HEADER);
+  if (raw === null) return null;
+  const text = raw.trim();
+  const value = Number(text);
+  if (!/^\d+$/.test(text) || !Number.isSafeInteger(value)) {
+    return errorResponse(400, `${APPEND_OFFSET_HEADER} must be a non-negative decimal integer`);
+  }
+  return value;
+}
+
+function appendConflict(message: string): Error {
+  return Object.assign(new Error(`VFS_CONFLICT conflict: ${message}`), {
+    code: "VFS_CONFLICT",
+    status: 409,
+  });
+}
+
+async function writeFully(handle: FileHandle, chunk: Uint8Array, path: string): Promise<void> {
+  let offset = 0;
+  while (offset < chunk.byteLength) {
+    const { bytesWritten } = await handle.write(chunk, offset, chunk.byteLength - offset, null);
+    if (bytesWritten === 0) {
+      throw new Error(`streamed upload made no write progress for ${path}`);
+    }
+    offset += bytesWritten;
+  }
+}
+
+/** Publish a staged whole file: the store's bounded-memory install when it has
+ *  one, otherwise a buffered write under the same precondition. */
+async function installStagedFile(
+  store: StreamingVfsStorage,
+  path: string,
+  stagedPath: string,
+  expectedHash: string,
+  options: StreamingWriteOptions,
+): Promise<unknown> {
+  return typeof store.writeFromFile === "function"
+    ? store.writeFromFile(path, stagedPath, expectedHash, options)
+    : store.write(path, await readFile(stagedPath), options);
+}
+
+/**
+ * Apply a staged append tail. Stores exposing the native append (the local
+ * backend: true in-place O(tail) write) get it directly. Any other store gets
+ * a server-side construction: base (read back from the store) + tail is staged
+ * beside the tail, checked against the declared full hash, and published as an
+ * ordinary whole-file write under the base-hash precondition. That still saves
+ * the network transfer of the base; the store pays a full rewrite.
+ */
+async function appendStagedTail(
+  store: StreamingVfsStorage,
+  append: {
+    path: string;
+    tailPath: string;
+    offset: number;
+    expectedHash: string;
+    options: StreamingWriteOptions;
+    scratchDir: string;
+  },
+): Promise<unknown> {
+  const { path, tailPath, offset, expectedHash, options, scratchDir } = append;
+  if (typeof store.appendFromFile === "function") {
+    return store.appendFromFile(path, tailPath, BigInt(offset), expectedHash, options);
+  }
+  const fullPath = join(scratchDir, "appended");
+  const full = await open(fullPath, "wx", 0o600);
+  const hasher = new VfsContentHasher();
+  const absorb = async (chunk: Uint8Array) => {
+    hasher.update(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+    await writeFully(full, chunk, path);
+  };
+  try {
+    let copied = 0;
+    if (typeof store.readRange === "function") {
+      while (copied < offset) {
+        const length = Math.min(APPEND_BASE_COPY_CHUNK_BYTES, offset - copied);
+        const chunk = await store.readRange(path, BigInt(copied), length);
+        if (chunk.byteLength === 0) break;
+        await absorb(chunk);
+        copied += chunk.byteLength;
+      }
+    } else {
+      const base = await store.read(path);
+      if (base.byteLength === offset) {
+        await absorb(base);
+        copied = offset;
+      }
+    }
+    if (copied !== offset) {
+      throw appendConflict(`${APPEND_BASE_MISMATCH} for ${path}: stored base is shorter than append offset ${offset}`);
+    }
+    for await (const chunk of createReadStream(tailPath)) {
+      await absorb(chunk as Buffer);
+    }
+    await full.sync();
+  } finally {
+    await full.close();
+  }
+  if (hasher.digest() !== expectedHash) {
+    throw appendConflict(`${APPEND_CONTENT_HASH_MISMATCH} for ${path}`);
+  }
+  return installStagedFile(store, path, fullPath, expectedHash, options);
 }
 
 function parseOptionalNonNegativeInteger(
@@ -2770,6 +2929,7 @@ async function enforceFingerprintPrecondition(
   store: VfsStorage,
   path: string,
   precondition: FingerprintPrecondition,
+  appendOffset: number | null = null,
 ): Promise<Response | null> {
   if (!precondition.present) return null;
   const cur = await store.stat(path);
@@ -2779,6 +2939,15 @@ async function enforceFingerprintPrecondition(
     (precondition.predicate.kind === "content_fingerprint" &&
       precondition.predicate.fingerprint === curHash)
   ) {
+    // An append also needs the base it extends to be exactly `offset` bytes.
+    // Storage re-checks under its own lock; this answers early, before the
+    // tail is staged.
+    if (appendOffset !== null && cur !== null && BigInt(cur.sizeBytes) !== BigInt(appendOffset)) {
+      return errorResponse(
+        409,
+        `${APPEND_BASE_MISMATCH} for ${path}: stored size ${cur.sizeBytes} does not equal append offset ${appendOffset}`,
+      );
+    }
     return null;
   }
   // CAS mismatch -> 409 Conflict; the file is NOT touched (no clobber).

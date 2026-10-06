@@ -46,10 +46,15 @@ const EXECUTABLE_HEADER: &str = "x-chevalier-vfs-executable";
 const MODE_HEADER: &str = "x-chevalier-vfs-mode";
 const EXPECTED_CONTENT_HASH_HEADER: &str = "x-chevalier-vfs-expected-content-sha256";
 const STREAM_UPLOAD_HEADER: &str = "x-chevalier-vfs-stream-upload";
+/// Decimal byte length of the stored base a streamed upload extends. Its
+/// presence turns the body into the tail `[offset, offset + len)`; the
+/// expected-content hash still names the full resulting file.
+const APPEND_OFFSET_HEADER: &str = "x-chevalier-vfs-append-offset";
 const MAX_PATH_BATCH_ITEMS: usize = 4096;
 const DEFAULT_COMPONENT: &str = "vfs_gateway_storage";
 const DEFAULT_REASON: &str = "gateway vfs storage mutation";
 const OP_WRITE: &str = "vfs_write_through";
+const OP_STREAM_APPEND: &str = "vfs_stream_append";
 const OP_MKDIR: &str = "vfs_mkdir";
 const OP_UNLINK: &str = "vfs_unlink";
 const OP_RMDIR: &str = "vfs_rmdir";
@@ -113,6 +118,15 @@ pub struct GatewayVfsStorage {
     cfg: GatewayVfsStorageConfig,
     client: Client,
     implicit_leases: Arc<AtomicBool>,
+}
+
+struct StreamedPut<'a> {
+    path: &'a str,
+    source_path: &'a Path,
+    expected_content_hash: &'a str,
+    precondition: Option<&'a VfsStorageWritePrecondition>,
+    options: Option<VfsStorageWriteOptions>,
+    append_offset: Option<u64>,
 }
 
 impl GatewayVfsStorage {
@@ -281,6 +295,66 @@ impl GatewayVfsStorage {
             builder = builder.header(PRECONDITION_FILE_ID_HEADER, file_id);
         }
         builder
+    }
+
+    /// Stream one host-local file as a `PUT /file` body: the whole file for a
+    /// streamed write, or only the tail for an append at `append_offset`.
+    async fn put_streamed_file(&self, put: StreamedPut<'_>) -> VfsStorageResult<()> {
+        let metadata = tokio::fs::metadata(put.source_path)
+            .await
+            .map_err(|error| {
+                VfsStorageError::Internal(format!("stat staged VFS upload: {error}"))
+            })?;
+        if !metadata.is_file() {
+            return Err(VfsStorageError::BadRequest(
+                "staged VFS upload source is not a regular file".to_string(),
+            ));
+        }
+        let lease = self
+            .acquire_lease(put.path, 1, self.cfg.mutation_reason.as_str())
+            .await?;
+        let file = tokio::fs::File::open(put.source_path)
+            .await
+            .map_err(|error| {
+                VfsStorageError::Internal(format!("open staged VFS upload: {error}"))
+            })?;
+        let body =
+            reqwest::Body::wrap(StreamBody::new(ReaderStream::new(file).map_ok(Frame::data)));
+        let transfer_seconds = metadata.len().div_ceil(128 * 1024).max(300);
+        let mut request = self
+            .client
+            .put(self.url("/file"))
+            .query(&[("path", self.path_arg(put.path))])
+            .header(STREAM_UPLOAD_HEADER, "1")
+            .header(EXPECTED_CONTENT_HASH_HEADER, put.expected_content_hash)
+            .header(header::CONTENT_LENGTH, metadata.len())
+            .timeout(Duration::from_secs(transfer_seconds));
+        if let Some(offset) = put.append_offset {
+            request = request.header(APPEND_OFFSET_HEADER, offset.to_string());
+        }
+        let operation = if put.append_offset.is_some() {
+            OP_STREAM_APPEND
+        } else {
+            OP_WRITE
+        };
+        let mut request = self.mutation_headers_with_precondition(
+            request.body(body),
+            &lease,
+            operation,
+            put.precondition,
+        );
+        if let Some(options) = put.options {
+            let executable = options
+                .mode
+                .map(|mode| normalize_vfs_mode(mode) & 0o111 != 0)
+                .unwrap_or(options.executable);
+            request = request.header(EXECUTABLE_HEADER, executable.to_string());
+            if let Some(mode) = options.mode {
+                request = request.header(MODE_HEADER, normalize_vfs_mode(mode).to_string());
+            }
+        }
+        let result = self.send(request).await.map(|_| ());
+        self.release_after(&lease, result).await
     }
 
     async fn release_after<T>(
@@ -629,14 +703,6 @@ impl OptimizedVfsStorage for GatewayVfsStorage {
         precondition: Option<VfsStorageWritePrecondition>,
         options: Option<VfsStorageWriteOptions>,
     ) -> VfsStorageResult<VfsStorageWriteResult> {
-        let metadata = tokio::fs::metadata(source_path).await.map_err(|error| {
-            VfsStorageError::Internal(format!("stat staged VFS upload: {error}"))
-        })?;
-        if !metadata.is_file() {
-            return Err(VfsStorageError::BadRequest(
-                "staged VFS upload source is not a regular file".to_string(),
-            ));
-        }
         let expected_content_hash = expected_content_hash.ok_or_else(|| {
             VfsStorageError::BadRequest(
                 "streamed gateway writes require an expected content hash".to_string(),
@@ -646,46 +712,50 @@ impl OptimizedVfsStorage for GatewayVfsStorage {
             .stat(path)
             .await?
             .and_then(|metadata| metadata.content_hash);
-        let lease = self
-            .acquire_lease(path, 1, self.cfg.mutation_reason.as_str())
-            .await?;
-        let file = tokio::fs::File::open(source_path).await.map_err(|error| {
-            VfsStorageError::Internal(format!("open staged VFS upload: {error}"))
-        })?;
-        let body =
-            reqwest::Body::wrap(StreamBody::new(ReaderStream::new(file).map_ok(Frame::data)));
-        let transfer_seconds = metadata.len().div_ceil(128 * 1024).max(300);
-        let mut request = self.mutation_headers_with_precondition(
-            self.client
-                .put(self.url("/file"))
-                .query(&[("path", self.path_arg(path))])
-                .header(STREAM_UPLOAD_HEADER, "1")
-                .header(EXPECTED_CONTENT_HASH_HEADER, expected_content_hash)
-                .header(header::CONTENT_LENGTH, metadata.len())
-                .timeout(Duration::from_secs(transfer_seconds))
-                .body(body),
-            &lease,
-            OP_WRITE,
-            precondition.as_ref(),
-        );
-        if let Some(options) = options {
-            let executable = options
-                .mode
-                .map(|mode| normalize_vfs_mode(mode) & 0o111 != 0)
-                .unwrap_or(options.executable);
-            request = request.header(EXECUTABLE_HEADER, executable.to_string());
-            if let Some(mode) = options.mode {
-                request = request.header(MODE_HEADER, normalize_vfs_mode(mode).to_string());
-            }
-        }
-        let content_hash = expected_content_hash.to_string();
-        let result = self.send(request).await.map(|_| VfsStorageWriteResult {
+        self.put_streamed_file(StreamedPut {
+            path,
+            source_path,
+            expected_content_hash,
+            precondition: precondition.as_ref(),
+            options,
+            append_offset: None,
+        })
+        .await?;
+        Ok(VfsStorageWriteResult {
             path: path.to_string(),
-            changed: previous_hash.as_deref() != Some(content_hash.as_str()),
-            previous_hash: previous_hash.clone(),
-            content_hash,
-        });
-        self.release_after(&lease, result).await
+            changed: previous_hash.as_deref() != Some(expected_content_hash),
+            previous_hash,
+            content_hash: expected_content_hash.to_string(),
+        })
+    }
+
+    /// Send only the tail. The gateway verifies the base (hash and size)
+    /// and the full-file hash before it applies anything.
+    async fn append_from_local_file(
+        &self,
+        path: &str,
+        tail_path: &Path,
+        offset: u64,
+        expected_content_hash: &str,
+        precondition: VfsStorageWritePrecondition,
+        options: Option<VfsStorageWriteOptions>,
+    ) -> VfsStorageResult<VfsStorageWriteResult> {
+        let base_hash = crate::append_base_fingerprint(path, &precondition)?;
+        self.put_streamed_file(StreamedPut {
+            path,
+            source_path: tail_path,
+            expected_content_hash,
+            precondition: Some(&precondition),
+            options,
+            append_offset: Some(offset),
+        })
+        .await?;
+        Ok(VfsStorageWriteResult {
+            path: path.to_string(),
+            changed: base_hash != expected_content_hash,
+            previous_hash: Some(base_hash),
+            content_hash: expected_content_hash.to_string(),
+        })
     }
 
     async fn write_many_atomic(
@@ -2132,6 +2202,80 @@ mod tests {
         assert_eq!(upload_request.body, "stream me");
         let release_request = requests.recv().expect("release request");
         assert_eq!(release_request.target, "/lease");
+    }
+
+    #[tokio::test]
+    async fn gateway_append_sends_only_the_tail_with_base_and_full_hash() {
+        let staged = tempfile::NamedTempFile::new().expect("staged tail");
+        std::fs::write(staged.path(), b" world").expect("write staged tail");
+        let base_hash = hex_hash(b"hello");
+        let expected = hex_hash(b"hello world");
+        let (endpoint, requests) = serve_sequence(vec![
+            r#"{"resource_key":"rk","owner_token":"ot"}"#.to_string(),
+            String::new(),
+            String::new(),
+        ]);
+        let storage =
+            GatewayVfsStorage::new(GatewayVfsStorageConfig::new(endpoint).with_scope_path("scope"));
+
+        let result = storage
+            .append_from_local_file(
+                "log.txt",
+                staged.path(),
+                5,
+                &expected,
+                VfsStorageWritePrecondition::content_fingerprint(base_hash.clone()),
+                None,
+            )
+            .await
+            .expect("append upload");
+        assert_eq!(result.content_hash, expected);
+        assert_eq!(result.previous_hash.as_deref(), Some(base_hash.as_str()));
+        assert!(result.changed);
+
+        let lease_request = requests.recv().expect("lease request");
+        assert_eq!(lease_request.target, "/lease");
+        let upload = requests.recv().expect("upload request");
+        assert_eq!(upload.method, "PUT");
+        assert_query_value(&upload.target, "path", "scope/log.txt");
+        for header in [
+            "x-chevalier-vfs-stream-upload: 1".to_string(),
+            "x-chevalier-vfs-append-offset: 5".to_string(),
+            "x-chevalier-vfs-operation: vfs_stream_append".to_string(),
+            "x-chevalier-vfs-precondition-kind: content_fingerprint".to_string(),
+            format!("x-chevalier-vfs-precondition-fingerprint: {base_hash}"),
+            format!("x-chevalier-vfs-expected-content-sha256: {expected}"),
+            "content-length: 6".to_string(),
+        ] {
+            assert!(
+                upload.headers.contains(&header),
+                "missing `{header}` in {}",
+                upload.headers
+            );
+        }
+        assert_eq!(upload.body, " world");
+        let release_request = requests.recv().expect("release request");
+        assert_eq!(release_request.target, "/lease");
+    }
+
+    #[tokio::test]
+    async fn gateway_append_without_a_base_fingerprint_is_rejected_locally() {
+        let staged = tempfile::NamedTempFile::new().expect("staged tail");
+        let storage = GatewayVfsStorage::new(GatewayVfsStorageConfig::new(
+            "http://127.0.0.1:9".to_string(),
+        ));
+        let error = storage
+            .append_from_local_file(
+                "log.txt",
+                staged.path(),
+                0,
+                &hex_hash(b""),
+                VfsStorageWritePrecondition::absent(),
+                None,
+            )
+            .await
+            .expect_err("append needs a base");
+        assert!(matches!(error, VfsStorageError::BadRequest(_)));
     }
 
     #[tokio::test]
