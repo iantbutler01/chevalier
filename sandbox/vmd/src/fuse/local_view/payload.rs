@@ -125,6 +125,24 @@ struct StoreState {
 struct CapturedFile {
     length: u64,
     content_hash: String,
+    /// Hash state positioned after the captured bytes, so a caller that keeps
+    /// it can extend the content hash by later appended bytes without
+    /// re-reading what was captured.
+    hasher: ContentHasher,
+}
+
+/// A full-content snapshot of a backing file that no WAL record references.
+///
+/// The publisher takes one when a gateway refuses an append, so it can publish
+/// that generation's exact bytes instead. It is never part of a sync round and
+/// never durable: the name stays reserved (so compaction cannot reclaim it)
+/// until [`PayloadStore::release_snapshot`] removes it, and a crash leaves an
+/// unreferenced payload name that the next open reclaims.
+pub(crate) struct CapturedSnapshot {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    pub(crate) length: u64,
+    pub(crate) content_hash: String,
 }
 
 /// Owns `<state_dir>/payloads` and every byte inside it.
@@ -218,11 +236,15 @@ impl PayloadStore {
     /// A 1 GiB generation must never be materialized in one heap allocation.
     /// `expected_len`, when supplied, is the length the caller believes the
     /// source has; a mismatch is an error rather than a silently short payload.
+    ///
+    /// Also returns the hash state positioned after the captured bytes. The
+    /// seal keeps it for a large file so the next append generation hashes only
+    /// its new bytes.
     pub(crate) fn capture_file(
         &self,
         source: &Path,
         expected_len: Option<u64>,
-    ) -> Result<PayloadRef> {
+    ) -> Result<(PayloadRef, ContentHasher)> {
         let name = self.reserve_dedicated()?;
         let path = self.directory.join(&name);
         let captured = match capture_dedicated_file(source, &path, expected_len) {
@@ -236,12 +258,80 @@ impl PayloadStore {
             }
         };
         self.register_dedicated(&name)?;
+        Ok((
+            PayloadRef {
+                storage: PayloadStorage::DedicatedFile { file: name },
+                length: captured.length,
+                hash_algorithm: algorithm().as_str().to_string(),
+                content_hash: captured.content_hash,
+            },
+            captured.hasher,
+        ))
+    }
+
+    /// Capture exactly `length` bytes of `source` starting at `offset` into a
+    /// dedicated payload: the new bytes of a large append generation. A source
+    /// that ends before `offset + length` is an error, never a short payload.
+    pub(crate) fn capture_range(
+        &self,
+        source: &Path,
+        offset: u64,
+        length: u64,
+    ) -> Result<PayloadRef> {
+        let name = self.reserve_dedicated()?;
+        let path = self.directory.join(&name);
+        let captured = match capture_dedicated_range(source, &path, offset, length) {
+            Ok(captured) => captured,
+            Err(error) => {
+                self.discard_partial(&name, &path);
+                return Err(error);
+            }
+        };
+        self.register_dedicated(&name)?;
         Ok(PayloadRef {
             storage: PayloadStorage::DedicatedFile { file: name },
             length: captured.length,
             hash_algorithm: algorithm().as_str().to_string(),
             content_hash: captured.content_hash,
         })
+    }
+
+    /// Snapshot the first `length` bytes of `source` outside the WAL. See
+    /// [`CapturedSnapshot`]; the caller must hand it back to
+    /// [`Self::release_snapshot`].
+    pub(crate) fn capture_snapshot(&self, source: &Path, length: u64) -> Result<CapturedSnapshot> {
+        let name = self.reserve_dedicated()?;
+        let path = self.directory.join(&name);
+        match capture_dedicated_range(source, &path, 0, length) {
+            Ok(captured) => Ok(CapturedSnapshot {
+                name,
+                path,
+                length: captured.length,
+                content_hash: captured.content_hash,
+            }),
+            Err(error) => {
+                self.discard_partial(&name, &path);
+                Err(error)
+            }
+        }
+    }
+
+    /// Remove a snapshot and release its reservation.
+    pub(crate) fn release_snapshot(&self, snapshot: &CapturedSnapshot) {
+        self.discard_partial(&snapshot.name, &snapshot.path);
+    }
+
+    /// Where a payload's bytes live: the payload file, the offset of the first
+    /// byte and the length. Valid for both storage shapes, so a streamed upload
+    /// can chain dedicated files and packed segment ranges in one body.
+    pub(crate) fn location(&self, payload: &PayloadRef) -> Result<(PathBuf, u64, u64)> {
+        let name = payload.storage.file();
+        validate_payload_name(name)?;
+        Ok((
+            self.directory.join(name),
+            payload.storage.offset(),
+            payload.length,
+        ))
     }
 
     /// Bounded reader over exactly the payload's byte range.
@@ -274,7 +364,7 @@ impl PayloadStore {
     }
 
     /// Whole payload as bytes. Only valid below the publisher's streaming
-    /// threshold; callers above it must use [`Self::dedicated_path`].
+    /// threshold; callers above it stream from [`Self::location`].
     pub(crate) fn read_all(&self, payload: &PayloadRef) -> Result<Vec<u8>> {
         let mut reader = self.open_reader(payload)?;
         // The reader is already clamped to `payload.length`, so the reserve is
@@ -295,20 +385,6 @@ impl PayloadStore {
             );
         }
         Ok(bytes)
-    }
-
-    /// The on-disk path of a dedicated payload file, for a streamed upload.
-    /// `None` for a segment-packed payload, whose bytes must be read instead.
-    pub(crate) fn dedicated_path(&self, payload: &PayloadRef) -> Option<PathBuf> {
-        match &payload.storage {
-            PayloadStorage::DedicatedFile { file } => {
-                if validate_payload_name(file).is_err() {
-                    return None;
-                }
-                Some(self.directory.join(file))
-            }
-            PayloadStorage::Segment { .. } => None,
-        }
     }
 
     /// Re-read a payload and prove its length, algorithm and hash still match.
@@ -830,7 +906,8 @@ fn stream_capture(
     }
     Ok(CapturedFile {
         length,
-        content_hash: hasher.finalize(),
+        content_hash: hasher.digest(),
+        hasher,
     })
 }
 
@@ -853,8 +930,118 @@ fn hash_captured_file(destination: &Path) -> Result<CapturedFile> {
     }
     Ok(CapturedFile {
         length,
-        content_hash: hasher.finalize(),
+        content_hash: hasher.digest(),
+        hasher,
     })
+}
+
+/// Copy exactly `length` bytes of `source` from `offset` into a new file at
+/// `destination` through the fixed buffer, hashing as it goes. Positional reads
+/// leave the source's file offset alone, and a source that ends early fails
+/// the capture instead of producing a short payload.
+fn capture_dedicated_range(
+    source: &Path,
+    destination: &Path,
+    offset: u64,
+    length: u64,
+) -> Result<CapturedFile> {
+    let input =
+        File::open(source).with_context(|| format!("open payload source {}", source.display()))?;
+    let mut output = create_new(destination)?;
+    let mut hasher = ContentHasher::new();
+    let mut buffer = vec![
+        0_u8;
+        COPY_BUFFER_BYTES
+            .min(usize::try_from(length).unwrap_or(usize::MAX))
+            .max(1)
+    ];
+    let mut copied = 0_u64;
+    while copied < length {
+        let want =
+            usize::try_from((length - copied).min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = input
+            .read_at(&mut buffer[..want], offset.saturating_add(copied))
+            .with_context(|| format!("read payload source {}", source.display()))?;
+        if read == 0 {
+            bail!(
+                "payload source {} ended at byte {} while capturing {length} bytes from {offset}",
+                source.display(),
+                offset.saturating_add(copied)
+            );
+        }
+        output
+            .write_all(&buffer[..read])
+            .with_context(|| format!("write mount payload {}", destination.display()))?;
+        hasher.update(&buffer[..read]);
+        copied = copied.saturating_add(read as u64);
+    }
+    Ok(CapturedFile {
+        length: copied,
+        content_hash: hasher.digest(),
+        hasher,
+    })
+}
+
+/// Absorb exactly `length` bytes of `source` from `offset` into `hasher`
+/// through the fixed buffer. A source that ends early is an error, so the hash
+/// can never silently describe fewer bytes than the caller asked for.
+///
+/// The seal uses it to extend a held hash state by an append's new bytes, and
+/// -- once per lineage, when no state is held (after a restart) -- to hash the
+/// previous generation's bytes, so a large file's first append costs one read
+/// of the file and every later one costs only its new bytes.
+pub(crate) fn hash_file_range(
+    hasher: &mut ContentHasher,
+    source: &Path,
+    offset: u64,
+    length: u64,
+) -> Result<()> {
+    let input =
+        File::open(source).with_context(|| format!("open backing file {}", source.display()))?;
+    let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
+    let mut hashed = 0_u64;
+    while hashed < length {
+        let want =
+            usize::try_from((length - hashed).min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let position = offset.saturating_add(hashed);
+        let read = input
+            .read_at(&mut buffer[..want], position)
+            .with_context(|| format!("read backing file {}", source.display()))?;
+        if read == 0 {
+            bail!(
+                "backing file {} ended at byte {position} while hashing {length} bytes from \
+                 {offset}",
+                source.display()
+            );
+        }
+        hasher.update(&buffer[..read]);
+        hashed = hashed.saturating_add(read as u64);
+    }
+    Ok(())
+}
+
+/// Read exactly `length` bytes of `source` from `offset`. Only for ranges at or
+/// below `MAX_SEGMENTED_PAYLOAD_BYTES`: the new bytes of a small append.
+pub(crate) fn read_file_range(source: &Path, offset: u64, length: u64) -> Result<Vec<u8>> {
+    let length = usize::try_from(length)
+        .ok()
+        .filter(|length| *length <= MAX_SEGMENTED_PAYLOAD_BYTES)
+        .ok_or_else(|| {
+            anyhow!(
+                "refusing to read {length} bytes of {} into memory",
+                source.display()
+            )
+        })?;
+    let input =
+        File::open(source).with_context(|| format!("open backing file {}", source.display()))?;
+    let mut bytes = vec![0_u8; length];
+    input.read_exact_at(&mut bytes, offset).with_context(|| {
+        format!(
+            "read {length} bytes at {offset} of backing file {}",
+            source.display()
+        )
+    })?;
+    Ok(bytes)
 }
 
 #[cfg(test)]

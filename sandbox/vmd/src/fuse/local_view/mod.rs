@@ -40,10 +40,27 @@ pub(crate) mod tree;
 pub(crate) mod types;
 pub(crate) mod wal;
 
+#[cfg(test)]
+mod append_publication_tests;
+
 /// Bumped whenever a record or checkpoint field changes meaning. A mount whose
-/// durable state carries a different version fails closed rather than replaying
-/// records it may misinterpret.
-pub(crate) const WAL_FORMAT_VERSION: u32 = 2;
+/// durable state carries a version outside [`MIN_READABLE_WAL_FORMAT_VERSION`]
+/// ..= this one fails closed rather than replaying records it may misinterpret.
+///
+/// * 2 -- the mount-local WAL.
+/// * 3 -- adds the `append_file` content mutation. Every v2 record means the
+///   same thing under v3, so a v2 state directory is read unchanged; everything
+///   written from now on carries 3, so an older vmd that cannot interpret an
+///   append fails closed on the version instead of misreading the log.
+pub(crate) const WAL_FORMAT_VERSION: u32 = 3;
+
+/// Oldest durable format this build replays. See [`WAL_FORMAT_VERSION`].
+pub(crate) const MIN_READABLE_WAL_FORMAT_VERSION: u32 = 2;
+
+/// Whether durable state written under `version` can be replayed by this build.
+pub(crate) fn readable_wal_format(version: u32) -> bool {
+    (MIN_READABLE_WAL_FORMAT_VERSION..=WAL_FORMAT_VERSION).contains(&version)
+}
 
 /// Largest single WAL line accepted during replay. Payloads are by reference, so
 /// this bounds record framing only -- never file content.
@@ -54,6 +71,11 @@ pub(crate) const SEGMENT_TARGET_BYTES: u64 = 16 * 1024 * 1024;
 
 /// A payload at or below this size is packed into a shared segment; anything
 /// larger gets its own immutable file so the publisher can stream it.
+///
+/// It is also the append threshold: a file larger than this whose content only
+/// grew since its last sealed generation seals an `AppendFile` carrying just the
+/// new bytes, instead of snapshotting and re-uploading the whole file. Files at
+/// or below it stay on the packed whole-file path, where a copy is cheap.
 pub(crate) const MAX_SEGMENTED_PAYLOAD_BYTES: usize = 1024 * 1024;
 
 /// Soft rotate threshold for one WAL log generation. Sealed generations are

@@ -37,6 +37,19 @@
 //! This collapses the dominant copy/install pattern even when many worker tasks
 //! interleave their operations across unrelated files.
 //!
+//! ## Append generations
+//!
+//! An `AppendFile` generation publishes as a streamed `PUT /file` carrying only
+//! its new bytes: `x-chevalier-vfs-append-offset` names the base length, a
+//! `content_fingerprint` precondition names the base hash and the
+//! expected-content header names the whole result's hash. The WAL folds
+//! consecutive appends onto the content event they extend, so a burst of closes
+//! uploads as one request. A refused append (`400`/`409`/`412`) is never sent
+//! again: its generation's exact full content is recovered from the backing
+//! file (wherever later renames moved it, verified by hash) and published as a
+//! whole-file write, or, when a later accepted event already superseded those
+//! bytes, the append is complete without a request.
+//!
 //! ## Crash-safe idempotency
 //!
 //! `operation_ids` are **not** deduplicated across requests by the gateway: it
@@ -63,7 +76,7 @@
 //! backends consume the same ordered batches and acknowledge the same sequence
 //! semantics. There is no backend-specific path here and there must never be one.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -72,6 +85,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chevalier_sandbox::vfs::{
     VfsMetadata as RemoteMetadata, VfsNamespaceMutation, VfsWritePrecondition,
 };
+use reqwest::StatusCode;
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
@@ -81,9 +95,10 @@ use super::types::{
     DrainOutcome, LocalKind, MountEvent, MountMutation, PreImageState, PublicationHealth,
     PublishBatch, PublishRun, StoragePressure, dependency_sets_conflict,
 };
-use super::wal::{MountWal, WalNotify};
+use super::wal::{ContentSuccessor, FileSnapshot, MountWal, WalNotify};
 use crate::fuse::client::{
-    RemotePublication, RemoteVfsClient, RemoteWrite, rejected_request_status,
+    RemotePublication, RemoteVfsClient, RemoteWrite, StreamedWrite, UploadSegment,
+    VfsRequestStatusError, rejected_request_status,
 };
 
 /// The `base_content_hash` value `scope_remote_write` turns into
@@ -160,6 +175,36 @@ impl std::fmt::Debug for AuthoritativePathSource {
     }
 }
 
+/// Recovers a sealed generation's full bytes from the mount's backing tree.
+///
+/// Called with `(path, size, content_hash)` after the gateway refused an append:
+/// the mount snapshots the first `size` bytes of the backing file at `path` and
+/// returns the snapshot only when they hash to `content_hash`, i.e. only when
+/// they are exactly that generation. The publisher never resolves or reads a
+/// backing path itself.
+#[derive(Clone)]
+pub(crate) struct GenerationSource(
+    Arc<dyn Fn(&str, u64, &str) -> Result<Option<FileSnapshot>> + Send + Sync>,
+);
+
+impl GenerationSource {
+    pub(crate) fn new(
+        source: impl Fn(&str, u64, &str) -> Result<Option<FileSnapshot>> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(source))
+    }
+
+    fn snapshot(&self, path: &str, size: u64, content_hash: &str) -> Result<Option<FileSnapshot>> {
+        (self.0)(path, size, content_hash)
+    }
+}
+
+impl std::fmt::Debug for GenerationSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GenerationSource")
+    }
+}
+
 /// Tunables the mount passes in, defaulted from the module constants.
 #[derive(Clone, Debug)]
 pub(crate) struct PublisherOptions {
@@ -177,6 +222,10 @@ pub(crate) struct PublisherOptions {
     /// Current local path state, used only to resolve ambiguous replayed
     /// namespace operations after a gateway rejection.
     pub(crate) authoritative_paths: Option<AuthoritativePathSource>,
+    /// Full-content recovery for a rejected append. Without it a rejected
+    /// append is retained and retried until a later whole-file generation of
+    /// the path supersedes it.
+    pub(crate) generations: Option<GenerationSource>,
 }
 
 impl PublisherOptions {
@@ -191,6 +240,7 @@ impl PublisherOptions {
             surface_kind: surface_kind.to_string(),
             tree_generation: None,
             authoritative_paths: None,
+            generations: None,
         }
     }
 
@@ -201,6 +251,11 @@ impl PublisherOptions {
 
     pub(crate) fn with_authoritative_paths(mut self, source: AuthoritativePathSource) -> Self {
         self.authoritative_paths = Some(source);
+        self
+    }
+
+    pub(crate) fn with_generations(mut self, source: GenerationSource) -> Self {
+        self.generations = Some(source);
         self
     }
 }
@@ -342,6 +397,12 @@ struct PublisherState {
     blocked_sequence: Option<u64>,
     blocked_reason: Option<String>,
     last_error: Option<String>,
+    /// Sequences of append generations the gateway has already refused. An
+    /// append is never re-sent once refused: a later pass that still has to
+    /// publish it goes straight to its full-content fallback. Pruned as the
+    /// cursor passes them; a restart forgets them, which costs at most one more
+    /// refused request per append.
+    rejected_appends: BTreeSet<u64>,
 }
 
 struct PublisherShared {
@@ -553,6 +614,11 @@ impl PublisherShared {
             .with_context(|| {
                 format!("acknowledge vfs mount publication through {through_sequence}")
             })?;
+        let mut state = self.state();
+        state.rejected_appends = state
+            .rejected_appends
+            .split_off(&through_sequence.saturating_add(1));
+        drop(state);
         self.progress.notify_waiters();
         Ok(())
     }
@@ -805,7 +871,24 @@ impl PublisherShared {
         let requests = self.plan_content_requests(&events)?;
         let permits = Arc::new(Semaphore::new(self.options.concurrency.max(1)));
         let mut tasks: JoinSet<ContentTaskResult> = JoinSet::new();
+        let mut failures: Vec<(Vec<MountEvent>, anyhow::Error)> = Vec::new();
         for request in requests {
+            if let Some(sequence) = refused_append(&request.events)
+                && self.state().rejected_appends.contains(&sequence)
+            {
+                // Sending it again cannot succeed; reconcile it as the
+                // rejection it already received.
+                failures.push((
+                    request.events,
+                    anyhow::Error::new(VfsRequestStatusError {
+                        status: StatusCode::CONFLICT,
+                    })
+                    .context(format!(
+                        "append generation {sequence} was already refused by the gateway"
+                    )),
+                ));
+                continue;
+            }
             let client = self.client.clone();
             let wal = self.wal.clone();
             let surface_kind = self.options.surface_kind.clone();
@@ -825,12 +908,18 @@ impl PublisherShared {
         }
 
         let mut publications: Vec<RemotePublication> = Vec::new();
-        let mut failures: Vec<(Vec<MountEvent>, anyhow::Error)> = Vec::new();
         while let Some(joined) = tasks.join_next().await {
             let result = joined.context("join vfs mount content publication task")?;
             match result.outcome {
                 Ok(publication) => publications.push(publication),
-                Err(error) => failures.push((result.events, error)),
+                Err(error) => {
+                    if let Some(sequence) = refused_append(&result.events)
+                        && rejected_request_status(&error).is_some()
+                    {
+                        self.state().rejected_appends.insert(sequence);
+                    }
+                    failures.push((result.events, error));
+                }
             }
         }
 
@@ -857,20 +946,21 @@ impl PublisherShared {
         let mut batched: Vec<MountEvent> = Vec::new();
         let mut batched_bytes: u64 = 0;
         for event in events {
-            let payload = event
-                .payload
-                .as_ref()
-                .ok_or_else(|| anyhow!("content event {} carries no payload", event.sequence))?;
-            if payload.length >= self.options.stream_threshold_bytes {
+            if event.payload.is_none() {
+                bail!("content event {} carries no payload", event.sequence);
+            }
+            let kind = self.content_request_kind(event);
+            if kind != ContentRequestKind::Batched {
                 requests.push(ContentRequest {
-                    kind: ContentRequestKind::Streamed,
+                    kind,
                     events: vec![event.clone()],
                 });
                 continue;
             }
+            let length = event.wire_payload_length();
             if !batched.is_empty()
                 && (batched.len() >= chunk_events
-                    || batched_bytes.saturating_add(payload.length) > chunk_bytes)
+                    || batched_bytes.saturating_add(length) > chunk_bytes)
             {
                 requests.push(ContentRequest {
                     kind: ContentRequestKind::Batched,
@@ -878,7 +968,7 @@ impl PublisherShared {
                 });
                 batched_bytes = 0;
             }
-            batched_bytes = batched_bytes.saturating_add(payload.length);
+            batched_bytes = batched_bytes.saturating_add(length);
             batched.push(event.clone());
         }
         if !batched.is_empty() {
@@ -888,6 +978,20 @@ impl PublisherShared {
             });
         }
         Ok(requests)
+    }
+
+    /// How one content event goes on the wire. An append is always its own
+    /// streamed `PUT`; a whole-file generation streams once it (with any
+    /// appends folded onto it) reaches the stream threshold and is otherwise
+    /// batched into `write-many`.
+    fn content_request_kind(&self, event: &MountEvent) -> ContentRequestKind {
+        if matches!(event.mutation, MountMutation::AppendFile { .. }) {
+            ContentRequestKind::Append
+        } else if event.wire_payload_length() >= self.options.stream_threshold_bytes {
+            ContentRequestKind::Streamed
+        } else {
+            ContentRequestKind::Batched
+        }
     }
 
     /// Content events inside a run are independent, so a rejected request can
@@ -931,13 +1035,9 @@ impl PublisherShared {
         while let Some((events, rejection)) = pending.pop() {
             let Some(reason) = rejection else {
                 let request = ContentRequest {
-                    kind: if events.len() == 1
-                        && events[0].payload.as_ref().is_some_and(|payload| {
-                            payload.length >= self.options.stream_threshold_bytes
-                        }) {
-                        ContentRequestKind::Streamed
-                    } else {
-                        ContentRequestKind::Batched
+                    kind: match events.as_slice() {
+                        [event] => self.content_request_kind(event),
+                        _ => ContentRequestKind::Batched,
                     },
                     events: events.clone(),
                 };
@@ -1055,6 +1155,9 @@ impl PublisherShared {
     /// order, so repairing a historical generation cannot become final state
     /// when the guest subsequently changed it.
     async fn repair_rejected_content(&self, event: &MountEvent) -> Result<Option<u64>> {
+        if matches!(event.mutation, MountMutation::AppendFile { .. }) {
+            return self.repair_rejected_append(event).await.map(Some);
+        }
         let MountMutation::ReplaceFile {
             path,
             mode,
@@ -1087,11 +1190,7 @@ impl PublisherShared {
             base_content_hash: None,
         };
         let request = ContentRequest {
-            kind: if forced.payload_length() >= self.options.stream_threshold_bytes {
-                ContentRequestKind::Streamed
-            } else {
-                ContentRequestKind::Batched
-            },
+            kind: self.content_request_kind(&forced),
             events: vec![forced],
         };
         let publication = issue_content_request(
@@ -1107,6 +1206,110 @@ impl PublisherShared {
             "replayed authoritative content without stale remote preconditions"
         );
         Ok(Some(revision.max(publication.revision)))
+    }
+
+    /// Publish the full content of an append generation the gateway refused.
+    ///
+    /// A rejected append means the gateway does not hold the base it extends
+    /// (or predates the append contract and read the body as the whole file).
+    /// Retrying it unchanged can never succeed, and the WAL holds only its new
+    /// bytes, so the generation's exact full content is recovered from the
+    /// backing file instead: the bytes are snapshotted wherever accepted
+    /// history says they now live and published only if they hash to the
+    /// generation, as a whole-file write without stale replica preconditions.
+    /// The following WAL events then replay in order on top of it.
+    ///
+    /// When the bytes are gone, a later accepted event superseded them -- a
+    /// whole-file generation, a removal or an overwriting rename of the path --
+    /// and that event (still ahead of the cursor) determines every later state
+    /// of the replica, so this one is complete without a request. The one
+    /// exception is a hard link created in between, which exposed the bytes
+    /// under another name: that is retained and retried rather than guessed.
+    /// Either way the accepted WAL is never reordered and nothing is
+    /// acknowledged that the gateway will not converge onto.
+    async fn repair_rejected_append(&self, event: &MountEvent) -> Result<u64> {
+        let MountMutation::AppendFile { path, mode, .. } = &event.mutation else {
+            bail!(
+                "vfs mount event {} is not an append generation",
+                event.sequence
+            );
+        };
+        let (size, content_hash) = event
+            .published_content()
+            .map(|(size, hash)| (size, hash.to_string()))
+            .ok_or_else(|| anyhow!("append event {} has no published content", event.sequence))?;
+        let location = match self.wal.content_successor(path, event.last_sequence())? {
+            ContentSuccessor::At { path: location } => location,
+            ContentSuccessor::Superseded { aliased: false } => {
+                tracing::warn!(
+                    sequence = event.sequence,
+                    path,
+                    "rejected append is superseded by a later accepted generation or removal"
+                );
+                return Ok(self.client.observed_namespace_revision());
+            }
+            ContentSuccessor::Superseded { aliased: true } => bail!(
+                "append to {path} was rejected and its bytes were hard-linked before being \
+                 superseded; retaining it for retry"
+            ),
+        };
+        let Some(source) = self.options.generations.clone() else {
+            bail!("append to {path} was rejected and no generation source can recover it");
+        };
+        let lookup = location.clone();
+        let expected = content_hash.clone();
+        let snapshot =
+            tokio::task::spawn_blocking(move || source.snapshot(&lookup, size, &expected))
+                .await
+                .context("join append generation snapshot")??;
+        let Some(snapshot) = snapshot else {
+            bail!(
+                "append to {path} was rejected and the backing file at {location} no longer \
+                 holds that generation's {size} bytes; retaining it for retry"
+            );
+        };
+        // As for a rejected whole-file generation: a stale entry of the wrong
+        // kind is cleared first, then the bytes are written without stale
+        // replica preconditions.
+        let remote = self.client.stat_attributes_versioned(path).await?;
+        let mut revision = self
+            .client
+            .observed_namespace_revision()
+            .max(remote.revision);
+        if remote.value.as_ref().is_some_and(|metadata| {
+            LocalKind::from_wire_kind(metadata.kind.as_str()) != Some(LocalKind::File)
+        }) {
+            revision = revision.max(
+                self.remove_remote_subtree(path, event.idempotency_key.as_str())
+                    .await?,
+            );
+        }
+        let publication = self
+            .client
+            .write_streamed(
+                path,
+                vec![UploadSegment {
+                    path: snapshot.path().to_path_buf(),
+                    offset: 0,
+                    length: snapshot.length(),
+                }],
+                snapshot.content_hash(),
+                StreamedWrite::Replace {
+                    base_content_hash: None,
+                    expected_file_id: None,
+                },
+                Some(mode & 0o7777),
+                self.options.surface_kind.as_str(),
+            )
+            .await?;
+        drop(snapshot);
+        tracing::warn!(
+            sequence = event.sequence,
+            path,
+            size,
+            "replaced a rejected append with its generation's full content"
+        );
+        Ok(revision.max(publication.revision))
     }
 
     // -- reconciliation predicate -------------------------------------------
@@ -1140,7 +1343,7 @@ impl PublisherShared {
                 base_content_hash,
                 ..
             } => {
-                let payload = event.payload.as_ref().ok_or_else(|| {
+                let (_, content_hash) = event.published_content().ok_or_else(|| {
                     anyhow!("content event {} carries no payload", event.sequence)
                 })?;
                 let Some(metadata) = snapshots.get(path).await? else {
@@ -1150,9 +1353,19 @@ impl PublisherShared {
                 // when the write creates the path, so an overwrite legitimately
                 // leaves an older mode in place.
                 Ok(is_kind(&metadata, LocalKind::File)
-                    && metadata.content_hash.as_deref() == Some(payload.content_hash.as_str())
+                    && metadata.content_hash.as_deref() == Some(content_hash)
                     && (base_content_hash.as_deref() != Some(ABSENT_PRECONDITION)
                         || mode_agrees(&metadata, *mode)))
+            }
+            MountMutation::AppendFile { path, .. } => {
+                let (_, content_hash) = event.published_content().ok_or_else(|| {
+                    anyhow!("append event {} has no published content", event.sequence)
+                })?;
+                let Some(metadata) = snapshots.get(path).await? else {
+                    return Ok(false);
+                };
+                Ok(is_kind(&metadata, LocalKind::File)
+                    && metadata.content_hash.as_deref() == Some(content_hash))
             }
             MountMutation::CreateSymlink { path, target } => {
                 let remote = snapshots.get(path).await?;
@@ -1395,8 +1608,11 @@ impl PublisherShared {
 enum ContentRequestKind {
     /// Payloads under the stream threshold, packed into one `write-many`.
     Batched,
-    /// One oversized payload streamed from its dedicated payload file.
+    /// One whole-file generation streamed from its payload file(s).
     Streamed,
+    /// One append generation (with any appends folded onto it) streamed as
+    /// only its new bytes.
+    Append,
 }
 
 struct ContentRequest {
@@ -1424,12 +1640,12 @@ async fn issue_content_request(
             let writes = tokio::task::spawn_blocking(move || {
                 let mut writes = Vec::with_capacity(events.len());
                 for event in &events {
-                    let payload = event.payload.as_ref().ok_or_else(|| {
-                        anyhow!("content event {} carries no payload", event.sequence)
-                    })?;
-                    let bytes = wal.payload_bytes(payload).with_context(|| {
-                        format!("read payload for vfs mount event {}", event.sequence)
-                    })?;
+                    let mut bytes = Vec::new();
+                    for payload in event.payload_chain() {
+                        bytes.extend(wal.payload_bytes(payload).with_context(|| {
+                            format!("read payload for vfs mount event {}", event.sequence)
+                        })?);
+                    }
                     writes.push(remote_write_for(event, bytes)?);
                 }
                 anyhow::Ok(writes)
@@ -1438,49 +1654,80 @@ async fn issue_content_request(
             .context("join vfs mount payload read")??;
             client.write_many(writes, surface_kind).await
         }
-        ContentRequestKind::Streamed => {
+        ContentRequestKind::Streamed | ContentRequestKind::Append => {
             let event = request
                 .events
                 .first()
                 .ok_or_else(|| anyhow!("streamed content request carries no event"))?;
-            let payload = event
-                .payload
-                .as_ref()
+            let (_, content_hash) = event
+                .published_content()
                 .ok_or_else(|| anyhow!("content event {} carries no payload", event.sequence))?;
-            let MountMutation::ReplaceFile {
-                path,
-                mode,
-                expected_file_id,
-                base_content_hash,
-            } = &event.mutation
-            else {
-                bail!(
+            let segments = event
+                .payload_chain()
+                .map(|payload| {
+                    wal.payload_location(payload)
+                        .map(|(path, offset, length)| UploadSegment {
+                            path,
+                            offset,
+                            length,
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let (path, mode, write) = match &event.mutation {
+                MountMutation::ReplaceFile {
+                    path,
+                    mode,
+                    expected_file_id,
+                    base_content_hash,
+                } => (
+                    path,
+                    mode,
+                    StreamedWrite::Replace {
+                        base_content_hash: base_content_hash.as_deref(),
+                        expected_file_id: remote_file_id(expected_file_id.as_deref()),
+                    },
+                ),
+                MountMutation::AppendFile {
+                    path,
+                    mode,
+                    base_size,
+                    base_content_hash,
+                    ..
+                } => (
+                    path,
+                    mode,
+                    StreamedWrite::Append {
+                        base_size: *base_size,
+                        base_content_hash: base_content_hash.as_str(),
+                    },
+                ),
+                _ => bail!(
                     "vfs mount event {} is not a content generation",
                     event.sequence
-                );
+                ),
             };
-            // D9: a payload this large is always a dedicated, immutable file
-            // whose length is exactly `PayloadRef::length`, which is what lets
-            // the existing `write_staged_file` signature carry it unchanged.
-            let staged = wal.payload_path(payload).ok_or_else(|| {
-                anyhow!(
-                    "vfs mount event {} has a streamable payload with no dedicated file",
-                    event.sequence
-                )
-            })?;
             client
-                .write_staged_file(
+                .write_streamed(
                     path.as_str(),
-                    staged.as_path(),
-                    payload.length,
-                    payload.content_hash.as_str(),
-                    base_content_hash.as_deref(),
-                    remote_file_id(expected_file_id.as_deref()),
+                    segments,
+                    content_hash,
+                    write,
                     Some(mode & 0o7777),
                     surface_kind,
                 )
                 .await
         }
+    }
+}
+
+/// The head sequence of a single-append request, the unit a refusal is
+/// remembered by.
+fn refused_append(events: &[MountEvent]) -> Option<u64> {
+    match events {
+        [event] if matches!(event.mutation, MountMutation::AppendFile { .. }) => {
+            Some(event.sequence)
+        }
+        _ => None,
     }
 }
 
@@ -1569,7 +1816,7 @@ fn namespace_mutation_for(event: &MountEvent) -> Result<VfsNamespaceMutation> {
             path: path.clone(),
             mode: mode & 0o7777,
         },
-        MountMutation::ReplaceFile { .. } => bail!(
+        MountMutation::ReplaceFile { .. } | MountMutation::AppendFile { .. } => bail!(
             "vfs mount event {} is a content generation and cannot be published as a namespace \
              mutation",
             event.sequence
@@ -1734,6 +1981,7 @@ mod tests {
             payload,
             pre_image: MountPreImage::empty(),
             local_identity: Some(format!("1:{sequence}")),
+            folded_appends: Vec::new(),
         }
     }
 

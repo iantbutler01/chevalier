@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -21,8 +21,10 @@ use chevalier_sandbox::vfs::{
     VfsSubtreeMetadataRequest, VfsSubtreeMetadataResponse, VfsWriteManyItem,
     VfsWriteManyPublicationResponse, VfsWritePrecondition, scoped_vfs_path,
 };
+use futures::{StreamExt as _, TryStreamExt as _};
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 use tokio_util::io::ReaderStream;
 
 pub const RANGE_FINGERPRINT_HEADER: &str = "x-chevalier-vfs-range-fingerprint";
@@ -44,6 +46,11 @@ const STREAM_WRITE_MIN_TIMEOUT_SECS: u64 = 300;
 const STREAM_WRITE_MIN_BYTES_PER_SECOND: u64 = 128 * 1024;
 const STREAM_UPLOAD_HEADER: &str = "x-chevalier-vfs-stream-upload";
 const EXPECTED_CONTENT_HASH_HEADER: &str = "x-chevalier-vfs-expected-content-sha256";
+/// Marks a streamed `PUT /file` as an append: the decimal byte length of the
+/// base content the body extends. The body is exactly the bytes from that
+/// offset on, the `content_fingerprint` precondition names the base's hash, and
+/// the expected-content header names the hash of the whole resulting file.
+pub const APPEND_OFFSET_HEADER: &str = "x-chevalier-vfs-append-offset";
 const STREAM_READ_BUFFER_BYTES: usize = 1024 * 1024;
 const ADVISORY_LOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const ADVISORY_LOCK_RENEWAL_BATCH_SIZE: usize = 4_096;
@@ -158,6 +165,35 @@ pub struct Versioned<T> {
     /// `value`. Zero means the gateway did not provide a revision and the
     /// result must not seed a coherence-sensitive cache.
     pub revision: u64,
+}
+
+/// One contiguous byte range of an immutable local file. A streamed write's
+/// body is its segments in order, so several WAL payloads (a whole-file
+/// generation and the appends folded onto it, or a run of appends) upload as one
+/// request without being copied together first.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UploadSegment {
+    pub path: PathBuf,
+    pub offset: u64,
+    pub length: u64,
+}
+
+/// What a streamed write does to the gateway's current content.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamedWrite<'a> {
+    /// The body is the whole file. `base_content_hash` and `expected_file_id`
+    /// are the optional CAS preconditions a whole-file write may carry.
+    Replace {
+        base_content_hash: Option<&'a str>,
+        expected_file_id: Option<&'a str>,
+    },
+    /// The body extends exactly `base_size` bytes whose content hash is
+    /// `base_content_hash`; the gateway rejects it with 409 unless it holds
+    /// precisely that content.
+    Append {
+        base_size: u64,
+        base_content_hash: &'a str,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -791,43 +827,52 @@ impl RemoteVfsClient {
         }
     }
 
-    /// Publish one already-staged large file without materializing it in the
-    /// vmd heap or JSON/base64 expanding it through `/write-many`.
+    /// Stream `segments`, in order, as one `PUT /file` body, without
+    /// materializing them in the vmd heap or JSON/base64 expanding them through
+    /// `/write-many`: the bounded-memory path the publisher takes for an
+    /// oversized whole-file generation and for every append generation.
     ///
-    /// The gateway verifies `content_hash` while streaming the request to its
-    /// own temporary file, then hands that file to the storage backend. Small
-    /// writes continue to use `write_many`; this is the bounded-memory path the
-    /// publisher takes for a single oversized WAL payload.
-    pub async fn write_staged_file(
+    /// `content_hash` is always the hash of the whole file the gateway holds
+    /// afterwards: for a replace, the hash of the body; for an append, the hash
+    /// of the base followed by the body. The gateway verifies it while
+    /// streaming, so a body that is not what the caller claims is rejected
+    /// instead of stored. Every segment is checked to lie inside its file
+    /// before the request starts, so the declared `content-length` is exact.
+    pub async fn write_streamed(
         &self,
         path: &str,
-        staged_path: &Path,
-        size_bytes: u64,
+        segments: Vec<UploadSegment>,
         content_hash: &str,
-        base_content_hash: Option<&str>,
-        expected_file_id: Option<&str>,
+        write: StreamedWrite<'_>,
         mode: Option<u32>,
         surface_kind: &str,
     ) -> Result<RemotePublication> {
-        let staged = tokio::fs::File::open(staged_path)
-            .await
-            .with_context(|| format!("open staged vfs stream {}", staged_path.display()))?;
-        let metadata = staged
-            .metadata()
-            .await
-            .with_context(|| format!("stat staged vfs stream {}", staged_path.display()))?;
-        if !metadata.is_file() || metadata.len() != size_bytes {
-            return Err(anyhow!(
-                "staged vfs stream {} has {} bytes but the publication requires {}",
-                staged_path.display(),
-                metadata.len(),
-                size_bytes,
-            ));
+        let mut body_bytes = 0_u64;
+        for segment in &segments {
+            let metadata = tokio::fs::metadata(&segment.path)
+                .await
+                .with_context(|| format!("stat staged vfs stream {}", segment.path.display()))?;
+            let end = segment
+                .offset
+                .checked_add(segment.length)
+                .ok_or_else(|| anyhow!("staged vfs stream segment range overflows"))?;
+            if !metadata.is_file() || metadata.len() < end {
+                return Err(anyhow!(
+                    "staged vfs stream {} has {} bytes but the publication requires {}..{}",
+                    segment.path.display(),
+                    metadata.len(),
+                    segment.offset,
+                    end,
+                ));
+            }
+            body_bytes = body_bytes.saturating_add(segment.length);
         }
 
-        let lease = self
-            .acquire_lease(path, 1, "flush streamed vfs fuse write")
-            .await?;
+        let (operation, reason) = match write {
+            StreamedWrite::Replace { .. } => ("vfs_stream_write", "flush streamed vfs fuse write"),
+            StreamedWrite::Append { .. } => ("vfs_stream_append", "append streamed vfs fuse write"),
+        };
+        let lease = self.acquire_lease(path, 1, reason).await?;
         let result = async {
             let mut request = self
                 .client
@@ -835,7 +880,7 @@ impl RemoteVfsClient {
                 .query(&[("path", self.path_arg(path))])
                 .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
                 .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
-                .header(CHEVALIER_VFS_OPERATION_HEADER, "vfs_stream_write")
+                .header(CHEVALIER_VFS_OPERATION_HEADER, operation)
                 .header(
                     CHEVALIER_VFS_RESOURCE_KEY_HEADER,
                     lease.resource_key.as_str(),
@@ -846,14 +891,38 @@ impl RemoteVfsClient {
                 )
                 .header(STREAM_UPLOAD_HEADER, "1")
                 .header(EXPECTED_CONTENT_HASH_HEADER, content_hash)
-                .header(header::CONTENT_LENGTH, size_bytes)
-                .timeout(stream_write_attempt_timeout(size_bytes));
+                .header(header::CONTENT_LENGTH, body_bytes)
+                .timeout(stream_write_attempt_timeout(body_bytes));
             request = with_mode_header(request, mode);
-            request = with_precondition_headers(request, base_content_hash, expected_file_id);
-            let body = reqwest::Body::wrap_stream(ReaderStream::with_capacity(
-                staged,
-                STREAM_READ_BUFFER_BYTES,
-            ));
+            request = match write {
+                StreamedWrite::Replace {
+                    base_content_hash,
+                    expected_file_id,
+                } => with_precondition_headers(request, base_content_hash, expected_file_id),
+                StreamedWrite::Append {
+                    base_size,
+                    base_content_hash,
+                } => with_precondition_headers(
+                    request.header(APPEND_OFFSET_HEADER, base_size.to_string()),
+                    Some(base_content_hash),
+                    None,
+                ),
+            };
+            // Each file is opened only when the stream reaches it, so a long
+            // chain of folded appends holds one descriptor at a time, and each
+            // read is clamped to exactly its segment.
+            let body = reqwest::Body::wrap_stream(
+                futures::stream::iter(segments)
+                    .then(|segment| async move {
+                        let mut file = tokio::fs::File::open(&segment.path).await?;
+                        file.seek(std::io::SeekFrom::Start(segment.offset)).await?;
+                        Ok::<_, std::io::Error>(ReaderStream::with_capacity(
+                            file.take(segment.length),
+                            STREAM_READ_BUFFER_BYTES,
+                        ))
+                    })
+                    .try_flatten(),
+            );
             let response = self.request_mutation(request.body(body)).await?;
             let revision = parse_namespace_revision(response.headers())
                 .expect("mutation response revision was validated");

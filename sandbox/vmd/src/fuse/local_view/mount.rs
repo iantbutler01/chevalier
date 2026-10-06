@@ -46,18 +46,22 @@ use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use chevalier_vfs_hash::ContentHasher;
+
+use super::payload::{hash_file_range, read_file_range};
 use super::publisher::MountPublisher;
 use super::tree::{BackingTree, MountFile};
 use super::types::{
     AppliedMutation, ApplyState, DependencyKey, DrainOutcome, LocalMetadata, LocalStatfs,
-    LocalTimestamp, MountMutation, MountOwnerRecord, PayloadSource, PublicationHealth,
-    RENAME_EXCHANGE, RENAME_WHITEOUT, RecoveryResolution, RecoverySummary, StoragePressure,
-    ancestors_of, merge_dependency_keys,
+    LocalTimestamp, MountMutation, MountOwnerRecord, PayloadSource, PreparedEvent,
+    PublicationHealth, RENAME_EXCHANGE, RENAME_WHITEOUT, RecoveryResolution, RecoverySummary,
+    StoragePressure, ancestors_of, merge_dependency_keys,
 };
-use super::wal::MountWal;
+use super::wal::{FileSnapshot, MountWal};
 use super::{
     CHECKPOINT_EVENT_INTERVAL, CHECKPOINT_INTERVAL_MS, MAX_SEGMENTED_PAYLOAD_BYTES,
-    MountStateLayout, WAL_FORMAT_VERSION, sync_directory,
+    MIN_READABLE_WAL_FORMAT_VERSION, MountStateLayout, WAL_FORMAT_VERSION, readable_wal_format,
+    sync_directory,
 };
 
 /// How the mount was constructed.
@@ -158,9 +162,10 @@ fn validate_owner_record(
     options: &MountLocalViewOptions,
     path: &Path,
 ) -> Result<()> {
-    if record.format_version != WAL_FORMAT_VERSION {
+    if !readable_wal_format(record.format_version) {
         bail!(
-            "mount owner record {} has format {} (expected {WAL_FORMAT_VERSION})",
+            "mount owner record {} has format {} (this build reads \
+             {MIN_READABLE_WAL_FORMAT_VERSION}..={WAL_FORMAT_VERSION})",
             path.display(),
             record.format_version
         );
@@ -249,6 +254,12 @@ pub(crate) struct MountLocalView {
     /// the durable authority; this exists so `flush`/`fsync` on a clean handle
     /// costs one hash lookup instead of a snapshot of every dirty path.
     dirty: Mutex<BTreeSet<String>>,
+    /// Append detection: per path, what is known about its content since the
+    /// last sealed generation. Held for every dirty path whose changes have
+    /// all extended that generation, and kept across a seal only for files
+    /// above the append threshold. In memory only -- a restart loses it, and
+    /// the next seal of a dirty path is then a whole-file generation.
+    lineages: Mutex<HashMap<String, ContentLineage>>,
     /// Last cached [`StoragePressure`], refreshed by the maintenance task. The
     /// write path must never pay for a `statvfs`.
     pressure: AtomicU8,
@@ -316,6 +327,7 @@ impl MountLocalView {
             locks: PathLocks::new(),
             publisher: Mutex::new(None),
             dirty: Mutex::new(BTreeSet::new()),
+            lineages: Mutex::new(HashMap::new()),
             pressure: AtomicU8::new(encode_pressure(StoragePressure::None)),
             checkpointed_sequence: AtomicU64::new(0),
             compacted_sequence: AtomicU64::new(0),
@@ -450,6 +462,7 @@ impl MountLocalView {
         let keys = mutation.dependency_keys();
         let _guard = self.locks.acquire(&keys)?;
         let applied = self.commit_mutation(wal, mutation, PayloadSource::None)?;
+        self.forget_lineages(path)?;
         self.metadata_after(&applied, path)
     }
 
@@ -487,6 +500,8 @@ impl MountLocalView {
                 }
             };
         wal.commit(prepared, applied.local_identity.clone())?;
+        // A new file has no generation to append to: its first seal is whole.
+        self.forget_lineages(path)?;
         // The created generation is content the gateway has never seen. Marking
         // it dirty is what lets the publisher fold the creation into the first
         // `ReplaceFile` instead of publishing an empty file and then its bytes.
@@ -508,6 +523,7 @@ impl MountLocalView {
         let keys = mutation.dependency_keys();
         let _guard = self.locks.acquire(&keys)?;
         let applied = self.commit_mutation(wal, mutation, PayloadSource::None)?;
+        self.forget_lineages(path)?;
         self.metadata_after(&applied, path)
     }
 
@@ -525,6 +541,11 @@ impl MountLocalView {
         let keys = mutation.dependency_keys();
         let _guard = self.locks.acquire(&keys)?;
         let applied = self.commit_mutation(wal, mutation, PayloadSource::None)?;
+        // Writes through either name now change both, and only the written name
+        // is marked dirty, so neither may append onto a remembered generation
+        // until a seal with a single link re-establishes one.
+        self.forget_lineages(existing_path)?;
+        self.forget_lineages(new_path)?;
         self.metadata_after(&applied, new_path)
     }
 
@@ -555,6 +576,11 @@ impl MountLocalView {
         // The dirty marker follows the name, so a later seal still finds the
         // generation the guest wrote under the old path.
         self.retarget_dirty(wal, old_path, new_path)?;
+        // Append lineage does not: the next seal under either name is whole,
+        // which is what keeps an append from ever being planned against a
+        // generation the gateway holds under a different name.
+        self.forget_lineage_subtree(old_path)?;
+        self.forget_lineage_subtree(new_path)?;
         Ok(())
     }
 
@@ -577,6 +603,7 @@ impl MountLocalView {
         if self.is_dirty(path)? {
             self.clear_dirty(wal, path)?;
         }
+        self.forget_lineages(path)?;
         Ok(())
     }
 
@@ -589,6 +616,7 @@ impl MountLocalView {
         let keys = mutation.dependency_keys();
         let _guard = self.locks.acquire(&keys)?;
         self.commit_mutation(wal, mutation, PayloadSource::None)?;
+        self.forget_lineage_subtree(path)?;
         Ok(())
     }
 
@@ -681,6 +709,7 @@ impl MountLocalView {
             self.reject_content_under_pressure("an O_TRUNC open")?;
             let keys = content_keys(path, false);
             let _guard = self.locks.acquire(&keys)?;
+            self.note_content_change(path, &file, ContentChange::Truncate)?;
             self.mark_dirty(wal, path)?;
             file.truncate(0)?;
         }
@@ -700,6 +729,7 @@ impl MountLocalView {
         // the committed `ReplaceFile` that describes it.
         let keys = content_keys(&path, false);
         let _guard = self.locks.acquire(&keys)?;
+        self.note_content_change(&path, file, ContentChange::At { offset })?;
         self.mark_dirty(wal, &path)?;
         file.write_at(bytes, offset)
     }
@@ -712,6 +742,7 @@ impl MountLocalView {
         let path = file.path();
         let keys = content_keys(&path, false);
         let _guard = self.locks.acquire(&keys)?;
+        self.note_content_change(&path, file, ContentChange::At { offset })?;
         self.mark_dirty(wal, &path)?;
         file.allocate(offset, length)
     }
@@ -732,6 +763,7 @@ impl MountLocalView {
         let path = destination.path();
         let keys = content_keys(&path, false);
         let _guard = self.locks.acquire(&keys)?;
+        self.note_content_change(&path, destination, ContentChange::At { offset })?;
         self.mark_dirty(wal, &path)?;
         destination.copy_range_from(source, source_offset, offset, length)
     }
@@ -749,6 +781,8 @@ impl MountLocalView {
         let path = file.path();
         let keys = content_keys(&path, false);
         let _guard = self.locks.acquire(&keys)?;
+        let current = file.metadata()?.size_bytes;
+        self.note_content_change(&path, file, ContentChange::Resize { size, current })?;
         self.mark_dirty(wal, &path)?;
         file.truncate(size)?;
         file.metadata()
@@ -763,20 +797,26 @@ impl MountLocalView {
         let file = self.tree.open_file(path, libc::O_WRONLY)?;
         let keys = content_keys(path, false);
         let _guard = self.locks.acquire(&keys)?;
+        let current = file.metadata()?.size_bytes;
+        self.note_content_change(path, &file, ContentChange::Resize { size, current })?;
         self.mark_dirty(wal, path)?;
         file.truncate(size)?;
         file.metadata()
     }
 
-    /// Seal a path's current backing content into one committed `ReplaceFile`
+    /// Seal a path's current backing content into one committed content
     /// generation, returning its sequence.
     ///
     /// Holds the path's **exclusive** dependency key across payload capture and
     /// commit, so no guest write can interleave between the snapshot and the
-    /// record. That is what lets recovery treat "a committed `ReplaceFile`
+    /// record. That is what lets recovery treat "a committed content generation
     /// clears the dirty marker" as unconditionally correct. With a reflink the
     /// window is microseconds; the streaming fallback is the only case where a
     /// concurrent writer waits, and it happens at close, when the writer is done.
+    ///
+    /// A large file whose every change since its previous generation extended
+    /// it seals an `AppendFile` carrying only the new bytes; everything else
+    /// seals a whole-file `ReplaceFile`.
     pub(crate) fn seal_content(&self, path: &str) -> Result<Option<u64>> {
         let Some(wal) = self.wal.as_ref() else {
             return Ok(None);
@@ -795,6 +835,10 @@ impl MountLocalView {
 
     /// The seal itself. The caller must already hold `path`'s exclusive key.
     fn seal_locked(&self, wal: &MountWal, path: &str) -> Result<Option<u64>> {
+        // Whatever this seal produces, the lineage describing the generation
+        // being sealed is spent: the next one starts from what this seal
+        // commits.
+        let lineage = self.lock_lineages()?.remove(path);
         let Some(metadata) = self.tree.lstat(path)? else {
             // The name is gone; whatever content it held is either unlinked or
             // reachable under the name a rename moved it to.
@@ -807,6 +851,47 @@ impl MountLocalView {
         }
 
         let backing_path = self.tree.resolve(path)?;
+        let appended = match lineage {
+            Some(lineage) if lineage.extends_into(&metadata) => {
+                self.seal_append(wal, path, &metadata, &backing_path, lineage)?
+            }
+            _ => None,
+        };
+        let sealed = match appended {
+            Some(sealed) => sealed,
+            None => self.seal_whole(wal, path, &metadata, &backing_path)?,
+        };
+        self.clear_dirty(wal, path)?;
+        // Keep the hash state of a large single-link generation, so the next
+        // append to it hashes only its new bytes. A small file needs none: if
+        // it grows past the threshold, a lineage opened at its first change
+        // hashes its (small) previous generation once.
+        if let Some(hasher) = sealed.hasher
+            && metadata.link_count == 1
+            && sealed.size > MAX_SEGMENTED_PAYLOAD_BYTES as u64
+        {
+            self.lock_lineages()?.insert(
+                path.to_string(),
+                ContentLineage {
+                    base_size: sealed.size,
+                    base_hash: Some(sealed.content_hash),
+                    hasher: Some(hasher),
+                    identity: metadata.local_identity.clone(),
+                    append_only: true,
+                },
+            );
+        }
+        Ok(Some(sealed.sequence))
+    }
+
+    /// Seal the whole backing file as one `ReplaceFile` generation.
+    fn seal_whole(
+        &self,
+        wal: &MountWal,
+        path: &str,
+        metadata: &LocalMetadata,
+        backing_path: &Path,
+    ) -> Result<SealedGeneration> {
         let mutation = MountMutation::ReplaceFile {
             path: path.to_string(),
             mode: metadata.mode,
@@ -822,7 +907,7 @@ impl MountLocalView {
         // segment threshold into memory so they share one packed payload file;
         // larger generations retain the reflink/streamed dedicated-file path.
         let small_payload = if metadata.size_bytes <= MAX_SEGMENTED_PAYLOAD_BYTES as u64 {
-            let bytes = std::fs::read(&backing_path).with_context(|| {
+            let bytes = std::fs::read(backing_path).with_context(|| {
                 format!("read small backing generation {}", backing_path.display())
             })?;
             if bytes.len() as u64 != metadata.size_bytes {
@@ -839,9 +924,108 @@ impl MountLocalView {
         };
         let payload = match small_payload.as_deref() {
             Some(bytes) => PayloadSource::Bytes(bytes),
-            None => PayloadSource::File(backing_path.as_path()),
+            None => PayloadSource::File(backing_path),
         };
-        let prepared = wal.prepare(mutation, payload, pre_image)?;
+        let (prepared, hasher) = wal.prepare_capturing(mutation, payload, pre_image)?;
+        let captured = prepared
+            .event
+            .payload
+            .clone()
+            .ok_or_else(|| anyhow!("sealed generation of {path:?} carries no payload"))?;
+        let sequence = self.apply_prepared(wal, prepared)?;
+        Ok(SealedGeneration {
+            sequence,
+            size: captured.length,
+            content_hash: captured.content_hash,
+            hasher,
+        })
+    }
+
+    /// Seal only the bytes appended since the generation `lineage` describes.
+    ///
+    /// Cost is proportional to the new bytes: the previous generation's hash
+    /// state is extended rather than recomputed (it is computed from the backing
+    /// file once when no state is held, e.g. after a restart, which is sound
+    /// because the lineage proves those bytes unchanged). Returns `None`, and
+    /// the caller seals the whole file instead, when the backing bytes turn out
+    /// not to be the generation the lineage remembers.
+    fn seal_append(
+        &self,
+        wal: &MountWal,
+        path: &str,
+        metadata: &LocalMetadata,
+        backing_path: &Path,
+        lineage: ContentLineage,
+    ) -> Result<Option<SealedGeneration>> {
+        let base_size = lineage.base_size;
+        let size = metadata.size_bytes;
+        let appended = size - base_size;
+        let mut hasher = match lineage.hasher {
+            Some(hasher) => hasher,
+            None => {
+                let mut hasher = ContentHasher::new();
+                hash_file_range(&mut hasher, backing_path, 0, base_size)?;
+                hasher
+            }
+        };
+        let base_content_hash = hasher.digest();
+        if let Some(expected) = lineage.base_hash.as_deref()
+            && expected != base_content_hash
+        {
+            tracing::warn!(
+                path,
+                base_size,
+                expected,
+                actual = %base_content_hash,
+                "append lineage disagrees with its previous generation; sealing the whole file"
+            );
+            return Ok(None);
+        }
+
+        let small_tail = appended <= MAX_SEGMENTED_PAYLOAD_BYTES as u64;
+        let tail = if small_tail {
+            let bytes = read_file_range(backing_path, base_size, appended)?;
+            hasher.update(&bytes);
+            Some(bytes)
+        } else {
+            hash_file_range(&mut hasher, backing_path, base_size, appended)?;
+            None
+        };
+        let content_hash = hasher.digest();
+        let mutation = MountMutation::AppendFile {
+            path: path.to_string(),
+            mode: metadata.mode,
+            base_size,
+            base_content_hash,
+            size,
+            content_hash: content_hash.clone(),
+        };
+        mutation.validate()?;
+        let pre_image = {
+            let paths = mutation.affected_paths();
+            self.tree.observe(&paths)?
+        };
+        let payload = match tail.as_deref() {
+            Some(bytes) => PayloadSource::Bytes(bytes),
+            None => PayloadSource::Range {
+                path: backing_path,
+                offset: base_size,
+                length: appended,
+            },
+        };
+        let (prepared, _) = wal.prepare_capturing(mutation, payload, pre_image)?;
+        let sequence = self.apply_prepared(wal, prepared)?;
+        Ok(Some(SealedGeneration {
+            sequence,
+            size,
+            content_hash,
+            hasher: Some(hasher),
+        }))
+    }
+
+    /// Apply and commit a prepared content generation, aborting it if the
+    /// apply fails.
+    fn apply_prepared(&self, wal: &MountWal, prepared: PreparedEvent) -> Result<u64> {
         let sequence = prepared.sequence();
         match self.tree.apply(&prepared.event.mutation) {
             Ok(applied) => wal.commit(prepared, applied.local_identity.clone())?,
@@ -850,8 +1034,34 @@ impl MountLocalView {
                 return Err(error);
             }
         }
-        self.clear_dirty(wal, path)?;
-        Ok(Some(sequence))
+        Ok(sequence)
+    }
+
+    /// Snapshot a sealed generation's full content from the backing file, for
+    /// the publisher when the gateway refused an append of it.
+    ///
+    /// Takes no lock: the snapshot copies the first `size` bytes of the backing
+    /// file at `path` and is returned only when they hash to `content_hash`, so
+    /// a concurrent writer can make it come back empty but never wrong.
+    pub(crate) fn snapshot_generation(
+        &self,
+        path: &str,
+        size: u64,
+        content_hash: &str,
+    ) -> Result<Option<FileSnapshot>> {
+        let wal = self.writable_wal()?;
+        let Some(metadata) = self.tree.lstat(path)? else {
+            return Ok(None);
+        };
+        if !metadata.is_file() || metadata.size_bytes < size {
+            return Ok(None);
+        }
+        let backing_path = self.tree.resolve(path)?;
+        let snapshot = wal.snapshot_file_prefix(&backing_path, size)?;
+        if snapshot.content_hash() != content_hash {
+            return Ok(None);
+        }
+        Ok(Some(snapshot))
     }
 
     /// Seal every dirty path. Used by `fsyncdir`, snapshot and drain.
@@ -1304,6 +1514,139 @@ impl MountLocalView {
         }
         Ok(())
     }
+
+    // -- append detection ------------------------------------------------------
+
+    fn lock_lineages(&self) -> Result<MutexGuard<'_, HashMap<String, ContentLineage>>> {
+        self.lineages
+            .lock()
+            .map_err(|_| anyhow!("mount append lineage index poisoned"))
+    }
+
+    /// Record a content change about to land on `path` through `file`. The
+    /// caller holds the path's (shared) content key, so no seal runs
+    /// concurrently and the lineage it updates is the one the next seal reads.
+    ///
+    /// A lineage is opened only on the clean -> dirty transition, i.e. before
+    /// the first change since the last generation lands, from the file as it is
+    /// right then: a clean file's bytes are exactly its last generation. A
+    /// dirty path without a lineage stays without one, so it seals whole.
+    fn note_content_change(
+        &self,
+        path: &str,
+        file: &MountFile,
+        change: ContentChange,
+    ) -> Result<()> {
+        let mut lineages = self.lock_lineages()?;
+        if let Some(lineage) = lineages.get_mut(path) {
+            if lineage.append_only && !change.extends(lineage.base_size) {
+                lineage.append_only = false;
+            }
+            return Ok(());
+        }
+        if self.is_dirty(path)? {
+            return Ok(());
+        }
+        let metadata = file.metadata()?;
+        if metadata.link_count != 1 || !change.extends(metadata.size_bytes) {
+            return Ok(());
+        }
+        lineages.insert(
+            path.to_string(),
+            ContentLineage {
+                base_size: metadata.size_bytes,
+                base_hash: None,
+                hasher: None,
+                identity: metadata.local_identity,
+                append_only: true,
+            },
+        );
+        Ok(())
+    }
+
+    fn forget_lineages(&self, path: &str) -> Result<()> {
+        self.lock_lineages()?.remove(path);
+        Ok(())
+    }
+
+    fn forget_lineage_subtree(&self, prefix: &str) -> Result<()> {
+        self.lock_lineages()?
+            .retain(|path, _| !is_at_or_under(path, prefix));
+        Ok(())
+    }
+}
+
+/// What the mount knows about a path's content since its last sealed
+/// generation, so a seal can tell an append from a rewrite without comparing
+/// bytes.
+///
+/// Exactness is the whole contract: an append generation claims its first
+/// `base_size` bytes are the previous generation, and the gateway extends
+/// whatever it holds by the new bytes. So every path that can change bytes
+/// below `base_size` either clears `append_only` (writes, copies, allocations,
+/// truncation) or drops the lineage (create, rename, removal, hard link), and
+/// the seal rechecks the backing identity, link count and size before trusting
+/// it.
+struct ContentLineage {
+    /// Length of the generation the next seal would extend.
+    base_size: u64,
+    /// That generation's content hash, when this process sealed it.
+    base_hash: Option<String>,
+    /// Hash state positioned after exactly `base_size` bytes of it. `None` for
+    /// a lineage opened on a clean file; the seal then hashes those bytes once.
+    hasher: Option<ContentHasher>,
+    /// Backing `dev:ino` of the generation's file.
+    identity: String,
+    /// False once any change since the generation could have touched bytes
+    /// below `base_size` or shrunk the file.
+    append_only: bool,
+}
+
+impl ContentLineage {
+    /// Whether the file as `metadata` describes it is this lineage's
+    /// generation followed by new bytes, and large enough to seal as an append.
+    fn extends_into(&self, metadata: &LocalMetadata) -> bool {
+        self.append_only
+            && self.base_size > 0
+            && metadata.size_bytes > self.base_size
+            && metadata.size_bytes > MAX_SEGMENTED_PAYLOAD_BYTES as u64
+            && metadata.link_count == 1
+            && metadata.local_identity == self.identity
+    }
+}
+
+/// A content change about to land on a backing file, as append detection sees
+/// it.
+#[derive(Clone, Copy, Debug)]
+enum ContentChange {
+    /// Bytes written, copied in or reserved starting at `offset`.
+    At { offset: u64 },
+    /// The size set to `size` from `current`.
+    Resize { size: u64, current: u64 },
+    /// An `O_TRUNC` open.
+    Truncate,
+}
+
+impl ContentChange {
+    /// Whether the change leaves the first `base_size` bytes untouched and the
+    /// file no shorter. Any shrink disqualifies, even one above `base_size`.
+    fn extends(self, base_size: u64) -> bool {
+        match self {
+            Self::At { offset } => offset >= base_size,
+            Self::Resize { size, current } => size >= current,
+            Self::Truncate => false,
+        }
+    }
+}
+
+/// What one seal committed.
+struct SealedGeneration {
+    sequence: u64,
+    size: u64,
+    content_hash: String,
+    /// Hash state positioned after the generation's bytes, when the seal
+    /// computed it incrementally (a whole-file capture or an append).
+    hasher: Option<ContentHasher>,
 }
 
 /// `path` is `prefix` itself or lives underneath it. An empty prefix is the
@@ -1944,5 +2287,369 @@ mod tests {
             Err(error) => error,
         };
         assert!(format!("{error:#}").contains("verify mount event"));
+    }
+
+    // -- append detection ---------------------------------------------------
+
+    use super::super::MAX_SEGMENTED_PAYLOAD_BYTES;
+    use crate::fuse::local_view::tree::MountFile;
+    use crate::fuse::local_view::types::MountEvent;
+    use chevalier_vfs_hash::hash_bytes;
+
+    const LARGE: usize = MAX_SEGMENTED_PAYLOAD_BYTES * 2 + 3;
+
+    fn pattern(length: usize, seed: u8) -> Vec<u8> {
+        (0..length)
+            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
+    }
+
+    fn open_view(root: &Path, runtime: &tokio::runtime::Runtime) -> std::sync::Arc<MountLocalView> {
+        MountLocalView::open(options(root, runtime.handle()))
+            .expect("open local view")
+            .view
+    }
+
+    /// Create `path` holding `bytes` and seal it, returning an open handle.
+    fn seed(view: &MountLocalView, path: &str, bytes: &[u8]) -> MountFile {
+        let (file, _) = view
+            .create_file(path, 0o644, libc::O_RDWR)
+            .expect("create file");
+        view.write(&file, bytes, 0).expect("write seed");
+        view.flush_handle(&file).expect("seal seed");
+        file
+    }
+
+    fn append(view: &MountLocalView, file: &MountFile, bytes: &[u8]) {
+        let end = file.metadata().expect("stat").size_bytes;
+        view.write(file, bytes, end).expect("append");
+        view.flush_handle(file).expect("seal append");
+    }
+
+    fn last_content_event(view: &MountLocalView, path: &str) -> MountEvent {
+        view.wal()
+            .expect("writable WAL")
+            .recovery_state()
+            .expect("recovery state")
+            .committed_unacknowledged
+            .into_iter()
+            .rev()
+            .find(|event| event.mutation.is_content() && event.mutation.primary_path() == path)
+            .expect("a sealed content generation")
+    }
+
+    fn backing_bytes(view: &MountLocalView, path: &str) -> Vec<u8> {
+        fs::read(view.tree().resolve(path).expect("resolve")).expect("read backing file")
+    }
+
+    /// The generation `event` describes, as the gateway would hold it.
+    fn assert_whole_generation(view: &MountLocalView, path: &str) {
+        let event = last_content_event(view, path);
+        let MountMutation::ReplaceFile { .. } = event.mutation else {
+            panic!(
+                "expected a whole-file generation of {path}, got {:?}",
+                event.mutation
+            );
+        };
+        let bytes = backing_bytes(view, path);
+        let payload = event.payload.as_ref().expect("payload");
+        assert_eq!(payload.length, bytes.len() as u64);
+        assert_eq!(payload.content_hash, hash_bytes(&bytes));
+    }
+
+    fn assert_append_generation(view: &MountLocalView, path: &str, base: &[u8]) {
+        let event = last_content_event(view, path);
+        let bytes = backing_bytes(view, path);
+        assert_eq!(
+            event.mutation,
+            MountMutation::AppendFile {
+                path: path.to_string(),
+                mode: match &event.mutation {
+                    MountMutation::AppendFile { mode, .. } => *mode,
+                    other => panic!("expected an append generation of {path}, got {other:?}"),
+                },
+                base_size: base.len() as u64,
+                base_content_hash: hash_bytes(base),
+                size: bytes.len() as u64,
+                content_hash: hash_bytes(&bytes),
+            }
+        );
+        let payload = event.payload.as_ref().expect("payload");
+        let wal = view.wal().expect("writable WAL");
+        assert_eq!(
+            wal.payload_bytes(payload).expect("read payload"),
+            bytes[base.len()..],
+            "an append's payload is exactly its new bytes"
+        );
+        wal.verify_event_payload(&event).expect("payload verifies");
+    }
+
+    #[test]
+    fn appending_to_a_large_file_seals_only_the_new_bytes() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let view = open_view(temp.path(), &runtime);
+        let file = seed(&view, "pilot.log", &pattern(LARGE, 1));
+        assert_whole_generation(&view, "pilot.log");
+
+        let before = backing_bytes(&view, "pilot.log");
+        append(&view, &file, &pattern(5_000, 2));
+        assert_append_generation(&view, "pilot.log", &before);
+        let small_tail = last_content_event(&view, "pilot.log");
+        assert!(matches!(
+            small_tail.payload.as_ref().expect("payload").storage,
+            PayloadStorage::Segment { .. }
+        ));
+
+        let before = backing_bytes(&view, "pilot.log");
+        append(&view, &file, &pattern(MAX_SEGMENTED_PAYLOAD_BYTES + 17, 3));
+        assert_append_generation(&view, "pilot.log", &before);
+        let large_tail = last_content_event(&view, "pilot.log");
+        assert!(matches!(
+            large_tail.payload.as_ref().expect("payload").storage,
+            PayloadStorage::DedicatedFile { .. }
+        ));
+
+        // Growing the size (a hole of zeros) and writing past it never touches
+        // the previous generation's bytes, so it is still an append.
+        let before = backing_bytes(&view, "pilot.log");
+        let size = before.len() as u64;
+        view.truncate(&file, size + 4096).expect("extend");
+        view.write(&file, b"after the hole", size + 4096)
+            .expect("write past the hole");
+        view.flush_handle(&file).expect("seal");
+        assert_append_generation(&view, "pilot.log", &before);
+
+        // A second handle appending (O_APPEND writers each see the end) keeps
+        // the lineage too.
+        let before = backing_bytes(&view, "pilot.log");
+        let (second, _) = view
+            .open_file("pilot.log", libc::O_WRONLY)
+            .expect("second handle");
+        append(&view, &second, b"from another descriptor\n");
+        assert_append_generation(&view, "pilot.log", &before);
+    }
+
+    #[test]
+    fn any_change_that_can_touch_the_previous_generation_seals_the_whole_file() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        type Disqualifier = fn(&MountLocalView, &MountFile) -> &'static str;
+        let cases: Vec<(&str, Disqualifier)> = vec![
+            ("write inside the previous generation", |view, file| {
+                view.write(file, b"patched", 10).expect("patch");
+                append(view, file, b"tail");
+                "target.log"
+            }),
+            ("shrink, then write beyond the old end", |view, file| {
+                let size = file.metadata().expect("stat").size_bytes;
+                view.truncate(file, size - 1).expect("shrink");
+                view.write(file, b"beyond", size).expect("write beyond");
+                view.flush_handle(file).expect("seal");
+                "target.log"
+            }),
+            ("path truncate that shrinks", |view, file| {
+                let size = file.metadata().expect("stat").size_bytes;
+                view.truncate_path("target.log", size - 10).expect("shrink");
+                view.write(file, &pattern(64, 9), size)
+                    .expect("write beyond");
+                view.flush_handle(file).expect("seal");
+                "target.log"
+            }),
+            ("O_TRUNC reopen", |view, _| {
+                let (file, _) = view
+                    .open_file("target.log", libc::O_WRONLY | libc::O_TRUNC)
+                    .expect("truncating open");
+                view.write(&file, &pattern(LARGE + 100, 4), 0)
+                    .expect("rewrite");
+                view.flush_handle(&file).expect("seal");
+                "target.log"
+            }),
+            (
+                "allocation starting inside the previous generation",
+                |view, file| {
+                    let size = file.metadata().expect("stat").size_bytes;
+                    view.allocate(file, 0, size + 4096).expect("allocate");
+                    view.flush_handle(file).expect("seal");
+                    "target.log"
+                },
+            ),
+            ("range copy into the previous generation", |view, file| {
+                let source = seed(view, "source.bin", b"copied over the prefix");
+                view.copy_range(file, &source, 0, 0, 22).expect("copy");
+                append(view, file, b"tail");
+                "target.log"
+            }),
+            // Namespace changes inside the dirty window: the generation being
+            // extended is no longer what that name will hold remotely.
+            ("rename over a path with unsealed appends", |view, file| {
+                let end = file.metadata().expect("stat").size_bytes;
+                view.write(file, b"unsealed", end).expect("unsealed append");
+                drop(seed(view, "replacement.log", &pattern(LARGE, 5)));
+                view.rename("replacement.log", "target.log", 0)
+                    .expect("rename over");
+                let (file, _) = view
+                    .open_file("target.log", libc::O_WRONLY)
+                    .expect("open replacement");
+                append(view, &file, b"tail");
+                "target.log"
+            }),
+            ("rename away with unsealed appends", |view, file| {
+                let end = file.metadata().expect("stat").size_bytes;
+                view.write(file, b"unsealed", end).expect("unsealed append");
+                view.rename("target.log", "moved.log", 0).expect("rename");
+                file.retarget("moved.log");
+                view.flush_handle(file).expect("seal");
+                "moved.log"
+            }),
+            ("hard link with unsealed appends", |view, file| {
+                let end = file.metadata().expect("stat").size_bytes;
+                view.write(file, b"unsealed", end).expect("unsealed append");
+                view.create_hard_link("target.log", "alias.log")
+                    .expect("link");
+                view.flush_handle(file).expect("seal");
+                "target.log"
+            }),
+            ("append while hard-linked", |view, file| {
+                view.create_hard_link("target.log", "alias.log")
+                    .expect("link");
+                append(view, file, b"tail");
+                "target.log"
+            }),
+        ];
+        for (name, disqualify) in cases {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let view = open_view(temp.path(), &runtime);
+            let file = seed(&view, "target.log", &pattern(LARGE, 6));
+            let path = disqualify(&view, &file);
+            let event = last_content_event(&view, path);
+            assert!(
+                matches!(event.mutation, MountMutation::ReplaceFile { .. }),
+                "{name}: expected a whole-file generation, got {:?}",
+                event.mutation
+            );
+            assert_whole_generation(&view, path);
+        }
+    }
+
+    /// A rename of a clean file moves its generation to the new name on the
+    /// gateway too, so appends after it extend exactly that generation; the
+    /// append's base is hashed from the bytes and checked by the gateway.
+    #[test]
+    fn appends_after_a_clean_rename_extend_the_renamed_generation() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let view = open_view(temp.path(), &runtime);
+        drop(seed(&view, "app.log", &pattern(LARGE, 12)));
+        drop(seed(&view, "app.log.next", &pattern(LARGE + 9, 13)));
+        view.rename("app.log", "app.log.1", 0).expect("rotate");
+        view.rename("app.log.next", "app.log", 0).expect("replace");
+
+        let rotated = backing_bytes(&view, "app.log.1");
+        let (file, _) = view
+            .open_file("app.log.1", libc::O_WRONLY)
+            .expect("open rotated");
+        append(&view, &file, b"late line\n");
+        assert_append_generation(&view, "app.log.1", &rotated);
+
+        let current = backing_bytes(&view, "app.log");
+        let (file, _) = view.open_file("app.log", libc::O_WRONLY).expect("open new");
+        append(&view, &file, b"first line\n");
+        assert_append_generation(&view, "app.log", &current);
+    }
+
+    #[test]
+    fn a_small_file_that_grows_past_the_threshold_appends_to_its_last_generation() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let view = open_view(temp.path(), &runtime);
+        let small = pattern(100_000, 7);
+        let file = seed(&view, "grows.log", &small);
+        assert_whole_generation(&view, "grows.log");
+        // Still small after the change: the packed whole-file path.
+        append(&view, &file, b"still small");
+        assert_whole_generation(&view, "grows.log");
+        let before = backing_bytes(&view, "grows.log");
+        append(&view, &file, &pattern(MAX_SEGMENTED_PAYLOAD_BYTES, 8));
+        assert_append_generation(&view, "grows.log", &before);
+    }
+
+    #[test]
+    fn a_restarted_mount_appends_after_hashing_the_previous_generation_once() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let seeded = pattern(LARGE, 10);
+        {
+            let view = open_view(temp.path(), &runtime);
+            drop(seed(&view, "pilot.log", &seeded));
+            view.wal().expect("WAL").sync_local().expect("sync");
+        }
+        let view = open_view(temp.path(), &runtime);
+        let (file, _) = view
+            .open_file("pilot.log", libc::O_WRONLY)
+            .expect("reopen file");
+        append(&view, &file, b"after restart\n");
+        assert_append_generation(&view, "pilot.log", &seeded);
+    }
+
+    #[test]
+    fn recovery_commits_an_applied_append_and_keeps_it_publishable() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = pattern(LARGE, 11);
+        let tail = b"sealed but never committed".to_vec();
+        let mut full = base.clone();
+        full.extend_from_slice(&tail);
+        {
+            let view = open_view(temp.path(), &runtime);
+            let file = seed(&view, "pilot.log", &base);
+            file.write_at(&tail, base.len() as u64).expect("write tail");
+            let wal = view.wal().expect("WAL");
+            let mutation = MountMutation::AppendFile {
+                path: "pilot.log".to_string(),
+                mode: 0o644,
+                base_size: base.len() as u64,
+                base_content_hash: hash_bytes(&base),
+                size: full.len() as u64,
+                content_hash: hash_bytes(&full),
+            };
+            let pre_image = view
+                .tree()
+                .observe(&mutation.affected_paths())
+                .expect("pre-image");
+            // The process dies after the prepare is durable and before its
+            // commit record.
+            wal.prepare(mutation, PayloadSource::Bytes(&tail), pre_image)
+                .expect("prepare append");
+            wal.sync_local().expect("sync");
+        }
+        let opened = MountLocalView::open(options(temp.path(), runtime.handle())).expect("recover");
+        assert_eq!(opened.recovery.resolved_committed, 1);
+        let event = last_content_event(&opened.view, "pilot.log");
+        assert!(matches!(event.mutation, MountMutation::AppendFile { .. }));
+        assert_eq!(
+            event.published_content(),
+            Some((full.len() as u64, hash_bytes(&full).as_str()))
+        );
+        let batch = opened
+            .view
+            .wal()
+            .expect("WAL")
+            .next_publish_batch(
+                64,
+                64 * 1024 * 1024,
+                super::super::STREAM_PAYLOAD_THRESHOLD_BYTES,
+            )
+            .expect("batch")
+            .expect("pending batch");
+        // The whole-file seed and its recovered append publish as one upload.
+        let [create, published] = batch.events.as_slice() else {
+            panic!("expected the creation and one folded content event: {batch:?}");
+        };
+        assert!(matches!(create.mutation, MountMutation::CreateFile { .. }));
+        assert_eq!(published.folded_appends.len(), 1);
+        assert_eq!(
+            published.published_content(),
+            Some((full.len() as u64, hash_bytes(&full).as_str()))
+        );
     }
 }

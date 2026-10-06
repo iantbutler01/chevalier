@@ -278,8 +278,9 @@ impl BackingTree {
     /// * `SetMode` -> `fchmodat`
     /// * `SetTimes` -> `utimensat`
     /// * `SetOwner` -> `fchownat(AT_SYMLINK_NOFOLLOW)`
-    /// * `ReplaceFile` -> no syscall at all; the bytes are already in the backing
-    ///   file and the mutation only records the sealed generation
+    /// * `ReplaceFile` / `AppendFile` -> no syscall at all; the bytes are
+    ///   already in the backing file and the mutation only records the sealed
+    ///   generation
     ///
     /// Bumps and returns the generation counter, and reports the resulting
     /// entry's `dev:ino` so the commit record can bind identity.
@@ -307,7 +308,7 @@ impl BackingTree {
                 let (_file, applied) = self.apply_create_file(path, *mode, libc::O_WRONLY)?;
                 Ok(applied)
             }
-            MountMutation::ReplaceFile { path, .. } => {
+            MountMutation::ReplaceFile { path, .. } | MountMutation::AppendFile { path, .. } => {
                 // No syscall: the backing file already holds the bytes, and the
                 // payload was captured as an immutable snapshot before the
                 // record was prepared. The mutation only names a generation.
@@ -464,7 +465,10 @@ impl BackingTree {
     pub(crate) fn classify(&self, event: &MountEvent) -> Result<ApplyState> {
         let paths = event.mutation.affected_paths();
         let observed = self.observe(&paths)?;
-        if matches!(event.mutation, MountMutation::ReplaceFile { .. }) {
+        if matches!(
+            event.mutation,
+            MountMutation::ReplaceFile { .. } | MountMutation::AppendFile { .. }
+        ) {
             // A content generation applies with no syscall at all, so there is
             // nothing in the tree to inspect. Its payload is an immutable
             // snapshot of bytes the guest already observed, which is exactly the
@@ -486,7 +490,7 @@ impl BackingTree {
     /// the mount closed.
     pub(crate) fn invert(&self, event: &MountEvent) -> Result<()> {
         match &event.mutation {
-            MountMutation::ReplaceFile { .. } => {
+            MountMutation::ReplaceFile { .. } | MountMutation::AppendFile { .. } => {
                 // Applied with no syscall, so there is nothing to undo: the
                 // backing bytes were never touched by the mutation itself.
                 Ok(())
@@ -720,7 +724,7 @@ impl BackingTree {
                 .ok_or_else(|| anyhow!("no observation recorded for {path:?}"))
         };
         match &event.mutation {
-            MountMutation::ReplaceFile { .. } => Ok(true),
+            MountMutation::ReplaceFile { .. } | MountMutation::AppendFile { .. } => Ok(true),
             MountMutation::CreateDirectory { path, .. } => {
                 Ok(observed_state(path)?.kind() == Some(LocalKind::Directory))
             }

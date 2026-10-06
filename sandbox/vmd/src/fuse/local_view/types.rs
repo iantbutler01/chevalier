@@ -11,7 +11,7 @@ use std::path::{Component, Path};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use super::WAL_FORMAT_VERSION;
+use super::{MIN_READABLE_WAL_FORMAT_VERSION, WAL_FORMAT_VERSION, readable_wal_format};
 
 // ---------------------------------------------------------------------------
 // Mutation vocabulary
@@ -92,6 +92,27 @@ pub(crate) enum MountMutation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base_content_hash: Option<String>,
     },
+    /// A content generation that only extended the previous one. The payload is
+    /// exactly the new bytes `[base_size, size)`; the generation's full content
+    /// is the previous generation (`base_size` bytes hashing to
+    /// `base_content_hash`) followed by the payload, and hashes to
+    /// `content_hash`. Sealed only when every change since the previous
+    /// generation landed at or beyond `base_size` with no shrink, so the prefix
+    /// is byte-identical to that generation.
+    ///
+    /// Published as `PUT /file` with `x-chevalier-vfs-append-offset:
+    /// base_size`, a `content_fingerprint` precondition on `base_content_hash`
+    /// and `content_hash` as the expected result. A gateway that rejects it is
+    /// answered with a full-content publication of this generation, never a
+    /// blind retry.
+    AppendFile {
+        path: String,
+        mode: u32,
+        base_size: u64,
+        base_content_hash: String,
+        size: u64,
+        content_hash: String,
+    },
     CreateSymlink {
         path: String,
         target: String,
@@ -149,12 +170,62 @@ impl MountMutation {
                 bail!("unsupported rename flags {flags:#x} in a mount mutation");
             }
         }
+        if let Self::AppendFile {
+            path,
+            base_size,
+            base_content_hash,
+            size,
+            content_hash,
+            ..
+        } = self
+        {
+            if *base_size == 0 || size <= base_size {
+                bail!(
+                    "append generation of {path:?} must extend a non-empty base: base {base_size} \
+                     bytes, result {size} bytes"
+                );
+            }
+            if base_content_hash.is_empty() || content_hash.is_empty() {
+                bail!("append generation of {path:?} must name its base and result hashes");
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject a payload that cannot be this mutation's bytes. Checked when the
+    /// payload is captured and again on replay, so an append whose payload is
+    /// not exactly its new bytes never reaches the publisher.
+    pub(crate) fn validate_payload(&self, payload: Option<&PayloadRef>) -> Result<()> {
+        if self.requires_payload() != payload.is_some() {
+            bail!(
+                "mount mutation payload mismatch: operation requires_payload={} supplied={}",
+                self.requires_payload(),
+                payload.is_some()
+            );
+        }
+        if let (
+            Self::AppendFile {
+                path,
+                base_size,
+                size,
+                ..
+            },
+            Some(payload),
+        ) = (self, payload)
+            && payload.length != size.saturating_sub(*base_size)
+        {
+            bail!(
+                "append generation of {path:?} carries {} payload bytes, expected {}",
+                payload.length,
+                size.saturating_sub(*base_size)
+            );
+        }
         Ok(())
     }
 
     /// Only a content generation carries payload bytes.
     pub(crate) fn requires_payload(&self) -> bool {
-        matches!(self, Self::ReplaceFile { .. })
+        self.is_content()
     }
 
     /// True when the gateway contract cannot express this mutation. The
@@ -175,9 +246,9 @@ impl MountMutation {
     }
 
     /// True when the publisher routes this through `write-many` /
-    /// `write_staged_file` rather than `namespace-many`.
+    /// a streamed `PUT /file` rather than `namespace-many`.
     pub(crate) fn is_content(&self) -> bool {
-        matches!(self, Self::ReplaceFile { .. })
+        matches!(self, Self::ReplaceFile { .. } | Self::AppendFile { .. })
     }
 
     /// The path the mutation is primarily about; for a rename it is the
@@ -187,6 +258,7 @@ impl MountMutation {
             Self::CreateDirectory { path, .. }
             | Self::CreateFile { path, .. }
             | Self::ReplaceFile { path, .. }
+            | Self::AppendFile { path, .. }
             | Self::CreateSymlink { path, .. }
             | Self::RemoveFile { path, .. }
             | Self::RemoveDirectory { path }
@@ -204,6 +276,7 @@ impl MountMutation {
             Self::CreateDirectory { path, .. }
             | Self::CreateFile { path, .. }
             | Self::ReplaceFile { path, .. }
+            | Self::AppendFile { path, .. }
             | Self::CreateSymlink { path, .. }
             | Self::RemoveFile { path, .. }
             | Self::RemoveDirectory { path }
@@ -439,6 +512,13 @@ pub(crate) enum PayloadSource<'a> {
     Bytes(&'a [u8]),
     /// Capture an immutable snapshot of this backing file, preferring a reflink.
     File(&'a Path),
+    /// Capture exactly `length` bytes of this backing file starting at
+    /// `offset` into a dedicated payload: the new bytes of a large append.
+    Range {
+        path: &'a Path,
+        offset: u64,
+        length: u64,
+    },
 }
 
 impl PayloadSource<'_> {
@@ -572,6 +652,14 @@ pub(crate) struct MountEvent {
     /// for hard-link and rename dependency tracking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) local_identity: Option<String>,
+    /// Publication-only, never persisted: later `AppendFile` generations of the
+    /// same path that a publish batch folded onto this content event, oldest
+    /// first. The event then publishes as one request whose body is its own
+    /// payload followed by each folded payload, ending in the last folded
+    /// generation's content. Always empty on an event read from or written to
+    /// the log.
+    #[serde(skip)]
+    pub(crate) folded_appends: Vec<MountEvent>,
 }
 
 impl MountEvent {
@@ -584,6 +672,48 @@ impl MountEvent {
 
     pub(crate) fn dependency_keys(&self) -> Vec<DependencyKey> {
         self.mutation.dependency_keys()
+    }
+
+    /// Own payload followed by every folded append's, in upload order.
+    pub(crate) fn payload_chain(&self) -> impl Iterator<Item = &PayloadRef> {
+        self.payload.iter().chain(
+            self.folded_appends
+                .iter()
+                .filter_map(|folded| folded.payload.as_ref()),
+        )
+    }
+
+    /// Bytes this event uploads: its payload plus every folded append's.
+    pub(crate) fn wire_payload_length(&self) -> u64 {
+        self.payload_chain()
+            .map(|payload| payload.length)
+            .fold(0, u64::saturating_add)
+    }
+
+    /// The newest WAL sequence this event stands for once folded appends are
+    /// counted.
+    pub(crate) fn last_sequence(&self) -> u64 {
+        self.folded_appends
+            .last()
+            .map(|folded| folded.sequence)
+            .unwrap_or(self.sequence)
+    }
+
+    /// `(size, content_hash)` of the file once this content event is published:
+    /// the last folded append's result, otherwise the event's own. `None` for a
+    /// namespace event.
+    pub(crate) fn published_content(&self) -> Option<(u64, &str)> {
+        let last = self.folded_appends.last().unwrap_or(self);
+        match &last.mutation {
+            MountMutation::AppendFile {
+                size, content_hash, ..
+            } => Some((*size, content_hash.as_str())),
+            MountMutation::ReplaceFile { .. } => last
+                .payload
+                .as_ref()
+                .map(|payload| (payload.length, payload.content_hash.as_str())),
+            _ => None,
+        }
     }
 }
 
@@ -664,9 +794,10 @@ pub(crate) struct MountCheckpoint {
 
 impl MountCheckpoint {
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.format_version != WAL_FORMAT_VERSION {
+        if !readable_wal_format(self.format_version) {
             bail!(
-                "unsupported mount checkpoint format {} (expected {WAL_FORMAT_VERSION})",
+                "unsupported mount checkpoint format {} (this build reads \
+                 {MIN_READABLE_WAL_FORMAT_VERSION}..={WAL_FORMAT_VERSION})",
                 self.format_version
             );
         }

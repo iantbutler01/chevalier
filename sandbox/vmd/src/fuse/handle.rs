@@ -28,7 +28,8 @@ use super::local_view::mount::{
     default_state_dir_for_mountpoint,
 };
 use super::local_view::publisher::{
-    AuthoritativePathSource, MountPublisher, PublisherOptions, TreeGenerationSource,
+    AuthoritativePathSource, GenerationSource, MountPublisher, PublisherOptions,
+    TreeGenerationSource,
 };
 use super::local_view::types::{DrainOutcome, MountOwnerRecord, PublicationHealth};
 use super::local_view::wal::MountWal;
@@ -812,6 +813,7 @@ async fn attach_mount_publisher(
     // which the WAL reads as "keep the generation the last checkpoint carried".
     let weak_generation = Arc::downgrade(view);
     let weak_paths = Arc::downgrade(view);
+    let weak_content = Arc::downgrade(view);
     let options = PublisherOptions::defaults(surface_kind_for_scope(scope_path))
         .with_tree_generation(TreeGenerationSource::new(move || {
             weak_generation
@@ -824,6 +826,12 @@ async fn attach_mount_publisher(
                 anyhow::anyhow!("mount local view closed during publication reconciliation")
             })?;
             Ok(view.tree().lstat(path)?.map(|metadata| metadata.kind))
+        }))
+        .with_generations(GenerationSource::new(move |path, size, content_hash| {
+            let view = weak_content
+                .upgrade()
+                .ok_or_else(|| anyhow::anyhow!("mount local view closed during append recovery"))?;
+            view.snapshot_generation(path, size, content_hash)
         }));
     let publisher = MountPublisher::spawn(client.clone(), wal.clone(), Handle::current(), options);
     if let Err(error) = view.attach_publisher(Arc::clone(&publisher)) {

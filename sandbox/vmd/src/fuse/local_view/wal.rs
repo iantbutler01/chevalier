@@ -31,7 +31,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-use super::payload::{PayloadReader, PayloadStore};
+use chevalier_vfs_hash::ContentHasher;
+
+use super::payload::{CapturedSnapshot, PayloadReader, PayloadStore};
 use super::types::{
     CompactionOutcome, MountCheckpoint, MountEvent, MountMutation, MountPreImage, PayloadRef,
     PayloadSource, PreparedEvent, PublishBatch, RecoveryResolution, RecoveryState, StoragePressure,
@@ -40,7 +42,7 @@ use super::types::{
 use super::{
     DEFAULT_BACKING_FREE_BYTES_FLOOR, DEFAULT_BACKING_FREE_FRACTION_FLOOR, LOG_TARGET_BYTES,
     MAX_RECORD_BYTES, MountStateLayout, WAL_FORMAT_VERSION, WAL_SOFT_LIMIT_BYTES, create_new,
-    open_append, read_json, sync_directory, write_json_atomic,
+    open_append, read_json, readable_wal_format, sync_directory, write_json_atomic,
 };
 
 const BACKING_FREE_FRACTION_FLOOR_ENV: &str = "CHEVALIER_VMD_BACKING_FREE_FRACTION_FLOOR";
@@ -61,18 +63,33 @@ struct PreparedRecord {
     offset: u64,
 }
 
-/// Return the older content generation that `candidate` makes unnecessary on
-/// the wire. Walking backward stops at the first remote mutation that conflicts
-/// with the candidate. Only another `ReplaceFile` of the exact same path may be
-/// removed; a create, rename, link, delete or mode change remains an ordering
-/// boundary. Local-only owner/time records do not constrain gateway order.
-fn superseded_content_generation(events: &[MountEvent], candidate: &MountEvent) -> Option<usize> {
-    let MountMutation::ReplaceFile {
-        path: candidate_path,
-        ..
-    } = &candidate.mutation
-    else {
-        return None;
+/// Where a committed content generation goes in a publish batch's wire plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContentPlacement {
+    /// Its own wire item.
+    Push,
+    /// It makes the queued content event at this index unnecessary: a whole-file
+    /// generation replaces whatever the earlier generation (and any appends
+    /// folded onto it) would have left behind.
+    Supersede(usize),
+    /// It extends the queued content event at this index, whose published
+    /// result is exactly this append's base, so the two publish as one request.
+    Fold(usize),
+}
+
+/// Plan `candidate` against the events already queued. Walking backward stops
+/// at the first remote mutation that conflicts with the candidate. Only a
+/// content event of the exact same path is ever collapsed; a create, rename,
+/// link, delete or mode change remains an ordering boundary. Local-only
+/// owner/time records do not constrain gateway order.
+///
+/// Because every same-path content event either supersedes or folds into the
+/// nearest one, at most one content event per path is queued after the last
+/// boundary, which is what keeps this a single backward walk.
+fn place_content_generation(events: &[MountEvent], candidate: &MountEvent) -> ContentPlacement {
+    let candidate_path = match &candidate.mutation {
+        MountMutation::ReplaceFile { path, .. } | MountMutation::AppendFile { path, .. } => path,
+        _ => return ContentPlacement::Push,
     };
     let candidate_keys = candidate.dependency_keys();
     for (index, event) in events.iter().enumerate().rev() {
@@ -81,12 +98,44 @@ fn superseded_content_generation(events: &[MountEvent], candidate: &MountEvent) 
         {
             continue;
         }
-        return match &event.mutation {
-            MountMutation::ReplaceFile { path, .. } if path == candidate_path => Some(index),
-            _ => None,
+        let same_path_content =
+            event.mutation.is_content() && event.mutation.primary_path() == candidate_path;
+        if !same_path_content {
+            return ContentPlacement::Push;
+        }
+        return match &candidate.mutation {
+            MountMutation::ReplaceFile { .. } => ContentPlacement::Supersede(index),
+            MountMutation::AppendFile {
+                base_size,
+                base_content_hash,
+                ..
+            } if event.published_content() == Some((*base_size, base_content_hash.as_str())) => {
+                ContentPlacement::Fold(index)
+            }
+            // An append whose base is not what the queued event publishes is
+            // left standalone: the gateway's base precondition rejects it and
+            // the full-content fallback repairs it, rather than this planner
+            // splicing bytes onto a generation they do not extend.
+            _ => ContentPlacement::Push,
         };
     }
-    None
+    ContentPlacement::Push
+}
+
+/// Payload bytes `event`, with `folding` more appended bytes folded onto it,
+/// makes a batched `write-many` request hold in memory. Payloads at or above
+/// the stream threshold, and every append (always a streamed `PUT`), are read
+/// from disk while uploading instead.
+fn batched_payload_bytes(event: &MountEvent, folding: u64, stream_threshold_bytes: u64) -> u64 {
+    if matches!(event.mutation, MountMutation::AppendFile { .. }) {
+        return 0;
+    }
+    let length = event.wire_payload_length().saturating_add(folding);
+    if length >= stream_threshold_bytes {
+        0
+    } else {
+        length
+    }
 }
 
 /// Everything the append critical section touches. One short mutex: assign a
@@ -231,6 +280,57 @@ fn decode_pressure(level: u8) -> StoragePressure {
 #[derive(Clone)]
 pub(crate) struct MountWal {
     inner: Arc<WalInner>,
+}
+
+/// Where a committed content generation's bytes are now. See
+/// [`MountWal::content_successor`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ContentSuccessor {
+    /// Still reachable under `path` (the generation's own path, or where later
+    /// renames moved it), extended by nothing but appends.
+    At { path: String },
+    /// A later accepted event -- a whole-file generation, a removal or an
+    /// overwriting rename -- ended them, so no later state of the replica
+    /// depends on them. `aliased` records that a hard link exposed them under
+    /// another name first, which makes them observable after all.
+    Superseded { aliased: bool },
+}
+
+/// A transient full-content snapshot of a backing file. See
+/// [`MountWal::snapshot_file_prefix`]; the file is removed when this drops.
+pub(crate) struct FileSnapshot {
+    wal: MountWal,
+    captured: CapturedSnapshot,
+}
+
+impl FileSnapshot {
+    pub(crate) fn path(&self) -> &Path {
+        &self.captured.path
+    }
+
+    pub(crate) fn length(&self) -> u64 {
+        self.captured.length
+    }
+
+    pub(crate) fn content_hash(&self) -> &str {
+        &self.captured.content_hash
+    }
+}
+
+impl Drop for FileSnapshot {
+    fn drop(&mut self) {
+        self.wal.inner.payloads.release_snapshot(&self.captured);
+    }
+}
+
+impl std::fmt::Debug for FileSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FileSnapshot")
+            .field("path", &self.captured.path)
+            .field("length", &self.captured.length)
+            .finish()
+    }
 }
 
 impl MountWal {
@@ -496,6 +596,20 @@ impl MountWal {
         payload: PayloadSource<'_>,
         pre_image: MountPreImage,
     ) -> Result<PreparedEvent> {
+        self.prepare_capturing(mutation, payload, pre_image)
+            .map(|(prepared, _)| prepared)
+    }
+
+    /// [`Self::prepare`], also returning the content hash state positioned
+    /// after the captured bytes when the payload was a whole-file capture. The
+    /// seal keeps it for a large file so its next append generation hashes only
+    /// the new bytes.
+    pub(crate) fn prepare_capturing(
+        &self,
+        mutation: MountMutation,
+        payload: PayloadSource<'_>,
+        pre_image: MountPreImage,
+    ) -> Result<(PreparedEvent, Option<ContentHasher>)> {
         mutation.validate()?;
         if mutation.requires_payload() != payload.is_some() {
             bail!(
@@ -505,16 +619,38 @@ impl MountWal {
             );
         }
         // Capture, hash and copy with no append lock held.
-        let payload = match payload {
-            PayloadSource::None => None,
-            PayloadSource::Bytes(bytes) => Some(self.inner.payloads.capture_bytes(bytes)?),
-            PayloadSource::File(source) => Some(
-                self.inner
+        let (payload, hasher) = match payload {
+            PayloadSource::None => (None, None),
+            PayloadSource::Bytes(bytes) => (Some(self.inner.payloads.capture_bytes(bytes)?), None),
+            PayloadSource::File(source) => {
+                let (payload, hasher) = self
+                    .inner
                     .payloads
                     .capture_file(source, None)
-                    .with_context(|| format!("capture mount payload from {}", source.display()))?,
+                    .with_context(|| format!("capture mount payload from {}", source.display()))?;
+                (Some(payload), Some(hasher))
+            }
+            PayloadSource::Range {
+                path,
+                offset,
+                length,
+            } => (
+                Some(
+                    self.inner
+                        .payloads
+                        .capture_range(path, offset, length)
+                        .with_context(|| {
+                            format!(
+                                "capture mount payload bytes {offset}..{} from {}",
+                                offset.saturating_add(length),
+                                path.display()
+                            )
+                        })?,
+                ),
+                None,
             ),
         };
+        mutation.validate_payload(payload.as_ref())?;
 
         let mut state = self.append_lock()?;
         let sequence = state.next_sequence;
@@ -527,6 +663,7 @@ impl MountWal {
             payload,
             pre_image,
             local_identity: None,
+            folded_appends: Vec::new(),
         };
         let offset = append_framed(
             &mut state,
@@ -546,7 +683,7 @@ impl MountWal {
         state.next_sequence = sequence
             .checked_add(1)
             .ok_or_else(|| anyhow!("mount WAL sequence exhausted"))?;
-        Ok(PreparedEvent { event })
+        Ok((PreparedEvent { event }, hasher))
     }
 
     /// Make an applied mutation eligible for replay and publication.
@@ -816,6 +953,13 @@ impl MountWal {
     /// 65 MiB log reopened for each line must not upload every intermediate
     /// 65 MiB generation merely because the gateway models whole files.
     ///
+    /// Consecutive `AppendFile` generations fold onto the queued content event
+    /// they extend (a whole-file generation or an earlier append), so a burst of
+    /// appends publishes as one request carrying only their new bytes, and an
+    /// append is never sent before the generation it extends. A later
+    /// whole-file generation supersedes the queued event together with
+    /// everything folded onto it.
+    ///
     /// Payloads at or above `stream_threshold_bytes` do not consume the batched
     /// byte budget because the publisher streams them from disk. The publisher's
     /// request semaphore bounds concurrent oversized uploads; retaining several
@@ -855,30 +999,45 @@ impl MountWal {
                 break;
             }
 
-            let superseded = superseded_content_generation(&events, &record.event);
-            let old_payload = superseded
-                .map(|index| events[index].payload_length())
-                .unwrap_or(0);
-            let event_payload = record.event.payload_length();
+            let placement = place_content_generation(&events, &record.event);
+            let (removed_bytes, added_bytes) = match placement {
+                ContentPlacement::Push => (
+                    0,
+                    batched_payload_bytes(&record.event, 0, stream_threshold_bytes),
+                ),
+                ContentPlacement::Supersede(index) => (
+                    batched_payload_bytes(&events[index], 0, stream_threshold_bytes),
+                    batched_payload_bytes(&record.event, 0, stream_threshold_bytes),
+                ),
+                ContentPlacement::Fold(index) => (
+                    batched_payload_bytes(&events[index], 0, stream_threshold_bytes),
+                    batched_payload_bytes(
+                        &events[index],
+                        record.event.payload_length(),
+                        stream_threshold_bytes,
+                    ),
+                ),
+            };
             let next_payload_bytes = payload_bytes
-                .saturating_sub(if old_payload >= stream_threshold_bytes {
-                    0
-                } else {
-                    old_payload
-                })
-                .saturating_add(if event_payload >= stream_threshold_bytes {
-                    0
-                } else {
-                    event_payload
-                });
+                .saturating_sub(removed_bytes)
+                .saturating_add(added_bytes);
             if !events.is_empty() && next_payload_bytes > max_payload_bytes {
                 break;
             }
-            if let Some(index) = superseded {
-                events.remove(index);
+            match placement {
+                ContentPlacement::Push => events.push(record.event.clone()),
+                ContentPlacement::Supersede(index) => {
+                    events.remove(index);
+                    events.push(record.event.clone());
+                }
+                // The folded event keeps its position: everything queued
+                // after it is independent of this path, so moving the append
+                // earlier commutes with it.
+                ContentPlacement::Fold(index) => {
+                    events[index].folded_appends.push(record.event.clone());
+                }
             }
             payload_bytes = next_payload_bytes;
-            events.push(record.event.clone());
             scanned_events += 1;
             through_sequence = sequence;
             sequence = sequence.saturating_add(1);
@@ -1041,10 +1200,6 @@ impl MountWal {
         self.inner.payloads.read_all(payload)
     }
 
-    pub(crate) fn payload_path(&self, payload: &PayloadRef) -> Option<PathBuf> {
-        self.inner.payloads.dedicated_path(payload)
-    }
-
     /// Prove an event's immutable payload is still complete and unchanged.
     ///
     /// Committed events are verified by the publisher after it collapses a
@@ -1057,12 +1212,94 @@ impl MountWal {
                 .inner
                 .payloads
                 .verify(payload)
-                .with_context(|| format!("verify mount event {} payload", event.sequence)),
+                .with_context(|| format!("verify mount event {} payload", event.sequence))?,
             None if event.mutation.requires_payload() => {
                 bail!("mount content event {} carries no payload", event.sequence)
             }
-            None => Ok(()),
+            None => {}
         }
+        // Appends a publish batch folded onto this event upload in the same
+        // request, so they are held to the same proof.
+        for folded in &event.folded_appends {
+            self.verify_event_payload(folded)?;
+        }
+        Ok(())
+    }
+
+    /// `(payload file, offset, length)` of a payload, for a streamed upload that
+    /// chains several payloads into one body.
+    pub(crate) fn payload_location(&self, payload: &PayloadRef) -> Result<(PathBuf, u64, u64)> {
+        self.inner.payloads.location(payload)
+    }
+
+    /// Snapshot the first `length` bytes of the backing file at `source` into a
+    /// transient payload that no record references. Removed when the returned
+    /// value drops.
+    pub(crate) fn snapshot_file_prefix(&self, source: &Path, length: u64) -> Result<FileSnapshot> {
+        let captured = self.inner.payloads.capture_snapshot(source, length)?;
+        Ok(FileSnapshot {
+            wal: self.clone(),
+            captured,
+        })
+    }
+
+    /// Where the bytes a committed content generation of `path` left behind can
+    /// be found now, judged from the committed WAL suffix after
+    /// `after_sequence`.
+    ///
+    /// Used when the gateway refused an append and the publisher must publish
+    /// that generation's full content instead. Appends, mode and local-only
+    /// records leave the bytes in place; a rename of the path or an ancestor
+    /// moves them; a whole-file generation, a removal or an overwriting rename
+    /// supersedes them. The walk stops at the first unresolved sequence, so it
+    /// only ever reasons from accepted history. `At` is a hint, not a proof:
+    /// the caller still hashes the bytes it finds against the generation.
+    pub(crate) fn content_successor(
+        &self,
+        path: &str,
+        after_sequence: u64,
+    ) -> Result<ContentSuccessor> {
+        let state = self.append_lock()?;
+        let mut current = path.to_string();
+        let mut aliased = false;
+        let mut sequence = after_sequence.saturating_add(1);
+        while sequence < state.next_sequence {
+            if state.aborted.contains(&sequence) {
+                sequence = sequence.saturating_add(1);
+                continue;
+            }
+            let Some(record) = state.prepared.get(&sequence) else {
+                break;
+            };
+            if !state.committed.contains(&sequence) {
+                break;
+            }
+            let superseded = match &record.event.mutation {
+                MountMutation::ReplaceFile { path, .. }
+                | MountMutation::RemoveFile { path, .. } => *path == current,
+                MountMutation::RemoveDirectory { path } => is_at_or_below(&current, path),
+                MountMutation::Rename {
+                    old_path, new_path, ..
+                } => {
+                    if is_at_or_below(&current, old_path) {
+                        current = format!("{new_path}{}", &current[old_path.len()..]);
+                        false
+                    } else {
+                        is_at_or_below(&current, new_path)
+                    }
+                }
+                MountMutation::CreateHardLink { existing_path, .. } => {
+                    aliased |= *existing_path == current;
+                    false
+                }
+                _ => false,
+            };
+            if superseded {
+                return Ok(ContentSuccessor::Superseded { aliased });
+            }
+            sequence = sequence.saturating_add(1);
+        }
+        Ok(ContentSuccessor::At { path: current })
     }
 
     // -- maintenance ---------------------------------------------------------
@@ -1692,7 +1929,7 @@ fn apply_scanned_record(
             generation: recorded,
             first_sequence: _,
         } => {
-            if format_version != WAL_FORMAT_VERSION {
+            if !readable_wal_format(format_version) {
                 bail!("unsupported mount WAL header format {format_version}");
             }
             observe_epoch(&mut scan.epoch, &epoch)?;
@@ -1703,19 +1940,22 @@ fn apply_scanned_record(
             }
         }
         WalRecord::Prepared { event } => {
-            if event.format_version != WAL_FORMAT_VERSION {
+            if !readable_wal_format(event.format_version) {
                 bail!(
                     "unsupported mount WAL event format {}",
                     event.format_version
                 );
             }
             event.mutation.validate()?;
-            if event.mutation.requires_payload() != event.payload.is_some() {
-                bail!(
-                    "mount WAL sequence {} has an invalid payload shape",
-                    event.sequence
-                );
-            }
+            event
+                .mutation
+                .validate_payload(event.payload.as_ref())
+                .with_context(|| {
+                    format!(
+                        "mount WAL sequence {} has an invalid payload shape",
+                        event.sequence
+                    )
+                })?;
             observe_epoch(&mut scan.epoch, &event.epoch)?;
             if event.sequence >= scan.first_unpruned_sequence {
                 let sequence = event.sequence;
@@ -1902,7 +2142,9 @@ fn prune_resolved(state: &mut AppendState, through_sequence: u64) -> BTreeSet<St
 /// exactly the paths whose backing bytes the guest could still read back.
 fn apply_committed_dirty_effect(dirty: &mut BTreeSet<String>, mutation: &MountMutation) {
     match mutation {
-        MountMutation::ReplaceFile { path, .. } | MountMutation::RemoveFile { path, .. } => {
+        MountMutation::ReplaceFile { path, .. }
+        | MountMutation::AppendFile { path, .. }
+        | MountMutation::RemoveFile { path, .. } => {
             dirty.remove(path);
         }
         MountMutation::RemoveDirectory { path } => {
@@ -2026,6 +2268,8 @@ fn backing_free_space(_root: &Path) -> Option<BackingFreeSpace> {
 mod tests {
     use std::fs::{File, OpenOptions};
     use std::io::{Read, Write};
+
+    use chevalier_vfs_hash::hash_bytes;
 
     use super::append_record;
     use super::{BackingFreeSpace, MountStateLayout, MountWal, StoragePressureLimits};
@@ -2784,5 +3028,427 @@ mod tests {
         .expect("append duplicate");
         file.sync_all().expect("sync duplicate");
         assert!(MountWal::open(&MountStateLayout::new(temp.path()), None).is_err());
+    }
+
+    // -- append generations ------------------------------------------------
+
+    fn commit_replace(wal: &MountWal, path: &str, bytes: &[u8]) -> u64 {
+        let prepared = wal
+            .prepare(
+                MountMutation::ReplaceFile {
+                    path: path.to_string(),
+                    mode: 0o644,
+                    expected_file_id: None,
+                    base_content_hash: None,
+                },
+                PayloadSource::Bytes(bytes),
+                MountPreImage::empty(),
+            )
+            .expect("prepare whole generation");
+        let sequence = prepared.sequence();
+        wal.commit(prepared, None).expect("commit whole generation");
+        sequence
+    }
+
+    /// Commit an append of `tail` onto `base`, returning its sequence and the
+    /// resulting content.
+    fn commit_append(wal: &MountWal, path: &str, base: &[u8], tail: &[u8]) -> (u64, Vec<u8>) {
+        let mut content = base.to_vec();
+        content.extend_from_slice(tail);
+        let prepared = wal
+            .prepare(
+                MountMutation::AppendFile {
+                    path: path.to_string(),
+                    mode: 0o644,
+                    base_size: base.len() as u64,
+                    base_content_hash: hash_bytes(base),
+                    size: content.len() as u64,
+                    content_hash: hash_bytes(&content),
+                },
+                PayloadSource::Bytes(tail),
+                MountPreImage::empty(),
+            )
+            .expect("prepare append generation");
+        let sequence = prepared.sequence();
+        wal.commit(prepared, None)
+            .expect("commit append generation");
+        (sequence, content)
+    }
+
+    fn commit_namespace(wal: &MountWal, mutation: MountMutation) -> u64 {
+        let prepared = wal
+            .prepare(mutation, PayloadSource::None, MountPreImage::empty())
+            .expect("prepare namespace event");
+        let sequence = prepared.sequence();
+        wal.commit(prepared, None).expect("commit namespace event");
+        sequence
+    }
+
+    #[test]
+    fn consecutive_appends_fold_onto_the_generation_they_extend() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let wal = open(temp.path());
+        let base = vec![7_u8; 64];
+        let whole = commit_replace(&wal, "app.log", &base);
+        let (first, after_first) = commit_append(&wal, "app.log", &base, b"line one\n");
+        // An unrelated path between two appends neither blocks nor joins the
+        // fold.
+        commit_replace(&wal, "other.txt", b"unrelated");
+        let (second, after_second) = commit_append(&wal, "app.log", &after_first, b"line two\n");
+
+        let batch = wal
+            .next_publish_batch(64, 1024 * 1024, 8 * 1024 * 1024)
+            .expect("batch")
+            .expect("pending batch");
+        assert_eq!(batch.through_sequence, 4);
+        assert_eq!(batch.events.len(), 2);
+        let folded = &batch.events[0];
+        assert_eq!(folded.sequence, whole);
+        assert_eq!(
+            folded
+                .folded_appends
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(folded.last_sequence(), second);
+        assert_eq!(
+            folded.published_content(),
+            Some((
+                after_second.len() as u64,
+                hash_bytes(&after_second).as_str()
+            ))
+        );
+        assert_eq!(
+            folded.wire_payload_length(),
+            (base.len() + b"line one\n".len() + b"line two\n".len()) as u64
+        );
+        wal.verify_event_payload(folded)
+            .expect("folded payload chain verifies");
+        let mut uploaded = Vec::new();
+        for payload in folded.payload_chain() {
+            uploaded.extend(wal.payload_bytes(payload).expect("read payload"));
+        }
+        assert_eq!(uploaded, after_second);
+    }
+
+    #[test]
+    fn a_published_base_lets_appends_fold_onto_each_other() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let wal = open(temp.path());
+        let base = vec![1_u8; 32];
+        let whole = commit_replace(&wal, "app.log", &base);
+        wal.acknowledge(whole, 1, 0).expect("publish the base");
+        let (first, content) = commit_append(&wal, "app.log", &base, b"a");
+        let (second, content) = commit_append(&wal, "app.log", &content, b"bc");
+        let (third, content) = commit_append(&wal, "app.log", &content, b"def");
+
+        let batch = wal
+            .next_publish_batch(64, 1, 4)
+            .expect("batch")
+            .expect("pending batch");
+        assert_eq!(batch.through_sequence, third);
+        assert_eq!(batch.events.len(), 1);
+        let head = &batch.events[0];
+        assert_eq!(head.sequence, first);
+        assert!(matches!(
+            head.mutation,
+            MountMutation::AppendFile { base_size: 32, .. }
+        ));
+        assert_eq!(
+            head.folded_appends
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![second, third]
+        );
+        assert_eq!(head.wire_payload_length(), 6);
+        assert_eq!(
+            head.published_content(),
+            Some((content.len() as u64, hash_bytes(&content).as_str()))
+        );
+    }
+
+    #[test]
+    fn a_later_whole_generation_supersedes_queued_appends() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let wal = open(temp.path());
+        let base = vec![2_u8; 16];
+        commit_replace(&wal, "app.log", &base);
+        let (_, content) = commit_append(&wal, "app.log", &base, b"tail");
+        commit_append(&wal, "app.log", &content, b"more");
+        let rewrite = commit_replace(&wal, "app.log", b"rewritten");
+
+        let batch = wal
+            .next_publish_batch(64, 1024, 4096)
+            .expect("batch")
+            .expect("pending batch");
+        assert_eq!(batch.through_sequence, rewrite);
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].sequence, rewrite);
+        assert!(batch.events[0].folded_appends.is_empty());
+    }
+
+    #[test]
+    fn a_conflicting_boundary_or_foreign_base_keeps_an_append_standalone() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let wal = open(temp.path());
+        let base = vec![3_u8; 16];
+        commit_replace(&wal, "app.log", &base);
+        commit_namespace(
+            &wal,
+            MountMutation::SetMode {
+                path: "app.log".to_string(),
+                mode: 0o600,
+            },
+        );
+        let (behind_boundary, content) = commit_append(&wal, "app.log", &base, b"x");
+        // An append whose recorded base is not what the queued event publishes
+        // is never spliced onto it.
+        let (foreign, _) = commit_append(&wal, "app.log", b"not the base", b"y");
+
+        let batch = wal
+            .next_publish_batch(64, 1024, 4096)
+            .expect("batch")
+            .expect("pending batch");
+        let sequences: Vec<u64> = batch.events.iter().map(|event| event.sequence).collect();
+        assert_eq!(sequences, vec![1, 2, behind_boundary, foreign]);
+        assert!(
+            batch
+                .events
+                .iter()
+                .all(|event| event.folded_appends.is_empty())
+        );
+        assert_eq!(
+            batch.events[2].published_content(),
+            Some((content.len() as u64, hash_bytes(&content).as_str()))
+        );
+    }
+
+    #[test]
+    fn append_generations_replay_and_reject_a_payload_that_is_not_their_new_bytes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let wal = open(temp.path());
+        let base = vec![4_u8; 128];
+        commit_replace(&wal, "app.log", &base);
+        let (sequence, content) = commit_append(&wal, "app.log", &base, b"appended");
+        let unresolved = wal
+            .prepare(
+                MountMutation::AppendFile {
+                    path: "app.log".to_string(),
+                    mode: 0o644,
+                    base_size: content.len() as u64,
+                    base_content_hash: hash_bytes(&content),
+                    size: content.len() as u64 + 3,
+                    content_hash: hash_bytes(b"whatever"),
+                },
+                PayloadSource::Bytes(b"abc"),
+                MountPreImage::empty(),
+            )
+            .expect("prepare unresolved append");
+        let mismatched = wal.prepare(
+            MountMutation::AppendFile {
+                path: "app.log".to_string(),
+                mode: 0o644,
+                base_size: 10,
+                base_content_hash: "base".to_string(),
+                size: 20,
+                content_hash: "result".to_string(),
+            },
+            PayloadSource::Bytes(b"only five"),
+            MountPreImage::empty(),
+        );
+        assert!(format!("{:#}", mismatched.expect_err("short payload")).contains("payload bytes"));
+        assert!(
+            MountMutation::AppendFile {
+                path: "app.log".to_string(),
+                mode: 0o644,
+                base_size: 0,
+                base_content_hash: "base".to_string(),
+                size: 4,
+                content_hash: "result".to_string(),
+            }
+            .validate()
+            .is_err(),
+            "an append must extend a non-empty base"
+        );
+        wal.sync_local().expect("sync");
+        drop(wal);
+
+        let recovered = open(temp.path());
+        let state = recovered.recovery_state().expect("recovery state");
+        assert_eq!(state.committed_unacknowledged.len(), 2);
+        let replayed = &state.committed_unacknowledged[1];
+        assert_eq!(replayed.sequence, sequence);
+        assert_eq!(
+            replayed.mutation,
+            MountMutation::AppendFile {
+                path: "app.log".to_string(),
+                mode: 0o644,
+                base_size: 128,
+                base_content_hash: hash_bytes(&base),
+                size: content.len() as u64,
+                content_hash: hash_bytes(&content),
+            }
+        );
+        assert_eq!(state.unresolved_prepares, vec![unresolved.event]);
+        recovered
+            .verify_event_payload(replayed)
+            .expect("replayed append payload");
+        assert_eq!(
+            recovered
+                .payload_bytes(replayed.payload.as_ref().expect("payload"))
+                .expect("read"),
+            b"appended"
+        );
+        // A committed append clears the dirty marker exactly as a whole-file
+        // generation does.
+        assert!(recovered.dirty_content_paths().expect("dirty").is_empty());
+    }
+
+    #[test]
+    fn a_v2_state_directory_is_still_read_and_a_newer_one_fails_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = MountStateLayout::new(temp.path());
+        layout.ensure().expect("layout");
+        let epoch = "0190f5d2-0000-7000-8000-000000000000".to_string();
+        let write_log = |format_version: u32| {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(layout.log_path(0))
+                .expect("create log");
+            append_record(
+                &mut file,
+                &WalRecord::LogHeader {
+                    format_version,
+                    epoch: epoch.clone(),
+                    generation: 0,
+                    first_sequence: 1,
+                },
+            )
+            .expect("header");
+            file.sync_all().expect("sync");
+        };
+
+        write_log(2);
+        let wal = MountWal::open(&layout, Some(&epoch)).expect("open a v2 log");
+        commit_replace(&wal, "kept.txt", b"v2 state keeps working");
+        drop(wal);
+        let reopened = MountWal::open(&layout, Some(&epoch)).expect("reopen mixed log");
+        assert_eq!(
+            reopened
+                .recovery_state()
+                .expect("state")
+                .committed_unacknowledged
+                .len(),
+            1
+        );
+        drop(reopened);
+
+        let future = tempfile::tempdir().expect("tempdir");
+        let future_layout = MountStateLayout::new(future.path());
+        future_layout.ensure().expect("layout");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(future_layout.log_path(0))
+            .expect("create log");
+        append_record(
+            &mut file,
+            &WalRecord::LogHeader {
+                format_version: super::WAL_FORMAT_VERSION + 1,
+                epoch: epoch.clone(),
+                generation: 0,
+                first_sequence: 1,
+            },
+        )
+        .expect("header");
+        file.sync_all().expect("sync");
+        drop(file);
+        let error = match MountWal::open(&future_layout, Some(&epoch)) {
+            Ok(_) => panic!("a newer format must fail closed"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("unsupported mount WAL header format"));
+    }
+
+    #[test]
+    fn content_successor_follows_renames_and_reports_supersession() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let wal = open(temp.path());
+        let base = vec![5_u8; 8];
+        commit_replace(&wal, "logs/app.log", &base);
+        let (append, content) = commit_append(&wal, "logs/app.log", &base, b"+");
+        commit_append(&wal, "logs/app.log", &content, b"+");
+        commit_namespace(
+            &wal,
+            MountMutation::Rename {
+                old_path: "logs".to_string(),
+                new_path: "archive".to_string(),
+                flags: 0,
+            },
+        );
+        commit_namespace(
+            &wal,
+            MountMutation::Rename {
+                old_path: "archive/app.log".to_string(),
+                new_path: "archive/app.log.1".to_string(),
+                flags: 0,
+            },
+        );
+        assert_eq!(
+            wal.content_successor("logs/app.log", append)
+                .expect("successor"),
+            super::ContentSuccessor::At {
+                path: "archive/app.log.1".to_string()
+            }
+        );
+
+        commit_namespace(
+            &wal,
+            MountMutation::CreateHardLink {
+                existing_path: "archive/app.log.1".to_string(),
+                new_path: "archive/alias".to_string(),
+            },
+        );
+        commit_replace(&wal, "archive/app.log.1", b"rotated away");
+        assert_eq!(
+            wal.content_successor("logs/app.log", append)
+                .expect("successor"),
+            super::ContentSuccessor::Superseded { aliased: true }
+        );
+
+        let removed = commit_replace(&wal, "scratch.log", &base);
+        commit_namespace(
+            &wal,
+            MountMutation::RemoveFile {
+                path: "scratch.log".to_string(),
+                expected_file_id: None,
+            },
+        );
+        assert_eq!(
+            wal.content_successor("scratch.log", removed)
+                .expect("successor"),
+            super::ContentSuccessor::Superseded { aliased: false }
+        );
+
+        let overwritten = commit_replace(&wal, "target.log", &base);
+        commit_namespace(
+            &wal,
+            MountMutation::Rename {
+                old_path: "incoming.log".to_string(),
+                new_path: "target.log".to_string(),
+                flags: 0,
+            },
+        );
+        assert_eq!(
+            wal.content_successor("target.log", overwritten)
+                .expect("successor"),
+            super::ContentSuccessor::Superseded { aliased: false }
+        );
     }
 }
