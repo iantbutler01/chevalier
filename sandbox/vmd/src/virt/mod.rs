@@ -12,6 +12,7 @@ fn virtiofsd_args(
     spawn: &VirtiofsdSpawn,
     cache_mode: &str,
     sandbox_mode: &str,
+    rlimit_nofile: Option<u64>,
 ) -> Vec<String> {
     // Ubuntu 22.04 ships the legacy C daemon at this path. Its filesystem semantics
     // are compatible, but its CLI predates the Rust daemon's long options.
@@ -32,7 +33,7 @@ fn virtiofsd_args(
         ];
     }
 
-    vec![
+    let mut args = vec![
         format!("--socket-path={}", spawn.socket_path.display()),
         format!("--shared-dir={}", spawn.source_path.display()),
         format!("--cache={cache_mode}"),
@@ -41,7 +42,142 @@ fn virtiofsd_args(
         "--log-level=warn".to_string(),
         // Required for vhost-user migration cooperation in Rust virtiofsd >= 1.12.
         "--migration-mode=find-paths".to_string(),
-    ]
+    ];
+    if let Some(limit) = rlimit_nofile {
+        args.push(format!("--rlimit-nofile={limit}"));
+    }
+    args
+}
+
+/// Overrides the `RLIMIT_NOFILE` vmd asks each Rust virtiofsd to run with.
+/// `0` passes no `--rlimit-nofile`, leaving virtiofsd's own default.
+pub const VIRTIOFSD_RLIMIT_NOFILE_ENV: &str = "CHEVALIER_VMD_VIRTIOFSD_RLIMIT_NOFILE";
+
+/// Default descriptor ceiling for each Rust virtiofsd.
+///
+/// Without `--inode-file-handles`, virtiofsd keeps one `O_PATH` descriptor per
+/// inode the guest kernel has cached, so a workspace with about a million
+/// live inodes exhausts virtiofsd's own default of
+/// `min(1_000_000, fs.nr_open)` and the guest sees `EMFILE`. File handles are
+/// not an option here: the shared directory is vmd's own FUSE mount, which does
+/// not negotiate `FUSE_EXPORT_SUPPORT`, so virtiofsd falls back to descriptors
+/// anyway.
+///
+/// The kernel refuses any `RLIMIT_NOFILE` above `fs.nr_open`, so hosts must
+/// set `fs.nr_open` to at least this value (`sysctl -w fs.nr_open=16777216`,
+/// persisted under `/etc/sysctl.d/`). vmd clamps to the host ceiling and warns
+/// at startup when it is lower: virtiofsd exits outright when an explicit
+/// `--rlimit-nofile` cannot be applied.
+pub const DEFAULT_VIRTIOFSD_RLIMIT_NOFILE: u64 = 16_777_216;
+
+/// The `--rlimit-nofile` value for every Rust virtiofsd this vmd spawns,
+/// resolved and logged once. `None` leaves virtiofsd's own default.
+pub fn virtiofsd_rlimit_nofile() -> Option<u64> {
+    static RESOLVED: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        let configured = configured_virtiofsd_rlimit_nofile();
+        if configured == 0 {
+            tracing::info!(
+                env = VIRTIOFSD_RLIMIT_NOFILE_ENV,
+                "virtiofsd descriptor limit left at virtiofsd's default"
+            );
+            return None;
+        }
+        let nr_open = host_nr_open();
+        let hard_limit = if running_as_root() {
+            None
+        } else {
+            process_nofile_hard_limit()
+        };
+        let effective = clamp_virtiofsd_rlimit_nofile(configured, nr_open, hard_limit);
+        if let Some(nr_open) = nr_open
+            && nr_open < configured
+        {
+            warn!(
+                configured,
+                nr_open,
+                effective,
+                "host fs.nr_open is below the configured virtiofsd descriptor limit; \
+                 guests caching more inodes than {effective} will hit EMFILE. Raise it with \
+                 `sysctl -w fs.nr_open={configured}` and persist it under /etc/sysctl.d/"
+            );
+        }
+        if let Some(hard_limit) = hard_limit
+            && hard_limit < configured
+        {
+            warn!(
+                configured,
+                hard_limit,
+                effective,
+                "vmd's RLIMIT_NOFILE hard limit is below the configured virtiofsd descriptor \
+                 limit and vmd is not root; raise vmd's hard limit (e.g. systemd LimitNOFILE)"
+            );
+        }
+        tracing::info!(configured, effective, "virtiofsd descriptor limit resolved");
+        Some(effective)
+    })
+}
+
+fn configured_virtiofsd_rlimit_nofile() -> u64 {
+    let Ok(raw) = std::env::var(VIRTIOFSD_RLIMIT_NOFILE_ENV) else {
+        return DEFAULT_VIRTIOFSD_RLIMIT_NOFILE;
+    };
+    raw.trim().parse::<u64>().unwrap_or_else(|_| {
+        warn!(
+            env = VIRTIOFSD_RLIMIT_NOFILE_ENV,
+            value = %raw,
+            default = DEFAULT_VIRTIOFSD_RLIMIT_NOFILE,
+            "ignoring unparsable virtiofsd descriptor limit"
+        );
+        DEFAULT_VIRTIOFSD_RLIMIT_NOFILE
+    })
+}
+
+/// The highest descriptor limit virtiofsd can actually apply: the kernel caps
+/// every process at `fs.nr_open`, and a process without `CAP_SYS_RESOURCE`
+/// cannot raise its own hard limit.
+fn clamp_virtiofsd_rlimit_nofile(
+    configured: u64,
+    nr_open: Option<u64>,
+    unprivileged_hard_limit: Option<u64>,
+) -> u64 {
+    [nr_open, unprivileged_hard_limit]
+        .into_iter()
+        .flatten()
+        .fold(configured, u64::min)
+}
+
+#[cfg(target_os = "linux")]
+fn host_nr_open() -> Option<u64> {
+    std::fs::read_to_string("/proc/sys/fs/nr_open")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn host_nr_open() -> Option<u64> {
+    None
+}
+
+#[cfg(unix)]
+fn process_nofile_hard_limit() -> Option<u64> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0
+        || limit.rlim_max == libc::RLIM_INFINITY
+    {
+        return None;
+    }
+    Some(limit.rlim_max as u64)
+}
+
+#[cfg(not(unix))]
+fn process_nofile_hard_limit() -> Option<u64> {
+    None
 }
 use std::time::{Duration, Instant};
 
@@ -1407,6 +1543,7 @@ pub async fn spawn_virtiofsd(
         spawn,
         &cache_mode,
         &sandbox_mode,
+        virtiofsd_rlimit_nofile(),
     ));
     // @dive: Read-only enforcement runs on two layers: (1) the host filesystem at the
     //        VFS export root is already mounted ro, and (2) bootstrap/init.sh appends
@@ -1814,6 +1951,7 @@ mod tests {
                 &test_virtiofsd_spawn(),
                 "auto",
                 "chroot",
+                Some(DEFAULT_VIRTIOFSD_RLIMIT_NOFILE),
             ),
             vec![
                 "--socket-path=/tmp/virtiofsd.sock",
@@ -1835,10 +1973,49 @@ mod tests {
             &test_virtiofsd_spawn(),
             "auto",
             "chroot",
+            None,
         );
         assert!(args.contains(&"--shared-dir=/workspace/apps".to_string()));
         assert!(args.contains(&"--migration-mode=find-paths".to_string()));
         assert!(!args.contains(&"-o".to_string()));
+        assert!(!args.iter().any(|arg| arg.starts_with("--rlimit-nofile")));
+    }
+
+    #[test]
+    fn virtiofsd_args_raise_rust_daemon_descriptor_limit() {
+        let args = virtiofsd_args(
+            "/usr/libexec/virtiofsd",
+            &test_virtiofsd_spawn(),
+            "auto",
+            "chroot",
+            Some(DEFAULT_VIRTIOFSD_RLIMIT_NOFILE),
+        );
+        assert!(args.contains(&"--rlimit-nofile=16777216".to_string()));
+    }
+
+    #[test]
+    fn virtiofsd_descriptor_limit_never_exceeds_what_the_host_allows() {
+        let configured = DEFAULT_VIRTIOFSD_RLIMIT_NOFILE;
+        // Root on a host whose fs.nr_open admits the configured value.
+        assert_eq!(
+            clamp_virtiofsd_rlimit_nofile(configured, Some(1 << 30), None),
+            configured
+        );
+        // The production default nr_open would make virtiofsd exit at startup.
+        assert_eq!(
+            clamp_virtiofsd_rlimit_nofile(configured, Some(1_048_576), None),
+            1_048_576
+        );
+        // Unprivileged vmd cannot exceed its inherited hard limit either.
+        assert_eq!(
+            clamp_virtiofsd_rlimit_nofile(configured, Some(1 << 30), Some(524_288)),
+            524_288
+        );
+        // No readable ceiling (non-Linux): pass the configured value through.
+        assert_eq!(
+            clamp_virtiofsd_rlimit_nofile(configured, None, None),
+            configured
+        );
     }
 
     async fn serve_qmp_script(listener: UnixListener, script: Vec<(&'static str, Value)>) {

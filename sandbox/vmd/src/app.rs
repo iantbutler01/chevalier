@@ -62,6 +62,9 @@ use crate::{
 pub async fn run_server(mut config: Config) -> Result<()> {
     config.normalize().context("normalize vmd server config")?;
     ensure_vfio_memlock_limit(&config.pci).context("prepare PCI passthrough")?;
+    // Resolve (and warn about) the virtiofsd descriptor ceiling at startup
+    // rather than at the first VM boot.
+    let _ = crate::virt::virtiofsd_rlimit_nofile();
     let addr: SocketAddr = config
         .listen_address
         .parse()

@@ -269,13 +269,30 @@ struct InodeTable {
     path_to_ino: BTreeMap<String, INodeNo>,
     identity_to_ino: HashMap<String, INodeNo>,
     ino_to_path: HashMap<INodeNo, InodeRecord>,
+    /// Source of `InodeRecord::last_access` stamps. Strictly increasing, so a
+    /// stamp orders records by recency without ties.
+    access_clock: u64,
+    /// Every non-root record whose `lookup_count` is zero, keyed by its
+    /// current `(last_access, ino)`, oldest first.
+    ///
+    /// These are exactly the records retention may prune, so pruning pops from
+    /// the front instead of scanning `ino_to_path`. A guest can hold far more
+    /// than `MAX_RETAINED_INODE_RECORDS` inodes referenced, and FORGET runs
+    /// under the mutex every other callback needs: a full scan per FORGET
+    /// there stalls the whole mount. Keep this index in step with every write
+    /// of `lookup_count` and `last_access` and every removal from
+    /// `ino_to_path` -- `touch`, `lookup_with_identity`, `forget`,
+    /// `insert_record` and `remove_inode_record` are the only places that do
+    /// so.
+    unreferenced: BTreeSet<(u64, INodeNo)>,
 }
 
 struct InodeRecord {
     path: String,
     paths: BTreeSet<String>,
     identity: Option<String>,
-    last_access: Instant,
+    /// `InodeTable::access_clock` stamp of the latest use.
+    last_access: u64,
     lookup_count: u64,
 }
 
@@ -295,6 +312,8 @@ impl InodeTable {
             path_to_ino: BTreeMap::new(),
             identity_to_ino: HashMap::new(),
             ino_to_path: HashMap::new(),
+            access_clock: 0,
+            unreferenced: BTreeSet::new(),
         };
         table.path_to_ino.insert(String::new(), ROOT_INO);
         table.ino_to_path.insert(
@@ -303,11 +322,41 @@ impl InodeTable {
                 path: String::new(),
                 paths: BTreeSet::from([String::new()]),
                 identity: None,
-                last_access: Instant::now(),
+                last_access: 0,
                 lookup_count: u64::MAX,
             },
         );
         table
+    }
+
+    /// Stamp `ino` as just used and return its record, keeping its position in
+    /// `unreferenced` current.
+    fn touch(&mut self, ino: INodeNo) -> Option<&mut InodeRecord> {
+        let record = self.ino_to_path.get_mut(&ino)?;
+        self.access_clock += 1;
+        if ino != ROOT_INO && record.lookup_count == 0 {
+            self.unreferenced.remove(&(record.last_access, ino));
+            self.unreferenced.insert((self.access_clock, ino));
+        }
+        record.last_access = self.access_clock;
+        Some(record)
+    }
+
+    /// Bind a freshly minted inode. It starts unreferenced: only a reply that
+    /// hands it to the kernel (`lookup_with_identity`) counts a lookup.
+    fn insert_record(&mut self, ino: INodeNo, path: &str, identity: Option<&str>) {
+        self.access_clock += 1;
+        self.ino_to_path.insert(
+            ino,
+            InodeRecord {
+                path: path.to_string(),
+                paths: BTreeSet::from([path.to_string()]),
+                identity: identity.map(str::to_string),
+                last_access: self.access_clock,
+                lookup_count: 0,
+            },
+        );
+        self.unreferenced.insert((self.access_clock, ino));
     }
 
     fn ensure(&mut self, path: &str) -> INodeNo {
@@ -331,13 +380,11 @@ impl InodeTable {
                     return self.ensure_with_identity(path, Some(identity));
                 }
             }
-            if let Some(record) = self.ino_to_path.get_mut(&ino) {
-                record.last_access = Instant::now();
+            let mut bind_identity = None;
+            if let Some(record) = self.touch(ino) {
                 if record.identity.is_none() {
                     record.identity = identity.map(str::to_string);
-                    if let Some(identity) = identity {
-                        self.identity_to_ino.insert(identity.to_string(), ino);
-                    }
+                    bind_identity = identity;
                 }
                 if identity.is_some() {
                     // This pathname was just proven by a backing-tree lstat.
@@ -350,19 +397,21 @@ impl InodeTable {
                     record.path = path.to_string();
                 }
             }
+            if let Some(identity) = bind_identity {
+                self.identity_to_ino.insert(identity.to_string(), ino);
+            }
             return ino;
         }
         if let Some(identity) = identity
             && let Some(ino) = self.identity_to_ino.get(identity).copied()
         {
             self.path_to_ino.insert(path.to_string(), ino);
-            if let Some(record) = self.ino_to_path.get_mut(&ino) {
+            if let Some(record) = self.touch(ino) {
                 record.paths.insert(path.to_string());
                 // The caller obtained this identity from a positive local
                 // lookup. It is therefore a stronger route than an older alias
                 // or retained path hint.
                 record.path = path.to_string();
-                record.last_access = Instant::now();
             }
             return ino;
         }
@@ -372,16 +421,7 @@ impl InodeTable {
         if let Some(identity) = identity {
             self.identity_to_ino.insert(identity.to_string(), ino);
         }
-        self.ino_to_path.insert(
-            ino,
-            InodeRecord {
-                path: path.to_string(),
-                paths: BTreeSet::from([path.to_string()]),
-                identity: identity.map(str::to_string),
-                last_access: Instant::now(),
-                lookup_count: 0,
-            },
-        );
+        self.insert_record(ino, path, identity);
         ino
     }
 
@@ -392,15 +432,16 @@ impl InodeTable {
     fn lookup_with_identity(&mut self, path: &str, identity: Option<&str>) -> INodeNo {
         let ino = self.ensure_with_identity(path, identity);
         if let Some(record) = self.ino_to_path.get_mut(&ino) {
+            if record.lookup_count == 0 {
+                self.unreferenced.remove(&(record.last_access, ino));
+            }
             record.lookup_count = record.lookup_count.saturating_add(1);
         }
         ino
     }
 
     fn path(&mut self, ino: INodeNo) -> Option<String> {
-        let record = self.ino_to_path.get_mut(&ino)?;
-        record.last_access = Instant::now();
-        Some(record.path.clone())
+        self.touch(ino).map(|record| record.path.clone())
     }
 
     fn knows_path(&self, path: &str) -> bool {
@@ -408,9 +449,8 @@ impl InodeTable {
     }
 
     fn route(&mut self, ino: INodeNo) -> Option<(String, Option<String>)> {
-        let record = self.ino_to_path.get_mut(&ino)?;
-        record.last_access = Instant::now();
-        Some((record.path.clone(), record.identity.clone()))
+        self.touch(ino)
+            .map(|record| (record.path.clone(), record.identity.clone()))
     }
 
     fn retarget_identity(
@@ -441,12 +481,11 @@ impl InodeTable {
             }
         }
         self.path_to_ino.insert(path.to_string(), ino);
-        let Some(record) = self.ino_to_path.get_mut(&ino) else {
+        let Some(record) = self.touch(ino) else {
             return false;
         };
         record.paths.insert(path.to_string());
         record.path = path.to_string();
-        record.last_access = Instant::now();
         true
     }
 
@@ -482,32 +521,36 @@ impl InodeTable {
         }
         if let Some(record) = self.ino_to_path.get_mut(&ino) {
             record.lookup_count = record.lookup_count.saturating_sub(nlookup);
-            record.last_access = Instant::now();
         }
+        // Re-stamps the record and, now that it may have reached zero, files it
+        // in `unreferenced` under that stamp.
+        self.touch(ino);
         self.prune_forgotten_records_to(MAX_RETAINED_INODE_RECORDS);
     }
 
+    /// Drop the least recently used unreferenced records until at most `limit`
+    /// remain or none are left to drop. Referenced records and the root are
+    /// never candidates. Costs O(log n) per removed record and nothing when
+    /// every record is referenced.
     fn prune_forgotten_records_to(&mut self, limit: usize) {
-        if self.ino_to_path.len() <= limit.max(1) {
-            return;
-        }
-        let mut forgotten = self
-            .ino_to_path
-            .iter()
-            .filter(|(ino, record)| **ino != ROOT_INO && record.lookup_count == 0)
-            .map(|(ino, record)| (*ino, record.last_access))
-            .collect::<Vec<_>>();
-        forgotten.sort_by_key(|(_, last_access)| *last_access);
-        let remove = self.ino_to_path.len().saturating_sub(limit.max(1));
-        for (ino, _) in forgotten.into_iter().take(remove) {
+        let limit = limit.max(1);
+        while self.ino_to_path.len() > limit {
+            let Some((_, ino)) = self.unreferenced.pop_first() else {
+                return;
+            };
             self.remove_inode_record(ino);
         }
     }
 
+    /// The only removal from `ino_to_path`: unbinds every route the record
+    /// still owns and leaves `unreferenced` consistent.
     fn remove_inode_record(&mut self, ino: INodeNo) {
         let Some(record) = self.ino_to_path.remove(&ino) else {
             return;
         };
+        if record.lookup_count == 0 {
+            self.unreferenced.remove(&(record.last_access, ino));
+        }
         for path in record.paths {
             if self.path_to_ino.get(path.as_str()) == Some(&ino) {
                 self.path_to_ino.remove(path.as_str());
@@ -518,6 +561,39 @@ impl InodeTable {
         {
             self.identity_to_ino.remove(identity.as_str());
         }
+    }
+
+    /// Test oracle for the table's cross-index invariants.
+    #[cfg(test)]
+    fn assert_consistent(&self) {
+        let expected = self
+            .ino_to_path
+            .iter()
+            .filter(|(ino, record)| **ino != ROOT_INO && record.lookup_count == 0)
+            .map(|(ino, record)| (record.last_access, *ino))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            self.unreferenced, expected,
+            "unreferenced index must hold exactly the zero-lookup records at their current stamps"
+        );
+        for (path, ino) in &self.path_to_ino {
+            let record = self
+                .ino_to_path
+                .get(ino)
+                .unwrap_or_else(|| panic!("path {path:?} routes to missing inode {ino:?}"));
+            assert!(
+                record.paths.contains(path),
+                "inode {ino:?} does not list its route {path:?}"
+            );
+        }
+        for (identity, ino) in &self.identity_to_ino {
+            let record = self
+                .ino_to_path
+                .get(ino)
+                .unwrap_or_else(|| panic!("identity {identity:?} binds missing inode {ino:?}"));
+            assert_eq!(record.identity.as_deref(), Some(identity.as_str()));
+        }
+        assert!(self.ino_to_path.contains_key(&ROOT_INO));
     }
 
     fn detach_exact(&mut self, path: &str) {
@@ -565,7 +641,11 @@ impl InodeTable {
             self.identity_to_ino.remove(identity.as_str());
         }
         if remove_inode {
-            self.ino_to_path.remove(&ino);
+            // Also drops a reverse identity binding kept by the
+            // identity-preserving variant: with the record gone, a later
+            // lookup of a surviving alias must mint a new inode rather than
+            // resolve to this one.
+            self.remove_inode_record(ino);
         }
     }
 
@@ -618,7 +698,7 @@ impl InodeTable {
             }
         }
         for ino in emptied {
-            self.ino_to_path.remove(&ino);
+            self.remove_inode_record(ino);
         }
     }
 
@@ -629,13 +709,12 @@ impl InodeTable {
             let new_path = format!("{to}{suffix}");
             self.path_to_ino.remove(old_path.as_str());
             self.path_to_ino.insert(new_path.clone(), ino);
-            if let Some(record) = self.ino_to_path.get_mut(&ino) {
+            if let Some(record) = self.touch(ino) {
                 record.paths.remove(old_path.as_str());
                 record.paths.insert(new_path.clone());
                 if record.path == old_path {
                     record.path = new_path;
                 }
-                record.last_access = Instant::now();
             }
         }
     }
@@ -2184,6 +2263,159 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// Production wedge: a guest holding ~1M referenced inodes made every
+    /// FORGET scan and sort the whole table under the filesystem mutex while
+    /// removing almost nothing.
+    #[test]
+    fn inode_table_forget_stays_cheap_far_above_retention_limit() {
+        const UNREFERENCED: usize = 50_000;
+        const REFERENCED: usize = 950_000;
+        const FORGETS: usize = 10_000;
+        let mut table = InodeTable::new();
+        for index in 0..UNREFERENCED {
+            table.ensure(format!("listing/{index}").as_str());
+        }
+        let referenced = (0..REFERENCED)
+            .map(|index| table.lookup(format!("tree/{index}").as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(table.ino_to_path.len(), UNREFERENCED + REFERENCED + 1);
+
+        let started = std::time::Instant::now();
+        for ino in &referenced[..FORGETS] {
+            table.forget(*ino, 1);
+        }
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "{FORGETS} forgets over a {}-record table took {elapsed:?}",
+            UNREFERENCED + REFERENCED + 1
+        );
+        // Above the limit every unreferenced record goes, oldest first; the
+        // referenced remainder (and the root) stays.
+        assert_eq!(table.ino_to_path.len(), REFERENCED - FORGETS + 1);
+        assert!(table.unreferenced.is_empty());
+        assert!(table.path(referenced[FORGETS]).is_some());
+        assert!(table.path(referenced[FORGETS - 1]).is_none());
+        assert!(!table.knows_path("listing/0"));
+        assert!(table.knows_path(format!("tree/{FORGETS}").as_str()));
+    }
+
+    #[test]
+    fn inode_table_prune_removes_only_the_oldest_unreferenced_records() {
+        let mut table = InodeTable::new();
+        let a = table.lookup_with_identity("a", Some("id-a"));
+        let b = table.lookup_with_identity("b", Some("id-b"));
+        let c = table.lookup_with_identity("c", Some("id-c"));
+        let d = table.lookup("dir/d");
+        let e = table.lookup("dir/e");
+        let revived = table.lookup("revived");
+        // Forget order sets recency: revived, c, a, e (oldest first).
+        for ino in [revived, c, a, e] {
+            table.forget(ino, 1);
+        }
+        // Re-referenced after being the oldest unreferenced record: it must
+        // never be pruned while the kernel holds it again.
+        assert_eq!(table.lookup("revived"), revived);
+        // A minted-but-unreturned record is unreferenced from birth.
+        let minted = table.ensure("minted");
+        // Using a record refreshes its recency: `a` becomes the newest.
+        assert_eq!(table.path(a).as_deref(), Some("a"));
+        table.assert_consistent();
+        // root + a..e + revived + minted
+        assert_eq!(table.ino_to_path.len(), 8);
+
+        table.prune_forgotten_records_to(6);
+        assert!(table.path(c).is_none(), "oldest unreferenced goes first");
+        assert!(table.path(e).is_none());
+        assert_eq!(table.path(a).as_deref(), Some("a"));
+        assert_eq!(table.path(revived).as_deref(), Some("revived"));
+        assert!(!table.knows_path("c"));
+        assert!(!table.identity_to_ino.contains_key("id-c"));
+        assert!(table.identity_to_ino.contains_key("id-a"));
+        table.assert_consistent();
+
+        table.prune_forgotten_records_to(1);
+        assert!(table.path(minted).is_none());
+        assert!(table.path(a).is_none());
+        assert!(!table.identity_to_ino.contains_key("id-a"));
+        // Nothing unreferenced is left; referenced records and the root stay
+        // even though the table is still above the limit.
+        assert_eq!(table.ino_to_path.len(), 4);
+        for ino in [ROOT_INO, b, d, revived] {
+            assert!(table.path(ino).is_some(), "{ino:?} is referenced");
+        }
+        assert!(table.unreferenced.is_empty());
+        table.assert_consistent();
+    }
+
+    #[test]
+    fn inode_table_index_stays_consistent_through_rename_unlink_and_prune() {
+        let mut table = InodeTable::new();
+        let dir = table.lookup_with_identity("pkg_tmp", Some("dir"));
+        let child = table.lookup_with_identity("pkg_tmp/index.js", Some("child"));
+        let listed = table.ensure_with_identity("pkg_tmp/listed.js", Some("listed"));
+        let doomed = table.lookup_with_identity("pkg/old.js", Some("old"));
+        table.forget(child, 1);
+        table.assert_consistent();
+
+        // Replacing rename: the displaced destination subtree is detached.
+        table.rename_path("pkg_tmp", "pkg");
+        table.assert_consistent();
+        assert_eq!(table.path(dir).as_deref(), Some("pkg"));
+        assert_eq!(table.path(child).as_deref(), Some("pkg/index.js"));
+        assert_eq!(table.path(listed).as_deref(), Some("pkg/listed.js"));
+        assert_eq!(
+            table.path(doomed).as_deref(),
+            Some("pkg/old.js"),
+            "a referenced stable inode keeps its stale path only as a hint"
+        );
+        assert!(!table.knows_path("pkg/old.js"));
+
+        // Unlink of unreferenced records removes them outright.
+        table.detach_exact("pkg/index.js");
+        table.assert_consistent();
+        assert!(table.path(child).is_none());
+        table.detach_exact("pkg/listed.js");
+        assert!(table.path(listed).is_none());
+        table.assert_consistent();
+
+        // The kernel's late FORGET of the detached-but-referenced inode.
+        table.forget(doomed, 1);
+        table.assert_consistent();
+        table.prune_forgotten_records_to(1);
+        assert!(table.path(doomed).is_none());
+        table.assert_consistent();
+
+        table.detach_subtree("pkg");
+        table.assert_consistent();
+        assert_eq!(table.path(dir).as_deref(), Some("pkg"));
+        table.forget(dir, 1);
+        table.prune_forgotten_records_to(1);
+        assert_eq!(table.ino_to_path.len(), 1);
+        assert!(table.path_to_ino.len() == 1 && table.identity_to_ino.is_empty());
+        table.assert_consistent();
+    }
+
+    #[test]
+    fn inode_table_name_reuse_does_not_strand_a_dropped_inode_identity() {
+        let mut table = InodeTable::new();
+        let displaced = table.lookup_with_identity("pkg", Some("old-object"));
+        table.forget(displaced, 1);
+
+        // The name now resolves to another object; the unreferenced displaced
+        // record is dropped.
+        let replacement = table.lookup_with_identity("pkg", Some("new-object"));
+        assert_ne!(replacement, displaced);
+        assert!(table.path(displaced).is_none());
+        table.assert_consistent();
+
+        // A surviving hard link of the displaced object must get a live inode.
+        let alias = table.lookup_with_identity("cache/pkg-copy", Some("old-object"));
+        assert_eq!(table.path(alias).as_deref(), Some("cache/pkg-copy"));
+        table.assert_consistent();
     }
 
     #[test]
