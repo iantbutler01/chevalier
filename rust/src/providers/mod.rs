@@ -84,6 +84,7 @@ pub mod anthropic;
 pub(crate) mod anthropic_streaming;
 pub mod bedrock;
 pub mod codex_credentials;
+pub mod context_overflow;
 pub mod google;
 #[cfg(feature = "google-adc")]
 pub mod google_anthropic;

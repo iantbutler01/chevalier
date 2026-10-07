@@ -386,6 +386,9 @@ impl GoogleAnthropicClient {
 
     /// Handle error responses - categorize as retryable or non-retryable
     fn handle_error_response(&self, status: StatusCode, body: String) -> Error {
+        if let Some(overflow) = super::context_overflow::classify(status, &body) {
+            return overflow;
+        }
         match status {
             // Client errors (4xx) are generally not retryable
             StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {

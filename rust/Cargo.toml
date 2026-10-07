@@ -21,6 +21,7 @@ name = "chevalier"
 path = "src/lib.rs"
 
 [dependencies]
+regex = "1"
 # Proc macros
 chevalier-macros = { version = "0.2.1", path = "macros" }
 

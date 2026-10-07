@@ -356,6 +356,9 @@ impl OpenAIResponsesClient {
     }
 
     fn handle_error_response(&self, status: StatusCode, body: String) -> Error {
+        if let Some(overflow) = super::context_overflow::classify(status, &body) {
+            return overflow;
+        }
         match status {
             StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 Error::NonRetryable(format!("{}: {}", status, body))

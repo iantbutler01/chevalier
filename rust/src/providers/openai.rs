@@ -419,6 +419,9 @@ impl OAIClient {
 
     /// Handle error responses - categorize as retryable or non-retryable
     fn handle_error_response(&self, status: StatusCode, body: String) -> Error {
+        if let Some(overflow) = super::context_overflow::classify(status, &body) {
+            return overflow;
+        }
         match status {
             // Client errors (4xx) are generally not retryable
             StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
@@ -500,6 +503,9 @@ impl InferenceClient for OAIClient {
                 .as_str()
                 .unwrap_or("Unknown error")
                 .to_string();
+            if super::context_overflow::is_overflow_message(&error_msg) {
+                return Err(Error::ContextLengthExceeded(error_msg));
+            }
             return Err(Error::Inference(format!("{} ({:?})", error_msg, error)));
         }
 

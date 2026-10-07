@@ -519,6 +519,9 @@ impl OpenAICodexResponsesClient {
         if let Some(friendly) = codex_friendly_error(status, headers, &body) {
             return friendly;
         }
+        if let Some(overflow) = super::context_overflow::classify(status, &body) {
+            return overflow;
+        }
 
         match status {
             StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
