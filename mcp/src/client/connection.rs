@@ -321,6 +321,32 @@ impl McpClient {
         .await
     }
 
+    /// Connect to an MCP server reached through an already-open byte stream that carries
+    /// newline-delimited JSON-RPC, as a stdio server's pipes do. The caller owns whatever is on
+    /// the other end (a process on another machine, a terminal, a socket); `label` names it in
+    /// errors.
+    pub async fn from_io<R, W>(reader: R, writer: W, label: &str) -> Result<Self>
+    where
+        R: tokio::io::AsyncRead + Send + Unpin + 'static,
+        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        let service = ChevalierClientHandler
+            .serve((reader, writer))
+            .await
+            .map_err(|e| {
+                Error::Transport(format!("Failed to connect to MCP server '{label}': {e}"))
+            })?;
+        Ok(Self {
+            inner: ClientInner::Stdio(service),
+        })
+    }
+
+    /// Whether the connection has ended: the server went away or the client was closed.
+    pub fn is_closed(&self) -> bool {
+        let service = self.service();
+        service.is_closed() || service.is_transport_closed()
+    }
+
     /// Create a client from an McpServer configuration
     async fn from_server(server: McpServer) -> Result<Self> {
         match server.transport {

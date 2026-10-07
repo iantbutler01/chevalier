@@ -238,7 +238,19 @@ pub(crate) async fn connect_and_register(
     })?;
 
     let client = Arc::new(client);
+    register_client_tools(runtime, client.clone(), label).await?;
+    Ok(client)
+}
 
+/// Register every model-visible tool of a connected MCP server into the runtime.
+///
+/// If `label` is provided, tool names are prefixed as `{label}_{tool_name}`.
+/// The original tool name is still used when calling the remote server.
+pub(crate) async fn register_client_tools(
+    runtime: &crate::runtime::Runtime,
+    client: Arc<chevalier_mcp::client::McpClient>,
+    label: Option<&str>,
+) -> Result<()> {
     // Discover tools
     let tools_result = client
         .list_tools()
@@ -291,7 +303,7 @@ pub(crate) async fn connect_and_register(
             .await?;
     }
 
-    Ok(client)
+    Ok(())
 }
 
 /// Check if a tool has visibility: ["app"] only (no "model").
