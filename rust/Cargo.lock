@@ -806,6 +806,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "proptest",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
