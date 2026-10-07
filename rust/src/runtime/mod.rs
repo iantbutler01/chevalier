@@ -805,6 +805,18 @@ impl Runtime {
         let _ = crate::mcp::connect_and_register(self, &uri.into(), Some(label)).await?;
         Ok(())
     }
+
+    /// Register the tools of an MCP server the caller has already connected to, as
+    /// `{label}_{tool_name}`. The caller chose the transport and keeps the client, so one
+    /// connection can serve several runtimes.
+    #[cfg(feature = "mcp")]
+    pub async fn mcp_client_as(
+        &self,
+        client: std::sync::Arc<chevalier_mcp::client::McpClient>,
+        label: &str,
+    ) -> Result<()> {
+        crate::mcp::register_client_tools(self, client, Some(label)).await
+    }
 }
 
 impl Default for Runtime {
