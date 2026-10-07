@@ -94,6 +94,8 @@ struct ParsedModelString {
     prompt_cache_retention: Option<PromptCacheRetention>,
     /// `@vision=` override for whether this model accepts image input.
     image_input: Option<bool>,
+    /// `@account=`: the host's name for the ChatGPT subscription to run under.
+    subscription_account: Option<String>,
 }
 
 fn parse_image_input(value: &str) -> Result<bool> {
@@ -144,6 +146,7 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
     let mut inline_api_key = None;
     let mut prompt_cache_retention = None;
     let mut image_input = None;
+    let mut subscription_account = None;
 
     let model_name = if model_part.contains('@') {
         let model_parts: Vec<&str> = model_part.split('@').collect();
@@ -243,13 +246,16 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
                     ));
                 }
                 "api_key" => inline_api_key = Some(value.to_string()),
+                "account" if provider == "openai-codex-responses" && !value.is_empty() => {
+                    subscription_account = Some(value.to_string());
+                }
                 "cache" => prompt_cache_retention = Some(parse_prompt_cache_retention(value)?),
                 "vision" => image_input = Some(parse_image_input(value)?),
                 _ => {
                     return Err(Error::NonRetryable(format!(
                         "Unknown model parameter '@{}' in '{}'. Supported parameters: reasoning \
                          (aliases reasoning_level, reasoning_effort), cache, vision, server_url, endpoint (custom-openai identity), \
-                         api_key, provider, provider_ignore, provider_sort, cache_prefix, provider_min_throughput, provider_max_latency (OpenRouter chat completions only).",
+                         api_key, account (openai-codex-responses), provider, provider_ignore, provider_sort, cache_prefix, provider_min_throughput, provider_max_latency (OpenRouter chat completions only).",
                         key, model_str
                     )));
                 }
@@ -280,7 +286,22 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
         inline_api_key,
         prompt_cache_retention,
         image_input,
+        subscription_account,
     })
+}
+
+/// The provider config a call runs under: the host's live credential when the
+/// model string names a subscription `@account=`, otherwise the runtime's own.
+async fn resolve_call_provider_config(
+    model: &str,
+    provider_config: Option<ProviderConfig>,
+) -> Result<Option<ProviderConfig>> {
+    match parse_model_string(model)?.subscription_account {
+        Some(account) => Ok(Some(ProviderConfig::CodexSubscription(Box::new(
+            crate::providers::codex_credentials::resolve(&account).await?,
+        )))),
+        None => Ok(provider_config),
+    }
 }
 
 /// Result from non-streaming LLM call
@@ -859,6 +880,7 @@ fn resolve_codex_subscription_config(
 
     Ok(crate::providers::CodexSubscriptionProviderConfig {
         token,
+        identity: None,
         account_id,
         prompt_cache_key: None,
         base_url,
@@ -922,6 +944,7 @@ pub async fn call_llm(
     responses: Option<crate::providers::responses_control::ResponsesOptions>,
 ) -> Result<CallResult> {
     // Create client
+    let provider_config = resolve_call_provider_config(model, provider_config).await?;
     let client = create_inference_client_with_config(model, api_key, provider_config.as_ref())?;
     let parsed_model = parse_model_string(model)?;
     let provider_key = resolve_provider_key(model);
@@ -1043,6 +1066,7 @@ pub async fn call_llm_stream(
     responses: Option<crate::providers::responses_control::ResponsesOptions>,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<ResponseStreamEvent>> + Send>>> {
     // Create client
+    let provider_config = resolve_call_provider_config(model, provider_config).await?;
     let client = create_inference_client_with_config(model, api_key, provider_config.as_ref())?;
     let parsed_model = parse_model_string(model)?;
     let provider_key = resolve_provider_key(model);
@@ -1252,6 +1276,26 @@ mod tests {
             parsed.prompt_cache_retention,
             Some(PromptCacheRetention::H24)
         );
+    }
+
+    #[test]
+    fn a_subscription_account_names_only_a_codex_model() {
+        let parsed =
+            parse_model_string("openai-codex-responses:gpt-5.5@reasoning=medium@account=u-1")
+                .unwrap();
+        assert_eq!(parsed.model_name, "gpt-5.5");
+        assert_eq!(parsed.subscription_account.as_deref(), Some("u-1"));
+
+        assert!(parse_model_string("openai:gpt-5.5@account=u-1").is_err());
+        assert!(parse_model_string("openai-codex-responses:gpt-5.5@account=").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_model_without_an_account_keeps_the_runtime_config() {
+        let config = resolve_call_provider_config("openai:gpt-5.5", None)
+            .await
+            .unwrap();
+        assert!(config.is_none());
     }
 
     #[test]

@@ -379,6 +379,7 @@ impl Runtime {
             Some(ProviderConfig::CodexSubscription(Box::new(
                 CodexSubscriptionProviderConfig {
                     token: codex.token,
+                    identity: None,
                     account_id: codex.account_id,
                     prompt_cache_key: codex.prompt_cache_key,
                     base_url: codex.base_url,

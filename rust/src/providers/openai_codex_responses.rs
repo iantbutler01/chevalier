@@ -23,8 +23,8 @@ impl Drop for WebSocketTask {
 
 use crate::error::{Error, Result};
 use crate::providers::{
-    CodexSubscriptionProviderConfig, CodexSubscriptionTransport, GenerationConfig,
-    GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
+    CodexClientIdentity, CodexSubscriptionProviderConfig, CodexSubscriptionTransport,
+    GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
 use crate::retry::{RetryConfig, retry_with_backoff};
 use crate::schema::fix_tool_schema_for_provider;
@@ -74,6 +74,7 @@ pub struct OpenAICodexResponsesClient {
     model: String,
     token: String,
     account_id: String,
+    identity: CodexClientIdentity,
     prompt_cache_key: Option<String>,
     api_url: String,
     websocket_url: String,
@@ -96,6 +97,7 @@ impl Clone for OpenAICodexResponsesClient {
             model: self.model.clone(),
             token: self.token.clone(),
             account_id: self.account_id.clone(),
+            identity: self.identity.clone(),
             prompt_cache_key: self.prompt_cache_key.clone(),
             api_url: self.api_url.clone(),
             websocket_url: self.websocket_url.clone(),
@@ -116,6 +118,7 @@ impl std::fmt::Debug for OpenAICodexResponsesClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenAICodexResponsesClient")
             .field("model", &self.model)
+            .field("identity", &self.identity)
             .field("api_url", &self.api_url)
             .field("websocket_url", &self.websocket_url)
             .field("prompt_cache_key", &self.prompt_cache_key)
@@ -150,6 +153,10 @@ impl OpenAICodexResponsesClient {
             model: model.into(),
             token: config.token,
             account_id,
+            identity: config.identity.unwrap_or_else(|| CodexClientIdentity {
+                originator: OPENBRACKET_ORIGINATOR.to_string(),
+                user_agent: OPENBRACKET_USER_AGENT.to_string(),
+            }),
             prompt_cache_key: config
                 .prompt_cache_key
                 .map(|key| key.trim().chars().take(64).collect::<String>())
@@ -298,17 +305,22 @@ impl OpenAICodexResponsesClient {
         body: &Value,
         timeout: Option<Duration>,
     ) -> reqwest::RequestBuilder {
-        reqwest::Client::new()
+        let request = reqwest::Client::new()
             .post(&self.api_url)
             .timeout(timeout.unwrap_or(Duration::from_secs(180)))
             .header(header::AUTHORIZATION, format!("Bearer {}", self.token))
             .header("chatgpt-account-id", &self.account_id)
-            .header("originator", OPENBRACKET_ORIGINATOR)
-            .header(header::USER_AGENT, OPENBRACKET_USER_AGENT)
+            .header("originator", &self.identity.originator)
+            .header(header::USER_AGENT, &self.identity.user_agent)
             .header("OpenAI-Beta", OPENAI_BETA_RESPONSES)
             .header(header::ACCEPT, "text/event-stream")
-            .header(header::CONTENT_TYPE, "application/json")
-            .json(body)
+            .header(header::CONTENT_TYPE, "application/json");
+        // Codex clients name the conversation with the same id they cache under.
+        match &self.prompt_cache_key {
+            Some(session) => request.header("session-id", session),
+            None => request,
+        }
+        .json(body)
     }
 
     async fn make_sse_request(
@@ -340,13 +352,20 @@ impl OpenAICodexResponsesClient {
         })?;
 
         let mut builder = tokio_websockets::ClientBuilder::from_uri(uri);
+        let session = self
+            .prompt_cache_key
+            .clone()
+            .map(|session| ("session-id", session));
         for (name, value) in [
             ("Authorization", format!("Bearer {}", self.token)),
             ("chatgpt-account-id", self.account_id.clone()),
-            ("originator", OPENBRACKET_ORIGINATOR.to_string()),
-            ("User-Agent", OPENBRACKET_USER_AGENT.to_string()),
+            ("originator", self.identity.originator.clone()),
+            ("User-Agent", self.identity.user_agent.clone()),
             ("OpenAI-Beta", OPENAI_BETA_RESPONSES_WEBSOCKETS.to_string()),
-        ] {
+        ]
+        .into_iter()
+        .chain(session)
+        {
             builder = builder.add_header(
                 HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
                     Error::NonRetryable(format!("Invalid Codex websocket header '{}': {}", name, e))
@@ -1199,6 +1218,7 @@ mod tests {
     fn test_client() -> OpenAICodexResponsesClient {
         OpenAICodexResponsesClient::new(
             CodexSubscriptionProviderConfig {
+                identity: None,
                 token: TEST_CODEX_TOKEN.to_string(),
                 account_id: Some("acct_123".to_string()),
                 prompt_cache_key: None,
@@ -1270,6 +1290,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn codex_subscription_requests_carry_the_host_identity_and_session() {
+        let mut client = test_client();
+        client.identity = CodexClientIdentity {
+            originator: "host".to_string(),
+            user_agent: "host/1.2.3 (linux)".to_string(),
+        };
+        client.prompt_cache_key = Some("conversation-1".to_string());
+        let request = client
+            .sse_request_builder(&serde_json::json!({}), None)
+            .build()
+            .unwrap();
+        let header = |name: &str| {
+            request
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+
+        assert_eq!(header("originator").as_deref(), Some("host"));
+        assert_eq!(header("user-agent").as_deref(), Some("host/1.2.3 (linux)"));
+        assert_eq!(header("session-id").as_deref(), Some("conversation-1"));
+    }
+
     fn codex_rate_limit_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1338,6 +1383,7 @@ mod tests {
     fn test_build_codex_request_body_ignores_http_previous_response_id() {
         let client = OpenAICodexResponsesClient::new(
             CodexSubscriptionProviderConfig {
+                identity: None,
                 token: "header.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xMjMifX0.signature".to_string(),
                 account_id: Some("acct_123".to_string()),
                 prompt_cache_key: Some("task-123".to_string()),
@@ -1376,6 +1422,7 @@ mod tests {
     fn test_build_codex_request_body_with_summary_only_reasoning() {
         let client = OpenAICodexResponsesClient::new(
             CodexSubscriptionProviderConfig {
+                identity: None,
                 token: "header.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xMjMifX0.signature".to_string(),
                 account_id: Some("acct_123".to_string()),
                 prompt_cache_key: None,

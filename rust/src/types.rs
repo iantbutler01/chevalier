@@ -282,6 +282,7 @@ fn is_gemini_vision_model(model: &str) -> bool {
 /// The GPT-6 family (Astra, Sol, Luna, and point releases such as gpt-6.1-sol) is Responses-only, rejects sampling
 /// parameters, and accepts asynchronous tool definitions.
 pub fn is_gpt6_model(model_name: &str) -> bool {
+    let model_name = model_name.strip_prefix("openai/").unwrap_or(model_name);
     model_name.starts_with("gpt-6-") || model_name.starts_with("gpt-6.")
 }
 

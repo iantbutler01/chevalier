@@ -45,9 +45,19 @@ pub enum CodexSubscriptionTransport {
     Sse,
 }
 
+/// How a Codex subscription client names itself to the ChatGPT backend:
+/// the `originator` header and `User-Agent`. `None` on the config sends
+/// OpenBracket's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexClientIdentity {
+    pub originator: String,
+    pub user_agent: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct CodexSubscriptionProviderConfig {
     pub token: String,
+    pub identity: Option<CodexClientIdentity>,
     pub account_id: Option<String>,
     pub prompt_cache_key: Option<String>,
     pub base_url: Option<String>,
@@ -73,6 +83,7 @@ pub enum ProviderConfig {
 pub mod anthropic;
 pub(crate) mod anthropic_streaming;
 pub mod bedrock;
+pub mod codex_credentials;
 pub mod google;
 #[cfg(feature = "google-adc")]
 pub mod google_anthropic;
@@ -88,6 +99,7 @@ pub mod tracing_client;
 pub use anthropic::AnthropicClient;
 #[cfg(feature = "bedrock")]
 pub use bedrock::BedrockClient;
+pub use codex_credentials::{CodexCredentialSource, install_codex_credential_source};
 pub use google::{FileState, GoogleGenAIClient, UploadedFile};
 #[cfg(feature = "google-adc")]
 pub use google_anthropic::GoogleAnthropicClient;

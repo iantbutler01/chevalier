@@ -586,6 +586,7 @@ mod tests {
         let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
         for (model, gpt6) in [
             ("gpt-6-astra", true),
+            ("openai/gpt-6-astra", true),
             ("gpt-6-sol", true),
             ("gpt-6-luna", true),
             ("gpt-6.1-sol", true),
