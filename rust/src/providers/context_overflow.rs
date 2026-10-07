@@ -72,7 +72,10 @@ pub fn classify(status: StatusCode, body: &str) -> Option<Error> {
         );
     let overflow = status == StatusCode::PAYLOAD_TOO_LARGE
         || bodyless
-        || (status.is_client_error() && is_overflow_message(body));
+        // A 429 is a rate limit however it is worded ("too many tokens per minute").
+        || (status.is_client_error()
+            && status != StatusCode::TOO_MANY_REQUESTS
+            && is_overflow_message(body));
     overflow.then(|| Error::ContextLengthExceeded(format!("{status}: {body}")))
 }
 
