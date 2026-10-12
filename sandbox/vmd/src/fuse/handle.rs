@@ -702,7 +702,7 @@ fn surface_kind_for_scope(scope_path: &str) -> &'static str {
 /// A read-only mount whose state directory holds a complete earlier hydrate reconciles
 /// it in place; anything else, or a reconcile that fails, hydrates from empty. The
 /// marker brackets a full hydrate so an interrupted one is never mistaken for complete.
-async fn hydrate_or_reconcile(
+pub(super) async fn hydrate_or_reconcile(
     hydrator: &MountHydrator,
     marker: &Path,
     read_only: bool,

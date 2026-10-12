@@ -3,6 +3,8 @@ mod dispatch;
 pub mod fs;
 pub mod handle;
 pub(crate) mod local_view;
+#[cfg(test)]
+mod readonly_reconcile_tests;
 
 pub use handle::{
     DEFAULT_VFS_DRAIN_TIMEOUT, FuseHandle, GUARDED_VFS_DRAIN_TIMEOUT, UnpublishedMountState,
