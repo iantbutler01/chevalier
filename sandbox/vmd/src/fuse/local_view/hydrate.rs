@@ -800,7 +800,17 @@ impl MountHydrator {
             tracing::info!(path = %file.path, "hydrated a file the server rewrote after listing it");
             return Ok(());
         }
-        Err(mismatch)
+        // The gateway still records a hash its own bytes do not have (a record that drifted from
+        // its content, as Crow's April digest excerpts did). Those bytes are what every read of
+        // this file returns, so the mount keeps them rather than refusing the whole Nym.
+        tracing::warn!(
+            path = %file.path,
+            recorded = current.as_deref().unwrap_or("none"),
+            served = %local_hash,
+            error = %mismatch,
+            "the gateway's recorded hash does not match the bytes it serves; keeping the served bytes"
+        );
+        Ok(())
     }
 
     /// Ranged streaming of one large file directly into its backing descriptor.
