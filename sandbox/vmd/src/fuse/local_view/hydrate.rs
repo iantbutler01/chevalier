@@ -758,11 +758,8 @@ impl MountHydrator {
                     file.path
                 )
             })?;
-            verify_downloaded(
-                file,
-                bytes.len() as u64,
-                &chevalier_vfs_hash::hash_bytes(&bytes),
-            )?;
+            self.verify_or_recheck(file, bytes.len() as u64, &chevalier_vfs_hash::hash_bytes(&bytes))
+                .await?;
             write_all_at(&handle, &bytes, 0)?;
             bytes.len() as u64
         } else {
@@ -773,6 +770,29 @@ impl MountHydrator {
             .set_mode(mode)
             .with_context(|| format!("apply the hydrated mode of {:?}", file.path))?;
         Ok(written)
+    }
+
+    /// Verify a whole-file download, tolerating a file the server rewrote after `/tree` listed
+    /// it. The API keeps writing a Nym's own files (a conversation's index, its entries) while a
+    /// read-only root hydrates, so a listing's hash can be one publication behind the bytes the
+    /// read returned. When the gateway's current hash is the downloaded one, the newer content is
+    /// the right content; anything else is still a mismatch.
+    async fn verify_or_recheck(&self, file: &RemoteFile, length: u64, local_hash: &str) -> Result<()> {
+        let Err(mismatch) = verify_downloaded(file, length, local_hash) else {
+            return Ok(());
+        };
+        let current = self
+            .client
+            .stat_versioned(&file.path)
+            .await
+            .with_context(|| format!("re-stat the vfs file {:?} after a hash mismatch", file.path))?
+            .value
+            .and_then(|metadata| metadata.content_hash);
+        if current.as_deref() == Some(local_hash) {
+            tracing::info!(path = %file.path, "hydrated a file the server rewrote after listing it");
+            return Ok(());
+        }
+        Err(mismatch)
     }
 
     /// Ranged streaming of one large file directly into its backing descriptor.
