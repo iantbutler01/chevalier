@@ -703,7 +703,7 @@ impl MountHydrator {
             return Ok(());
         }
         let base_revision = state.base_revision;
-        let results: Vec<(usize, Result<u64>)> = {
+        let results: Vec<(usize, Result<Option<u64>>)> = {
             let buckets = &state.buckets;
             stream::iter(pending.into_iter().map(move |index| {
                 let file = &buckets[index].members[0];
