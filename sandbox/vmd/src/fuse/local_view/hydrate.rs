@@ -212,6 +212,10 @@ pub(crate) struct MountHydrator {
     /// through one `buffer_unordered` of this width, so the hydrate never has
     /// more than this many round trips outstanding.
     concurrency: usize,
+    /// Path prefixes (relative to the scope) whose files this mount never holds. Their
+    /// directories are still materialized so nested mounts keep their mountpoints.
+    /// Set from `CHEVALIER_VFS_SKIP_FILES_UNDER` (comma separated).
+    skip_files_under: Vec<String>,
 }
 
 impl MountHydrator {
@@ -220,6 +224,7 @@ impl MountHydrator {
             client,
             view,
             concurrency: HYDRATE_CONCURRENCY,
+            skip_files_under: skip_files_under_from_env(),
         }
     }
 
@@ -450,10 +455,13 @@ impl MountHydrator {
                 );
             }
             let path = join_mount_path(directory, &entry.name);
-            names.insert(entry.name.clone());
             let Some(kind) = LocalKind::from_wire_kind(entry.kind.as_str()) else {
                 bail!("vfs entry {path:?} has an unknown kind {:?}", entry.kind);
             };
+            if kind != LocalKind::Directory && under_any(&path, &self.skip_files_under) {
+                continue;
+            }
+            names.insert(entry.name.clone());
             match kind {
                 LocalKind::Directory => {
                     let mode = entry
@@ -518,6 +526,14 @@ impl MountHydrator {
             // The scope root is the backing tree root; it exists by construction
             // and carries no entry of its own.
             return Ok(Some(LocalKind::Directory));
+        }
+        if under_any(path, &self.skip_files_under) {
+            if let Some(local) = tree.lstat(path)? {
+                if local.kind != LocalKind::Directory {
+                    remove_backing_entry(&backing_path(tree, path)?)?;
+                    return Ok(None);
+                }
+            }
         }
         let answer = self
             .client
@@ -1116,6 +1132,23 @@ fn sync_backing_filesystem(root: &Path) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Verification helpers
 // ---------------------------------------------------------------------------
+
+pub(crate) const SKIP_FILES_UNDER_ENV: &str = "CHEVALIER_VFS_SKIP_FILES_UNDER";
+
+fn skip_files_under_from_env() -> Vec<String> {
+    std::env::var(SKIP_FILES_UNDER_ENV)
+        .unwrap_or_default()
+        .split(',')
+        .map(|prefix| prefix.trim().trim_matches('/').to_string())
+        .filter(|prefix| !prefix.is_empty())
+        .collect()
+}
+
+fn under_any(path: &str, prefixes: &[String]) -> bool {
+    prefixes
+        .iter()
+        .any(|prefix| path.strip_prefix(prefix.as_str()).is_some_and(|rest| rest.starts_with('/')))
+}
 
 /// Fold one response's revision into a hydrate whose base is already fixed.
 fn reconcile_revision(base_revision: u64, revision: u64, what: &str) -> Result<()> {
