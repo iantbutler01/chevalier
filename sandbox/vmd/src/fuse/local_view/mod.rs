@@ -202,6 +202,13 @@ impl MountStateLayout {
         self.root.join(OWNER_FILE)
     }
 
+    /// Present only while the backing tree holds a complete hydrate of a read-only
+    /// scope. Written after a full hydrate finishes and removed before one starts, so
+    /// a restart can reconcile what is already on disk instead of downloading it again.
+    pub(crate) fn hydrated_marker_path(&self) -> PathBuf {
+        self.root.join("hydrated")
+    }
+
     pub(crate) fn log_path(&self, generation: u64) -> PathBuf {
         self.wal_dir()
             .join(format!("{LOG_PREFIX}{generation:020}{LOG_SUFFIX}"))

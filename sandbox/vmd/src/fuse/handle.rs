@@ -21,7 +21,7 @@ use crate::state::types::SharedMountSpec;
 use super::client::RemoteVfsClient;
 use super::fs::RemoteFuseFs;
 use super::local_view::hydrate::{
-    KernelPathInvalidator, MountHydrator, RemoteFollower, RemoteFollowerHandle,
+    HydrationOutcome, KernelPathInvalidator, MountHydrator, RemoteFollower, RemoteFollowerHandle,
 };
 use super::local_view::mount::{
     MountLocalView, MountLocalViewOptions, MountOpen, MountOwnership,
@@ -699,6 +699,40 @@ fn surface_kind_for_scope(scope_path: &str) -> &'static str {
 /// re-hydrated: it may hold committed local work the gateway has not
 /// acknowledged yet, and re-materializing over it would mount a lagging replica
 /// on top of an unpublished WAL.
+/// A read-only mount whose state directory holds a complete earlier hydrate reconciles
+/// it in place; anything else, or a reconcile that fails, hydrates from empty. The
+/// marker brackets a full hydrate so an interrupted one is never mistaken for complete.
+async fn hydrate_or_reconcile(
+    hydrator: &MountHydrator,
+    marker: &Path,
+    read_only: bool,
+) -> Result<HydrationOutcome> {
+    if read_only && marker.exists() {
+        match hydrator.reconcile().await {
+            Ok(outcome) => {
+                tracing::info!(files = outcome.files, bytes = outcome.bytes, "reconciled a complete earlier hydrate");
+                return Ok(outcome);
+            }
+            Err(error) => tracing::warn!(%error, "reconcile failed; hydrating from empty"),
+        }
+    }
+    remove_marker(marker)?;
+    let outcome = hydrator.hydrate().await?;
+    if read_only {
+        std::fs::write(marker, outcome.remote_revision.to_string())
+            .with_context(|| format!("record the complete hydrate at {}", marker.display()))?;
+    }
+    Ok(outcome)
+}
+
+fn remove_marker(marker: &Path) -> Result<()> {
+    match std::fs::remove_file(marker) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", marker.display())),
+    }
+}
+
 async fn open_mount_local_view(
     client: &RemoteVfsClient,
     scope_path: &str,
@@ -751,13 +785,16 @@ async fn open_mount_local_view(
 
     let hydrator = Arc::new(MountHydrator::new(client.clone(), Arc::clone(&view)));
     if needs_hydration {
-        let outcome = hydrator.hydrate().await.with_context(|| {
-            format!(
-                "hydrate vfs scope {:?} into {}",
-                scope_path,
-                state_dir.display()
-            )
-        })?;
+        let marker = MountStateLayout::new(state_dir).hydrated_marker_path();
+        let outcome = hydrate_or_reconcile(&hydrator, &marker, read_only)
+            .await
+            .with_context(|| {
+                format!(
+                    "hydrate vfs scope {:?} into {}",
+                    scope_path,
+                    state_dir.display()
+                )
+            })?;
         tracing::info!(
             mountpoint = %mountpoint.display(),
             scope = scope_path,

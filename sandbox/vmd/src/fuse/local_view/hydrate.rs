@@ -136,6 +136,9 @@ struct HydrationState {
     /// Immediate child directories of every directory the walk listed, so the
     /// prefetch descent follows the same shape without a second round of `/tree`.
     child_directories: HashMap<String, Vec<String>>,
+    /// A reconcile over a complete earlier hydrate: a file whose backing copy already
+    /// has the listed size and hash is left alone, and nothing is bulk-prefetched.
+    keep_current_files: bool,
 }
 
 impl HydrationState {
@@ -300,6 +303,50 @@ impl MountHydrator {
     /// Re-materialize exactly the paths and subtrees a remote publication
     /// touched. Used by [`RemoteFollower`]; never used by a writable mount,
     /// where a remote acknowledgement must not change the local view.
+    /// Bring a backing tree that holds a complete earlier hydrate up to the scope as it
+    /// stands: walk it with pruning, fetch only files whose local copy differs from the
+    /// listing, and drop what the gateway no longer has. A read-only mount restarted on
+    /// a guest that already hydrated it pays for what changed, not for the whole scope.
+    pub(crate) async fn reconcile(&self) -> Result<HydrationOutcome> {
+        let mut state = HydrationState {
+            keep_current_files: true,
+            ..HydrationState::default()
+        };
+        let root = [String::new()];
+        self.walk_subtree(&root[0], true, &mut state).await?;
+        self.materialize_content(&root, &mut state).await?;
+        sync_backing_filesystem(self.view.tree().root())?;
+        let mut outcome = state.outcome;
+        outcome.remote_revision = state.base_revision;
+        Ok(outcome)
+    }
+
+    /// Whether the backing copy of `path` already holds the listed content. A listing
+    /// without a hash (above the `/tree` hash budget) is never trusted as current.
+    fn backing_file_is_current(&self, path: &str, size_bytes: u64, content_hash: Option<&str>) -> Result<bool> {
+        let Some(expected) = content_hash else {
+            return Ok(false);
+        };
+        let tree = self.view.tree();
+        match tree.lstat(path)? {
+            Some(local) if local.kind == LocalKind::File && local.size_bytes == size_bytes => {}
+            _ => return Ok(false),
+        }
+        let mut file = std::fs::File::open(backing_path(tree, path)?)
+            .with_context(|| format!("open the backing file {path:?} to compare it"))?;
+        let mut hasher = chevalier_vfs_hash::ContentHasher::new();
+        let mut buffer = vec![0u8; 1 << 20];
+        loop {
+            let read = std::io::Read::read(&mut file, &mut buffer)
+                .with_context(|| format!("read the backing file {path:?} to compare it"))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(hasher.finalize() == expected)
+    }
+
     pub(crate) async fn rehydrate_paths(
         &self,
         paths: &[String],
@@ -427,6 +474,15 @@ impl MountHydrator {
                     state.outcome.symlinks += 1;
                 }
                 LocalKind::File => {
+                    if state.keep_current_files
+                        && self.backing_file_is_current(
+                            &path,
+                            entry.size_bytes,
+                            entry.content_hash.as_deref(),
+                        )?
+                    {
+                        continue;
+                    }
                     state.push_file(
                         RemoteFile {
                             path,
@@ -572,7 +628,11 @@ impl MountHydrator {
         if state.buckets.is_empty() {
             return Ok(());
         }
-        self.warm_packs(prefixes, state).await?;
+        // A reconcile fetches the few files that changed; a pack prefetch of the whole
+        // scope would download everything again.
+        if !state.keep_current_files {
+            self.warm_packs(prefixes, state).await?;
+        }
         self.fill_content_gaps(state).await?;
         self.link_aliases(state)
     }
