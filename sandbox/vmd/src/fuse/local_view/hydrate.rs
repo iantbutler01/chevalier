@@ -667,11 +667,13 @@ impl MountHydrator {
             return Ok(());
         };
         let file = bucket.members[member].clone();
-        verify_downloaded(
-            &file,
-            bytes.len() as u64,
-            &chevalier_vfs_hash::hash_bytes(bytes),
-        )?;
+        // A pack can hold an older publication of a file the server has since rewritten; the
+        // per-file download fetches its current bytes instead.
+        if verify_downloaded(&file, bytes.len() as u64, &chevalier_vfs_hash::hash_bytes(bytes))
+            .is_err()
+        {
+            return Ok(());
+        }
         let handle = self
             .view
             .tree()
@@ -713,10 +715,14 @@ impl MountHydrator {
         };
 
         for (index, result) in results {
-            let bytes = result?;
-            state.buckets[index].materialized = Some(0);
-            state.outcome.files += 1;
-            state.outcome.bytes += bytes;
+            match result? {
+                Some(bytes) => {
+                    state.buckets[index].materialized = Some(0);
+                    state.outcome.files += 1;
+                    state.outcome.bytes += bytes;
+                }
+                None => state.buckets[index].members.clear(),
+            }
         }
         Ok(())
     }
@@ -729,7 +735,7 @@ impl MountHydrator {
     /// the content, and the local hash is always computed -- a missing gateway
     /// hash means the file exceeded the `/tree` hash budget, never that it is
     /// empty.
-    async fn download_file(&self, file: &RemoteFile, base_revision: u64) -> Result<u64> {
+    async fn download_file(&self, file: &RemoteFile, base_revision: u64) -> Result<Option<u64>> {
         let mode = file.local_mode();
         let handle = self
             .view
@@ -751,13 +757,15 @@ impl MountHydrator {
                 answer.revision,
                 &format!("the read of {:?}", file.path),
             )?;
-            let bytes = answer.value.ok_or_else(|| {
-                anyhow!(
-                    "vfs file {:?} disappeared during hydration; a server-side writer behind a \
-                     mounted view is not supported",
-                    file.path
-                )
-            })?;
+            let Some(bytes) = answer.value else {
+                // The API removed it after `/tree` listed it (a digest or compaction pass over a
+                // Nym's own conversation): there is nothing to mirror, so the name is dropped
+                // rather than failing the whole hydrate.
+                drop(handle);
+                remove_backing_entry(&backing_path(self.view.tree(), &file.path)?)?;
+                tracing::info!(path = %file.path, "skipped a file the server removed during hydration");
+                return Ok(None);
+            };
             self.verify_or_recheck(file, bytes.len() as u64, &chevalier_vfs_hash::hash_bytes(&bytes))
                 .await?;
             write_all_at(&handle, &bytes, 0)?;
@@ -769,7 +777,7 @@ impl MountHydrator {
         handle
             .set_mode(mode)
             .with_context(|| format!("apply the hydrated mode of {:?}", file.path))?;
-        Ok(written)
+        Ok(Some(written))
     }
 
     /// Verify a whole-file download, tolerating a file the server rewrote after `/tree` listed
@@ -865,6 +873,9 @@ impl MountHydrator {
         let tree = self.view.tree();
         let mut linked = 0u64;
         for bucket in &state.buckets {
+            if bucket.members.is_empty() {
+                continue;
+            }
             let leader = bucket.materialized.ok_or_else(|| {
                 anyhow!(
                     "hydration left {:?} without content",
