@@ -685,9 +685,7 @@ impl FreestyleControl {
                     SandboxError::InvalidConfig(format!("Freestyle api key header: {err}"))
                 })?,
         );
-        let (ws, response) = connect_async(request)
-            .await
-            .map_err(|err| SandboxError::DaemonUnavailable(format!("Freestyle pty ws: {err}")))?;
+        let (ws, response) = connect_pty(vm_id, request).await?;
         if response.status() != StatusCode::SWITCHING_PROTOCOLS {
             return Err(SandboxError::InvalidResponse(format!(
                 "Freestyle pty websocket returned {}",
@@ -1684,6 +1682,56 @@ fn websocket_api_url(api_url: &str) -> String {
     } else {
         format!("wss://{base}")
     }
+}
+
+/// How long one PTY handshake may take. A healthy one answers in tens of milliseconds; about one
+/// in five sits for a fixed ~75 s on Freestyle's side before answering, so a slow attempt is
+/// dropped and tried again rather than waited out.
+const PTY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const PTY_CONNECT_ATTEMPTS: u32 = 5;
+
+type PtySocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Open the PTY websocket, retrying a handshake that does not answer in time.
+async fn connect_pty(
+    vm_id: &str,
+    request: tokio_tungstenite::tungstenite::handshake::client::Request,
+) -> Result<(
+    PtySocket,
+    tokio_tungstenite::tungstenite::handshake::client::Response,
+)> {
+    let mut last = String::new();
+    for attempt in 1..=PTY_CONNECT_ATTEMPTS {
+        let started = std::time::Instant::now();
+        let cause = match tokio::time::timeout(PTY_CONNECT_TIMEOUT, connect_async(request.clone()))
+            .await
+        {
+            Ok(Ok(connected)) => {
+                if attempt > 1 {
+                    tracing::info!(
+                        vm_id,
+                        attempt,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "freestyle pty connected after retry"
+                    );
+                }
+                return Ok(connected);
+            }
+            Ok(Err(err)) => {
+                last = err.to_string();
+                "refused"
+            }
+            Err(_) => {
+                last = format!("no answer within {}s", PTY_CONNECT_TIMEOUT.as_secs());
+                "timeout"
+            }
+        };
+        tracing::warn!(vm_id, attempt, cause, "freestyle pty connect retry");
+    }
+    Err(SandboxError::DaemonUnavailable(format!(
+        "Freestyle pty ws: {PTY_CONNECT_ATTEMPTS} attempts failed: {last}"
+    )))
 }
 
 async fn decode_json<T>(response: reqwest::Response, action: &str) -> Result<T>
