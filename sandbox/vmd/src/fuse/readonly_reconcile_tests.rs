@@ -13,9 +13,9 @@ use chevalier_vfs_hash::hash_bytes;
 
 use super::client::RemoteVfsClient;
 use super::handle::hydrate_or_reconcile;
+use super::local_view::MountStateLayout;
 use super::local_view::hydrate::MountHydrator;
 use super::local_view::mount::{MountLocalView, MountLocalViewOptions};
-use super::local_view::MountStateLayout;
 
 #[derive(Default)]
 struct Remote {
@@ -24,10 +24,16 @@ struct Remote {
 }
 
 fn listing(files: &BTreeMap<String, Vec<u8>>, dir: &str) -> Option<Vec<serde_json::Value>> {
-    let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+    let prefix = if dir.is_empty() {
+        String::new()
+    } else {
+        format!("{dir}/")
+    };
     let mut entries: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     for (path, bytes) in files {
-        let Some(rest) = path.strip_prefix(&prefix) else { continue };
+        let Some(rest) = path.strip_prefix(&prefix) else {
+            continue;
+        };
         match rest.split_once('/') {
             Some((child, _)) => {
                 entries.insert(child.to_string(), serde_json::json!({
@@ -88,18 +94,35 @@ struct Gateway {
 impl Gateway {
     async fn start(files: &[(&str, &str)]) -> Self {
         let remote = Arc::new(Remote::default());
-        remote.files.lock().unwrap().extend(files.iter().map(|(p, b)| (p.to_string(), b.as_bytes().to_vec())));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind gateway");
+        remote.files.lock().unwrap().extend(
+            files
+                .iter()
+                .map(|(p, b)| (p.to_string(), b.as_bytes().to_vec())),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gateway");
         let endpoint = format!("http://{}", listener.local_addr().expect("gateway address"));
         let router = axum::Router::new()
             .route("/{*path}", axum::routing::any(serve))
             .with_state(Arc::clone(&remote));
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.expect("serve gateway") });
-        Self { remote, endpoint, server }
+        let server =
+            tokio::spawn(
+                async move { axum::serve(listener, router).await.expect("serve gateway") },
+            );
+        Self {
+            remote,
+            endpoint,
+            server,
+        }
     }
 
     fn set(&self, path: &str, bytes: &str) {
-        self.remote.files.lock().unwrap().insert(path.to_string(), bytes.as_bytes().to_vec());
+        self.remote
+            .files
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), bytes.as_bytes().to_vec());
     }
 
     fn remove(&self, path: &str) {
@@ -122,11 +145,16 @@ impl Gateway {
             tokio: tokio::runtime::Handle::current(),
         })
         .expect("open read-only view");
-        assert!(opened.needs_hydration, "a read-only view always asks to be brought current");
+        assert!(
+            opened.needs_hydration,
+            "a read-only view always asks to be brought current"
+        );
         let client = RemoteVfsClient::new(&self.endpoint, "token", "").expect("client");
         let hydrator = MountHydrator::new(client, Arc::clone(&opened.view));
         let marker = MountStateLayout::new(state).hydrated_marker_path();
-        hydrate_or_reconcile(&hydrator, &marker, true).await.expect("hydrate or reconcile");
+        hydrate_or_reconcile(&hydrator, &marker, true)
+            .await
+            .expect("hydrate or reconcile");
     }
 }
 
@@ -145,22 +173,51 @@ async fn a_restart_over_a_complete_hydrate_fetches_only_what_changed() {
     let state = tempfile::tempdir().expect("state dir");
 
     gateway.start_mount(state.path()).await;
-    assert_eq!(gateway.raw_reads(), 3, "the first start hydrates every file");
-    assert!(MountStateLayout::new(state.path()).hydrated_marker_path().exists());
+    assert_eq!(
+        gateway.raw_reads(),
+        3,
+        "the first start hydrates every file"
+    );
+    assert!(
+        MountStateLayout::new(state.path())
+            .hydrated_marker_path()
+            .exists()
+    );
 
     gateway.set("conversations/a/0002_assistant.md", "hi there, rewritten");
     gateway.remove("notes/todo.md");
     gateway.set("conversations/a/0003_user.md", "new turn");
 
     gateway.start_mount(state.path()).await;
-    assert_eq!(gateway.raw_reads(), 5, "the restart fetches only the rewritten and the new file");
-    assert_eq!(local(state.path(), "conversations/a/0001_user.md").as_deref(), Some("hello"));
-    assert_eq!(local(state.path(), "conversations/a/0002_assistant.md").as_deref(), Some("hi there, rewritten"));
-    assert_eq!(local(state.path(), "conversations/a/0003_user.md").as_deref(), Some("new turn"));
-    assert_eq!(local(state.path(), "notes/todo.md"), None, "a file the gateway dropped is pruned");
+    assert_eq!(
+        gateway.raw_reads(),
+        5,
+        "the restart fetches only the rewritten and the new file"
+    );
+    assert_eq!(
+        local(state.path(), "conversations/a/0001_user.md").as_deref(),
+        Some("hello")
+    );
+    assert_eq!(
+        local(state.path(), "conversations/a/0002_assistant.md").as_deref(),
+        Some("hi there, rewritten")
+    );
+    assert_eq!(
+        local(state.path(), "conversations/a/0003_user.md").as_deref(),
+        Some("new turn")
+    );
+    assert_eq!(
+        local(state.path(), "notes/todo.md"),
+        None,
+        "a file the gateway dropped is pruned"
+    );
 
     gateway.start_mount(state.path()).await;
-    assert_eq!(gateway.raw_reads(), 5, "a restart with nothing changed downloads nothing");
+    assert_eq!(
+        gateway.raw_reads(),
+        5,
+        "a restart with nothing changed downloads nothing"
+    );
     gateway.server.abort();
 }
 
@@ -170,10 +227,15 @@ async fn a_populated_tree_without_the_marker_hydrates_from_empty() {
     let state = tempfile::tempdir().expect("state dir");
 
     gateway.start_mount(state.path()).await;
-    std::fs::remove_file(MountStateLayout::new(state.path()).hydrated_marker_path()).expect("drop marker");
+    std::fs::remove_file(MountStateLayout::new(state.path()).hydrated_marker_path())
+        .expect("drop marker");
     gateway.start_mount(state.path()).await;
 
-    assert_eq!(gateway.raw_reads(), 4, "an unmarked tree is not trusted and is downloaded again");
+    assert_eq!(
+        gateway.raw_reads(),
+        4,
+        "an unmarked tree is not trusted and is downloaded again"
+    );
     assert_eq!(local(state.path(), "b.md").as_deref(), Some("two"));
     gateway.server.abort();
 }

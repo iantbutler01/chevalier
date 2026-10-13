@@ -710,7 +710,11 @@ pub(super) async fn hydrate_or_reconcile(
     if read_only && marker.exists() {
         match hydrator.reconcile().await {
             Ok(outcome) => {
-                tracing::info!(files = outcome.files, bytes = outcome.bytes, "reconciled a complete earlier hydrate");
+                tracing::info!(
+                    files = outcome.files,
+                    bytes = outcome.bytes,
+                    "reconciled a complete earlier hydrate"
+                );
                 return Ok(outcome);
             }
             Err(error) => tracing::warn!(%error, "reconcile failed; hydrating from empty"),

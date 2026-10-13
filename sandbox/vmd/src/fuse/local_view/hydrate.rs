@@ -328,7 +328,12 @@ impl MountHydrator {
 
     /// Whether the backing copy of `path` already holds the listed content. A listing
     /// without a hash (above the `/tree` hash budget) is never trusted as current.
-    fn backing_file_is_current(&self, path: &str, size_bytes: u64, content_hash: Option<&str>) -> Result<bool> {
+    fn backing_file_is_current(
+        &self,
+        path: &str,
+        size_bytes: u64,
+        content_hash: Option<&str>,
+    ) -> Result<bool> {
         let Some(expected) = content_hash else {
             return Ok(false);
         };
@@ -745,8 +750,12 @@ impl MountHydrator {
         let file = bucket.members[member].clone();
         // A pack can hold an older publication of a file the server has since rewritten; the
         // per-file download fetches its current bytes instead.
-        if verify_downloaded(&file, bytes.len() as u64, &chevalier_vfs_hash::hash_bytes(bytes))
-            .is_err()
+        if verify_downloaded(
+            &file,
+            bytes.len() as u64,
+            &chevalier_vfs_hash::hash_bytes(bytes),
+        )
+        .is_err()
         {
             return Ok(());
         }
@@ -842,8 +851,12 @@ impl MountHydrator {
                 tracing::info!(path = %file.path, "skipped a file the server removed during hydration");
                 return Ok(None);
             };
-            self.verify_or_recheck(file, bytes.len() as u64, &chevalier_vfs_hash::hash_bytes(&bytes))
-                .await?;
+            self.verify_or_recheck(
+                file,
+                bytes.len() as u64,
+                &chevalier_vfs_hash::hash_bytes(&bytes),
+            )
+            .await?;
             write_all_at(&handle, &bytes, 0)?;
             bytes.len() as u64
         } else {
@@ -861,7 +874,12 @@ impl MountHydrator {
     /// read-only root hydrates, so a listing's hash can be one publication behind the bytes the
     /// read returned. When the gateway's current hash is the downloaded one, the newer content is
     /// the right content; anything else is still a mismatch.
-    async fn verify_or_recheck(&self, file: &RemoteFile, length: u64, local_hash: &str) -> Result<()> {
+    async fn verify_or_recheck(
+        &self,
+        file: &RemoteFile,
+        length: u64,
+        local_hash: &str,
+    ) -> Result<()> {
         let Err(mismatch) = verify_downloaded(file, length, local_hash) else {
             return Ok(());
         };
@@ -1145,9 +1163,10 @@ fn skip_files_under_from_env() -> Vec<String> {
 }
 
 fn under_any(path: &str, prefixes: &[String]) -> bool {
-    prefixes
-        .iter()
-        .any(|prefix| path.strip_prefix(prefix.as_str()).is_some_and(|rest| rest.starts_with('/')))
+    prefixes.iter().any(|prefix| {
+        path.strip_prefix(prefix.as_str())
+            .is_some_and(|rest| rest.starts_with('/'))
+    })
 }
 
 /// Fold one response's revision into a hydrate whose base is already fixed.
