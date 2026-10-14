@@ -1704,29 +1704,28 @@ async fn connect_pty(
     let mut last = String::new();
     for attempt in 1..=PTY_CONNECT_ATTEMPTS {
         let started = std::time::Instant::now();
-        let cause = match tokio::time::timeout(PTY_CONNECT_TIMEOUT, connect_async(request.clone()))
-            .await
-        {
-            Ok(Ok(connected)) => {
-                if attempt > 1 {
-                    tracing::info!(
-                        vm_id,
-                        attempt,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        "freestyle pty connected after retry"
-                    );
+        let cause =
+            match tokio::time::timeout(PTY_CONNECT_TIMEOUT, connect_async(request.clone())).await {
+                Ok(Ok(connected)) => {
+                    if attempt > 1 {
+                        tracing::info!(
+                            vm_id,
+                            attempt,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "freestyle pty connected after retry"
+                        );
+                    }
+                    return Ok(connected);
                 }
-                return Ok(connected);
-            }
-            Ok(Err(err)) => {
-                last = err.to_string();
-                "refused"
-            }
-            Err(_) => {
-                last = format!("no answer within {}s", PTY_CONNECT_TIMEOUT.as_secs());
-                "timeout"
-            }
-        };
+                Ok(Err(err)) => {
+                    last = err.to_string();
+                    "refused"
+                }
+                Err(_) => {
+                    last = format!("no answer within {}s", PTY_CONNECT_TIMEOUT.as_secs());
+                    "timeout"
+                }
+            };
         tracing::warn!(vm_id, attempt, cause, "freestyle pty connect retry");
     }
     Err(SandboxError::DaemonUnavailable(format!(
