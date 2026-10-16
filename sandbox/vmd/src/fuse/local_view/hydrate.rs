@@ -289,7 +289,7 @@ pub(crate) struct MountHydrator {
     /// mount links, `computer_mounts.rs`). Walks and point refreshes leave them alone.
     synthetic: std::sync::RwLock<HashSet<String>>,
     /// Remote file identity retained across point refreshes, rebuilt by the initial walk.
-    file_ids: std::sync::RwLock<HashMap<String, String>>,
+    file_ids: std::sync::RwLock<HashMap<String, HashSet<String>>>,
 }
 
 /// The background fill of a mount's placeholders; stops when dropped.
@@ -356,6 +356,17 @@ impl MountHydrator {
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .contains(path)
+    }
+
+    fn forget_file_identity(&self, path: &str) {
+        let prefix = format!("{path}/");
+        self.file_ids
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, paths| {
+                paths.retain(|known| known != path && !known.starts_with(&prefix));
+                !paths.is_empty()
+            });
     }
 
     pub(crate) fn view(&self) -> &Arc<MountLocalView> {
@@ -453,6 +464,7 @@ impl MountHydrator {
             return Ok(());
         }
         self.view.lazy().forget_subtree(path);
+        self.forget_file_identity(path);
         remove_backing_entry(&backing_path(self.view.tree(), path)?)
     }
 
@@ -679,17 +691,17 @@ impl MountHydrator {
         for path in paths {
             self.refresh_path(path, &mut state).await?;
         }
-        let aliases: Vec<String> = self
-            .file_ids
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|(path, id)| {
-                state.bucket_of_file_id.contains_key(*id)
-                    && !state.bucket_of_path.contains_key(*path)
-            })
-            .map(|(path, _)| path.clone())
-            .collect();
+        let aliases: HashSet<String> = {
+            let known = self.file_ids.read().unwrap_or_else(|e| e.into_inner());
+            state
+                .bucket_of_file_id
+                .keys()
+                .filter_map(|id| known.get(id))
+                .flatten()
+                .filter(|path| !state.bucket_of_path.contains_key(*path))
+                .cloned()
+                .collect()
+        };
         for path in aliases {
             self.refresh_path(&path, &mut state).await?;
         }
@@ -885,6 +897,7 @@ impl MountHydrator {
         state.observe_revision(answer.revision, &format!("the stat of {path:?}"))?;
         let Some(metadata) = answer.value else {
             self.view.lazy().forget_subtree(path);
+            self.forget_file_identity(path);
             remove_backing_entry(&backing_path(tree, path)?)?;
             return Ok(None);
         };
@@ -977,6 +990,7 @@ impl MountHydrator {
                     continue;
                 }
                 self.view.lazy().forget_subtree(&path);
+                self.forget_file_identity(&path);
             }
             remove_backing_entry(&entry.path())?;
         }
@@ -998,7 +1012,10 @@ impl MountHydrator {
             let mut known = self.file_ids.write().unwrap_or_else(|e| e.into_inner());
             for (id, index) in &state.bucket_of_file_id {
                 for member in &state.buckets[*index].members {
-                    known.insert(member.path.clone(), id.clone());
+                    known
+                        .entry(id.clone())
+                        .or_default()
+                        .insert(member.path.clone());
                 }
             }
         }
