@@ -3,7 +3,7 @@
 //! every request it gets.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,6 +34,9 @@ struct Remote {
     files: Mutex<BTreeMap<String, Vec<u8>>>,
     requests: Mutex<Vec<String>>,
     raw_reads: AtomicUsize,
+    fail_stat: AtomicBool,
+    stat_failures: AtomicUsize,
+    file_ids: Mutex<HashMap<String, String>>,
     frames: broadcast::Sender<String>,
     head: Mutex<i64>,
     applied: Mutex<Vec<i64>>,
@@ -46,7 +49,11 @@ struct Remote {
     closing_opens: AtomicUsize,
 }
 
-fn listing(files: &BTreeMap<String, Vec<u8>>, dir: &str) -> Option<Vec<serde_json::Value>> {
+fn listing(
+    files: &BTreeMap<String, Vec<u8>>,
+    ids: &HashMap<String, String>,
+    dir: &str,
+) -> Option<Vec<serde_json::Value>> {
     let prefix = if dir.is_empty() {
         String::new()
     } else {
@@ -65,7 +72,7 @@ fn listing(files: &BTreeMap<String, Vec<u8>>, dir: &str) -> Option<Vec<serde_jso
             }
             None => {
                 entries.insert(rest.to_string(), serde_json::json!({
-                    "name": rest, "kind": "file", "size_bytes": bytes.len(), "file_id": format!("id:{path}"),
+                    "name": rest, "kind": "file", "size_bytes": bytes.len(), "file_id": ids.get(path).cloned().unwrap_or_else(|| format!("id:{path}")),
                     "content_hash": hash_bytes(bytes), "mode": 0o644
                 }));
             }
@@ -90,7 +97,9 @@ async fn serve(
         (Method::GET, "/changes")
             if remote
                 .failing_opens
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
                 .is_ok() =>
         {
             StatusCode::BAD_GATEWAY.into_response()
@@ -98,7 +107,9 @@ async fn serve(
         (Method::GET, "/changes")
             if remote
                 .closing_opens
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
                 .is_ok() =>
         {
             Response::new(Body::empty())
@@ -119,7 +130,11 @@ async fn serve(
             Response::new(Body::from_stream(stream))
         }
         (Method::POST, "/changes/applied") => StatusCode::NO_CONTENT.into_response(),
-        (Method::GET, "/tree") => match listing(&remote.files.lock().unwrap(), &path) {
+        (Method::GET, "/tree") => match listing(
+            &remote.files.lock().unwrap(),
+            &remote.file_ids.lock().unwrap(),
+            &path,
+        ) {
             Some(entries) => Json(entries).into_response(),
             None => StatusCode::NOT_FOUND.into_response(),
         },
@@ -131,16 +146,20 @@ async fn serve(
             }
         }
         (Method::GET, "/stat") => {
+            if remote.fail_stat.load(Ordering::SeqCst) {
+                remote.stat_failures.fetch_add(1, Ordering::SeqCst);
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             let files = remote.files.lock().unwrap();
             if let Some(bytes) = files.get(&path) {
                 return Json(serde_json::json!({
-                    "kind": "file", "size_bytes": bytes.len(), "file_id": format!("id:{path}"),
+                    "kind": "file", "size_bytes": bytes.len(), "file_id": remote.file_ids.lock().unwrap().get(&path).cloned().unwrap_or_else(|| format!("id:{path}")),
                     "link_count": 1, "link_target": null, "content_hash": hash_bytes(bytes),
                     "executable": false, "mode": 0o644, "updated_at": null
                 }))
                 .into_response();
             }
-            if listing(&files, &path).is_some() {
+            if listing(&files, &remote.file_ids.lock().unwrap(), &path).is_some() {
                 return Json(serde_json::json!({
                     "kind": "directory", "size_bytes": 0, "file_id": null, "link_count": 1,
                     "link_target": null, "content_hash": null, "executable": true, "mode": 0o755,
@@ -159,7 +178,11 @@ async fn record_applied(
     State(remote): State<Arc<Remote>>,
     Json(body): Json<serde_json::Value>,
 ) -> StatusCode {
-    remote.requests.lock().unwrap().push("POST /changes/applied".into());
+    remote
+        .requests
+        .lock()
+        .unwrap()
+        .push("POST /changes/applied".into());
     if let Some(seq) = body.get("seq").and_then(|seq| seq.as_i64()) {
         remote.applied.lock().unwrap().push(seq);
     }
@@ -183,6 +206,9 @@ impl Gateway {
             ),
             requests: Mutex::default(),
             raw_reads: AtomicUsize::new(0),
+            fail_stat: AtomicBool::new(false),
+            stat_failures: AtomicUsize::new(0),
+            file_ids: Mutex::default(),
             frames: broadcast::channel(64).0,
             head: Mutex::new(0),
             applied: Mutex::default(),
@@ -195,15 +221,13 @@ impl Gateway {
             .expect("bind gateway");
         let endpoint = format!("http://{}", listener.local_addr().expect("gateway address"));
         let router = axum::Router::new()
-            .route(
-                "/changes/applied",
-                axum::routing::post(record_applied),
-            )
+            .route("/changes/applied", axum::routing::post(record_applied))
             .route("/{*path}", axum::routing::any(serve))
             .with_state(Arc::clone(&remote));
-        let server = tokio::spawn(async move {
-            axum::serve(listener, router).await.expect("serve gateway")
-        });
+        let server =
+            tokio::spawn(
+                async move { axum::serve(listener, router).await.expect("serve gateway") },
+            );
         Self {
             remote,
             endpoint,
@@ -362,7 +386,14 @@ async fn a_followed_change_reaches_the_mount_and_advances_the_cursor() {
     let gateway = Gateway::start(&[("notes/a.md", "one"), ("notes/b.md", "two")], true).await;
     let state = tempfile::tempdir().expect("state");
     let mut mount = Mount::open(&gateway, state.path()).await;
-    store_cursor(state.path(), &ChangeCursor { epoch: EPOCH.into(), seq: 0 }).unwrap();
+    store_cursor(
+        state.path(),
+        &ChangeCursor {
+            epoch: EPOCH.into(),
+            seq: 0,
+        },
+    )
+    .unwrap();
     mount.follow(&gateway, state.path(), None);
     stream_open(&gateway, 1).await;
     let reads_after_hydrate = gateway.raw_reads();
@@ -378,13 +409,25 @@ async fn a_followed_change_reaches_the_mount_and_advances_the_cursor() {
     .await;
     eventually("the applied reports", || gateway.applied().ends_with(&[3])).await;
 
-    assert_eq!(gateway.raw_reads() - reads_after_hydrate, 2, "two files fetched, the delete is local");
+    assert_eq!(
+        gateway.raw_reads() - reads_after_hydrate,
+        2,
+        "two files fetched, the delete is local"
+    );
     assert_eq!(load_cursor(state.path()).map(|cursor| cursor.seq), Some(3));
     assert_eq!(mount.control.applied(), 3);
-    assert!(mount.control.wait_applied(3, Duration::from_millis(10)).await);
+    assert!(
+        mount
+            .control
+            .wait_applied(3, Duration::from_millis(10))
+            .await
+    );
     let invalidated = mount.invalidator.paths.lock().unwrap().clone();
     for path in ["notes/a.md", "memory/new.md", "notes/b.md"] {
-        assert!(invalidated.iter().any(|seen| seen == path), "{path} revoked");
+        assert!(
+            invalidated.iter().any(|seen| seen == path),
+            "{path} revoked"
+        );
     }
     gateway.server.abort();
 }
@@ -394,7 +437,14 @@ async fn an_event_the_mount_already_reflects_fetches_nothing() {
     let gateway = Gateway::start(&[("work/out.txt", "same bytes")], true).await;
     let state = tempfile::tempdir().expect("state");
     let mut mount = Mount::open(&gateway, state.path()).await;
-    store_cursor(state.path(), &ChangeCursor { epoch: EPOCH.into(), seq: 0 }).unwrap();
+    store_cursor(
+        state.path(),
+        &ChangeCursor {
+            epoch: EPOCH.into(),
+            seq: 0,
+        },
+    )
+    .unwrap();
     mount.follow(&gateway, state.path(), None);
     stream_open(&gateway, 1).await;
     let reads = gateway.raw_reads();
@@ -405,9 +455,17 @@ async fn an_event_the_mount_already_reflects_fetches_nothing() {
     // The report follows the local advance; wait for it so the request list is complete.
     eventually("the applied report", || gateway.applied() == vec![1]).await;
 
-    assert_eq!(gateway.raw_reads(), reads, "no content re-fetch for an echo");
+    assert_eq!(
+        gateway.raw_reads(),
+        reads,
+        "no content re-fetch for an echo"
+    );
     let since: Vec<String> = gateway.requests()[requests..].to_vec();
-    assert_eq!(since, vec!["POST /changes/applied".to_string()], "no stat, no read");
+    assert_eq!(
+        since,
+        vec!["POST /changes/applied".to_string()],
+        "no stat, no read"
+    );
     gateway.server.abort();
 }
 
@@ -416,7 +474,14 @@ async fn an_idle_follower_makes_no_requests() {
     let gateway = Gateway::start(&[("a.md", "a")], true).await;
     let state = tempfile::tempdir().expect("state");
     let mut mount = Mount::open(&gateway, state.path()).await;
-    store_cursor(state.path(), &ChangeCursor { epoch: EPOCH.into(), seq: 0 }).unwrap();
+    store_cursor(
+        state.path(),
+        &ChangeCursor {
+            epoch: EPOCH.into(),
+            seq: 0,
+        },
+    )
+    .unwrap();
     mount.follow(&gateway, state.path(), None);
     stream_open(&gateway, 1).await;
     let requests = gateway.requests().len();
@@ -436,7 +501,14 @@ async fn resync_walks_the_scope_and_continues_from_the_sent_head() {
     let gateway = Gateway::start(&[("keep.md", "k"), ("gone.md", "g")], true).await;
     let state = tempfile::tempdir().expect("state");
     let mut mount = Mount::open(&gateway, state.path()).await;
-    store_cursor(state.path(), &ChangeCursor { epoch: EPOCH.into(), seq: 0 }).unwrap();
+    store_cursor(
+        state.path(),
+        &ChangeCursor {
+            epoch: EPOCH.into(),
+            seq: 0,
+        },
+    )
+    .unwrap();
     mount.follow(&gateway, state.path(), None);
     stream_open(&gateway, 1).await;
 
@@ -448,7 +520,9 @@ async fn resync_walks_the_scope_and_continues_from_the_sent_head() {
         .lock()
         .unwrap()
         .insert("added.md".into(), b"added".to_vec());
-    gateway.push(serde_json::json!({"t": "resync", "epoch": EPOCH, "head": 40, "reason": "below_floor"}));
+    gateway.push(
+        serde_json::json!({"t": "resync", "epoch": EPOCH, "head": 40, "reason": "below_floor"}),
+    );
 
     eventually("the resync walk", || {
         local(state.path(), "gone.md").is_none()
@@ -481,7 +555,10 @@ async fn without_a_cursor_the_follower_walks_then_streams_from_the_head() {
     })
     .await;
     gateway.commit_put(8, "a.md", "a2");
-    eventually("the next change", || local(state.path(), "a.md").as_deref() == Some("a2")).await;
+    eventually("the next change", || {
+        local(state.path(), "a.md").as_deref() == Some("a2")
+    })
+    .await;
     gateway.server.abort();
 }
 
@@ -490,7 +567,14 @@ async fn a_reconnect_request_reopens_the_stream_from_the_cursor() {
     let gateway = Gateway::start(&[("a.md", "a")], true).await;
     let state = tempfile::tempdir().expect("state");
     let mut mount = Mount::open(&gateway, state.path()).await;
-    store_cursor(state.path(), &ChangeCursor { epoch: EPOCH.into(), seq: 5 }).unwrap();
+    store_cursor(
+        state.path(),
+        &ChangeCursor {
+            epoch: EPOCH.into(),
+            seq: 5,
+        },
+    )
+    .unwrap();
     mount.follow(&gateway, state.path(), None);
     stream_open(&gateway, 1).await;
     mount.control.request_reconnect();
@@ -511,7 +595,14 @@ async fn a_reconnect_request_cuts_a_failure_backoff_short() {
     gateway.remote.failing_opens.store(2, Ordering::SeqCst);
     let state = tempfile::tempdir().expect("state");
     let mut mount = Mount::open(&gateway, state.path()).await;
-    store_cursor(state.path(), &ChangeCursor { epoch: EPOCH.into(), seq: 5 }).unwrap();
+    store_cursor(
+        state.path(),
+        &ChangeCursor {
+            epoch: EPOCH.into(),
+            seq: 5,
+        },
+    )
+    .unwrap();
     mount.follow(&gateway, state.path(), None);
     // Two failures: the follower now waits about a second before the third attempt.
     stream_open(&gateway, 2).await;
@@ -537,11 +628,20 @@ async fn the_head_is_read_before_the_walk_and_an_old_gateway_means_polling() {
     let gateway = Gateway::start(&[], true).await;
     *gateway.remote.head.lock().unwrap() = 12;
     match read_feed_head(&gateway.client()).await {
-        FeedHead::At(cursor) => assert_eq!(cursor, ChangeCursor { epoch: EPOCH.into(), seq: 12 }),
+        FeedHead::At(cursor) => assert_eq!(
+            cursor,
+            ChangeCursor {
+                epoch: EPOCH.into(),
+                seq: 12
+            }
+        ),
         _ => panic!("expected the head"),
     }
     let old = Gateway::start(&[], false).await;
-    assert!(matches!(read_feed_head(&old.client()).await, FeedHead::Unsupported));
+    assert!(matches!(
+        read_feed_head(&old.client()).await,
+        FeedHead::Unsupported
+    ));
     gateway.server.abort();
     old.server.abort();
 }
@@ -563,7 +663,14 @@ async fn computer_mount_links_follow_the_manifest_and_survive_a_walk() {
     .await;
     let state = tempfile::tempdir().expect("state");
     let mut mount = Mount::open(&gateway, state.path()).await;
-    store_cursor(state.path(), &ChangeCursor { epoch: EPOCH.into(), seq: 0 }).unwrap();
+    store_cursor(
+        state.path(),
+        &ChangeCursor {
+            epoch: EPOCH.into(),
+            seq: 0,
+        },
+    )
+    .unwrap();
     let invalidator: Arc<dyn KernelPathInvalidator> = mount.invalidator.clone();
     let mounts = ComputerMounts::new(
         MountSpawner {
@@ -598,7 +705,10 @@ async fn computer_mount_links_follow_the_manifest_and_survive_a_walk() {
         link("vm/mounts/task").as_deref() == Some("../../conversations/c/0001_assistant/mount")
     })
     .await;
-    assert_eq!(link("vm/mounts/skills").as_deref(), Some("../../.runtime/skills"));
+    assert_eq!(
+        link("vm/mounts/skills").as_deref(),
+        Some("../../.runtime/skills")
+    );
 
     // A full walk keeps the links (the gateway still lists vm/mounts/task as a directory).
     gateway.push(serde_json::json!({"t": "resync", "epoch": EPOCH, "head": 1, "reason": "epoch"}));
@@ -636,7 +746,10 @@ async fn computer_mount_links_follow_the_manifest_and_survive_a_walk() {
                 .exists()
     })
     .await;
-    assert_eq!(link("vm/mounts/skills").as_deref(), Some("../../.runtime/skills"));
+    assert_eq!(
+        link("vm/mounts/skills").as_deref(),
+        Some("../../.runtime/skills")
+    );
     gateway.server.abort();
 }
 
@@ -657,7 +770,14 @@ async fn a_stream_that_fails_right_after_every_open_backs_off_instead_of_stormin
     gateway.remote.closing_opens.store(1_000, Ordering::SeqCst);
     let state = tempfile::tempdir().expect("state");
     let mut mount = Mount::open(&gateway, state.path()).await;
-    store_cursor(state.path(), &ChangeCursor { epoch: EPOCH.into(), seq: 0 }).unwrap();
+    store_cursor(
+        state.path(),
+        &ChangeCursor {
+            epoch: EPOCH.into(),
+            seq: 0,
+        },
+    )
+    .unwrap();
     mount.follow(&gateway, state.path(), None);
     tokio::time::sleep(Duration::from_millis(3_200)).await;
     let opens = change_opens(&gateway);
@@ -677,7 +797,14 @@ async fn a_mode_change_with_the_same_content_reaches_the_mount() {
     let gateway = Gateway::start(&[("bin/run.sh", "#!/bin/sh\necho hi\n")], true).await;
     let state = tempfile::tempdir().expect("state");
     let mut mount = Mount::open(&gateway, state.path()).await;
-    store_cursor(state.path(), &ChangeCursor { epoch: EPOCH.into(), seq: 0 }).unwrap();
+    store_cursor(
+        state.path(),
+        &ChangeCursor {
+            epoch: EPOCH.into(),
+            seq: 0,
+        },
+    )
+    .unwrap();
     mount.follow(&gateway, state.path(), None);
     stream_open(&gateway, 1).await;
     let reads = gateway.raw_reads();
@@ -687,17 +814,137 @@ async fn a_mode_change_with_the_same_content_reaches_the_mount() {
         "seq": 1, "path": "bin/run.sh", "op": "put", "kind": "file", "size": bytes.len(),
         "hash": hash_bytes(bytes.as_bytes()), "mode": 0o755, "origin": "api", "at_ms": 0
     }]}));
-    let backing = MountStateLayout::new(state.path()).tree_dir().join("bin/run.sh");
+    let backing = MountStateLayout::new(state.path())
+        .tree_dir()
+        .join("bin/run.sh");
     eventually("the mode change", || {
         std::fs::metadata(&backing)
             .map(|meta| meta.permissions().mode() & 0o777 == 0o755)
             .unwrap_or(false)
     })
     .await;
-    assert_eq!(gateway.raw_reads(), reads, "a mode change fetches no content");
+    assert_eq!(
+        gateway.raw_reads(),
+        reads,
+        "a mode change fetches no content"
+    );
     assert!(
-        mount.invalidator.paths.lock().unwrap().iter().any(|path| path == "bin/run.sh"),
+        mount
+            .invalidator
+            .paths
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path == "bin/run.sh"),
         "the mode change revokes the kernel's cached attributes"
     );
+    gateway.server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_change_never_advances_the_cursor_and_recovers_without_restart() {
+    let gateway = Gateway::start(&[("a", "old")], true).await;
+    let state = tempfile::tempdir().unwrap();
+    let mut mount = Mount::open(&gateway, state.path()).await;
+    store_cursor(
+        state.path(),
+        &ChangeCursor {
+            epoch: EPOCH.into(),
+            seq: 0,
+        },
+    )
+    .unwrap();
+    mount.follow(&gateway, state.path(), None);
+    stream_open(&gateway, 1).await;
+    gateway.remote.fail_stat.store(true, Ordering::SeqCst);
+    for _ in 0..200 {
+        mount.control.request_reconnect();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        gateway.commit_put(1, "a", "new");
+        if gateway.remote.stat_failures.load(Ordering::SeqCst) >= 6 {
+            break;
+        }
+    }
+    assert!(gateway.remote.stat_failures.load(Ordering::SeqCst) >= 6);
+    assert_eq!(load_cursor(state.path()).unwrap().seq, 0);
+    assert_eq!(mount.control.applied(), 0);
+    assert_eq!(local(state.path(), "a").as_deref(), Some("old"));
+    assert!(!gateway.applied().contains(&1));
+    gateway.remote.fail_stat.store(false, Ordering::SeqCst);
+    for _ in 0..100 {
+        mount.control.request_reconnect();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        gateway.commit_put(1, "a", "new");
+        if mount.control.applied() == 1 {
+            break;
+        }
+    }
+    eventually("the retried change", || mount.control.applied() == 1).await;
+    assert_eq!(local(state.path(), "a").as_deref(), Some("new"));
+    gateway.server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incremental_hard_links_join_existing_inodes() {
+    use std::os::unix::fs::MetadataExt;
+    let gateway = Gateway::start(&[("a", "shared")], true).await;
+    let state = tempfile::tempdir().unwrap();
+    let mount = Mount::open(&gateway, state.path()).await;
+    let tree = MountStateLayout::new(state.path()).tree_dir();
+    for alias in ["b", "0-first"] {
+        gateway
+            .remote
+            .files
+            .lock()
+            .unwrap()
+            .insert(alias.into(), b"shared".to_vec());
+        gateway
+            .remote
+            .file_ids
+            .lock()
+            .unwrap()
+            .insert(alias.into(), "id:a".into());
+        mount
+            .hydrator
+            .rehydrate_paths(&[alias.into()], &[])
+            .await
+            .unwrap();
+        let original = std::fs::metadata(tree.join("a")).unwrap();
+        assert_eq!(
+            original.ino(),
+            std::fs::metadata(tree.join(alias)).unwrap().ino()
+        );
+    }
+    let a = std::fs::metadata(tree.join("a")).unwrap();
+    assert_eq!(a.nlink(), 3);
+    assert_eq!(a.ino(), std::fs::metadata(tree.join("b")).unwrap().ino());
+    gateway.server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_root_reposts_its_applied_cursor_after_reconnect() {
+    let gateway = Gateway::start(&[("a", "shared")], true).await;
+    let state = tempfile::tempdir().unwrap();
+    let mut mount = Mount::open(&gateway, state.path()).await;
+    store_cursor(
+        state.path(),
+        &ChangeCursor {
+            epoch: EPOCH.into(),
+            seq: 7,
+        },
+    )
+    .unwrap();
+    mount.control = FollowControl::local_only();
+    mount.follow(&gateway, state.path(), None);
+    stream_open(&gateway, 1).await;
+    assert!(gateway.applied().is_empty());
+    drop(mount.follower.take());
+    mount.control = FollowControl::new();
+    mount.follow(&gateway, state.path(), None);
+    stream_open(&gateway, 2).await;
+    eventually("root cursor acknowledgment", || {
+        gateway.applied().contains(&7)
+    })
+    .await;
     gateway.server.abort();
 }

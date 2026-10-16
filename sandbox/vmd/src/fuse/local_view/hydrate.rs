@@ -288,6 +288,8 @@ pub(crate) struct MountHydrator {
     /// Paths this mount keeps itself rather than mirroring from the gateway (the computer
     /// mount links, `computer_mounts.rs`). Walks and point refreshes leave them alone.
     synthetic: std::sync::RwLock<HashSet<String>>,
+    /// Remote file identity retained across point refreshes, rebuilt by the initial walk.
+    file_ids: std::sync::RwLock<HashMap<String, String>>,
 }
 
 /// The background fill of a mount's placeholders; stops when dropped.
@@ -323,6 +325,7 @@ impl MountHydrator {
             lazy,
             follows_feed: AtomicBool::new(false),
             synthetic: std::sync::RwLock::default(),
+            file_ids: std::sync::RwLock::default(),
         });
         hydrator.view.lazy().attach_fetcher(&hydrator);
         hydrator
@@ -676,6 +679,20 @@ impl MountHydrator {
         for path in paths {
             self.refresh_path(path, &mut state).await?;
         }
+        let aliases: Vec<String> = self
+            .file_ids
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(path, id)| {
+                state.bucket_of_file_id.contains_key(*id)
+                    && !state.bucket_of_path.contains_key(*path)
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in aliases {
+            self.refresh_path(&path, &mut state).await?;
+        }
         let mut walked: Vec<String> = Vec::new();
         for subtree in subtrees {
             // The prefix's own entry is not in its own listing, so it is
@@ -976,6 +993,14 @@ impl MountHydrator {
     ) -> Result<()> {
         if state.buckets.is_empty() {
             return Ok(());
+        }
+        {
+            let mut known = self.file_ids.write().unwrap_or_else(|e| e.into_inner());
+            for (id, index) in &state.bucket_of_file_id {
+                for member in &state.buckets[*index].members {
+                    known.insert(member.path.clone(), id.clone());
+                }
+            }
         }
         if state.lazy {
             return self.place_placeholders(state);
