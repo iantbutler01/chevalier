@@ -15,7 +15,9 @@
 //!   tree.rs     BackingTree      the local materialized tree + single-syscall applies
 //!   wal.rs      MountWal         the sequenced log, checkpoints, compaction, group fsync
 //!     payload.rs PayloadStore    immutable payload segments and dedicated files
-//! hydrate.rs    MountHydrator    eager gateway hydration into the backing tree
+//! hydrate.rs    MountHydrator    gateway hydration into the backing tree (namespace at
+//!                                mount, file bytes staged behind placeholders)
+//!   lazy.rs     LazyContent      the placeholders still waiting for their bytes
 //! publisher.rs  MountPublisher   the ordered asynchronous gateway publisher
 //! types.rs                       every shared type and on-disk record shape
 //! ```
@@ -33,6 +35,7 @@ use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
 pub(crate) mod hydrate;
+pub(crate) mod lazy;
 pub(crate) mod mount;
 pub(crate) mod payload;
 pub(crate) mod publisher;

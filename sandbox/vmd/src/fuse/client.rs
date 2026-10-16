@@ -27,6 +27,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 use tokio_util::io::ReaderStream;
 
+use super::auth::VfsAuth;
+
 pub const RANGE_FINGERPRINT_HEADER: &str = "x-chevalier-vfs-range-fingerprint";
 /// Transient-failure budget sized to ride out a gateway restart, not mask a
 /// broken one: only transport failures and 5xx/429/408 consume it — hard 4xx
@@ -91,8 +93,12 @@ pub(super) const BULK_METADATA_MAX_HASH_BYTES: u64 = 1024 * 1024;
 #[derive(Clone, Debug)]
 pub struct RemoteVfsClient {
     client: Client,
+    /// Spec 86 D: the client the change stream is opened on. No overall request timeout (the
+    /// stream is open for as long as the mount is) and no keepalive of its own: an idle
+    /// stream sends nothing.
+    stream_client: Client,
     endpoint: String,
-    auth_token: String,
+    auth: Arc<VfsAuth>,
     scope_path: String,
     revisions: Arc<SharedRevisionState>,
 }
@@ -115,6 +121,94 @@ struct SharedRevisionState {
     /// endpoints provide their own serialization. Real lease-backed gateways
     /// never set this and retain acquire/release behavior unchanged.
     implicit_leases: AtomicBool,
+}
+
+/// Spec 86 D: how the change stream opened.
+pub enum ChangeStreamOpen {
+    /// The gateway does not serve a change stream; follow by polling instead.
+    Unsupported,
+    Stream(ChangeStream),
+}
+
+/// An open change stream: newline-delimited JSON frames, read as they arrive.
+pub struct ChangeStream {
+    response: reqwest::Response,
+    buffer: Vec<u8>,
+}
+
+impl ChangeStream {
+    /// The next frame; `None` when the gateway ended the stream.
+    pub async fn next_frame(&mut self) -> Result<Option<ChangeFrame>> {
+        loop {
+            if let Some(end) = self.buffer.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = self.buffer.drain(..=end).collect();
+                let line = &line[..line.len() - 1];
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                return serde_json::from_slice(line)
+                    .map(Some)
+                    .context("decode a vfs change stream frame");
+            }
+            match self
+                .response
+                .chunk()
+                .await
+                .context("read the vfs change stream")?
+            {
+                Some(chunk) => self.buffer.extend_from_slice(&chunk),
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+/// One frame of the change stream (the API's `routes/runtime_nymfs_internal/changes.rs`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum ChangeFrame {
+    /// Coalesced, final-state events in `seq` order. Once applied, the cursor is `head`.
+    Changes {
+        head: i64,
+        events: Vec<ChangeEvent>,
+    },
+    /// Nothing outstanding up to `head`; `epoch` is sent when the stream opened without a
+    /// cursor.
+    CaughtUp {
+        #[serde(default)]
+        epoch: Option<String>,
+        head: i64,
+    },
+    /// The cursor cannot be served: walk the scope, then continue from `epoch:head`.
+    Resync {
+        epoch: String,
+        head: i64,
+        reason: String,
+    },
+    /// The credential no longer holds: reconnect with a fresh one.
+    Reauth,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ChangeEvent {
+    pub seq: i64,
+    /// Nym-relative.
+    pub path: String,
+    /// `put`, `delete` or `subtree`.
+    pub op: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub hash: Option<String>,
+    #[serde(default)]
+    pub mode: Option<u32>,
+    #[serde(default)]
+    pub origin: Option<String>,
+    /// Commit time, Unix milliseconds.
+    #[serde(default)]
+    pub at_ms: Option<i64>,
 }
 
 pub struct RemoteWrite {
@@ -264,6 +358,10 @@ struct AdvisoryLockRequest<'a> {
 
 impl RemoteVfsClient {
     pub fn new(endpoint: &str, auth_token: &str, scope_path: &str) -> Result<Self> {
+        Self::with_auth(endpoint, VfsAuth::static_token(auth_token), scope_path)
+    }
+
+    pub fn with_auth(endpoint: &str, auth: VfsAuth, scope_path: &str) -> Result<Self> {
         let endpoint = endpoint.trim_end_matches('/').to_string();
         let scope_path = scope_path.trim_matches('/').to_string();
         let mut builder = Client::builder()
@@ -275,10 +373,20 @@ impl RemoteVfsClient {
             builder = builder.http2_prior_knowledge();
         }
         let client = builder.build().context("build vfs reqwest client")?;
+        let mut stream_builder = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .pool_max_idle_per_host(0);
+        if http2_prior_knowledge_enabled(&endpoint) {
+            stream_builder = stream_builder.http2_prior_knowledge();
+        }
+        let stream_client = stream_builder
+            .build()
+            .context("build vfs change stream client")?;
         Ok(Self {
             client,
+            stream_client,
             endpoint,
-            auth_token: auth_token.to_string(),
+            auth: Arc::new(auth),
             scope_path,
             revisions: Arc::new(SharedRevisionState::default()),
         })
@@ -1051,12 +1159,106 @@ impl RemoteVfsClient {
         format!("{}{}", self.endpoint, suffix)
     }
 
-    async fn request(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    /// Spec 86 D: open the owner's change stream from `after` (`<epoch>:<seq>`), or from the
+    /// current head when `None` (the first frame is then `caught_up` with that head).
+    /// `Unsupported` when the gateway does not serve it (an older API, or the rollout flag
+    /// off), in which case the mount falls back to polling. A 401/403 is `Unsupported` too
+    /// when this mount holds no access token exchanged for its own per-computer credential:
+    /// the stream is a per-computer door, and a deployment-token mount will never get in.
+    /// With an exchanged token it is an error the follower counts (`is_auth_refusal`).
+    pub async fn open_change_stream(&self, after: Option<&str>) -> Result<ChangeStreamOpen> {
+        let mut request = self.stream_client.get(self.url("/changes"));
+        if let Some(after) = after {
+            request = request.query(&[("after", after)]);
+        }
+        let response = self.send_authorized(request).await?;
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED {
+            return Ok(ChangeStreamOpen::Unsupported);
+        }
+        let refused = status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN;
+        if refused && !self.auth.holds_exchanged_token().await {
+            tracing::info!(
+                %status,
+                "the vfs change stream refused a mount without a per-computer credential"
+            );
+            return Ok(ChangeStreamOpen::Unsupported);
+        }
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow::Error::new(VfsRequestStatusError { status })
+                .context(format!("open vfs change stream: {status} {body}")));
+        }
+        Ok(ChangeStreamOpen::Stream(ChangeStream {
+            response,
+            buffer: Vec::new(),
+        }))
+    }
+
+    /// Report that this mount applied the feed through `seq`. Sent after an applied batch,
+    /// never on a timer; the API's pre-command barrier waits on it.
+    pub async fn report_changes_applied(&self, epoch: &str, seq: i64) -> Result<()> {
+        self.request(
+            self.client
+                .post(self.url("/changes/applied"))
+                .json(&serde_json::json!({ "epoch": epoch, "seq": seq }))
+                .timeout(METADATA_READ_ATTEMPT_TIMEOUT),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// A Nym-relative path from the change feed, relative to this client's scope; `None`
+    /// when it lies outside the scope.
+    pub fn scope_relative(&self, path: &str) -> Option<String> {
+        let path = path.trim_matches('/');
+        if self.scope_path.is_empty() {
+            return Some(path.to_string());
+        }
+        if path == self.scope_path {
+            return Some(String::new());
+        }
+        path.strip_prefix(&format!("{}/", self.scope_path))
+            .map(str::to_string)
+    }
+
+    /// Forget the access token so the next request exchanges the mount credential again
+    /// (the change stream answered `reauth`).
+    pub async fn reauthenticate(&self) {
+        if let Ok(token) = self.auth.bearer(&self.client).await {
+            self.auth.invalidate(&token).await;
+        }
+    }
+
+    /// Sends with the current bearer. A 401 on an exchanged access token (expired while
+    /// the VM was paused, or minted under a rotated key) is answered by exchanging again
+    /// and resending once; a request whose body cannot be replayed is not resent.
+    async fn send_authorized(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        let replay = if self.auth.refreshable() {
+            builder.try_clone()
+        } else {
+            None
+        };
+        let token = self.auth.bearer(&self.client).await?;
         let response = builder
-            .bearer_auth(&self.auth_token)
+            .bearer_auth(&token)
             .send()
             .await
             .context("send vfs request")?;
+        let Some(replay) = replay.filter(|_| response.status() == StatusCode::UNAUTHORIZED) else {
+            return Ok(response);
+        };
+        self.auth.invalidate(&token).await;
+        let token = self.auth.bearer(&self.client).await?;
+        replay
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("send vfs request")
+    }
+
+    async fn request(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        let response = self.send_authorized(builder).await?;
         if response.status().is_success() || response.status() == StatusCode::PARTIAL_CONTENT {
             return Ok(response);
         }
@@ -1096,11 +1298,9 @@ impl RemoteVfsClient {
                 .try_clone()
                 .ok_or_else(|| anyhow!("cannot clone vfs read request for retry"))?;
             let outcome = async {
-                let response = request
-                    .bearer_auth(&self.auth_token)
-                    .send()
+                let response = self
+                    .send_authorized(request)
                     .await
-                    .context("send vfs request")
                     .map_err(ReadFailure::transient)?;
                 let status = response.status();
                 if status.is_success()

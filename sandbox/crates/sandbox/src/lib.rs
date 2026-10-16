@@ -29,6 +29,7 @@ use uuid::Uuid;
 #[cfg(feature = "distributed-control")]
 mod distributed;
 mod freestyle;
+pub use freestyle::MountRefresh;
 mod opencomputer;
 pub mod placement;
 pub mod slo;
@@ -177,6 +178,14 @@ pub enum SandboxError {
     SessionNotFound(String),
     #[error("daemon unavailable: {0}")]
     DaemonUnavailable(String),
+    /// The provider refused a request about a VM because of the VM's state (HTTP 409).
+    /// Freestyle answers `VM_STARTING` for a VM wedged in `starting`; `code` is the
+    /// provider's stable error code when it gave one, and `message` keeps its whole reply.
+    #[error("provider conflict: {message}")]
+    ProviderConflict {
+        code: Option<String>,
+        message: String,
+    },
     /// The VM is running but its guest RPC sidecar (portproxy/shell exec) did not answer
     /// within the readiness budget. `restarted == false` means the guest was created or
     /// started by the current operation and is simply still booting: never a rebind
@@ -310,6 +319,10 @@ pub struct FreestyleBackendConfig {
     pub required_egress_domains: Vec<String>,
     /// Shared-mount launch templates keyed by mount tag, guest path, or backend profile.
     pub shared_mounts: HashMap<String, ManagedMountConfig>,
+    /// Per-mount, per-VM credential for templates that name `{vfs_credential}`; `None`
+    /// renders it empty. Set in code by the embedding service, never from config.
+    #[serde(skip)]
+    pub mount_credentials: Option<MountCredentialMinter>,
 }
 
 impl Default for FreestyleBackendConfig {
@@ -330,6 +343,7 @@ impl Default for FreestyleBackendConfig {
             egress_allowlist: None,
             required_egress_domains: Vec::new(),
             shared_mounts: HashMap::new(),
+            mount_credentials: None,
         }
     }
 }
@@ -437,6 +451,36 @@ pub struct ManagedMountConfig {
 
 pub type OpenComputerMountConfig = ManagedMountConfig;
 pub type FreestyleMountConfig = ManagedMountConfig;
+
+/// Where a Freestyle mount template's secrets take the credential minted for that mount.
+pub const MOUNT_CREDENTIAL_PLACEHOLDER: &str = "{vfs_credential}";
+
+/// Mints the credential a guest-run mount presents to its VFS gateway, from the shared
+/// mount and the id of the VM it is rendered for. The value replaces
+/// [`MOUNT_CREDENTIAL_PLACEHOLDER`] in the template's secrets (never its argv, which
+/// every guest user can read). It must be the same for the same mount and VM: an attach
+/// compares the guest's mount script byte for byte, and a script whose mounts differ
+/// restarts them.
+#[derive(Clone)]
+pub struct MountCredentialMinter(Arc<dyn Fn(&SharedMount, &str) -> Option<String> + Send + Sync>);
+
+impl MountCredentialMinter {
+    pub fn new(
+        mint: impl Fn(&SharedMount, &str) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(mint))
+    }
+
+    pub fn mint(&self, shared: &SharedMount, vm_id: &str) -> Option<String> {
+        (self.0)(shared, vm_id)
+    }
+}
+
+impl std::fmt::Debug for MountCredentialMinter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MountCredentialMinter(..)")
+    }
+}
 
 impl Default for OpenComputerBackendConfig {
     fn default() -> Self {
@@ -1062,7 +1106,7 @@ impl ForwardHandle {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct SessionInfo {
     pub session_id: String,
     pub vm_id: String,
@@ -1070,6 +1114,33 @@ pub struct SessionInfo {
     pub state: i32,
     pub parent_session_id: Option<String>,
     pub fork_id: Option<String>,
+    /// The VM's metadata as the provider reports it (see [`META_CREATED_AT`]).
+    pub metadata: HashMap<String, String>,
+}
+
+/// Metadata a managed create stamps on every VM it makes: the Unix time, in seconds, the
+/// create began. Lets a caller tell an abandoned or superseded VM from one being created.
+pub const META_CREATED_AT: &str = "chevalier.created_at";
+
+/// Metadata a caller sets on a Freestyle create that must not take its session's slug yet:
+/// one of two creates racing for the same session, where the loser is deleted. The winner
+/// takes the slug with [`Sandbox::claim_session_slug`].
+pub const META_SLUG_DEFERRED: &str = "chevalier.slug_deferred";
+
+/// Metadata marking a Freestyle machine created ahead of its session (a warm spare), which
+/// [`Sandbox::adopt_session`] later makes a session's machine. Spares are never paused for
+/// idleness. The caller chooses the value (who keeps the spare).
+pub const META_SPARE: &str = "chevalier.spare";
+
+/// What [`Sandbox::probe_session`] learned about a guest that answered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GuestProbe {
+    /// The guest's shared mounts are still coming up (a fresh or rebooted guest hydrating
+    /// its files). Its commands wait for them in the guest; nothing needs to.
+    pub mounts_starting: bool,
+    /// SHA-256 of the guest's mount script, when it has one. Compared through
+    /// [`Sandbox::guest_mounts_current`].
+    pub(crate) mount_script_sha256: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3951,7 +4022,7 @@ impl Session {
         if let ControlBackend::Managed(control) = &self.sandbox.inner.control_backend {
             control.delete_sandbox(&self.vm_id).await?;
             self.sandbox
-                .clear_managed_session_aliases(&self.session_id, &self.vm_id)
+                .clear_managed_session_aliases(&self.vm_id)
                 .await;
             return Ok(());
         }
@@ -4538,6 +4609,170 @@ impl Sandbox {
         Ok(session)
     }
 
+    /// The first half of [`Self::attach_session_with_mounts`]: find the session's machine
+    /// and bring it to running. On Freestyle that is all: the other provider calls an
+    /// attach makes (retention, egress rules, the guest's mounts) are
+    /// [`Self::reconcile_resumed_session`]'s, so a caller can bound "does the machine
+    /// answer" ([`Self::probe_session`]) on its own. Other backends attach as
+    /// [`Self::attach_session`] does.
+    pub async fn resume_session(&self, session_id: &str) -> Result<Session> {
+        let ControlBackend::Managed(ManagedControl::Freestyle(control)) =
+            &self.inner.control_backend
+        else {
+            return self.attach_session(session_id).await;
+        };
+        let started = Instant::now();
+        let vm = self.freestyle_vm(control, session_id).await?;
+        control.resume(&vm.id).await?;
+        log_slo_observation("session.resume.freestyle", started.elapsed(), "ok");
+        Ok(Session::new_with_backend(
+            self.clone(),
+            session_id.to_string(),
+            vm.id,
+            control.api_url().to_string(),
+            None,
+            Vec::new(),
+        ))
+    }
+
+    /// Run a trivial command on a resumed session's machine: it answers commands. On other
+    /// backends the attach already proved that.
+    pub async fn probe_session(&self, session: &Session) -> Result<GuestProbe> {
+        let ControlBackend::Managed(ManagedControl::Freestyle(control)) =
+            &self.inner.control_backend
+        else {
+            return Ok(GuestProbe::default());
+        };
+        let (mounts_starting, mount_script_sha256) = control.probe(session.vm_id()).await?;
+        Ok(GuestProbe {
+            mounts_starting,
+            mount_script_sha256,
+        })
+    }
+
+    /// Whether the guest `probe` describes already runs the mount script `shared_mounts`
+    /// render to, so an attach has no mounts to change and its reconcile can run off the
+    /// ready path (it can then only replay the script, never restart the guest). False when
+    /// unknown. Always true on other backends, whose attach already brought the mounts up.
+    pub fn guest_mounts_current(
+        &self,
+        session: &Session,
+        probe: &GuestProbe,
+        shared_mounts: &[SharedMount],
+    ) -> bool {
+        let ControlBackend::Managed(ManagedControl::Freestyle(control)) =
+            &self.inner.control_backend
+        else {
+            return true;
+        };
+        probe.mount_script_sha256.is_some()
+            && control
+                .mount_script_sha256(session.vm_id(), shared_mounts)
+                .is_ok_and(|wanted| wanted == probe.mount_script_sha256)
+    }
+
+    /// The second half of an attach, for a session [`Self::resume_session`] returned: on
+    /// Freestyle, keep the VM's indefinite retention and required egress rules current and
+    /// bring its mounts to `shared_mounts` (see [`Self::attach_session_with_mounts`]; empty
+    /// replays the guest's own script). May restart the guest when its mounts change.
+    /// `None` on other backends, whose `resume_session` already did all of it.
+    pub async fn reconcile_resumed_session(
+        &self,
+        session: &Session,
+        shared_mounts: &[SharedMount],
+    ) -> Result<Option<MountRefresh>> {
+        let ControlBackend::Managed(ManagedControl::Freestyle(control)) =
+            &self.inner.control_backend
+        else {
+            return Ok(None);
+        };
+        control
+            .reconcile_resumed(session.vm_id(), shared_mounts)
+            .await
+            .map(Some)
+    }
+
+    /// Make `vm_id`, a spare created ahead of its session ([`META_SPARE`]), the machine of the
+    /// session `opts` describes: its id, name and metadata, and its `shared_mounts` started as
+    /// a create's bootstrap starts them. The spare keeps no slug; see
+    /// [`Self::claim_session_slug`]. Freestyle only. On error the caller deletes the spare.
+    pub async fn adopt_session(&self, vm_id: &str, opts: SessionOptions) -> Result<Session> {
+        let ControlBackend::Managed(ManagedControl::Freestyle(control)) =
+            &self.inner.control_backend
+        else {
+            return Err(SandboxError::Unsupported(
+                "adopting a spare machine is only available for Freestyle".to_string(),
+            ));
+        };
+        let session_id = opts.session_id.unwrap_or_else(|| vm_id.to_string());
+        let mut metadata = opts.metadata;
+        metadata.insert(
+            "chevalier.requested_session_id".to_string(),
+            session_id.clone(),
+        );
+        metadata.insert(META_SESSION_ID.to_string(), session_id.clone());
+        if let Some(name) = opts.name.as_deref().filter(|name| !name.trim().is_empty()) {
+            metadata.insert("chevalier.name".to_string(), name.to_string());
+        }
+        control
+            .adopt_sandbox(vm_id, metadata, &opts.shared_mounts)
+            .await?;
+        self.bind_managed_session_alias(&session_id, vm_id).await;
+        Ok(Session::new_with_backend(
+            self.clone(),
+            session_id,
+            vm_id.to_string(),
+            control.api_url().to_string(),
+            None,
+            opts.shared_mounts,
+        ))
+    }
+
+    /// Make `vm_id` the holder of `session_id`'s slug, taking it from whichever VM holds it
+    /// (see [`META_SLUG_DEFERRED`]). Freestyle only; other backends have no slugs.
+    pub async fn claim_session_slug(&self, vm_id: &str, session_id: &str) -> Result<()> {
+        let ControlBackend::Managed(ManagedControl::Freestyle(control)) =
+            &self.inner.control_backend
+        else {
+            return Ok(());
+        };
+        control.claim_slug(vm_id, session_id).await
+    }
+
+    /// What the provider reports about a session's machine, read without touching it:
+    /// state and metadata. Freestyle only.
+    pub async fn session_info(&self, session_id: &str) -> Result<SessionInfo> {
+        let ControlBackend::Managed(ManagedControl::Freestyle(control)) =
+            &self.inner.control_backend
+        else {
+            return Err(SandboxError::Unsupported(
+                "session_info is only available for Freestyle sessions".to_string(),
+            ));
+        };
+        let vm = self.freestyle_vm(control, session_id).await?;
+        Ok(freestyle::session_info(vm))
+    }
+
+    /// A Freestyle session's VM, by VM id, by this process's alias, or by the logical
+    /// session id stamped in its metadata.
+    async fn freestyle_vm(
+        &self,
+        control: &freestyle::FreestyleControl,
+        session_id: &str,
+    ) -> Result<freestyle::FreestyleVm> {
+        let provider_id = self.managed_provider_session_id(session_id).await;
+        let vm = match control.get_sandbox(&provider_id).await {
+            Ok(vm) => vm,
+            Err(SandboxError::SessionNotFound(_)) if provider_id == session_id => control
+                .find_by_session_id(session_id)
+                .await?
+                .ok_or_else(|| SandboxError::SessionNotFound(session_id.to_string()))?,
+            Err(error) => return Err(error),
+        };
+        self.bind_managed_session_alias(session_id, &vm.id).await;
+        Ok(vm)
+    }
+
     /// Reconstruct a session handle without restoring, starting, or probing the VM.
     /// Lifecycle owners use this when the next action is explicitly pause, restore,
     /// start, or discard; ordinary `attach_session` retains its ready-to-execute contract.
@@ -4613,7 +4848,7 @@ impl Sandbox {
         if let ControlBackend::Managed(control) = &self.inner.control_backend {
             let provider_session_id = self.managed_provider_session_id(session_id).await;
             control.delete_sandbox(&provider_session_id).await?;
-            self.clear_managed_session_aliases(session_id, &provider_session_id)
+            self.clear_managed_session_aliases(&provider_session_id)
                 .await;
             return Ok(());
         }
@@ -4705,6 +4940,7 @@ impl Sandbox {
                     state: vm.state,
                     parent_session_id: vm.metadata.get(META_PARENT_SESSION_ID).cloned(),
                     fork_id: vm.metadata.get(META_FORK_ID).cloned(),
+                    metadata: vm.metadata.clone(),
                 });
             }
         }
@@ -4956,9 +5192,11 @@ impl Sandbox {
             .unwrap_or_else(|| session_id.to_string())
     }
 
-    async fn clear_managed_session_aliases(&self, logical_session_id: &str, provider_id: &str) {
+    /// Forget the aliases naming `provider_id`. Only those: a session's alias may already name
+    /// the machine that replaced this one (a deleted hedge loser or replaced computer shares
+    /// its session id with it).
+    async fn clear_managed_session_aliases(&self, provider_id: &str) {
         let mut aliases = self.inner.managed_session_aliases.lock().await;
-        aliases.remove(logical_session_id);
         aliases.retain(|_, mapped_provider_id| mapped_provider_id != provider_id);
     }
 
@@ -7451,9 +7689,21 @@ mod tests {
             "provider-session"
         );
 
+        // Deleting a machine the session has since moved off leaves its alias alone.
         sandbox
-            .clear_managed_session_aliases("requested-session", "provider-session")
+            .bind_managed_session_alias("requested-session", "replacement")
             .await;
+        sandbox
+            .clear_managed_session_aliases("provider-session")
+            .await;
+        assert_eq!(
+            sandbox
+                .managed_provider_session_id("requested-session")
+                .await,
+            "replacement"
+        );
+
+        sandbox.clear_managed_session_aliases("replacement").await;
         assert_eq!(
             sandbox
                 .managed_provider_session_id("requested-session")

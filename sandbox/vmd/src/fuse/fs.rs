@@ -750,6 +750,7 @@ impl InodeTable {
                 ino: Some(ino),
                 parent: None,
                 name: OsString::new(),
+                path: String::new(),
             });
         };
         let parent_ino = self.path_to_ino.get(parent).copied();
@@ -760,6 +761,7 @@ impl InodeTable {
             ino,
             parent: parent_ino,
             name: OsString::from(name),
+            path: path.to_string(),
         })
     }
 
@@ -805,6 +807,19 @@ struct KernelInvalTarget {
     ino: Option<INodeNo>,
     parent: Option<INodeNo>,
     name: OsString,
+    /// Scope-relative path, so a pinned dentry (a mountpoint) can be spared.
+    path: String,
+}
+
+/// Whether `path` is a pinned mountpoint or a directory above one. Invalidating such a
+/// dentry would make the kernel detach the mount on it (`d_invalidate` unmounts submounts).
+fn dentry_is_pinned(pinned: &BTreeSet<String>, path: &str) -> bool {
+    pinned.iter().any(|mountpoint| {
+        mountpoint == path
+            || mountpoint
+                .strip_prefix(path)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
 }
 
 /// Split a scope-relative VFS path into its parent directory and leaf name.
@@ -863,6 +878,9 @@ struct PathInvalidatorInner {
     /// Edge-detects notifier failures so a broken channel warns once, not once
     /// per path.
     warned: AtomicBool,
+    /// Mountpoints of mounts stacked inside this one (task bindings): their dentries and
+    /// their ancestors' are never invalidated.
+    pinned: Mutex<BTreeSet<String>>,
 }
 
 /// Coalesced work. Repeated requests for the same path collapse into one
@@ -889,6 +907,7 @@ impl MountPathInvalidator {
             queue: Mutex::new(PathInvalidatorQueue::default()),
             signal: Condvar::new(),
             warned: AtomicBool::new(false),
+            pinned: Mutex::new(BTreeSet::new()),
         });
         let worker = Arc::clone(&inner);
         if let Err(error) = std::thread::Builder::new()
@@ -950,6 +969,16 @@ impl KernelPathInvalidator for MountPathInvalidator {
     fn invalidate_all(&self) {
         self.inner.enqueue(|queue| queue.sweep = true);
     }
+
+    fn pin_dentries(&self, mountpoints: &[String]) {
+        if let Ok(mut pinned) = self.inner.pinned.lock() {
+            *pinned = mountpoints
+                .iter()
+                .map(|path| path.trim_matches('/').to_string())
+                .filter(|path| !path.is_empty())
+                .collect();
+        }
+    }
 }
 
 impl PathInvalidatorInner {
@@ -990,7 +1019,17 @@ impl PathInvalidatorInner {
             };
             // The inode-table lock is dropped before any `writev` into
             // `/dev/fuse`, so a revocation can never block a lookup behind it.
-            let targets = self.resolve(&paths, &subtrees, sweep);
+            let mut targets = self.resolve(&paths, &subtrees, sweep);
+            if let Ok(pinned) = self.pinned.lock()
+                && !pinned.is_empty()
+            {
+                for target in &mut targets {
+                    if dentry_is_pinned(&pinned, &target.path) {
+                        // Attributes may still be refreshed; the dentry stays.
+                        target.parent = None;
+                    }
+                }
+            }
             self.apply(&targets);
         }
     }
@@ -2046,6 +2085,29 @@ impl RemoteFuseFs {
         // macFUSE FSKit uses direct I/O to keep close-time sealing correct.
         let _ = read_only;
         InitFlags::FUSE_AUTO_INVAL_DATA | directory_prefetch
+    }
+}
+
+#[cfg(test)]
+mod pinned_dentry_tests {
+    use std::collections::BTreeSet;
+
+    use super::dentry_is_pinned;
+
+    #[test]
+    fn a_resync_sweep_spares_mountpoints_and_the_directories_above_them() {
+        let pinned: BTreeSet<String> = ["conversations/c/0010_assistant/mount".to_string()]
+            .into_iter()
+            .collect();
+        assert!(dentry_is_pinned(&pinned, "conversations/c/0010_assistant/mount"));
+        assert!(dentry_is_pinned(&pinned, "conversations/c/0010_assistant"));
+        assert!(dentry_is_pinned(&pinned, "conversations"));
+        // Siblings, look-alike prefixes and descendants are invalidated as usual.
+        assert!(!dentry_is_pinned(&pinned, "conversations/c/0011_assistant"));
+        assert!(!dentry_is_pinned(&pinned, "conversations/c/0010_assistant/mount2"));
+        assert!(!dentry_is_pinned(&pinned, "conversations/c/0010_assistant/mount/file"));
+        assert!(!dentry_is_pinned(&pinned, "skills"));
+        assert!(!dentry_is_pinned(&BTreeSet::new(), "conversations"));
     }
 }
 
@@ -3153,6 +3215,16 @@ impl RemoteFuseFs {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(err),
         }
+    }
+
+    /// Whether some file's bytes have not arrived yet (an open may wait on a fetch).
+    pub(super) fn has_pending_content(&self) -> bool {
+        self.local.lazy().outstanding() > 0
+    }
+
+    #[cfg(test)]
+    pub(super) fn lazy_content(&self) -> &super::local_view::lazy::LazyContent {
+        self.local.lazy()
     }
 
     pub(super) fn open(&self, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
