@@ -48,6 +48,7 @@ use uuid::Uuid;
 
 use chevalier_vfs_hash::ContentHasher;
 
+use super::lazy::LazyContent;
 use super::payload::{hash_file_range, read_file_range};
 use super::publisher::MountPublisher;
 use super::tree::{BackingTree, MountFile};
@@ -98,11 +99,17 @@ pub(crate) struct MountOwnership {
     /// The locked descriptor. Closing it releases the `flock`, so it lives
     /// exactly as long as the mount does.
     _owner_file: File,
+    /// The directory held another owner's state, which `acquire` deleted: the mount
+    /// starts from empty and must hydrate.
+    replaced_foreign_state: bool,
 }
 
 impl MountOwnership {
     /// Take the lock, minting the owner record for a fresh state directory and
-    /// validating scope/endpoint/tag against an existing one.
+    /// validating scope/endpoint/tag against an existing one. A directory that
+    /// belongs to another owner (the gateway namespace the endpoint names, i.e.
+    /// another Nym) is emptied and minted afresh: its tree and WAL are that owner's
+    /// files and writes, which this mount must neither serve nor publish.
     pub(crate) fn acquire(options: &MountLocalViewOptions) -> Result<Self> {
         options.layout.ensure()?;
         let path = options.layout.owner_path();
@@ -120,7 +127,35 @@ impl MountOwnership {
             .with_context(|| format!("read mount owner record {}", path.display()))?;
         let existing = existing.trim();
 
-        let record = if existing.is_empty() {
+        let foreign = match existing {
+            "" => None,
+            existing => {
+                let record: MountOwnerRecord = serde_json::from_str(existing)
+                    .with_context(|| format!("decode mount owner record {}", path.display()))?;
+                let foreign = endpoint_owner(&record.endpoint) != endpoint_owner(&options.endpoint);
+                Some((record, foreign))
+            }
+        };
+        let replaced_foreign_state = matches!(foreign, Some((_, true)));
+        if let Some((record, true)) = &foreign {
+            tracing::warn!(
+                state_dir = %options.layout.root().display(),
+                previous_endpoint = %record.endpoint,
+                endpoint = %options.endpoint,
+                "mount state directory belongs to another owner; deleting it and starting fresh"
+            );
+            wipe_all_but_owner_record(&options.layout)?;
+        }
+
+        let record = if let Some((mut record, false)) = foreign {
+            validate_owner_record(&record, options, &path)?;
+            if record.endpoint != options.endpoint {
+                record.endpoint = options.endpoint.clone();
+                persist_owner_record(&mut file, &path, &record)?;
+                sync_directory(options.layout.root())?;
+            }
+            record
+        } else {
             // A fresh state directory mints its epoch once. It persists across
             // restarts so `{epoch}:{sequence}` idempotency keys stay stable.
             let record = MountOwnerRecord {
@@ -134,27 +169,58 @@ impl MountOwnership {
             persist_owner_record(&mut file, &path, &record)?;
             sync_directory(options.layout.root())?;
             record
-        } else {
-            let mut record: MountOwnerRecord = serde_json::from_str(existing)
-                .with_context(|| format!("decode mount owner record {}", path.display()))?;
-            validate_owner_record(&record, options, &path)?;
-            if record.endpoint != options.endpoint {
-                record.endpoint = options.endpoint.clone();
-                persist_owner_record(&mut file, &path, &record)?;
-                sync_directory(options.layout.root())?;
-            }
-            record
         };
 
         Ok(Self {
             record,
             _owner_file: file,
+            replaced_foreign_state,
         })
     }
 
     pub(crate) fn epoch(&self) -> &str {
         &self.record.epoch
     }
+
+    pub(crate) fn replaced_foreign_state(&self) -> bool {
+        self.replaced_foreign_state
+    }
+}
+
+/// The gateway namespace an endpoint names: its last path segment, the owner id
+/// (`.../vfs/{owner}`). Scheme, host and port are routing and may change for the
+/// same owner (a guest moved to a private API address keeps its state).
+fn endpoint_owner(endpoint: &str) -> &str {
+    let path = endpoint.split_once("://").map_or(endpoint, |(_, rest)| {
+        rest.find('/').map_or("", |slash| &rest[slash..])
+    });
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+}
+
+/// Empties a state directory that belongs to another owner, keeping only the owner
+/// record the caller holds locked (it is rewritten next), and recreates the layout.
+fn wipe_all_but_owner_record(layout: &MountStateLayout) -> Result<()> {
+    let owner_path = layout.owner_path();
+    for entry in std::fs::read_dir(layout.root())
+        .with_context(|| format!("list mount state directory {}", layout.root().display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path == owner_path {
+            continue;
+        }
+        let removed = if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        removed.with_context(|| format!("delete foreign mount state {}", path.display()))?;
+    }
+    layout.ensure()
 }
 
 fn validate_owner_record(
@@ -176,11 +242,14 @@ fn validate_owner_record(
             path.display()
         );
     }
-    // Scope and tag are the durable identity. The endpoint is routing metadata:
-    // it may change when the same gateway namespace moves between network
-    // addresses, while the ownership epoch and unpublished WAL remain intact.
-    // Adopting a foreign scope or tag would publish this mount's WAL into
-    // somebody else's namespace, so those mismatches still fail closed.
+    // Called only for a directory of the same owner (`endpoint_owner`); another
+    // owner's directory is emptied before this. Scope and tag are the durable
+    // identity within the owner. The endpoint's address is routing metadata: it may
+    // change when the same gateway namespace moves between network addresses, while
+    // the ownership epoch and unpublished WAL remain intact. Adopting a foreign
+    // scope or tag would publish this mount's WAL into the wrong part of the
+    // owner's namespace, and the WAL is still the owner's own unpublished work, so
+    // those mismatches fail closed rather than delete it.
     if record.scope_path != options.scope_path {
         bail!(
             "mount state directory {} belongs to scope {:?}, not {:?}",
@@ -267,6 +336,9 @@ pub(crate) struct MountLocalView {
     compacted_sequence: AtomicU64,
     stopping: AtomicBool,
     maintenance: Mutex<Option<JoinHandle<()>>>,
+    /// Files whose bytes have not been fetched yet (`lazy.rs`). Every callback that could
+    /// observe or change a file's bytes waits here first.
+    lazy: LazyContent,
 }
 
 impl fmt::Debug for MountLocalView {
@@ -309,6 +381,7 @@ impl MountLocalView {
         let needs_hydration = options.read_only || options.layout.is_empty()?;
 
         let ownership = MountOwnership::acquire(&options)?;
+        let needs_hydration = needs_hydration || ownership.replaced_foreign_state();
         let tree = BackingTree::open(&options.layout.tree_dir())?;
         let wal = if options.read_only {
             None
@@ -320,7 +393,7 @@ impl MountLocalView {
             layout: options.layout,
             scope_path: options.scope_path,
             read_only: options.read_only,
-            tokio: options.tokio,
+            tokio: options.tokio.clone(),
             _ownership: ownership,
             tree,
             wal,
@@ -333,6 +406,7 @@ impl MountLocalView {
             compacted_sequence: AtomicU64::new(0),
             stopping: AtomicBool::new(false),
             maintenance: Mutex::new(None),
+            lazy: LazyContent::new(options.tokio.clone()),
         });
 
         let recovery = view.recover()?;
@@ -419,6 +493,10 @@ impl MountLocalView {
         &self.tree
     }
 
+    pub(crate) fn lazy(&self) -> &LazyContent {
+        &self.lazy
+    }
+
     /// `None` for a read-only mount.
     pub(crate) fn wal(&self) -> Option<&MountWal> {
         self.wal.as_ref()
@@ -475,6 +553,7 @@ impl MountLocalView {
         flags: i32,
     ) -> Result<(MountFile, LocalMetadata)> {
         let wal = self.writable_wal()?;
+        self.lazy.ensure(path)?;
         let mutation = MountMutation::CreateFile {
             path: path.to_string(),
             mode,
@@ -533,6 +612,7 @@ impl MountLocalView {
         new_path: &str,
     ) -> Result<LocalMetadata> {
         let wal = self.writable_wal()?;
+        self.lazy.ensure(existing_path)?;
         let mutation = MountMutation::CreateHardLink {
             existing_path: existing_path.to_string(),
             new_path: new_path.to_string(),
@@ -564,6 +644,9 @@ impl MountLocalView {
                 "RENAME_EXCHANGE and RENAME_WHITEOUT have no atomic gateway form",
             ));
         }
+        // A placeholder's bytes are fetched by the remote name it was listed under, which
+        // the publication of this rename retires: fetch everything it moves first.
+        self.lazy.ensure_subtree(old_path)?;
         let mutation = MountMutation::Rename {
             old_path: old_path.to_string(),
             new_path: new_path.to_string(),
@@ -573,6 +656,8 @@ impl MountLocalView {
         let keys = mutation.dependency_keys();
         let _guard = self.locks.acquire(&keys)?;
         self.commit_mutation(wal, mutation, PayloadSource::None)?;
+        // A placeholder the rename displaced is unreachable now.
+        self.lazy.forget(new_path);
         // The dirty marker follows the name, so a later seal still finds the
         // generation the guest wrote under the old path.
         self.retarget_dirty(wal, old_path, new_path)?;
@@ -600,6 +685,8 @@ impl MountLocalView {
         let keys = mutation.dependency_keys();
         let _guard = self.locks.acquire(&keys)?;
         self.commit_mutation(wal, mutation, PayloadSource::None)?;
+        // An unlinked placeholder needs no bytes under this name.
+        self.lazy.forget(path);
         if self.is_dirty(path)? {
             self.clear_dirty(wal, path)?;
         }
@@ -643,6 +730,8 @@ impl MountLocalView {
         mtime: Option<LocalTimestamp>,
     ) -> Result<LocalMetadata> {
         let wal = self.writable_wal()?;
+        // Filling a placeholder restores the times it had, which would undo these.
+        self.lazy.ensure(path)?;
         let mutation = MountMutation::SetTimes {
             path: path.to_string(),
             atime,
@@ -687,6 +776,9 @@ impl MountLocalView {
                 "mount is a read-only replica of its scope",
             ));
         }
+        // Every read and write goes through an open handle, so this is where a
+        // placeholder's bytes become real before anything can see or change them.
+        self.lazy.ensure(path)?;
         // Creation and truncation are the mount's business, not the backing
         // open's: the truncate is a content mutation that has to dirty the path.
         let open_flags = flags & !(libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC);
@@ -794,6 +886,7 @@ impl MountLocalView {
     pub(crate) fn truncate_path(&self, path: &str, size: u64) -> Result<LocalMetadata> {
         let wal = self.writable_wal()?;
         self.reject_content_under_pressure("a truncate")?;
+        self.lazy.ensure(path)?;
         let file = self.tree.open_file(path, libc::O_WRONLY)?;
         let keys = content_keys(path, false);
         let _guard = self.locks.acquire(&keys)?;
@@ -1950,6 +2043,18 @@ pub(crate) fn clone_mount_state(
             target.display()
         );
     }
+    // A parent still filling placeholders hands them to the child, which fetches them from
+    // its own copy of the scope. That only works when the marks came along: a copy without
+    // them would serve a placeholder's zeros as content.
+    if super::lazy::root_has_pending(&source) && !super::lazy::root_has_pending(&target) {
+        let _ = std::fs::remove_dir_all(child.layout.root());
+        bail!(
+            "the parent replica {} still has unfetched files and the copy at {} lost their \
+             placeholder marks; refusing to clone it",
+            source.display(),
+            target.display()
+        );
+    }
     match MountLocalView::open(child) {
         Ok(opened) => {
             drop(opened);
@@ -1964,7 +2069,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::{MountLocalView, MountLocalViewOptions, clone_mount_state};
+    use super::{MountLocalView, MountLocalViewOptions, clone_mount_state, endpoint_owner};
     use crate::fuse::local_view::MountStateLayout;
     use crate::fuse::local_view::types::{
         MountMutation, MountOwnerRecord, PayloadSource, PayloadStorage,
@@ -2238,6 +2343,85 @@ mod tests {
         assert_eq!(current.scope_path, original.scope_path);
         assert_eq!(current.mount_tag, original.mount_tag);
         assert_eq!(current.endpoint, "http://192.168.0.34:8930");
+    }
+
+    /// A state directory left by another Nym (a template copy boots from the source's disk,
+    /// and every Nym's mounts use the same tags) is deleted, not adopted: its tree is that
+    /// Nym's files and its WAL that Nym's unpublished writes, which this mount must neither
+    /// serve nor publish into its own namespace. The same Nym on a new address keeps both.
+    #[test]
+    fn a_state_directory_from_another_nym_is_replaced_not_adopted() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = MountStateLayout::new(temp.path());
+        let at = |endpoint: &str| {
+            let mut options = options(temp.path(), runtime.handle());
+            options.endpoint = endpoint.to_string();
+            options
+        };
+        let owner = || -> MountOwnerRecord {
+            serde_json::from_slice(&fs::read(layout.owner_path()).expect("read owner"))
+                .expect("decode owner")
+        };
+        let tree_entries = || fs::read_dir(layout.tree_dir()).expect("tree").count();
+
+        let source =
+            MountLocalView::open(at("http://10.0.0.1:3001/v1/internal/chevalier/vfs/nym-a"))
+                .expect("open as nym-a");
+        let (file, _) = source
+            .view
+            .create_file("secret.txt", 0o644, libc::O_RDWR)
+            .expect("create file");
+        source.view.write(&file, b"nym-a's file", 0).expect("write");
+        source.view.flush_handle(&file).expect("seal");
+        drop(file);
+        drop(source);
+        let source_epoch = owner().epoch;
+        assert!(tree_entries() > 0);
+
+        // Same Nym, new address: everything kept, including the unpublished write.
+        let moved =
+            MountLocalView::open(at("http://10.0.0.2:3002/v1/internal/chevalier/vfs/nym-a/"))
+                .expect("reopen nym-a elsewhere");
+        assert!(!moved.needs_hydration);
+        assert!(moved.recovery.committed_unacknowledged > 0);
+        drop(moved);
+        assert_eq!(owner().epoch, source_epoch);
+
+        // Same Nym, another scope in this directory: still refused, its writes kept.
+        let mut other_scope = at("http://10.0.0.2:3002/v1/internal/chevalier/vfs/nym-a");
+        other_scope.scope_path = "other-scope".into();
+        assert!(MountLocalView::open(other_scope).is_err());
+        assert!(tree_entries() > 0);
+
+        // Another Nym: emptied and minted afresh, so it hydrates its own files.
+        let recipient =
+            MountLocalView::open(at("http://10.0.0.2:3002/v1/internal/chevalier/vfs/nym-b"))
+                .expect("open as nym-b");
+        assert!(recipient.needs_hydration);
+        assert_eq!(recipient.recovery.replayed_events, 0);
+        assert_eq!(tree_entries(), 0);
+        drop(recipient);
+        let current = owner();
+        assert_ne!(current.epoch, source_epoch);
+        assert_eq!(
+            current.endpoint,
+            "http://10.0.0.2:3002/v1/internal/chevalier/vfs/nym-b"
+        );
+    }
+
+    #[test]
+    fn an_endpoints_owner_is_its_last_path_segment() {
+        assert_eq!(
+            endpoint_owner("http://api:3001/v1/internal/chevalier/vfs/nym-a"),
+            "nym-a"
+        );
+        assert_eq!(
+            endpoint_owner("https://api/v1/internal/nymfs/nym-a/?x=1"),
+            "nym-a"
+        );
+        assert_eq!(endpoint_owner("http://127.0.0.1:1"), "");
+        assert_eq!(endpoint_owner("/owner/nym-1"), "nym-1");
     }
 
     #[test]

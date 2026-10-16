@@ -3,9 +3,9 @@
 // @dive-rel: ControlBackend::Managed so consumers keep one sandbox API. Wire shapes follow the
 // @dive-rel: public v5 OpenAPI spec (https://api.freestyle.sh/openapi.json).
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use bytes::Bytes;
@@ -28,6 +28,7 @@ use crate::{
 
 #[path = "freestyle_guest_mounts.rs"]
 mod guest_mounts;
+pub use guest_mounts::MountRefresh;
 use guest_mounts::*;
 
 /// Every session the facade creates carries this metadata key so `list_sessions`
@@ -40,6 +41,39 @@ const META_SESSION_ID: &str = "chevalier.session_id";
 const METADATA_VALUE_LIMIT: usize = 63;
 const META_SESSION_ID_TAIL: &str = "chevalier.session_id.tail";
 const META_NAME: &str = "chevalier.name";
+/// Set by a caller creating a VM to replace one it has given up on (stuck, unresponsive).
+/// Its value is the retiring VM's id; see `reassigns_slug`.
+const META_REPLACES_VM_ID: &str = "chevalier.replaces_vm_id";
+/// Set by a caller making a VM that must not take its session's slug at create: a second,
+/// hedged create racing the first (whichever loses is deleted, and a late create's takeover
+/// would leave the slug on it). The winner takes the slug afterwards (`claim_slug`).
+pub(crate) const META_SLUG_DEFERRED: &str = crate::META_SLUG_DEFERRED;
+/// Set on a VM created ahead of its session (a warm spare): it is never paused for idleness,
+/// so it answers at once when `adopt_sandbox` makes it a session's machine.
+pub(crate) const META_SPARE: &str = crate::META_SPARE;
+/// The trivial command a resume is proven by. Its own bound sits well above a healthy
+/// guest's answer (well under a second); callers bound the whole resume more tightly.
+const PROBE_EXEC_MS: u64 = 10_000;
+/// Prints the mount unit's state, then the SHA-256 of the guest's mount script (empty when
+/// it has none). Root's, because the script directory is.
+const PROBE_COMMAND: &str = "systemctl is-active chevalier-mounts.service 2>/dev/null; sha256sum /etc/chevalier/mounts.sh 2>/dev/null | cut -d' ' -f1; true";
+/// Runs ahead of every session command and terminal. While the guest's mount unit is still
+/// bringing its mounts up (a new VM hydrating its NymFS root, or a boot), it waits for it,
+/// so nothing reads the bare mountpoints the mounts will cover or writes files there that
+/// the mount would then hide. A unit that is up, failed or absent holds nothing (an
+/// attach's mount refresh repairs a failed one), and after 300 s the command runs anyway.
+/// `is-active` reads systemd's state over D-Bus, so the session user can run it.
+const MOUNT_GATE: &str = r#"n=0
+while [ "$n" -lt 1200 ]; do
+  case "$(systemctl is-active chevalier-mounts.service 2>/dev/null)" in
+    activating|reloading) ;;
+    inactive)
+      systemctl -q is-enabled chevalier-mounts.service 2>/dev/null || break
+      case "$(systemctl is-system-running 2>/dev/null)" in initializing|starting) ;; *) break;; esac;;
+    *) break;;
+  esac
+  n=$((n+1)); sleep 0.25
+done"#;
 
 /// Freestyle caps `exec-await` at five minutes of wall clock.
 const EXEC_AWAIT_MAX_MS: u64 = 300_000;
@@ -55,6 +89,20 @@ pub(crate) struct FreestyleControl {
     /// Whether guests get `GuestMountScript::SelfHealing` (the default) or `Legacy`. Shared
     /// by every clone, so the switch reaches whichever copy runs the next attach.
     mount_self_heal: Arc<AtomicBool>,
+    /// Provider state this process has already confirmed, shared by every clone, so an
+    /// attach does not ask again for what only this facade changes.
+    confirmed: Arc<Mutex<Confirmed>>,
+}
+
+/// What [`FreestyleControl`] confirmed once and need not confirm again.
+#[derive(Default)]
+struct Confirmed {
+    /// VMs with indefinite retention (read from their record, or after setting it).
+    retained: HashSet<String>,
+    /// (VM, domain) pairs whose required egress rule exists.
+    egress: HashSet<(String, String)>,
+    /// The configured private network exists.
+    network: bool,
 }
 
 /// The subset of a Freestyle VM record the facade acts on.
@@ -66,6 +114,8 @@ pub(crate) struct FreestyleVm {
     auto_delete_seconds: Option<u64>,
     #[serde(default, rename = "ttlSeconds")]
     ttl_seconds: Option<u64>,
+    #[serde(default, rename = "idleTimeoutSeconds")]
+    idle_timeout_seconds: Option<i64>,
     #[serde(default)]
     pub metadata: HashMap<String, String>,
     #[serde(default)]
@@ -162,7 +212,14 @@ impl FreestyleControl {
             cfg,
             client: Client::new(),
             mount_self_heal: Arc::new(AtomicBool::new(true)),
+            confirmed: Arc::default(),
         })
+    }
+
+    fn confirmed(&self) -> std::sync::MutexGuard<'_, Confirmed> {
+        self.confirmed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     pub(crate) fn api_url(&self) -> &str {
@@ -181,18 +238,24 @@ impl FreestyleControl {
         egress_allowlist: Option<Vec<String>>,
         shared_mounts: &[SharedMount],
     ) -> Result<FreestyleVm> {
+        let started = std::time::Instant::now();
         let snapshot_id = image
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .or_else(|| (!self.cfg.snapshot_id.is_empty()).then(|| self.cfg.snapshot_id.clone()));
         metadata.insert(META_MANAGED_BY.to_string(), MANAGED_BY_VALUE.to_string());
+        metadata.insert(
+            crate::META_CREATED_AT.to_string(),
+            unix_now_secs().to_string(),
+        );
         if let Some(session_id) = metadata.get(META_SESSION_ID).cloned() {
             store_session_id(&mut metadata, &session_id);
         }
-        let slug = metadata
-            .get("chevalier.requested_session_id")
-            .map(|value| session_slug(value));
+        let slug = create_slug(&metadata);
+        let spare = metadata.contains_key(META_SPARE);
         let display_name = metadata.get(META_NAME).cloned();
+        let reassign_slug =
+            slug.is_some() && reassigns_slug(self.cfg.require_persistent, &metadata);
         let mut effective_egress = egress_allowlist.or_else(|| self.cfg.egress_allowlist.clone());
         if let Some(domains) = effective_egress.as_mut() {
             domains.extend(self.cfg.required_egress_domains.iter().cloned());
@@ -200,14 +263,18 @@ impl FreestyleControl {
             domains.dedup();
         }
         let body = CreateVmBody {
-            reassign_slug: slug.is_some() && !self.cfg.require_persistent,
+            reassign_slug,
             snapshot_id,
             slug,
             display_name,
             metadata: metadata_within_limits(metadata),
             firewall: FirewallSpec::for_egress(effective_egress.clone()),
             tls: TlsSpec::for_egress_domains(effective_egress.as_deref()),
-            idle_timeout_seconds: self.cfg.idle_timeout_secs.map(|value| value as i64),
+            idle_timeout_seconds: if spare {
+                Some(-1)
+            } else {
+                self.cfg.idle_timeout_secs.map(|value| value as i64)
+            },
             auto_delete_seconds: self.cfg.auto_delete_secs.map(|value| value as i64),
             automatic_restart: Some(true),
             networks: match self.private_network().await? {
@@ -219,6 +286,11 @@ impl FreestyleControl {
             .send(self.client.post(self.url("/v5/vms")).json(&body))
             .await?;
         let vm: FreestyleVm = decode_json(response, "create vm").await?;
+        let created_ms = started.elapsed().as_millis() as u64;
+        // The VM exists from here. A caller that gives up on this create (drops its future,
+        // as a timeout does) would otherwise leave it running, unbound, with nothing
+        // knowing its id; the guard deletes it instead.
+        let mut abandoned = AbandonedCreate::new(self, &vm.id);
         let bootstrap = async {
             self.validate_retention(&vm)?;
             if let Some(resources) = resources {
@@ -226,12 +298,77 @@ impl FreestyleControl {
             }
             self.ensure_configured_mounts(&vm.id, shared_mounts).await
         };
-        if let Err(error) = bootstrap.await {
+        let bootstrapped = bootstrap.await;
+        abandoned.disarm();
+        if let Err(error) = bootstrapped {
             // Never leave a half-configured VM behind: the caller has no id to reap it by.
             let _ = self.delete_sandbox(&vm.id).await;
             return Err(error);
         }
+        tracing::info!(
+            vm_id = %vm.id,
+            create_ms = created_ms,
+            bootstrap_ms = started.elapsed().as_millis() as u64 - created_ms,
+            "created a Freestyle computer"
+        );
         Ok(vm)
+    }
+
+    /// Move `session_id`'s slug to `vm_id`, atomically, from whichever VM holds it (see
+    /// `META_SLUG_DEFERRED`). The previous holder keeps running and loses only its slug.
+    pub(crate) async fn claim_slug(&self, vm_id: &str, session_id: &str) -> Result<()> {
+        let response = self
+            .send(self.client.patch(self.vm_url(vm_id, "")).json(&serde_json::json!({
+                "slug": session_slug(session_id),
+                "reassignSlug": true,
+            })))
+            .await?;
+        let _: FreestyleVm = decode_json(response, "claim slug").await?;
+        Ok(())
+    }
+
+    /// Make a spare (`META_SPARE`) the machine of the session `metadata` names: its metadata
+    /// and display name become the session's, its retention a session machine's, and its
+    /// mounts `shared_mounts`, as a create's bootstrap leaves them. The caller deletes the VM
+    /// when this fails.
+    pub(crate) async fn adopt_sandbox(
+        &self,
+        vm_id: &str,
+        mut metadata: HashMap<String, String>,
+        shared_mounts: &[SharedMount],
+    ) -> Result<()> {
+        let started = std::time::Instant::now();
+        metadata.insert(META_MANAGED_BY.to_string(), MANAGED_BY_VALUE.to_string());
+        metadata.insert(
+            crate::META_CREATED_AT.to_string(),
+            unix_now_secs().to_string(),
+        );
+        if let Some(session_id) = metadata.get(META_SESSION_ID).cloned() {
+            store_session_id(&mut metadata, &session_id);
+        }
+        // An empty value removes a key: the VM is a spare no longer.
+        metadata.insert(META_SPARE.to_string(), String::new());
+        let display_name = metadata.get(META_NAME).cloned();
+        let response = self
+            .send(self.client.patch(self.vm_url(vm_id, "")).json(&serde_json::json!({
+                "metadata": metadata_within_limits(metadata),
+                "displayName": display_name,
+                "autoDeleteSeconds": -1,
+                "ttlSeconds": -1,
+                "idleTimeoutSeconds": self.cfg.idle_timeout_secs.map_or(-1, |seconds| seconds as i64),
+            })))
+            .await?;
+        let vm: FreestyleVm = decode_json(response, "adopt spare vm").await?;
+        self.validate_retention(&vm)?;
+        let patched_ms = started.elapsed().as_millis() as u64;
+        self.ensure_configured_mounts(vm_id, shared_mounts).await?;
+        tracing::info!(
+            vm_id,
+            patch_ms = patched_ms,
+            bootstrap_ms = started.elapsed().as_millis() as u64 - patched_ms,
+            "adopted a spare Freestyle computer"
+        );
+        Ok(())
     }
 
     pub(crate) async fn get_sandbox(&self, vm_id: &str) -> Result<FreestyleVm> {
@@ -243,7 +380,18 @@ impl FreestyleControl {
                 vm.id
             )));
         }
+        if self.retention_current(&vm) {
+            self.confirmed().retained.insert(vm.id.clone());
+        }
         Ok(vm)
+    }
+
+    /// Whether `vm`'s record already has the retention `ensure_retention` sets.
+    fn retention_current(&self, vm: &FreestyleVm) -> bool {
+        vm.auto_delete_seconds.is_none()
+            && vm.ttl_seconds.is_none()
+            && vm.idle_timeout_seconds.filter(|seconds| *seconds >= 0)
+                == self.cfg.idle_timeout_secs.map(|seconds| seconds as i64)
     }
 
     fn in_configured_vpc(&self, vm: &FreestyleVm) -> bool {
@@ -271,7 +419,7 @@ impl FreestyleControl {
     }
 
     async fn ensure_retention(&self, vm_id: &str) -> Result<()> {
-        if !self.cfg.require_persistent {
+        if !self.cfg.require_persistent || self.confirmed().retained.contains(vm_id) {
             return Ok(());
         }
         let response = self.send(self.client.patch(self.vm_url(vm_id, "")).json(
@@ -282,7 +430,9 @@ impl FreestyleControl {
             }),
         )).await?;
         let vm: FreestyleVm = decode_json(response, "set persistent retention").await?;
-        self.validate_retention(&vm)
+        self.validate_retention(&vm)?;
+        self.confirmed().retained.insert(vm_id.to_string());
+        Ok(())
     }
 
     async fn wait_for_state(&self, vm_id: &str, state: FreestyleVmState) -> Result<FreestyleVm> {
@@ -389,6 +539,78 @@ impl FreestyleControl {
             .map(|_| ())
     }
 
+    /// `ensure_running` without its retention and egress reconciliation: only the state
+    /// read and, unless the VM already runs, the start and the wait for `running`. A VM
+    /// Freestyle holds in `starting` is waited on here; callers bound the wait.
+    pub(crate) async fn resume(&self, vm_id: &str) -> Result<()> {
+        let mut current = self.get_sandbox(vm_id).await?;
+        if current.state == FreestyleVmState::Pausing {
+            current = self.wait_for_state(vm_id, FreestyleVmState::Paused).await?;
+        }
+        match current.state {
+            FreestyleVmState::Running => return Ok(()),
+            FreestyleVmState::Starting => {}
+            _ => {
+                let response = self
+                    .send(self.client.post(self.vm_url(vm_id, "/start")))
+                    .await?;
+                decode_json::<FreestyleVm>(response, "start vm").await?;
+            }
+        }
+        self.wait_for_state(vm_id, FreestyleVmState::Running)
+            .await
+            .map(|_| ())
+    }
+
+    /// Run a trivial command, proving the VM's guest answers commands. It reads the guest's
+    /// mount unit and script, so the answer also says whether its mounts are still coming up
+    /// (a fresh or rebooted guest hydrating) and which mount script it runs.
+    pub(crate) async fn probe(&self, vm_id: &str) -> Result<(bool, Option<[u8; 32]>)> {
+        let result = self
+            .exec_await(
+                vm_id,
+                PROBE_COMMAND,
+                None,
+                Some(PROBE_EXEC_MS),
+                None,
+                Some(ROOT_USER),
+            )
+            .await?;
+        match result.status_code {
+            Some(0) => Ok(parse_probe(&result.stdout.unwrap_or_default())),
+            status => Err(SandboxError::InvalidResponse(format!(
+                "Freestyle VM {vm_id} did not run a probe command (status {status:?})"
+            ))),
+        }
+    }
+
+    /// SHA-256 of the mount script `shared_mounts` render to for `vm_id`; `None` when there
+    /// are no mounts (an attach then replays the guest's own script).
+    pub(crate) fn mount_script_sha256(
+        &self,
+        vm_id: &str,
+        shared_mounts: &[SharedMount],
+    ) -> Result<Option<[u8; 32]>> {
+        use sha2::Digest;
+        let mounts = self.resolve_mounts(vm_id, shared_mounts)?;
+        Ok((!mounts.is_empty())
+            .then(|| sha2::Sha256::digest(self.guest_mount_script().render(&mounts)).into()))
+    }
+
+    /// What an attach does besides resuming: keep indefinite retention and the required
+    /// egress rules, and bring the guest's mounts to `shared_mounts`.
+    pub(crate) async fn reconcile_resumed(
+        &self,
+        vm_id: &str,
+        shared_mounts: &[SharedMount],
+    ) -> Result<MountRefresh> {
+        self.ensure_retention(vm_id).await?;
+        self.ensure_required_egress(vm_id).await?;
+        let outcome = self.refresh_configured_mounts(vm_id, shared_mounts).await?;
+        tracing::info!(vm_id, ?outcome, "guest mounts after resume");
+        Ok(outcome)
+    }
+
     pub(crate) async fn list_sessions(&self) -> Result<Vec<crate::SessionInfo>> {
         let mut sessions = Vec::new();
         let mut offset = 0usize;
@@ -403,20 +625,11 @@ impl FreestyleControl {
             let page: ListVmsResponse = decode_json(response, "list vms").await?;
             let count = page.vms.len();
             for vm in page.vms {
-                if !self.in_configured_vpc(&vm) {
+                if !self.in_configured_vpc(&vm) || session_id_from_metadata(&vm.metadata).is_none()
+                {
                     continue;
                 }
-                let Some(session_id) = session_id_from_metadata(&vm.metadata) else {
-                    continue;
-                };
-                sessions.push(crate::SessionInfo {
-                    session_id,
-                    vm_id: vm.id,
-                    name: vm.display_name.unwrap_or_default(),
-                    state: vm.state.as_proto_state(),
-                    parent_session_id: vm.metadata.get("chevalier.parent_session_id").cloned(),
-                    fork_id: vm.metadata.get("chevalier.fork_id").cloned(),
-                });
+                sessions.push(session_info(vm));
             }
             offset += count;
             if count == 0 || offset >= page.total_count {
@@ -568,6 +781,7 @@ impl FreestyleControl {
         } else {
             shell_command(&shell, command)
         };
+        let wrapped = format!("{}; {wrapped}", mount_gate_command());
         let result = self
             .exec_await(
                 vm_id,
@@ -579,7 +793,11 @@ impl FreestyleControl {
             )
             .await?;
 
-        let (input_tx, _input_rx) = mpsc::channel::<ExecInput>(1);
+        // The command has already exited, with its stdin closed, by the time this handle
+        // exists. Input to it (an end-of-file, typically) is accepted and has nothing left to
+        // reach, rather than failing as a send on a closed channel.
+        let (input_tx, mut input_rx) = mpsc::channel::<ExecInput>(1);
+        tokio::spawn(async move { while input_rx.recv().await.is_some() {} });
         let (event_tx, event_rx) = mpsc::channel(4);
         let stdout = result.stdout.unwrap_or_default();
         let stderr = result.stderr.unwrap_or_default();
@@ -653,7 +871,10 @@ impl FreestyleControl {
                 .join(" ");
             exec_line = format!("env {exports} {exec_line}");
         }
-        query.push(("exec".to_string(), exec_line));
+        query.push((
+            "exec".to_string(),
+            format!("{}; {exec_line}", mount_gate_command()),
+        ));
         if let Some(cols) = opts.cols {
             query.push(("cols".to_string(), cols.to_string()));
         }
@@ -695,6 +916,13 @@ impl FreestyleControl {
         let (mut write, mut read) = ws.split();
         let (input_tx, mut input_rx) = mpsc::channel(64);
         let (event_tx, event_rx) = mpsc::channel(128);
+        let session_id = Arc::new(std::sync::OnceLock::<String>::new());
+        let (client, api_key, sessions_url, ended_session) = (
+            self.client.clone(),
+            self.cfg.api_key.clone(),
+            self.vm_url(vm_id, "/pty/sessions"),
+            Arc::clone(&session_id),
+        );
 
         tokio::spawn(async move {
             while let Some(input) = input_rx.recv().await {
@@ -715,6 +943,27 @@ impl FreestyleControl {
                 }
             }
             let _ = write.close().await;
+            // The handle's owner is done with the terminal. Closing the socket only detaches,
+            // so the session, and whatever still runs in it (a program that never got its
+            // input, say), would otherwise live on: end it.
+            if let Some(id) = ended_session.get() {
+                let url = format!("{sessions_url}/{}", urlencoding::encode(id));
+                match client.delete(&url).bearer_auth(&api_key).send().await {
+                    Ok(response)
+                        if response.status().is_success()
+                            || response.status() == StatusCode::NOT_FOUND => {}
+                    Ok(response) => tracing::warn!(
+                        session_id = %id,
+                        status = %response.status(),
+                        "freestyle pty session did not close"
+                    ),
+                    Err(err) => tracing::warn!(
+                        session_id = %id,
+                        error = %err,
+                        "freestyle pty session did not close"
+                    ),
+                }
+            }
         });
 
         tokio::spawn(async move {
@@ -742,7 +991,22 @@ impl FreestyleControl {
                                 .await;
                             break;
                         }
-                        Some(PtyControl::SessionInfo) | None => {}
+                        Some(PtyControl::SessionInfo(id)) => {
+                            if let Some(id) = id {
+                                let _ = session_id.set(id);
+                            }
+                        }
+                        Some(PtyControl::LossyReplay) => {
+                            let _ = event_tx
+                                .send(Err(SandboxError::DaemonUnavailable(
+                                    "Freestyle pty: the terminal's host restarted and input \
+                                     written to it was lost"
+                                        .to_string(),
+                                )))
+                                .await;
+                            break;
+                        }
+                        None => {}
                     },
                     Ok(Message::Close(_)) => {
                         let _ = event_tx.send(Ok(ShellEvent::Exit(0))).await;
@@ -904,7 +1168,7 @@ impl FreestyleControl {
         vm_id: &str,
         shared_mounts: &[SharedMount],
     ) -> Result<()> {
-        let mounts = self.resolve_mounts(shared_mounts)?;
+        let mounts = self.resolve_mounts(vm_id, shared_mounts)?;
         if mounts.is_empty() {
             // Attach passes no mounts: re-run whatever this guest already persisted.
             let result = self
@@ -926,19 +1190,30 @@ impl FreestyleControl {
             };
         }
         let script = self.guest_mount_script().render(&mounts);
-        self.write_file(vm_id, MOUNT_SCRIPT_PATH, script.into_bytes())
-            .await?;
-        self.write_file(vm_id, MOUNT_UNIT_PATH, MOUNT_UNIT.as_bytes().to_vec())
-            .await?;
+        // One command installs the script (from stdin), the unit, and starts it: each
+        // provider round trip here delays a new computer's first command. systemd is
+        // reloaded only when the unit file changes (a guest image can carry it), and the unit
+        // is enabled by its symlink, because `systemctl enable` reloads systemd again (each
+        // reload ~0.3 s on a new guest).
         let result = self
             .exec_await(
                 vm_id,
                 &format!(
-                    "chmod 600 {MOUNT_SCRIPT_PATH} && systemctl daemon-reload && systemctl enable --now chevalier-mounts.service && systemctl is-active chevalier-mounts.service"
+                    // Started, not waited on: a new guest hydrating a large NymFS root takes
+                    // minutes, and the VM answers commands long before. Commands wait for the
+                    // mounts in the guest (`MOUNT_GATE`); this only waits for the unit to leave
+                    // `inactive`, so no command slips in before the gate can see it starting.
+                    "{install} && printf '%s' {unit} > {staged} && if cmp -s {staged} {MOUNT_UNIT_PATH}; then rm -f {staged}; else mv {staged} {MOUNT_UNIT_PATH} && systemctl daemon-reload; fi && mkdir -p {wants} && ln -sf {MOUNT_UNIT_PATH} {wants}/chevalier-mounts.service && systemctl start --no-block chevalier-mounts.service && for _ in $(seq 1 100); do [ \"$(systemctl is-active chevalier-mounts.service)\" != inactive ] && break; sleep 0.05; done; systemctl -q is-enabled chevalier-mounts.service",
+                    install = mount_script_install_command(MOUNT_SCRIPT_PATH),
+                    unit = shell_quote(MOUNT_UNIT),
+                    staged = "/run/chevalier-mounts.service.next",
+                    wants = "/etc/systemd/system/multi-user.target.wants",
                 ),
                 None,
                 Some(EXEC_AWAIT_MAX_MS),
-                None, Some(ROOT_USER))
+                Some(script.as_bytes()),
+                Some(ROOT_USER),
+            )
             .await?;
         match result.status_code {
             Some(0) => Ok(()),
@@ -978,24 +1253,23 @@ impl FreestyleControl {
         vm_id: &str,
         shared_mounts: &[SharedMount],
     ) -> Result<MountRefresh> {
-        let mounts = self.resolve_mounts(shared_mounts)?;
+        let mounts = self.resolve_mounts(vm_id, shared_mounts)?;
         if mounts.is_empty() {
             self.ensure_configured_mounts(vm_id, &[]).await?;
             return Ok(MountRefresh::Replayed);
         }
-        self.write_file(
-            vm_id,
-            MOUNT_SCRIPT_NEXT_PATH,
-            self.guest_mount_script().render(&mounts).into_bytes(),
-        )
-        .await?;
+        let next = self.guest_mount_script().render(&mounts);
         let result = self
             .exec_await(
                 vm_id,
-                &mount_refresh_command(),
+                &format!(
+                    "{} && {}",
+                    mount_script_install_command(MOUNT_SCRIPT_NEXT_PATH),
+                    mount_refresh_command()
+                ),
                 None,
                 Some(MOUNT_REFRESH_EXEC_MS),
-                None,
+                Some(next.as_bytes()),
                 Some(ROOT_USER),
             )
             .await?;
@@ -1004,8 +1278,9 @@ impl FreestyleControl {
             (Some(0), Some(outcome)) => outcome,
             _ => {
                 return Err(SandboxError::InvalidResponse(format!(
-                    "Freestyle mount refresh not ready (status {:?})",
-                    result.status_code
+                    "Freestyle mount refresh not ready (status {:?}): {}",
+                    result.status_code,
+                    result.stderr.unwrap_or_default().trim()
                 )));
             }
         };
@@ -1034,11 +1309,24 @@ impl FreestyleControl {
         Ok(outcome)
     }
 
-    fn resolve_mounts(&self, shared_mounts: &[SharedMount]) -> Result<Vec<RenderedMount>> {
+    fn resolve_mounts(
+        &self,
+        vm_id: &str,
+        shared_mounts: &[SharedMount],
+    ) -> Result<Vec<RenderedMount>> {
         let mut rendered = Vec::with_capacity(shared_mounts.len());
         for shared in shared_mounts {
             let template = self.shared_mount_template(shared)?;
-            rendered.push(RenderedMount::render(template, shared));
+            let credential = self
+                .cfg
+                .mount_credentials
+                .as_ref()
+                .and_then(|minter| minter.mint(shared, vm_id));
+            rendered.push(RenderedMount::render(
+                template,
+                shared,
+                credential.as_deref(),
+            ));
         }
         Ok(rendered)
     }
@@ -1062,6 +1350,10 @@ impl FreestyleControl {
     /// newly required endpoints. No L3 Internet grant or wildcard is introduced.
     async fn ensure_required_egress(&self, vm_id: &str) -> Result<()> {
         for domain in &self.cfg.required_egress_domains {
+            let key = (vm_id.to_string(), domain.clone());
+            if self.confirmed().egress.contains(&key) {
+                continue;
+            }
             let response = self
                 .send(
                     self.client
@@ -1076,6 +1368,7 @@ impl FreestyleControl {
                     && rule.source.vm_id.as_deref() == Some(vm_id)
                     && rule.destination.public == Some(true)
             }) {
+                self.confirmed().egress.insert(key);
                 continue;
             }
             let body = CreateTlsRuleBody {
@@ -1093,6 +1386,7 @@ impl FreestyleControl {
                 .send(self.client.post(self.url("/v5/tls")).json(&body))
                 .await?;
             let _: TlsRule = decode_json(response, "create required egress tls rule").await?;
+            self.confirmed().egress.insert(key);
         }
         Ok(())
     }
@@ -1152,6 +1446,15 @@ impl FreestyleControl {
         else {
             return Ok(None);
         };
+        if self.confirmed().network {
+            return Ok(Some(slug.to_string()));
+        }
+        let found = self.find_or_create_private_network(slug).await?;
+        self.confirmed().network = true;
+        Ok(Some(found))
+    }
+
+    async fn find_or_create_private_network(&self, slug: &str) -> Result<String> {
         let existing = self
             .client
             .get(self.url(&format!("/v5/vpcs/{}", urlencoding::encode(slug))))
@@ -1162,7 +1465,7 @@ impl FreestyleControl {
                 SandboxError::DaemonUnavailable(format!("Freestyle request failed: {err}"))
             })?;
         if existing.status().is_success() {
-            return Ok(Some(slug.to_string()));
+            return Ok(slug.to_string());
         }
         if existing.status() != StatusCode::NOT_FOUND {
             return Err(freestyle_response_error(existing).await);
@@ -1176,7 +1479,7 @@ impl FreestyleControl {
             .send(self.client.post(self.url("/v5/vpcs")).json(&body))
             .await
         {
-            Ok(_) => Ok(Some(slug.to_string())),
+            Ok(_) => Ok(slug.to_string()),
             // Another process created it between the probe and the create.
             Err(error) => {
                 let recheck = self
@@ -1186,7 +1489,7 @@ impl FreestyleControl {
                     )
                     .await;
                 if recheck.is_ok() {
-                    Ok(Some(slug.to_string()))
+                    Ok(slug.to_string())
                 } else {
                     Err(error)
                 }
@@ -1308,6 +1611,105 @@ fn detached_command(shell: &str, command: &str) -> String {
         shell_quote(shell),
         shell_quote(command)
     )
+}
+
+/// `PROBE_COMMAND`'s answer: whether the mount unit is still starting, and the guest's
+/// mount script digest when it printed a well-formed one.
+fn parse_probe(stdout: &str) -> (bool, Option<[u8; 32]>) {
+    let mut lines = stdout.lines().map(str::trim);
+    let starting = lines.next() == Some("activating");
+    let digest = lines.next().and_then(|hex| {
+        let mut digest = [0u8; 32];
+        (hex.len() == 64).then_some(())?;
+        for (byte, pair) in digest.iter_mut().zip(hex.as_bytes().chunks(2)) {
+            *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+        }
+        Some(digest)
+    });
+    (starting, digest)
+}
+
+/// `MOUNT_GATE` as a command to run ahead of another.
+fn mount_gate_command() -> String {
+    format!("sh -c {}", shell_quote(MOUNT_GATE))
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// A session as the facade lists it.
+pub(crate) fn session_info(vm: FreestyleVm) -> crate::SessionInfo {
+    crate::SessionInfo {
+        session_id: session_id_from_metadata(&vm.metadata).unwrap_or_default(),
+        name: vm.display_name.unwrap_or_default(),
+        state: vm.state.as_proto_state(),
+        parent_session_id: vm.metadata.get("chevalier.parent_session_id").cloned(),
+        fork_id: vm.metadata.get("chevalier.fork_id").cloned(),
+        vm_id: vm.id,
+        metadata: vm.metadata,
+    }
+}
+
+/// Deletes, when dropped armed, a VM whose create was abandoned after Freestyle made it.
+struct AbandonedCreate {
+    control: Option<FreestyleControl>,
+    vm_id: String,
+}
+
+impl AbandonedCreate {
+    fn new(control: &FreestyleControl, vm_id: &str) -> Self {
+        Self {
+            control: Some(control.clone()),
+            vm_id: vm_id.to_string(),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.control = None;
+    }
+}
+
+impl Drop for AbandonedCreate {
+    fn drop(&mut self) {
+        let Some(control) = self.control.take() else {
+            return;
+        };
+        let vm_id = std::mem::take(&mut self.vm_id);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(%vm_id, "an abandoned Freestyle create could not be deleted: no runtime");
+            return;
+        };
+        runtime.spawn(async move {
+            match control.delete_sandbox(&vm_id).await {
+                Ok(()) => tracing::info!(%vm_id, "deleted the VM of an abandoned Freestyle create"),
+                Err(error) => tracing::warn!(%vm_id, %error, "could not delete the VM of an abandoned Freestyle create"),
+            }
+        });
+    }
+}
+
+/// Whether a create takes its slug over from whichever VM holds it. A persistent computer
+/// keeps its slug for life, so a retried create can never take it from a running machine by
+/// accident; the exception is a deliberate replacement, which names the VM it retires in
+/// `META_REPLACES_VM_ID` and takes its slug, leaving the retired VM to be discarded.
+fn reassigns_slug(require_persistent: bool, metadata: &HashMap<String, String>) -> bool {
+    !require_persistent
+        || metadata
+            .get(META_REPLACES_VM_ID)
+            .is_some_and(|vm_id| !vm_id.trim().is_empty())
+}
+
+/// The slug a create takes: its session's, unless the caller deferred it.
+fn create_slug(metadata: &HashMap<String, String>) -> Option<String> {
+    if metadata.contains_key(META_SLUG_DEFERRED) {
+        return None;
+    }
+    metadata
+        .get("chevalier.requested_session_id")
+        .map(|value| session_slug(value))
 }
 
 /// Freestyle's slug rules: 1–63 chars of `[a-z0-9-]`, no leading/trailing/repeated `-`.
@@ -1633,7 +2035,12 @@ pub(crate) struct CheckpointInfo {
 enum PtyControl {
     Exited(i32),
     Error(String),
-    SessionInfo,
+    /// The session's id, for ending it: closing the socket only detaches from it.
+    SessionInfo(Option<String>),
+    /// The terminal's host restarted and replayed scrollback behind a terminal reset. When
+    /// the replay is not exact, input written around the restart is gone (measured: a 15 KB
+    /// burst of input triggers this, and the program never sees that input or any after it).
+    LossyReplay,
 }
 
 fn pty_control_event(text: &str) -> Option<PtyControl> {
@@ -1653,7 +2060,16 @@ fn pty_control_event(text: &str) -> Option<PtyControl> {
                 .unwrap_or("unknown error")
                 .to_string(),
         )),
-        "sessionInfo" => Some(PtyControl::SessionInfo),
+        "sessionInfo" => Some(PtyControl::SessionInfo(value.get("sessionId").and_then(
+            |id| match id {
+                serde_json::Value::String(id) => Some(id.clone()),
+                serde_json::Value::Number(id) => Some(id.to_string()),
+                _ => None,
+            },
+        ))),
+        "replayStart" if value.get("exact").and_then(serde_json::Value::as_bool) != Some(true) => {
+            Some(PtyControl::LossyReplay)
+        }
         _ => None,
     }
 }
@@ -1747,6 +2163,12 @@ where
 async fn freestyle_response_error(response: reqwest::Response) -> SandboxError {
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
+    freestyle_error(status, body)
+}
+
+/// A non-success Freestyle reply as an error: 404 is a missing VM, 409 a VM whose state
+/// refused the request, anything else an invalid response.
+fn freestyle_error(status: StatusCode, body: String) -> SandboxError {
     let code = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
         .and_then(|value| {
@@ -1757,6 +2179,15 @@ async fn freestyle_response_error(response: reqwest::Response) -> SandboxError {
         });
     match (status, code.as_deref()) {
         (StatusCode::NOT_FOUND, _) => SandboxError::SessionNotFound(format!("Freestyle: {body}")),
+        (StatusCode::CONFLICT, _) => SandboxError::ProviderConflict {
+            message: format!(
+                "Freestyle request failed with {status}{}: {body}",
+                code.as_deref()
+                    .map(|code| format!(" [{code}]"))
+                    .unwrap_or_default()
+            ),
+            code,
+        },
         _ => SandboxError::InvalidResponse(format!(
             "Freestyle request failed with {status}{}: {body}",
             code.map(|code| format!(" [{code}]")).unwrap_or_default()
@@ -1976,6 +2407,36 @@ mod tests {
     }
 
     #[test]
+    fn a_deferred_create_takes_no_slug() {
+        let mut metadata = HashMap::from([(
+            "chevalier.requested_session_id".to_string(),
+            "Nym-ABC".to_string(),
+        )]);
+        assert_eq!(create_slug(&metadata).as_deref(), Some("nym-abc"));
+        metadata.insert(META_SLUG_DEFERRED.to_string(), "true".to_string());
+        assert_eq!(create_slug(&metadata), None);
+    }
+
+    #[test]
+    fn only_a_named_replacement_takes_a_persistent_computers_slug() {
+        let plain = HashMap::from([(META_SESSION_ID.to_string(), "nym-a".to_string())]);
+        let mut replacing = plain.clone();
+        replacing.insert(META_REPLACES_VM_ID.to_string(), "vm-stuck".to_string());
+        let mut blank = plain.clone();
+        blank.insert(META_REPLACES_VM_ID.to_string(), " ".to_string());
+        assert!(
+            !reassigns_slug(true, &plain),
+            "a retry never takes the slug"
+        );
+        assert!(!reassigns_slug(true, &blank));
+        assert!(reassigns_slug(true, &replacing), "a replacement does");
+        assert!(
+            reassigns_slug(false, &plain),
+            "ephemeral sessions always did"
+        );
+    }
+
+    #[test]
     fn create_body_joins_the_configured_private_network() {
         let body = CreateVmBody {
             snapshot_id: Some("sh-1".to_string()),
@@ -2059,6 +2520,40 @@ mod tests {
             serde_json::to_value(&tls.rules[0]).unwrap()["destination"],
             json!({"public": true})
         );
+    }
+
+    #[test]
+    fn a_409_is_a_typed_provider_conflict_carrying_freestyles_code() {
+        let body = r#"{"code":"VM_STARTING","message":"vm is starting"}"#.to_string();
+        match freestyle_error(StatusCode::CONFLICT, body) {
+            SandboxError::ProviderConflict { code, message } => {
+                assert_eq!(code.as_deref(), Some("VM_STARTING"));
+                assert!(message.contains("409") && message.contains("[VM_STARTING]"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            freestyle_error(StatusCode::NOT_FOUND, String::new()),
+            SandboxError::SessionNotFound(_)
+        ));
+        assert!(matches!(
+            freestyle_error(StatusCode::BAD_GATEWAY, "{}".to_string()),
+            SandboxError::InvalidResponse(_)
+        ));
+    }
+
+    /// Session commands and terminals wait for a guest's mounts that are still coming up;
+    /// the create only starts them, and the probe reports them without waiting.
+    #[test]
+    fn session_commands_wait_for_mounts_the_create_only_starts() {
+        let gate = mount_gate_command();
+        assert!(gate.starts_with("sh -c '") && gate.contains("is-active chevalier-mounts.service"));
+        assert!(
+            MOUNT_GATE.contains("activating|reloading) ;;"),
+            "waits while mounting"
+        );
+        assert!(MOUNT_GATE.contains("-lt 1200"), "but never forever");
+        assert!(!PROBE_COMMAND.contains("while"), "the probe never waits");
     }
 
     #[test]
@@ -2156,13 +2651,13 @@ mod tests {
             "CHEVALIER_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN".to_string(),
             "tok".to_string(),
         );
-        let rendered = RenderedMount::render(&template, &shared_mount());
+        let rendered = RenderedMount::render(&template, &shared_mount(), None);
         assert_eq!(rendered.mountpoint, "/mnt/nymfs");
         assert_eq!(
             rendered.command[2],
             "exec /usr/local/bin/chevalier-vfs-fuse --endpoint https://api.example.com/v1/runtime/internal/vfs/owner --scope nyms/abc --tag nymfs-root /mnt/nymfs"
         );
-        let script = rendered.launch_script();
+        let script = mount_script(std::slice::from_ref(&rendered));
         assert!(script.contains("if [ ! -e '/run/chevalier/mounts/nymfs-root' ]"));
         assert!(script.contains("export CHEVALIER_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN='tok'"));
         assert!(script.contains("export CHEVALIER_VFS_READ_ONLY=false"));
@@ -2178,6 +2673,86 @@ mod tests {
     }
 
     #[test]
+    fn mount_credentials_are_minted_per_mount_and_vm_into_secrets_only() {
+        let mut template = ManagedMountConfig::command(
+            "",
+            [
+                "sh",
+                "-lc",
+                "exec vfs --endpoint {vfs_endpoint} {mountpoint} {vfs_credential}",
+            ],
+        );
+        template.secrets.insert(
+            "CHEVALIER_VFS_MOUNT_CREDENTIAL".to_string(),
+            crate::MOUNT_CREDENTIAL_PLACEHOLDER.to_string(),
+        );
+        let control = FreestyleControl::new(FreestyleBackendConfig {
+            api_key: "test".into(),
+            shared_mounts: HashMap::from([("nymfs-root".to_string(), template.clone())]),
+            mount_credentials: Some(crate::MountCredentialMinter::new(|shared, vm_id| {
+                Some(format!("cred:{}:{vm_id}", shared.mount_tag))
+            })),
+            ..Default::default()
+        })
+        .unwrap();
+        let first = control.resolve_mounts("vm-1", &[shared_mount()]).unwrap();
+        let again = control.resolve_mounts("vm-1", &[shared_mount()]).unwrap();
+        let other_vm = control.resolve_mounts("vm-2", &[shared_mount()]).unwrap();
+        let credential =
+            |mounts: &[RenderedMount]| mounts[0].env["CHEVALIER_VFS_MOUNT_CREDENTIAL"].clone();
+        assert_eq!(credential(&first), "cred:nymfs-root:vm-1");
+        // The same VM renders the same script, so an attach never restarts its mounts.
+        assert_eq!(first, again);
+        assert_eq!(credential(&other_vm), "cred:nymfs-root:vm-2");
+        // argv is readable by every guest user; the credential never lands there.
+        assert!(first[0].command[2].ends_with("{vfs_credential}"));
+
+        // Without a minter the placeholder renders empty rather than reaching the guest.
+        let unminted = RenderedMount::render(&template, &shared_mount(), None);
+        assert_eq!(unminted.env["CHEVALIER_VFS_MOUNT_CREDENTIAL"], "");
+    }
+
+    /// The probe's digest of a guest's script, taken by the guest's own `sha256sum`, matches
+    /// the digest of what an attach would render for that VM, and only for that VM.
+    #[test]
+    fn the_probe_tells_whether_a_guest_runs_the_wanted_mount_script() {
+        let mut template = ManagedMountConfig::command("", ["vfs", "{mountpoint}"]);
+        template.secrets.insert(
+            "CHEVALIER_VFS_MOUNT_CREDENTIAL".to_string(),
+            crate::MOUNT_CREDENTIAL_PLACEHOLDER.to_string(),
+        );
+        let control = FreestyleControl::new(FreestyleBackendConfig {
+            api_key: "test".into(),
+            shared_mounts: HashMap::from([("nymfs-root".to_string(), template)]),
+            mount_credentials: Some(crate::MountCredentialMinter::new(|_, vm_id| {
+                Some(format!("cred:{vm_id}"))
+            })),
+            ..Default::default()
+        })
+        .unwrap();
+        let mounts = [shared_mount()];
+        let script = control
+            .guest_mount_script()
+            .render(&control.resolve_mounts("vm-1", &mounts).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mounts.sh");
+        std::fs::write(&path, script).unwrap();
+        let probe = PROBE_COMMAND
+            .replace("/etc/chevalier/mounts.sh", path.to_str().unwrap())
+            .replace("systemctl is-active chevalier-mounts.service 2>/dev/null", "echo active");
+        let output = std::process::Command::new("sh").arg("-c").arg(&probe).output().unwrap();
+        let (starting, digest) = parse_probe(&String::from_utf8(output.stdout).unwrap());
+        assert!(!starting);
+        assert!(digest.is_some());
+        assert_eq!(control.mount_script_sha256("vm-1", &mounts).unwrap(), digest);
+        assert_ne!(control.mount_script_sha256("vm-2", &mounts).unwrap(), digest);
+        // No script, or no mounts wanted, is never current.
+        assert_eq!(parse_probe("activating\n\n"), (true, None));
+        assert_eq!(parse_probe("inactive\n"), (false, None));
+        assert_eq!(control.mount_script_sha256("vm-1", &[]).unwrap(), None);
+    }
+
+    #[test]
     fn pty_control_frames_decode() {
         assert!(matches!(
             pty_control_event(r#"{"type":"exited","exitCode":3}"#),
@@ -2188,8 +2763,18 @@ mod tests {
         );
         assert!(matches!(
             pty_control_event(r#"{"type":"sessionInfo","sessionId":"x"}"#),
-            Some(PtyControl::SessionInfo)
+            Some(PtyControl::SessionInfo(Some(id))) if id == "x"
         ));
+        assert!(matches!(
+            pty_control_event(r#"{"type":"sessionInfo","sessionId":105,"created":true}"#),
+            Some(PtyControl::SessionInfo(Some(id))) if id == "105"
+        ));
+        assert!(matches!(
+            pty_control_event(r#"{"type":"replayStart","exact":false}"#),
+            Some(PtyControl::LossyReplay)
+        ));
+        assert!(pty_control_event(r#"{"type":"replayStart","exact":true}"#).is_none());
+        assert!(pty_control_event(r#"{"type":"keepalive","intervalMs":20000}"#).is_none());
         assert!(pty_control_event("not json").is_none());
     }
 

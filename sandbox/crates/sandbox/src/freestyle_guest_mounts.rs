@@ -4,7 +4,9 @@
 use std::collections::HashMap;
 
 use super::{shell_quote, shell_words_join};
-use crate::{ManagedMountConfig, SharedMount, render_shared_mount_template};
+use crate::{
+    MOUNT_CREDENTIAL_PLACEHOLDER, ManagedMountConfig, SharedMount, render_shared_mount_template,
+};
 
 /// Guest-side marker directory: one file per mount tag records that the mount
 /// command was launched in this boot, so attach does not relaunch it.
@@ -15,6 +17,27 @@ pub(super) const MOUNT_SCRIPT_PATH: &str = "/etc/chevalier/mounts.sh";
 pub(super) const MOUNT_UNIT_PATH: &str = "/etc/systemd/system/chevalier-mounts.service";
 pub(super) const MOUNT_UNIT: &str = "[Unit]\nDescription=Chevalier shared mounts\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/sh /etc/chevalier/mounts.sh\n\n[Install]\nWantedBy=multi-user.target\n";
 pub(super) const MOUNT_SCRIPT_NEXT_PATH: &str = "/etc/chevalier/mounts.sh.next";
+/// Holds the mount scripts, which carry mount credentials: root's alone.
+pub(super) const MOUNT_SCRIPT_DIR: &str = "/etc/chevalier";
+
+/// Run as root before a mount script is written. The directory is made (or, on a guest
+/// created before this, tightened to) 0700 root, so a script is never readable by the
+/// session user even for the moment before its own `chmod 600`; and a refresh's script
+/// left by an interrupted attach is removed rather than left holding credentials.
+pub(super) fn mount_script_dir_prepare_command() -> String {
+    format!(
+        "install -d -o root -g root -m 0700 {MOUNT_SCRIPT_DIR} && chown root:root {MOUNT_SCRIPT_DIR} && chmod 0700 {MOUNT_SCRIPT_DIR} && rm -f {MOUNT_SCRIPT_NEXT_PATH}"
+    )
+}
+
+/// Installs the mount script arriving on stdin at `path`: the directory made root-only
+/// first, the file never readable by anyone but root.
+pub(super) fn mount_script_install_command(path: &str) -> String {
+    format!(
+        "{} && (umask 077 && cat > {path}) && chmod 600 {path}",
+        mount_script_dir_prepare_command()
+    )
+}
 
 /// Seconds an attach gives the guest's mount script to confirm every mount. Boot runs
 /// the same script under no such bound, so a hydrating root keeps its long wait there.
@@ -70,6 +93,7 @@ fn mount_refresh_script() -> String {
     format!(
         r#"set -u
 cur={MOUNT_SCRIPT_PATH}; next={MOUNT_SCRIPT_NEXT_PATH}; state={MOUNT_STATE_DIR}
+chmod 600 "$next"
 replay() {{ timeout --foreground -k {KILL_GRACE_SECS} {MOUNT_REPLAY_SECS} /bin/sh "$cur" || {{ echo mounts=not-ready; exit 1; }}; }}
 launches() {{ {LAUNCHES_SED} "$1"; }}
 if [ -f "$cur" ] && cmp -s "$next" "$cur"; then rm -f "$next"; replay; echo mounts=unchanged; exit 0; fi
@@ -196,17 +220,41 @@ flock -w {MOUNT_LOCK_WAIT_SECS} 9 || exit 1
 mount_state() {{ P=$1 timeout -k 1 2 awk '$5 == ENVIRON["P"] {{ found = 1 }} END {{ exit found ? 0 : 3 }}' /proc/self/mountinfo; }}
 "#
     );
+    // A mount waits only for the earlier mounts it sits inside (started on a bare mountpoint,
+    // the parent would later hide it); siblings come up side by side, and the script ends
+    // once every mount is up.
+    for (index, mount) in mounts.iter().enumerate() {
+        for parent in mounts[..index]
+            .iter()
+            .filter(|earlier| contains_path(&earlier.mountpoint, &mount.mountpoint))
+        {
+            script.push_str(&parent.wait_script());
+        }
+        script.push_str(&mount.start_script());
+    }
     for mount in mounts {
-        script.push_str(&mount.launch_script());
+        script.push_str(&mount.wait_script());
     }
     script
 }
 
-/// How long the mount script waits for one mount to appear before starting the next.
-/// A fresh guest hydrates each read-only scope eagerly before mounting it, and a Nym
-/// root with tens of thousands of small files takes minutes; moving on early starts
-/// the nested mounts on the bare mountpoint, where the root later hides them. It sits
-/// just inside the exec cap the whole script runs under.
+/// Whether `inner` is `outer` or lies beneath it.
+fn contains_path(outer: &str, inner: &str) -> bool {
+    let outer = outer.trim_end_matches('/');
+    inner == outer
+        || inner
+            .strip_prefix(outer)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// How long the mount script waits for one mount to appear (before starting the mounts
+/// inside it, or before it ends).
+/// A fresh guest walks each scope's namespace before mounting it (file bytes follow in
+/// the background, spec 86), which is seconds for a large Nym root, but a daemon with
+/// eager hydration (`CHEVALIER_VFS_EAGER_HYDRATE=1`, or a backing filesystem without
+/// user xattrs) still takes minutes; moving on early starts the nested mounts on the bare
+/// mountpoint, where the root later hides them. It sits just inside the exec cap the
+/// whole script runs under.
 const MOUNT_READY_WAIT_SECS: u64 = 280;
 
 /// A shared mount's launch command after `{placeholder}` rendering.
@@ -220,7 +268,13 @@ pub(super) struct RenderedMount {
 }
 
 impl RenderedMount {
-    pub(super) fn render(template: &ManagedMountConfig, shared: &SharedMount) -> Self {
+    /// `credential` fills `{vfs_credential}` in the template's secrets; absent, it is
+    /// rendered empty so no literal placeholder reaches the guest.
+    pub(super) fn render(
+        template: &ManagedMountConfig,
+        shared: &SharedMount,
+        credential: Option<&str>,
+    ) -> Self {
         let mountpoint = if template.path.trim().is_empty() {
             shared.guest_path.clone()
         } else {
@@ -234,7 +288,10 @@ impl RenderedMount {
             .map(|(key, value)| (key.clone(), render(value)))
             .collect();
         for (key, value) in &template.secrets {
-            env.insert(key.clone(), render(value));
+            env.insert(
+                key.clone(),
+                render(value).replace(MOUNT_CREDENTIAL_PLACEHOLDER, credential.unwrap_or_default()),
+            );
         }
         Self {
             mount_tag: shared.mount_tag.clone(),
@@ -268,11 +325,28 @@ impl RenderedMount {
         }
     }
 
+    /// Wait for this mount to appear, whoever launched it, while its daemon lives.
+    pub(super) fn wait_script(&self) -> String {
+        let marker = shell_quote(&format!(
+            "{MOUNT_STATE_DIR}/{}",
+            sanitize_tag(&self.mount_tag)
+        ));
+        format!(
+            r#"pid=$(cat {marker} 2>/dev/null || echo 0)
+for _ in $(seq 1 {polls}); do mount_state {table_path} && break; kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+mount_state {table_path} || {{ echo mount=not-ready >&2; exit 1; }}
+"#,
+            table_path = shell_quote(&mount_table_path(&self.mountpoint)),
+            // Polled finely: every mount's wait sits on a new computer's first command.
+            polls = MOUNT_READY_WAIT_SECS * 10,
+        )
+    }
+
     /// Start a missing daemon, or replace one the kernel no longer lists as mounted whose
     /// log shows it mounted before (an orphan). A live daemon that never logged its mount
     /// is still hydrating and keeps its wait. When the mount table cannot be read, nothing
     /// is replaced: a daemon is killed only on a definite "not mounted".
-    pub(super) fn launch_script(&self) -> String {
+    pub(super) fn start_script(&self) -> String {
         let LaunchParts {
             marker,
             log,
@@ -282,9 +356,6 @@ impl RenderedMount {
             argv,
         } = self.launch_parts();
         format!(
-            // Wait for this mount before the next starts, whether this run launched it or
-            // a concurrent run (boot and an attach's replay) did: later mounts can sit
-            // inside this one, and one started first would be hidden beneath it.
             r#"present=0; mount_state {table_path} || present=$?
 if [ "$present" = 3 ]; then
   pid=$(cat {marker} 2>/dev/null || true)
@@ -309,13 +380,9 @@ if [ ! -e {marker} ]; then
   nohup {argv} >{log} 2>&1 </dev/null 9>&- &
   echo $! > {marker}
 fi
-pid=$(cat {marker} 2>/dev/null || echo 0)
-for _ in $(seq 1 {polls}); do mount_state {table_path} && break; kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
-mount_state {table_path} || {{ echo mount=not-ready >&2; exit 1; }}
 "#,
             table_path = shell_quote(&mount_table_path(&self.mountpoint)),
             mounted_log = shell_quote(&format!("fuser::session: Mounting {}", self.mountpoint)),
-            polls = MOUNT_READY_WAIT_SECS * 2,
         )
     }
 
@@ -411,6 +478,48 @@ mod tests {
         // Nothing is stopped or unmounted in place.
         assert!(!script.contains("kill -TERM"));
         assert!(!script.contains("umount"));
+    }
+
+    /// The script directory ends 0700 whether it was missing or made world-readable by an
+    /// older guest, and a leftover refresh script is gone before the next is written.
+    #[test]
+    fn the_script_directory_is_made_root_only_before_a_script_is_written() {
+        let root = std::env::temp_dir().join(format!("mount-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = root.join("etc/chevalier");
+        let command = mount_script_dir_prepare_command()
+            .replace(MOUNT_SCRIPT_DIR, &dir.display().to_string())
+            .replace("-o root -g root ", "")
+            .replace(&format!("chown root:root {} && ", dir.display()), "");
+        let run = || {
+            assert!(
+                std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        let mode = || {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777
+        };
+        run();
+        assert_eq!(mode(), 0o700);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(dir.join("mounts.sh.next"), "credential").unwrap();
+        run();
+        assert_eq!(mode(), 0o700);
+        assert!(!dir.join("mounts.sh.next").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+        // The refresh tightens the script it was given before anything else.
+        let script = mount_refresh_script();
+        assert!(script.find("chmod 600 \"$next\"").unwrap() < script.find("cmp -s").unwrap());
     }
 
     #[test]

@@ -18,10 +18,16 @@ use tokio::task::JoinHandle;
 use crate::config::Config;
 use crate::state::types::SharedMountSpec;
 
+use super::change_stream::{
+    ChangeStreamFollower, ChangeStreamFollowerHandle, FeedHead, FollowControl, forget_cursor,
+    load_cursor, read_feed_head, store_cursor,
+};
 use super::client::RemoteVfsClient;
+use super::computer_mounts::{ComputerMounts, MountSpawner};
 use super::fs::RemoteFuseFs;
 use super::local_view::hydrate::{
-    HydrationOutcome, KernelPathInvalidator, MountHydrator, RemoteFollower, RemoteFollowerHandle,
+    BackgroundFill, HydrationOutcome, KernelPathInvalidator, MountHydrator, RemoteFollower,
+    RemoteFollowerHandle,
 };
 use super::local_view::mount::{
     MountLocalView, MountLocalViewOptions, MountOpen, MountOwnership,
@@ -79,9 +85,16 @@ pub struct FuseHandle {
     // advances. `Arc` because `FuseHandle` is cloned into `VmRuntime`; the
     // follower stops when the last clone drops.
     _follower: Option<Arc<RemoteFollowerHandle>>,
+    // Spec 86 D: a read-only observer following the change feed instead of polling.
+    _change_follower: Option<Arc<ChangeStreamFollowerHandle>>,
+    // Spec 86 D: the task-binding mounts this (root) mount keeps for the computer.
+    computer_mounts: Option<Arc<ComputerMounts>>,
     // Writable mounts only: the task that keeps publication health in the log.
     // Aborted when the last clone drops, exactly like the follower.
     _publication_watch: Option<Arc<PublicationWatch>>,
+    // The background fetch of file bytes the hydrate left as placeholders.
+    // Aborted when the last clone drops; an open still fetches what it needs.
+    _content_fill: Option<Arc<BackgroundFill>>,
 }
 
 impl Clone for FuseHandle {
@@ -93,7 +106,10 @@ impl Clone for FuseHandle {
             bare_mountpoint: Arc::clone(&self.bare_mountpoint),
             local: Arc::clone(&self.local),
             _follower: self._follower.clone(),
+            _change_follower: self._change_follower.clone(),
+            computer_mounts: self.computer_mounts.clone(),
             _publication_watch: self._publication_watch.clone(),
+            _content_fill: self._content_fill.clone(),
         }
     }
 }
@@ -109,6 +125,14 @@ impl fmt::Debug for FuseHandle {
 impl FuseHandle {
     pub fn mountpoint(&self) -> &Path {
         &self.mountpoint
+    }
+
+    /// Drain and unmount the task-binding mounts this mount keeps (spec 86 D); call before
+    /// unmounting it, since they sit inside it.
+    pub async fn shutdown_computer_mounts(&self) {
+        if let Some(mounts) = &self.computer_mounts {
+            mounts.shutdown().await;
+        }
     }
 
     /// How far the gateway replica is behind this mount's locally accepted view.
@@ -440,7 +464,7 @@ pub async fn mount_vfs_fuse(
     let state_dir = MountStateLayout::for_mount(vm_dir, &mount.mount_tag);
     mount_remote_vfs_fuse(
         &mount.vfs_endpoint,
-        auth_token,
+        super::auth::VfsAuth::static_token(auth_token),
         &mount.vfs_scope_path,
         &mount.mount_tag,
         &mountpoint,
@@ -544,6 +568,22 @@ fn known_macos_fskit_mountpoints_for_vm(vm_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(mountpoints)
 }
 
+/// A mount's state directory holds the Nym's files and their unpublished writes, so
+/// only the mount's own account may enter it. The process umask is cleared, which left
+/// every directory the mount created world-writable (0777); an existing directory is
+/// tightened on every start, so guests made before this change are fixed by a remount.
+fn restrict_state_dir(state_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("create mount state directory {}", state_dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restrict mount state directory {}", state_dir.display()))?;
+    }
+    Ok(())
+}
+
 /// Mount one remote VFS scope.
 ///
 /// `state_dir` holds this mount's durable local state — the backing tree, the
@@ -552,7 +592,7 @@ fn known_macos_fskit_mountpoints_for_vm(vm_dir: &Path) -> Result<Vec<PathBuf>> {
 /// would scatter authoritative state wherever the caller happened to mount.
 pub async fn mount_remote_vfs_fuse(
     endpoint: &str,
-    auth_token: &str,
+    auth: super::auth::VfsAuth,
     scope_path: &str,
     mount_tag: &str,
     mountpoint: &Path,
@@ -560,6 +600,41 @@ pub async fn mount_remote_vfs_fuse(
     read_only: bool,
     owner: Option<super::fs::MountOwner>,
 ) -> Result<FuseHandle> {
+    mount_remote_vfs_fuse_following(
+        endpoint, auth, scope_path, mount_tag, mountpoint, state_dir, read_only, owner, None,
+    )
+    .await
+}
+
+/// Spec 86 D: a read-only mount that follows its Nym's change feed instead of polling.
+pub struct FollowOptions {
+    /// Lets the daemon's control socket ask for a reconnect and wait on applied changes.
+    pub control: Arc<FollowControl>,
+    /// On the Nym's root mount: also keep the computer's task bindings mounted.
+    pub computer_mounts: Option<ComputerMountsOptions>,
+}
+
+pub struct ComputerMountsOptions {
+    pub spawner: MountSpawner,
+    /// The manifest the API writes, relative to the mount's scope.
+    pub manifest_path: String,
+}
+
+/// `mount_remote_vfs_fuse`, with a read-only mount following the change feed when `follow`
+/// is given and the gateway serves it (polling otherwise).
+#[allow(clippy::too_many_arguments)]
+pub async fn mount_remote_vfs_fuse_following(
+    endpoint: &str,
+    auth: super::auth::VfsAuth,
+    scope_path: &str,
+    mount_tag: &str,
+    mountpoint: &Path,
+    state_dir: &Path,
+    read_only: bool,
+    owner: Option<super::fs::MountOwner>,
+    follow: Option<FollowOptions>,
+) -> Result<FuseHandle> {
+    let follow = follow.filter(|_| read_only);
     if !REMOTE_FUSE_MOUNT_SUPPORTED {
         bail!("vfs fuse mounts require Linux or a macOS build with macos-fskit");
     }
@@ -567,10 +642,18 @@ pub async fn mount_remote_vfs_fuse(
         bail!("read-only VFS mounts are not supported by the macOS FSKit profile");
     }
     clear_process_umask();
+    restrict_state_dir(state_dir)?;
 
-    let client = RemoteVfsClient::new(endpoint, auth_token, scope_path)?;
+    let client = RemoteVfsClient::with_auth(endpoint, auth, scope_path)?;
     let local = open_mount_local_view(
-        &client, scope_path, endpoint, mount_tag, mountpoint, state_dir, read_only,
+        &client,
+        scope_path,
+        endpoint,
+        mount_tag,
+        mountpoint,
+        state_dir,
+        read_only,
+        follow.is_some(),
     )
     .await?;
 
@@ -615,20 +698,51 @@ pub async fn mount_remote_vfs_fuse(
     // re-read. Both halves run off the FUSE threads — the follower on the tokio
     // runtime, the revocation on the invalidator's own thread. A writable mount
     // is the authority for its scope and never follows anything.
-    let follower = if read_only {
+    // Spec 86 D: with the change feed, the follower waits for the kernel mount (the task
+    // bindings it may mount sit inside this one) and then streams.
+    let (mounted, mounted_signal) = tokio::sync::oneshot::channel::<()>();
+    let mut follower = None;
+    let mut change_follower = None;
+    let mut computer_mounts = None;
+    if read_only {
         let invalidator: Arc<dyn KernelPathInvalidator> =
             notifier_binding.path_invalidator(session.notifier());
-        RemoteFollower::spawn(
-            client,
-            Arc::clone(&local.hydrator),
-            Arc::clone(&local.view),
-            invalidator,
-            Handle::current(),
-        )
-        .map(Arc::new)
-    } else {
-        None
-    };
+        match follow.filter(|_| local.follows_feed) {
+            Some(follow) => {
+                computer_mounts = follow.computer_mounts.map(|options| {
+                    ComputerMounts::new(
+                        options.spawner,
+                        &options.manifest_path,
+                        Arc::clone(&local.hydrator),
+                        Arc::clone(&invalidator),
+                    )
+                });
+                change_follower = Some(Arc::new(ChangeStreamFollower::spawn(
+                    client,
+                    Arc::clone(&local.hydrator),
+                    invalidator,
+                    state_dir.to_path_buf(),
+                    follow.control,
+                    computer_mounts.clone(),
+                    mounted_signal,
+                )));
+            }
+            None => {
+                follower = RemoteFollower::spawn(
+                    client,
+                    Arc::clone(&local.hydrator),
+                    Arc::clone(&local.view),
+                    invalidator,
+                    Handle::current(),
+                )
+                .map(Arc::new);
+            }
+        }
+    }
+
+    // The namespace is complete and served; the bytes the hydrate deferred arrive
+    // behind it, and an open of one that has not arrived fetches it first.
+    let content_fill = local.hydrator.spawn_background_fill().map(Arc::new);
 
     let handle = FuseHandle {
         session: Arc::new(Mutex::new(Some(session))),
@@ -637,7 +751,10 @@ pub async fn mount_remote_vfs_fuse(
         bare_mountpoint: Arc::clone(&bare_mountpoint),
         local: local.view,
         _follower: follower,
+        _change_follower: change_follower,
+        computer_mounts,
         _publication_watch: local.publication_watch,
+        _content_fill: content_fill,
     };
 
     // Bounds the kernel mount itself and nothing else: the state directory is
@@ -656,6 +773,7 @@ pub async fn mount_remote_vfs_fuse(
                 let _ = unmount_fuse(&handle).await;
                 return Err(error);
             }
+            let _ = mounted.send(());
             return Ok(handle);
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -675,6 +793,8 @@ struct OpenedMountLocalView {
     view: Arc<MountLocalView>,
     hydrator: Arc<MountHydrator>,
     publication_watch: Option<Arc<PublicationWatch>>,
+    /// Spec 86 D: the gateway serves a change stream and this mount follows it.
+    follows_feed: bool,
 }
 
 /// The gateway surface a scope's publications are attributed to. Derived once
@@ -745,6 +865,7 @@ async fn open_mount_local_view(
     mountpoint: &Path,
     state_dir: &Path,
     read_only: bool,
+    follow_feed: bool,
 ) -> Result<OpenedMountLocalView> {
     let options = MountLocalViewOptions {
         layout: MountStateLayout::new(state_dir),
@@ -787,7 +908,53 @@ async fn open_mount_local_view(
         "opened the mount-local vfs state directory"
     );
 
-    let hydrator = Arc::new(MountHydrator::new(client.clone(), Arc::clone(&view)));
+    let hydrator = MountHydrator::shared(client.clone(), Arc::clone(&view));
+    let mut needs_hydration = needs_hydration;
+    // Spec 86 D: a read-only mount following the change feed reads the head before it
+    // walks, then streams from it, so a change committed during the walk is replayed
+    // rather than lost. A restart with a complete earlier hydrate and a cursor needs no
+    // walk at all: the stream catches it up from the cursor.
+    let mut follows_feed = false;
+    if read_only && follow_feed {
+        let marker = MountStateLayout::new(state_dir).hydrated_marker_path();
+        match read_feed_head(client).await {
+            FeedHead::Unsupported => forget_cursor(state_dir),
+            head => {
+                follows_feed = true;
+                hydrator.follow_change_feed();
+                let cursor = load_cursor(state_dir);
+                let head = match head {
+                    FeedHead::At(head) => Some(head),
+                    _ => None,
+                };
+                let resumable = marker.exists()
+                    && cursor.as_ref().is_some_and(|cursor| {
+                        head.as_ref().is_none_or(|head| head.epoch == cursor.epoch)
+                    });
+                if resumable {
+                    tracing::info!(
+                        scope = scope_path,
+                        cursor = cursor.as_ref().map(|cursor| cursor.seq),
+                        "resuming a complete earlier hydrate from its change cursor"
+                    );
+                    needs_hydration = false;
+                } else {
+                    // The walk below starts from `head`; without one the follower resyncs.
+                    forget_cursor(state_dir);
+                    if let Some(head) = &head {
+                        store_cursor(state_dir, head)?;
+                    }
+                }
+            }
+        }
+    }
+    if !needs_hydration {
+        // A restarted writable mount keeps its tree; any placeholders it still had are
+        // tracked again and filled.
+        hydrator
+            .resume_placeholders()
+            .context("resume the mount's placeholders")?;
+    }
     if needs_hydration {
         let marker = MountStateLayout::new(state_dir).hydrated_marker_path();
         let outcome = hydrate_or_reconcile(&hydrator, &marker, read_only)
@@ -808,7 +975,9 @@ async fn open_mount_local_view(
             symlinks = outcome.symlinks,
             hard_links = outcome.hard_links,
             bytes = outcome.bytes,
-            "eagerly hydrated the mount-local backing tree"
+            deferred_files = outcome.deferred_files,
+            deferred_bytes = outcome.deferred_bytes,
+            "hydrated the mount-local backing tree; deferred file bytes follow in the background"
         );
     }
 
@@ -831,6 +1000,7 @@ async fn open_mount_local_view(
         view,
         hydrator,
         publication_watch,
+        follows_feed,
     })
 }
 
@@ -1682,5 +1852,25 @@ mod tests {
                 & 0o777,
             0o700
         );
+    }
+
+    /// The umask is cleared for the mount's whole life, so this is what keeps the
+    /// guest's own users out of the backing tree and the unpublished WAL.
+    #[cfg(unix)]
+    #[test]
+    fn mount_state_directories_are_closed_to_every_other_account() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let fresh = temp.path().join("vfs-state/nymfs-root");
+        super::restrict_state_dir(&fresh).unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&fresh), 0o700);
+
+        // A directory an earlier mount left world-writable is tightened on restart.
+        let existing = temp.path().join("vfs-state/task");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o777)).unwrap();
+        super::restrict_state_dir(&existing).unwrap();
+        assert_eq!(mode(&existing), 0o700);
     }
 }

@@ -133,8 +133,9 @@ impl Gateway {
         self.remote.raw_reads.load(Ordering::SeqCst)
     }
 
-    /// Open the read-only view over `state`, as a mount daemon start does, and hydrate or
-    /// reconcile it. The view is dropped on return so the next start can take ownership.
+    /// Open the read-only view over `state`, as a mount daemon start does, hydrate or
+    /// reconcile it, and let the background fill fetch the bytes it deferred. The view is
+    /// dropped on return so the next start can take ownership.
     async fn start_mount(&self, state: &std::path::Path) {
         let opened = MountLocalView::open(MountLocalViewOptions {
             layout: MountStateLayout::new(state),
@@ -150,11 +151,13 @@ impl Gateway {
             "a read-only view always asks to be brought current"
         );
         let client = RemoteVfsClient::new(&self.endpoint, "token", "").expect("client");
-        let hydrator = MountHydrator::new(client, Arc::clone(&opened.view));
+        let hydrator = MountHydrator::shared(client, Arc::clone(&opened.view));
         let marker = MountStateLayout::new(state).hydrated_marker_path();
         hydrate_or_reconcile(&hydrator, &marker, true)
             .await
             .expect("hydrate or reconcile");
+        hydrator.fill_all().await;
+        assert_eq!(opened.view.lazy().outstanding(), 0, "every byte arrived");
     }
 }
 

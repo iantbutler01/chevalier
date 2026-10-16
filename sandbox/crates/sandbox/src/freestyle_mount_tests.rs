@@ -2,7 +2,7 @@
 //! (`/proc/self/mountinfo`, `/proc/mounts`) and a `mountpoint` whose answer the test
 //! controls, so each test decides what a mount looks like without root or FUSE.
 use super::*;
-use std::{fs, os::unix::fs::PermissionsExt, process::Command, time::Instant};
+use std::{fs, os::unix::fs::PermissionsExt, process::Command, time::{Duration, Instant}};
 
 /// What a deployed guest holds today: `mount_script` at chevalier origin/main `0b265d1f`,
 /// rendered for `nym_mounts()`.
@@ -144,6 +144,64 @@ fn single_mount_script(guest: &Guest) -> String {
     let script = guest.localize(&mount_script(&[mount]));
     fs::write(format!("{}/mounts.sh", guest.root), &script).unwrap();
     point
+}
+
+/// Mounts nested in the root wait for it, as they must (started first, they would sit beneath
+/// it); the sibling mounts inside it come up side by side rather than one after another, so a
+/// new computer's first command waits for the slowest mount, not the sum of them.
+#[test]
+fn nested_mounts_wait_for_their_parent_and_siblings_start_together() {
+    let guest = Guest::new();
+    let root = guest.root.clone();
+    // A stand-in daemon that takes 0.4 s to mount, and records when it started and mounted.
+    let mount = |tag: &str, point: &str| RenderedMount {
+        mount_tag: tag.into(),
+        mountpoint: format!("{root}/{point}"),
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "date +%s%N > {root}/{tag}.started; sleep 0.4; echo '36 25 0:99 / {root}/{point} rw - fuse.test test rw' >> {root}/mountinfo; date +%s%N > {root}/{tag}.mounted; exec sleep 60"
+            ),
+        ],
+        env: HashMap::new(),
+        read_only: false,
+    };
+    let mounts = [
+        mount("root", "nym"),
+        mount("shared", "nym/vm/mounts/shared"),
+        mount("task", "nym/vm/mounts/task"),
+        mount("skills", "nym/vm/mounts/skills"),
+    ];
+    // Localized by hand: the mountpoints already sit under the guest root.
+    let script = mount_script(&mounts)
+        .replace("/run/chevalier/mounts", &format!("{root}/run/mounts"))
+        .replace("/proc/self/mountinfo", &format!("{root}/mountinfo"));
+    fs::write(format!("{root}/mounts.sh"), &script).unwrap();
+    let started = Instant::now();
+    assert_success(&guest.run("timeout --foreground -k 1 10 sh mounts.sh"));
+    let elapsed = started.elapsed();
+    let at = |file: &str| -> u128 {
+        fs::read_to_string(format!("{root}/{file}"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    for child in ["shared", "task", "skills"] {
+        assert!(
+            at(&format!("{child}.started")) >= at("root.mounted"),
+            "{child} started before the root it sits in was mounted"
+        );
+    }
+    let starts = ["shared", "task", "skills"].map(|child| at(&format!("{child}.started")));
+    let spread_ms = (starts.iter().max().unwrap() - starts.iter().min().unwrap()) / 1_000_000;
+    assert!(spread_ms < 300, "siblings started {spread_ms} ms apart");
+    // Root then one round of siblings is ~0.8 s; one after another would be ~1.6 s.
+    assert!(
+        elapsed < Duration::from_millis(1400),
+        "the script took {elapsed:?}"
+    );
 }
 
 #[test]

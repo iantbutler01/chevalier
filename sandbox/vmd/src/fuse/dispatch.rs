@@ -6,9 +6,11 @@
 //! `spawn_blocking` added two scheduler hops to every local LOOKUP/CREATE/WRITE
 //! in package extraction workloads without adding concurrency.
 //!
-//! Only distributed blocking-lock waits use a separate bounded Tokio pool. They
-//! are the one callback class that still reaches the gateway, and this prevents
-//! a lock waiter from occupying every native FUSE request thread. Kernel-side
+//! Two callback classes use a separate bounded Tokio pool, because both can wait
+//! on the gateway: distributed blocking-lock waits, and (while the mount still
+//! holds lazy placeholders, spec 86 D) the operations that may have to fetch a
+//! placeholder's bytes first (`open`, `setattr`, `rename`, `link`). Neither may
+//! occupy every native FUSE request thread. Kernel-side
 //! parallelism is raised in `init` (`max_background` defaults to 12, which would
 //! otherwise throttle the whole exercise from above).
 //!
@@ -42,6 +44,9 @@ use super::fs::{LockWaitCancellation, RemoteFuseFs};
 /// gateway can absorb.
 const MAX_IN_FLIGHT_OPS: usize = 64;
 const MAX_IN_FLIGHT_BLOCKING_LOCKS: usize = 32;
+/// Operations that may wait for a placeholder's bytes at once; the rest queue in
+/// Tokio, never on a native request thread.
+const MAX_IN_FLIGHT_CONTENT_WAITS: usize = 64;
 const OPERATION_COUNTER_LOG_INTERVAL: u64 = 20_000;
 
 #[derive(Default)]
@@ -239,6 +244,7 @@ impl Drop for LockWaitRegistration {
 pub struct SpawnedFuseFs {
     inner: Arc<RemoteFuseFs>,
     blocking_lock_ops: Arc<Semaphore>,
+    content_wait_ops: Arc<Semaphore>,
     lock_waits: Arc<LockWaitRegistry>,
     operation_counters: OperationCounters,
 }
@@ -248,6 +254,7 @@ impl SpawnedFuseFs {
         Self {
             inner: Arc::new(inner),
             blocking_lock_ops: Arc::new(Semaphore::new(MAX_IN_FLIGHT_BLOCKING_LOCKS)),
+            content_wait_ops: Arc::new(Semaphore::new(MAX_IN_FLIGHT_CONTENT_WAITS)),
             lock_waits: Arc::new(LockWaitRegistry::default()),
             operation_counters: OperationCounters::default(),
         }
@@ -267,6 +274,27 @@ impl SpawnedFuseFs {
         op(&self.inner);
         self.operation_counters
             .record(operation, started_at.elapsed());
+    }
+
+    /// An operation that may first have to fetch a placeholder's bytes (up to the
+    /// lazy fetch timeout): on the bounded pool while placeholders remain, directly
+    /// once the mount has none.
+    fn spawn_content(
+        &self,
+        operation: &'static str,
+        request_id: RequestId,
+        op: impl FnOnce(&RemoteFuseFs) + Send + 'static,
+    ) {
+        if self.inner.has_pending_content() {
+            self.spawn_with_semaphore(
+                Arc::clone(&self.content_wait_ops),
+                operation,
+                request_id,
+                op,
+            );
+        } else {
+            self.spawn(operation, request_id, op);
+        }
     }
 
     fn spawn_blocking_lock(
@@ -414,7 +442,7 @@ impl Filesystem for SpawnedFuseFs {
         flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        self.spawn("setattr", req.unique(), move |fs| {
+        self.spawn_content("setattr", req.unique(), move |fs| {
             fs.setattr(
                 ino, mode, uid, gid, size, atime, mtime, ctime, fh, crtime, chgtime, bkuptime,
                 flags, reply,
@@ -467,7 +495,7 @@ impl Filesystem for SpawnedFuseFs {
     }
 
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        self.spawn("open", req.unique(), move |fs| fs.open(ino, flags, reply));
+        self.spawn_content("open", req.unique(), move |fs| fs.open(ino, flags, reply));
     }
 
     fn read(
@@ -743,7 +771,7 @@ impl Filesystem for SpawnedFuseFs {
     ) {
         let name: OsString = name.to_owned();
         let newname: OsString = newname.to_owned();
-        self.spawn("rename", req.unique(), move |fs| {
+        self.spawn_content("rename", req.unique(), move |fs| {
             fs.rename(parent, &name, newparent, &newname, flags, reply)
         });
     }
@@ -757,7 +785,7 @@ impl Filesystem for SpawnedFuseFs {
         reply: ReplyEntry,
     ) {
         let newname: OsString = newname.to_owned();
-        self.spawn("link", req.unique(), move |fs| {
+        self.spawn_content("link", req.unique(), move |fs| {
             fs.link(ino, newparent, &newname, reply)
         });
     }
@@ -787,7 +815,52 @@ mod tests {
     use fuser::{INodeNo, LockNamespace, LockOwner, RequestId};
     use tokio::sync::Semaphore;
 
-    use super::{LockWaitRegistry, spawn_bounded_blocking};
+    use super::{LockWaitRegistry, SpawnedFuseFs, spawn_bounded_blocking};
+    use crate::fuse::client::RemoteVfsClient;
+    use crate::fuse::fs::RemoteFuseFs;
+    use crate::fuse::local_view::lazy::Placeholder;
+
+    /// Spec 86 D: an open that may wait up to the lazy fetch timeout for a placeholder's
+    /// bytes must not hold a native request thread; once nothing is pending it runs inline.
+    #[test]
+    fn content_waits_leave_the_request_thread_while_placeholders_remain() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let client =
+            RemoteVfsClient::new("http://127.0.0.1:1", "test-token", "test-scope").unwrap();
+        let fs = RemoteFuseFs::new(client, false, "test-scope", runtime.handle().clone());
+        let dispatch = SpawnedFuseFs::new(fs);
+        let caller = std::thread::current().id();
+
+        let (ran_tx, ran_rx) = mpsc::channel();
+        dispatch.spawn_content("open", RequestId(1), move |_| {
+            ran_tx.send(std::thread::current().id()).unwrap();
+        });
+        assert_eq!(ran_rx.try_recv().ok(), Some(caller), "nothing pending: inline");
+
+        dispatch.inner().lazy_content().register(
+            vec!["big.bin".to_string()],
+            Placeholder { size_bytes: 1, content_hash: None },
+        );
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (ran_tx, ran_rx) = mpsc::channel();
+        let started = std::time::Instant::now();
+        dispatch.spawn_content("open", RequestId(2), move |_| {
+            // A fetch that does not come back until released.
+            release_rx.recv().ok();
+            ran_tx.send(std::thread::current().id()).unwrap();
+        });
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "the request thread was held by a content wait"
+        );
+        release_tx.send(()).unwrap();
+        let ran_on = ran_rx.recv_timeout(Duration::from_secs(2)).expect("op ran");
+        assert_ne!(ran_on, caller, "a content wait runs on the bounded pool");
+    }
 
     #[test]
     fn semaphore_waiters_do_not_consume_blocking_pool_threads() {
