@@ -40,9 +40,6 @@ const QUARANTINE_FILE: &str = "change-quarantine.json";
 /// Consecutive auth refusals (401/403) of the stream, despite an exchanged per-computer
 /// token, before the mount stops asking and polls.
 const MAX_AUTH_REFUSALS: u32 = 3;
-/// Consecutive failures to apply the batch at one cursor before its events are applied
-/// one at a time and the ones that still fail are quarantined.
-const MAX_BATCH_ATTEMPTS: u32 = 4;
 /// A session open at least this long counts as healthy when it ends: the next failure
 /// starts the backoff over (an idle stream cut by a proxy reconnects promptly).
 const HEALTHY_SESSION: Duration = Duration::from_secs(60);
@@ -238,7 +235,6 @@ pub(crate) struct ChangeStreamFollower {
     /// Consecutive stream refusals with an exchanged token (see `MAX_AUTH_REFUSALS`).
     auth_refusals: u32,
     /// The cursor seq a batch keeps failing at, and how many times it has.
-    batch_failures: Option<(i64, u32)>,
     /// Paths whose events were given up on, healed by the next walk.
     quarantine: BTreeSet<String>,
     cancel: Arc<Notify>,
@@ -295,7 +291,6 @@ impl ChangeStreamFollower {
             opened: None,
             progressed: false,
             auth_refusals: 0,
-            batch_failures: None,
             quarantine,
             cancel: Arc::clone(&cancel),
             stopped: Arc::clone(&stopped),
@@ -339,9 +334,7 @@ impl ChangeStreamFollower {
                     if opened.is_some() {
                         self.auth_refusals = 0;
                     }
-                    if progressed
-                        || opened.is_some_and(|at| at.elapsed() >= HEALTHY_SESSION)
-                    {
+                    if progressed || opened.is_some_and(|at| at.elapsed() >= HEALTHY_SESSION) {
                         backoff = BACKOFF_MIN;
                     }
                     if is_auth_refusal(&error) {
@@ -413,6 +406,19 @@ impl ChangeStreamFollower {
             ChangeStreamOpen::Unsupported => return Ok(SessionEnd::Unsupported),
             ChangeStreamOpen::Stream(stream) => stream,
         };
+        if self.control.reports_applied
+            && let Some(cursor) = &self.cursor
+        {
+            if self
+                .client
+                .report_changes_applied(&cursor.epoch, cursor.seq)
+                .await
+                .is_ok()
+            {
+                self.control.note_applied(cursor.seq);
+            }
+            // A stale epoch is refused here; consume the stream's resync frame next.
+        }
         self.opened = Some(Instant::now());
         info!(
             scope = %self.hydrator.view().scope_path(),
@@ -438,7 +444,7 @@ impl ChangeStreamFollower {
                         .as_ref()
                         .map(|cursor| cursor.epoch.clone())
                         .ok_or_else(|| anyhow!("change events arrived before a cursor"))?;
-                    self.apply_batch(&events).await?;
+                    self.apply(&events).await?;
                     self.advance(ChangeCursor { epoch, seq: head }).await?;
                 }
                 ChangeFrame::CaughtUp { epoch, head } => {
@@ -465,58 +471,6 @@ impl ChangeStreamFollower {
                 }
             }
         }
-    }
-
-    /// Apply one batch, bounding how often the same batch is retried: after
-    /// `MAX_BATCH_ATTEMPTS` failures at one cursor its events are applied one at a time, and
-    /// any that still fail are logged and quarantined (the next walk heals them) so the
-    /// changes behind them are not stuck.
-    async fn apply_batch(&mut self, events: &[ChangeEvent]) -> Result<()> {
-        let at = self.cursor.as_ref().map_or(0, |cursor| cursor.seq);
-        let error = match self.apply(events).await {
-            Ok(()) => {
-                self.batch_failures = None;
-                return Ok(());
-            }
-            Err(error) => error,
-        };
-        let attempts = match &mut self.batch_failures {
-            Some((seq, attempts)) if *seq == at => {
-                *attempts += 1;
-                *attempts
-            }
-            _ => {
-                self.batch_failures = Some((at, 1));
-                1
-            }
-        };
-        if attempts < MAX_BATCH_ATTEMPTS {
-            return Err(error);
-        }
-        warn!(
-            scope = %self.hydrator.view().scope_path(),
-            after = at,
-            attempts,
-            error = %format!("{error:#}"),
-            "a vfs change batch keeps failing; applying its events one at a time"
-        );
-        for event in events {
-            if let Err(error) = self.apply(std::slice::from_ref(event)).await {
-                warn!(
-                    scope = %self.hydrator.view().scope_path(),
-                    seq = event.seq,
-                    path = %event.path,
-                    error = %format!("{error:#}"),
-                    "quarantined a vfs change event; the next resync heals it"
-                );
-                if let Some(path) = self.client.scope_relative(&event.path) {
-                    self.quarantine.insert(path);
-                }
-            }
-        }
-        store_quarantine(&self.state_dir, &self.quarantine)?;
-        self.batch_failures = None;
-        Ok(())
     }
 
     /// Converge on the whole scope (no usable cursor): the same walk the polling follower
