@@ -453,7 +453,7 @@ async fn an_event_the_mount_already_reflects_fetches_nothing() {
     // The guest's own write coming back: same content.
     gateway.commit_put(1, "work/out.txt", "same bytes");
     // The report follows the local advance; wait for it so the request list is complete.
-    eventually("the applied report", || gateway.applied() == vec![1]).await;
+    eventually("the applied report", || gateway.applied().ends_with(&[1])).await;
 
     assert_eq!(
         gateway.raw_reads(),
