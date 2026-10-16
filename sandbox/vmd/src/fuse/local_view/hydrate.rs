@@ -691,6 +691,16 @@ impl MountHydrator {
         for path in paths {
             self.refresh_path(path, &mut state).await?;
         }
+        let mut walked: Vec<String> = Vec::new();
+        for subtree in subtrees {
+            // The prefix's own entry is not in its own listing, so it is
+            // refreshed as a point path first; only a directory is then walked.
+            let kind = self.refresh_path(subtree, &mut state).await?;
+            if subtree.is_empty() || matches!(kind, Some(LocalKind::Directory)) {
+                self.walk_subtree(subtree, true, &mut state).await?;
+                walked.push(subtree.clone());
+            }
+        }
         let aliases: HashSet<String> = {
             let known = self.file_ids.read().unwrap_or_else(|e| e.into_inner());
             state
@@ -704,16 +714,6 @@ impl MountHydrator {
         };
         for path in aliases {
             self.refresh_path(&path, &mut state).await?;
-        }
-        let mut walked: Vec<String> = Vec::new();
-        for subtree in subtrees {
-            // The prefix's own entry is not in its own listing, so it is
-            // refreshed as a point path first; only a directory is then walked.
-            let kind = self.refresh_path(subtree, &mut state).await?;
-            if subtree.is_empty() || matches!(kind, Some(LocalKind::Directory)) {
-                self.walk_subtree(subtree, true, &mut state).await?;
-                walked.push(subtree.clone());
-            }
         }
         let mut prefixes = walked;
         prefixes.extend(paths.iter().map(|path| parent_of(path)));

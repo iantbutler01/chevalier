@@ -948,3 +948,44 @@ async fn only_the_root_reposts_its_applied_cursor_after_reconnect() {
     .await;
     gateway.server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renamed_subtree_keeps_hard_links_to_paths_outside_it() {
+    use std::os::unix::fs::MetadataExt;
+    let gateway = Gateway::start(&[("a", "shared"), ("dir/b", "shared")], true).await;
+    gateway
+        .remote
+        .file_ids
+        .lock()
+        .unwrap()
+        .insert("dir/b".into(), "id:a".into());
+    let state = tempfile::tempdir().unwrap();
+    let mount = Mount::open(&gateway, state.path()).await;
+    gateway.remote.files.lock().unwrap().remove("dir/b");
+    gateway
+        .remote
+        .files
+        .lock()
+        .unwrap()
+        .insert("newdir/b".into(), b"shared".to_vec());
+    gateway
+        .remote
+        .file_ids
+        .lock()
+        .unwrap()
+        .insert("newdir/b".into(), "id:a".into());
+    mount
+        .hydrator
+        .rehydrate_paths(&[], &["dir".into(), "newdir".into()])
+        .await
+        .unwrap();
+    let tree = MountStateLayout::new(state.path()).tree_dir();
+    let a = std::fs::metadata(tree.join("a")).unwrap();
+    assert_eq!(
+        a.ino(),
+        std::fs::metadata(tree.join("newdir/b")).unwrap().ino()
+    );
+    assert_eq!(a.nlink(), 2);
+    assert!(!tree.join("dir").exists());
+    gateway.server.abort();
+}
