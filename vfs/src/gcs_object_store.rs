@@ -1030,16 +1030,55 @@ where
 {
     for attempt in 0..GCS_HTTP_MAX_ATTEMPTS {
         let request = build()?;
-        match request.send().await {
+        let started = std::time::Instant::now();
+        let result = request.send().await;
+        tracing::info!(
+            operation,
+            attempt = attempt + 1,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            status = result
+                .as_ref()
+                .ok()
+                .map(|response| response.status().as_u16()),
+            timeout = result
+                .as_ref()
+                .err()
+                .is_some_and(reqwest::Error::is_timeout),
+            connect = result
+                .as_ref()
+                .err()
+                .is_some_and(reqwest::Error::is_connect),
+            request_error = result
+                .as_ref()
+                .err()
+                .is_some_and(reqwest::Error::is_request),
+            body_error = result.as_ref().err().is_some_and(reqwest::Error::is_body),
+            "gcs.http_attempt"
+        );
+        match result {
             Ok(response)
                 if attempt + 1 < GCS_HTTP_MAX_ATTEMPTS
                     && should_retry_status(response.status()) =>
             {
-                tokio::time::sleep(retry_delay(attempt)).await;
+                let delay = retry_delay(attempt);
+                tracing::info!(
+                    operation,
+                    attempt = attempt + 1,
+                    backoff_ms = delay.as_millis() as u64,
+                    "gcs.http_retry"
+                );
+                tokio::time::sleep(delay).await;
             }
             Ok(response) => return Ok(response),
             Err(error) if attempt + 1 < GCS_HTTP_MAX_ATTEMPTS && should_retry_error(&error) => {
-                tokio::time::sleep(retry_delay(attempt)).await;
+                let delay = retry_delay(attempt);
+                tracing::info!(
+                    operation,
+                    attempt = attempt + 1,
+                    backoff_ms = delay.as_millis() as u64,
+                    "gcs.http_retry"
+                );
+                tokio::time::sleep(delay).await;
             }
             Err(error) => {
                 return Err(VfsStorageError::Internal(format!(
