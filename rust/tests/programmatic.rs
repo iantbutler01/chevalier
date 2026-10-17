@@ -226,6 +226,96 @@ async fn unavailable_recursive_and_denied_tools_do_not_bypass_host_policy() {
     assert!(sandbox.exited.load(Ordering::SeqCst));
 }
 
+/// A real process whose signal has taken effect, but the transport has not
+/// acknowledged the control request. Exit delivery remains independent.
+struct SlowSignalSandbox {
+    process: Arc<ProcessSandbox>,
+    signalled: Arc<AtomicBool>,
+    report_exit: bool,
+}
+
+struct SlowSignalSession {
+    process: Arc<dyn ProgrammaticSession>,
+    signalled: Arc<AtomicBool>,
+    report_exit: bool,
+}
+
+#[async_trait]
+impl ProgrammaticSandbox for SlowSignalSandbox {
+    async fn start_exec(
+        &self,
+        command: &str,
+        timeout: Duration,
+        cancel: CancellationToken,
+    ) -> Result<Arc<dyn ProgrammaticSession>> {
+        Ok(Arc::new(SlowSignalSession {
+            process: self.process.start_exec(command, timeout, cancel).await?,
+            signalled: self.signalled.clone(),
+            report_exit: self.report_exit,
+        }))
+    }
+}
+
+#[async_trait]
+impl ProgrammaticSession for SlowSignalSession {
+    async fn write(&self, data: &str) -> Result<()> {
+        self.process.write(data).await
+    }
+
+    async fn next(&self) -> Result<Option<ProgrammaticEvent>> {
+        let event = self.process.next().await?;
+        if !self.report_exit && matches!(event, None | Some(ProgrammaticEvent::Exit { .. })) {
+            std::future::pending().await
+        } else {
+            Ok(event)
+        }
+    }
+
+    async fn signal(&self, signal: i32) -> Result<()> {
+        self.signalled.store(true, Ordering::SeqCst);
+        self.process.signal(signal).await?;
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn observed_exit_preserves_completed_output_while_signal_acknowledgment_is_stalled() {
+    for report_exit in [true, false] {
+        let (process, dispatcher, tools) = fixture();
+        let sandbox = Arc::new(SlowSignalSandbox {
+            process: process.clone(),
+            signalled: Arc::new(AtomicBool::new(false)),
+            report_exit,
+        });
+        // Keep the completed runner alive until cleanup signals the real Node
+        // process. No exit is invented by the test transport.
+        let result = tokio::time::timeout(
+            Duration::from_secs(if report_exit { 3 } else { 8 }),
+            execute_programmatic(
+                "process.exit = () => {}; text('completed');",
+                &tools,
+                sandbox.clone(),
+                dispatcher,
+                ProgrammaticOptions::default(),
+            ),
+        )
+        .await
+        .expect("cleanup must remain bounded");
+        assert!(sandbox.signalled.load(Ordering::SeqCst));
+        assert!(process.exited.load(Ordering::SeqCst));
+        if report_exit {
+            assert_eq!(result.unwrap().output, vec![json!("completed")]);
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Sandbox did not confirm program termination or tool cancellation")
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn caller_cancellation_settles_dispatch_and_reaps_process_before_return() {
     let (sandbox, dispatcher, tools) = fixture();

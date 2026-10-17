@@ -275,29 +275,30 @@ async fn run_program(
     }
     let cleanup = async {
         if !terminal {
-            let mut signalled = outcome.is_err() && !awaiting_runner_exit;
-            if signalled {
-                let _ = session.signal(15).await;
-            }
-            let mut kill_at = Instant::now() + Duration::from_millis(200);
-            let mut killed = false;
+            // A transport can observe exit before acknowledging a signal (for
+            // example while its control request is still closing). Keep reading
+            // terminal events throughout escalation instead of awaiting that
+            // request inside the event loop.
+            let signals = async {
+                if outcome.is_err() && !awaiting_runner_exit {
+                    let _ = session.signal(15).await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    session.signal(15).await?;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                session.signal(9).await?;
+                std::future::pending::<Result<()>>().await
+            };
+            tokio::pin!(signals);
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep_until(kill_at), if !killed => {
-                        if signalled {
-                            killed = true;
-                            session.signal(9).await?;
-                        } else {
-                            signalled = true;
-                            session.signal(15).await?;
-                            kill_at = Instant::now() + Duration::from_millis(200);
-                        }
-                    }
                     event = events.recv() => match event {
                         Some(Ok(None | Some(ProgrammaticEvent::Exit { .. }))) => break,
                         Some(Ok(_)) => {},
                         _ => return Err(failure("Sandbox did not confirm program termination")),
-                    }
+                    },
+                    error = &mut signals => return error,
                 }
             }
         }
