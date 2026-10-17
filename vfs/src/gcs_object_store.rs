@@ -38,6 +38,10 @@ const GCS_HTTP_RETRY_JITTER_PCT: u64 = 25;
 const GCS_HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
 const GCS_HTTP_TCP_KEEPALIVE_SECS: u64 = 30;
 const GCS_HTTP_POOL_IDLE_TIMEOUT_SECS: u64 = 30;
+// Small immutable packs should retry a stalled first upload instead of holding
+// completion behind the ordinary deadline. Later attempts keep that deadline.
+const SMALL_CREATE_MAX_BYTES: usize = 64 * 1024;
+const SMALL_CREATE_FIRST_TIMEOUT: Duration = Duration::from_secs(3);
 const GCS_BATCH_DELETE_MAX_CALLS: usize = 100;
 const GCS_BATCH_ENDPOINT: &str = "https://storage.googleapis.com/batch/storage/v1";
 
@@ -62,6 +66,7 @@ pub struct GcsObjectStoreClient {
 #[derive(Clone)]
 struct GcsResolvedObjectStoreConfig {
     bucket: String,
+    request_timeout: Duration,
     api_base_url: String,
     upload_base_url: String,
     token_uri: String,
@@ -95,9 +100,10 @@ impl GcsObjectStoreClient {
         }
 
         let client = build_blocking_gcs_client(cfg.timeout_seconds)?;
+        let request_timeout = Duration::from_secs(cfg.timeout_seconds.max(1) as u64);
         let async_client = AsyncClient::builder()
             .connect_timeout(Duration::from_secs(GCS_HTTP_CONNECT_TIMEOUT_SECS))
-            .timeout(Duration::from_secs(cfg.timeout_seconds.max(1) as u64))
+            .timeout(request_timeout)
             .tcp_keepalive(Some(Duration::from_secs(GCS_HTTP_TCP_KEEPALIVE_SECS)))
             .pool_max_idle_per_host(256)
             .pool_idle_timeout(Some(Duration::from_secs(GCS_HTTP_POOL_IDLE_TIMEOUT_SECS)))
@@ -109,6 +115,7 @@ impl GcsObjectStoreClient {
             async_client,
             cfg: Arc::new(GcsResolvedObjectStoreConfig {
                 bucket: cfg.bucket.clone(),
+                request_timeout,
                 api_base_url: cfg.api_base_url.trim_end_matches('/').to_string(),
                 upload_base_url: cfg.upload_base_url.trim_end_matches('/').to_string(),
                 token_uri,
@@ -202,7 +209,7 @@ impl GcsObjectStoreClient {
         let client = self.async_client.clone();
         let token_uri = self.cfg.token_uri.clone();
         let response = send_with_retries_async(
-            move || {
+            move |_| {
                 Ok(client.post(&token_uri).form(&[
                     ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
                     ("assertion", assertion.as_str()),
@@ -292,7 +299,7 @@ impl GcsObjectStoreClient {
             }
             body.push_str(&format!("--{boundary}--\r\n"));
             let response = send_with_retries_async(
-                || {
+                |_| {
                     Ok(client
                         .post(GCS_BATCH_ENDPOINT)
                         .bearer_auth(&auth)
@@ -632,7 +639,7 @@ impl ObjectStoreClient for GcsObjectStoreClient {
         let object_url = self.object_metadata_url(&key);
         let auth = self.access_token_async().await?;
         let response = send_with_retries_async(
-            move || Ok(client.get(&object_url).bearer_auth(&auth)),
+            move |_| Ok(client.get(&object_url).bearer_auth(&auth)),
             "stat",
         )
         .await?;
@@ -697,6 +704,8 @@ impl ObjectStoreClient for GcsObjectStoreClient {
         condition: ObjectWriteCondition,
     ) -> VfsStorageResult<()> {
         let payload_len = bytes.len();
+        let first_timeout = (condition.if_absent && payload_len <= SMALL_CREATE_MAX_BYTES)
+            .then(|| self.cfg.request_timeout.min(SMALL_CREATE_FIRST_TIMEOUT));
         let key = key.to_string();
         let body = bytes.to_vec();
         let request_key = key.clone();
@@ -708,7 +717,7 @@ impl ObjectStoreClient for GcsObjectStoreClient {
             .instrument(info_span!("gcs_put.access_token"))
             .await?;
         let response = send_with_retries_async(
-            move || {
+            move |attempt| {
                 let mut request = client
                     .post(format!(
                         "{}/b/{}/o",
@@ -724,6 +733,11 @@ impl ObjectStoreClient for GcsObjectStoreClient {
                 }
                 if let Some(metageneration) = condition.if_metageneration_match.as_deref() {
                     request = request.query(&[("ifMetagenerationMatch", metageneration)]);
+                }
+                if attempt == 0
+                    && let Some(timeout) = first_timeout
+                {
+                    request = request.timeout(timeout);
                 }
                 Ok(request
                     .header(CONTENT_TYPE, "application/octet-stream")
@@ -772,7 +786,7 @@ impl ObjectStoreClient for GcsObjectStoreClient {
         let object_url = self.object_metadata_url(&key);
         let auth = self.access_token_async().await?;
         let response = send_with_retries_async(
-            move || {
+            move |_| {
                 let mut request = client.delete(&object_url).bearer_auth(&auth);
                 if let Some(generation) = condition.if_generation_match.as_deref() {
                     request = request.query(&[("ifGenerationMatch", generation)]);
@@ -821,7 +835,7 @@ impl ObjectStoreClient for GcsObjectStoreClient {
         let bucket = self.cfg.bucket.clone();
         let auth = self.access_token_async().await?;
         let response = send_with_retries_async(
-            move || {
+            move |_| {
                 Ok(client
                     .post(format!(
                         "{}/b/{}/o/{}/copyTo/b/{}/o/{}",
@@ -865,7 +879,7 @@ impl ObjectStoreClient for GcsObjectStoreClient {
         let bucket = self.cfg.bucket.clone();
         let auth = self.access_token_async().await?;
         let response = send_with_retries_async(
-            move || {
+            move |_| {
                 Ok(client
                     .get(format!(
                         "{}/b/{}/o",
@@ -1026,10 +1040,10 @@ where
 
 async fn send_with_retries_async<F>(build: F, operation: &str) -> VfsStorageResult<AsyncResponse>
 where
-    F: Fn() -> VfsStorageResult<AsyncRequestBuilder>,
+    F: Fn(usize) -> VfsStorageResult<AsyncRequestBuilder>,
 {
     for attempt in 0..GCS_HTTP_MAX_ATTEMPTS {
-        let request = build()?;
+        let request = build(attempt)?;
         let started = std::time::Instant::now();
         let result = request.send().await;
         tracing::info!(
@@ -1228,3 +1242,7 @@ mod tests {
         assert_eq!(connections.load(Ordering::SeqCst), GCS_HTTP_MAX_ATTEMPTS);
     }
 }
+
+#[cfg(test)]
+#[path = "gcs_object_store/upload_tests.rs"]
+mod upload_tests;
