@@ -208,9 +208,13 @@ impl FreestyleControl {
         if cfg.preview_domain_suffix.is_empty() {
             cfg.preview_domain_suffix = "style.dev".to_string();
         }
+        let client = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .map_err(|err| SandboxError::InvalidConfig(format!("Freestyle http client: {err}")))?;
         Ok(Self {
             cfg,
-            client: Client::new(),
+            client,
             mount_self_heal: Arc::new(AtomicBool::new(true)),
             confirmed: Arc::default(),
         })
@@ -455,14 +459,8 @@ impl FreestyleControl {
 
     pub(crate) async fn delete_sandbox(&self, vm_id: &str) -> Result<()> {
         let response = self
-            .client
-            .delete(self.vm_url(vm_id, ""))
-            .bearer_auth(&self.cfg.api_key)
-            .send()
-            .await
-            .map_err(|err| {
-                SandboxError::DaemonUnavailable(format!("Freestyle request failed: {err}"))
-            })?;
+            .dispatch(self.client.delete(self.vm_url(vm_id, "")))
+            .await?;
         if response.status() == StatusCode::NOT_FOUND || response.status().is_success() {
             return Ok(());
         }
@@ -1072,17 +1070,11 @@ impl FreestyleControl {
             )));
         }
         let response = self
-            .client
-            .delete(self.url(&format!(
+            .dispatch(self.client.delete(self.url(&format!(
                 "/v5/snapshots/{}",
                 urlencoding::encode(checkpoint_id)
-            )))
-            .bearer_auth(&self.cfg.api_key)
-            .send()
-            .await
-            .map_err(|err| {
-                SandboxError::DaemonUnavailable(format!("Freestyle request failed: {err}"))
-            })?;
+            ))))
+            .await?;
         if response.status() == StatusCode::NOT_FOUND || response.status().is_success() {
             return Ok(());
         }
@@ -1456,14 +1448,11 @@ impl FreestyleControl {
 
     async fn find_or_create_private_network(&self, slug: &str) -> Result<String> {
         let existing = self
-            .client
-            .get(self.url(&format!("/v5/vpcs/{}", urlencoding::encode(slug))))
-            .bearer_auth(&self.cfg.api_key)
-            .send()
-            .await
-            .map_err(|err| {
-                SandboxError::DaemonUnavailable(format!("Freestyle request failed: {err}"))
-            })?;
+            .dispatch(
+                self.client
+                    .get(self.url(&format!("/v5/vpcs/{}", urlencoding::encode(slug)))),
+            )
+            .await?;
         if existing.status().is_success() {
             return Ok(slug.to_string());
         }
@@ -1569,14 +1558,33 @@ impl FreestyleControl {
         )
     }
 
+    /// Send a request with the API key, making the connection again when it does not complete
+    /// within `CONNECT_TIMEOUT`. A connect that failed never reached Freestyle, so any request
+    /// may be sent again; one whose body cannot be cloned is sent once.
+    async fn dispatch(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        let mut builder = builder.bearer_auth(&self.cfg.api_key);
+        let mut attempt = 1;
+        loop {
+            let spare = (attempt < CONNECT_ATTEMPTS)
+                .then(|| builder.try_clone())
+                .flatten();
+            match builder.send().await {
+                Err(err) if err.is_connect() && spare.is_some() => {
+                    tracing::warn!(attempt, "freestyle connect retry");
+                    builder = spare.expect("checked above");
+                    attempt += 1;
+                }
+                sent => {
+                    return sent.map_err(|err| {
+                        SandboxError::DaemonUnavailable(format!("Freestyle request failed: {err}"))
+                    });
+                }
+            }
+        }
+    }
+
     async fn send(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
-        let response = builder
-            .bearer_auth(&self.cfg.api_key)
-            .send()
-            .await
-            .map_err(|err| {
-                SandboxError::DaemonUnavailable(format!("Freestyle request failed: {err}"))
-            })?;
+        let response = self.dispatch(builder).await?;
         if response.status().is_success() {
             return Ok(response);
         }
@@ -2100,10 +2108,17 @@ fn websocket_api_url(api_url: &str) -> String {
     }
 }
 
-/// How long one PTY handshake may take. A healthy one answers in tens of milliseconds; about one
-/// in five sits for a fixed ~75 s on Freestyle's side before answering, so a slow attempt is
-/// dropped and tried again rather than waited out.
-const PTY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// How long a TCP connect to Freestyle's API may take before it is dropped and made again. A
+/// healthy one completes in milliseconds, but from inside Freestyle's network (where the API
+/// runs) 40–50% of new connections to api.freestyle.sh sit a fixed 4 s before completing, while
+/// connects to other hosts from the same VMs do not (measured 2026-10-17 on the staging and
+/// production API VMs). A fresh connect usually lands, so retrying beats waiting.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+const CONNECT_ATTEMPTS: u32 = 5;
+
+/// How long one PTY handshake (connect, TLS and upgrade) may take. A healthy one answers in tens
+/// of milliseconds; one stuck on the slow connect above is dropped and tried again.
+const PTY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const PTY_CONNECT_ATTEMPTS: u32 = 5;
 
 type PtySocket =
@@ -2138,7 +2153,7 @@ async fn connect_pty(
                     "refused"
                 }
                 Err(_) => {
-                    last = format!("no answer within {}s", PTY_CONNECT_TIMEOUT.as_secs());
+                    last = format!("no answer within {}ms", PTY_CONNECT_TIMEOUT.as_millis());
                     "timeout"
                 }
             };
