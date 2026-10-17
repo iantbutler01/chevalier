@@ -2136,7 +2136,9 @@ async fn connect_pty(
     for attempt in 1..=PTY_CONNECT_ATTEMPTS {
         let started = std::time::Instant::now();
         let cause =
-            match tokio::time::timeout(PTY_CONNECT_TIMEOUT, connect_pty_socket(request.clone())).await {
+            match tokio::time::timeout(PTY_CONNECT_TIMEOUT, connect_pty_socket(request.clone()))
+                .await
+            {
                 Ok(Ok(connected)) => {
                     if attempt > 1 {
                         tracing::info!(
