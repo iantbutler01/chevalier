@@ -14,7 +14,7 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::client_async_tls;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use uuid::Uuid;
@@ -2136,7 +2136,7 @@ async fn connect_pty(
     for attempt in 1..=PTY_CONNECT_ATTEMPTS {
         let started = std::time::Instant::now();
         let cause =
-            match tokio::time::timeout(PTY_CONNECT_TIMEOUT, connect_async(request.clone())).await {
+            match tokio::time::timeout(PTY_CONNECT_TIMEOUT, connect_pty_socket(request.clone())).await {
                 Ok(Ok(connected)) => {
                     if attempt > 1 {
                         tracing::info!(
@@ -2162,6 +2162,51 @@ async fn connect_pty(
     Err(SandboxError::DaemonUnavailable(format!(
         "Freestyle pty ws: {PTY_CONNECT_ATTEMPTS} attempts failed: {last}"
     )))
+}
+
+// Race only TCP connections. TLS and the authenticated PTY request run once on the
+// winning socket, so trying another DNS address cannot start a second guest command.
+async fn connect_pty_socket(
+    request: tokio_tungstenite::tungstenite::handshake::client::Request,
+) -> std::result::Result<
+    (
+        PtySocket,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    tokio_tungstenite::tungstenite::Error,
+> {
+    use tokio_tungstenite::tungstenite::{Error, error::UrlError};
+    let host = request
+        .uri()
+        .host()
+        .ok_or(Error::Url(UrlError::NoHostName))?;
+    let port = request.uri().port_u16().unwrap_or_else(|| {
+        if request.uri().scheme_str() == Some("wss") {
+            443
+        } else {
+            80
+        }
+    });
+    let addresses = tokio::net::lookup_host((host.trim_matches(['[', ']']), port)).await?;
+    let socket = connect_pty_addresses(addresses).await?;
+    client_async_tls(request, socket).await
+}
+
+async fn connect_pty_addresses(
+    addresses: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let mut pending: futures::stream::FuturesUnordered<_> = addresses
+        .into_iter()
+        .map(tokio::net::TcpStream::connect)
+        .collect();
+    let mut error = std::io::Error::new(std::io::ErrorKind::NotFound, "PTY host has no addresses");
+    while let Some(connected) = pending.next().await {
+        match connected {
+            Ok(socket) => return Ok(socket),
+            Err(failed) => error = failed,
+        }
+    }
+    Err(error)
 }
 
 async fn decode_json<T>(response: reqwest::Response, action: &str) -> Result<T>
@@ -2215,6 +2260,85 @@ mod tests {
     use super::*;
     use crate::{SharedMountAvailability, SharedMountContinuity};
     use serde_json::json;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pty_uses_a_reachable_address_while_another_connect_is_stalled() {
+        use std::time::Duration;
+        use tokio::net::{TcpListener, TcpSocket, TcpStream};
+
+        // Fill a real listener's accept queue so further connects cannot finish.
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let stalled = socket.listen(1).unwrap();
+        let stalled_address = stalled.local_addr().unwrap();
+        let mut held = Vec::new();
+        let mut full = false;
+        for _ in 0..8 {
+            match tokio::time::timeout(
+                Duration::from_millis(50),
+                TcpStream::connect(stalled_address),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => held.push(stream),
+                Err(_) => {
+                    full = true;
+                    break;
+                }
+                Ok(Err(error)) => panic!("connect failed before the queue filled: {error}"),
+            }
+        }
+        assert!(full, "test listener's accept queue never filled");
+        let healthy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = healthy.local_addr().unwrap();
+        let connection = tokio::time::timeout(
+            Duration::from_millis(250),
+            connect_pty_addresses([stalled_address, address]),
+        )
+        .await
+        .expect("stalled DNS address held up the healthy endpoint")
+        .unwrap();
+        assert_eq!(connection.peer_addr().unwrap(), address);
+        let (_, peer) = healthy.accept().await.unwrap();
+        assert_eq!(peer, connection.local_addr().unwrap());
+    }
+
+    #[tokio::test]
+    async fn pty_address_selection_preserves_the_websocket_request_and_output() {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |request: &Request, response: Response| {
+                    assert_eq!(request.uri().path(), "/v5/vms/test/pty");
+                    assert_eq!(request.headers()["authorization"], "Bearer test-key");
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            ws.send(Message::Binary(Bytes::from_static(b"terminal-ready")))
+                .await
+                .unwrap();
+        });
+        let mut request = format!("ws://{address}/v5/vms/test/pty")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("authorization", "Bearer test-key".parse().unwrap());
+        let (mut ws, response) = connect_pty("test", request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(
+            ws.next().await.unwrap().unwrap(),
+            Message::Binary(Bytes::from_static(b"terminal-ready"))
+        );
+        server.await.unwrap();
+    }
 
     #[test]
     fn persistent_computers_reject_expiration_and_plan_caps() {
