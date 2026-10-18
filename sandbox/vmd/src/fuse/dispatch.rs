@@ -839,11 +839,18 @@ mod tests {
         dispatch.spawn_content("open", RequestId(1), move |_| {
             ran_tx.send(std::thread::current().id()).unwrap();
         });
-        assert_eq!(ran_rx.try_recv().ok(), Some(caller), "nothing pending: inline");
+        assert_eq!(
+            ran_rx.try_recv().ok(),
+            Some(caller),
+            "nothing pending: inline"
+        );
 
         dispatch.inner().lazy_content().register(
             vec!["big.bin".to_string()],
-            Placeholder { size_bytes: 1, content_hash: None },
+            Placeholder {
+                size_bytes: 1,
+                content_hash: None,
+            },
         );
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let (ran_tx, ran_rx) = mpsc::channel();

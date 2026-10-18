@@ -47,7 +47,13 @@ const REQUEST_READ_TIMEOUT: Duration = if cfg!(test) {
 pub fn scoped_socket_path(root_socket: &Path, tag: &str) -> PathBuf {
     let tag: String = tag
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let mut name = root_socket
         .file_stem()
@@ -68,8 +74,8 @@ pub fn serve(path: &Path, control: Arc<FollowControl>) -> Result<JoinHandle<()>>
             return Err(error).with_context(|| format!("remove stale socket {}", path.display()));
         }
     }
-    let listener =
-        UnixListener::bind(path).with_context(|| format!("bind control socket {}", path.display()))?;
+    let listener = UnixListener::bind(path)
+        .with_context(|| format!("bind control socket {}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))
         .with_context(|| format!("open control socket {} to guest accounts", path.display()))?;
     let path = path.to_path_buf();
@@ -114,7 +120,10 @@ const MIN_RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 
 impl ReconnectLimiter {
     fn admit(&self, now: std::time::Instant) -> bool {
-        let mut last = self.last.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if last.is_some_and(|at| now.duration_since(at) < MIN_RECONNECT_INTERVAL) {
             return false;
         }
@@ -178,7 +187,9 @@ pub async fn request(path: &Path, request: &str) -> Result<String> {
     BufReader::new(reader).read_line(&mut line).await?;
     let line = line.trim().to_string();
     if line.is_empty() {
-        return Err(anyhow!("the vfs daemon closed the control socket without answering"));
+        return Err(anyhow!(
+            "the vfs daemon closed the control socket without answering"
+        ));
     }
     Ok(line)
 }

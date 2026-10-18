@@ -150,7 +150,8 @@ impl ComputerMounts {
         };
         let failed = self.reconcile_mounts(&mut state, &manifest.mounts).await;
         self.pin_mountpoints(&state);
-        self.reconcile_links(&mut state, &manifest.links, &failed).await;
+        self.reconcile_links(&mut state, &manifest.links, &failed)
+            .await;
         if failed.is_empty() {
             state.failed_rounds = 0;
             return;
@@ -246,7 +247,11 @@ impl ComputerMounts {
                 Err(error) => warn!(link, target, %error, "could not place a computer mount link"),
             }
         }
-        for link in state.links.keys().filter(|link| !wanted.contains_key(*link)) {
+        for link in state
+            .links
+            .keys()
+            .filter(|link| !wanted.contains_key(*link))
+        {
             if let Err(error) = self.hydrator.drop_synthetic_link(link).await {
                 warn!(link, %error, "could not remove a computer mount link");
             }

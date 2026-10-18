@@ -2,7 +2,12 @@
 //! (`/proc/self/mountinfo`, `/proc/mounts`) and a `mountpoint` whose answer the test
 //! controls, so each test decides what a mount looks like without root or FUSE.
 use super::*;
-use std::{fs, os::unix::fs::PermissionsExt, process::Command, time::{Duration, Instant}};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    process::Command,
+    time::{Duration, Instant},
+};
 
 /// What a deployed guest holds today: `mount_script` at chevalier origin/main `0b265d1f`,
 /// rendered for `nym_mounts()`.

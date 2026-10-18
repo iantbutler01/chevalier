@@ -168,10 +168,7 @@ impl ChangeStream {
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ChangeFrame {
     /// Coalesced, final-state events in `seq` order. Once applied, the cursor is `head`.
-    Changes {
-        head: i64,
-        events: Vec<ChangeEvent>,
-    },
+    Changes { head: i64, events: Vec<ChangeEvent> },
     /// Nothing outstanding up to `head`; `epoch` is sent when the stream opened without a
     /// cursor.
     CaughtUp {

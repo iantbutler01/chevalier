@@ -2099,13 +2099,22 @@ mod pinned_dentry_tests {
         let pinned: BTreeSet<String> = ["conversations/c/0010_assistant/mount".to_string()]
             .into_iter()
             .collect();
-        assert!(dentry_is_pinned(&pinned, "conversations/c/0010_assistant/mount"));
+        assert!(dentry_is_pinned(
+            &pinned,
+            "conversations/c/0010_assistant/mount"
+        ));
         assert!(dentry_is_pinned(&pinned, "conversations/c/0010_assistant"));
         assert!(dentry_is_pinned(&pinned, "conversations"));
         // Siblings, look-alike prefixes and descendants are invalidated as usual.
         assert!(!dentry_is_pinned(&pinned, "conversations/c/0011_assistant"));
-        assert!(!dentry_is_pinned(&pinned, "conversations/c/0010_assistant/mount2"));
-        assert!(!dentry_is_pinned(&pinned, "conversations/c/0010_assistant/mount/file"));
+        assert!(!dentry_is_pinned(
+            &pinned,
+            "conversations/c/0010_assistant/mount2"
+        ));
+        assert!(!dentry_is_pinned(
+            &pinned,
+            "conversations/c/0010_assistant/mount/file"
+        ));
         assert!(!dentry_is_pinned(&pinned, "skills"));
         assert!(!dentry_is_pinned(&BTreeSet::new(), "conversations"));
     }

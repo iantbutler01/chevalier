@@ -56,7 +56,12 @@ fn ranged(remote: &Remote, path: &str, range: &str, fingerprint: Option<&str>) -
     let (start, end) = range
         .trim_start_matches("bytes=")
         .split_once('-')
-        .map(|(start, end)| (start.parse::<usize>().unwrap(), end.parse::<usize>().unwrap()))
+        .map(|(start, end)| {
+            (
+                start.parse::<usize>().unwrap(),
+                end.parse::<usize>().unwrap(),
+            )
+        })
         .unwrap();
     let slice = bytes
         .get(start.min(bytes.len())..(end + 1).min(bytes.len()))
@@ -612,18 +617,25 @@ async fn a_failed_fetch_fails_the_open_and_a_later_open_retries() {
 /// and fetches the new bytes at their new size.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_large_file_rewritten_mid_fill_is_fetched_again_whole() {
-    let old: Vec<u8> = (0..9 * 1024 * 1024).map(|index| (index % 251) as u8).collect();
-    let new: Vec<u8> = (0..10 * 1024 * 1024).map(|index| (index % 241) as u8).collect();
-    let files: BTreeMap<String, Vec<u8>> = [("big.bin".to_string(), old.clone())]
-        .into_iter()
+    let old: Vec<u8> = (0..9 * 1024 * 1024)
+        .map(|index| (index % 251) as u8)
         .collect();
+    let new: Vec<u8> = (0..10 * 1024 * 1024)
+        .map(|index| (index % 241) as u8)
+        .collect();
+    let files: BTreeMap<String, Vec<u8>> =
+        [("big.bin".to_string(), old.clone())].into_iter().collect();
     let gateway = Gateway::start(files).await;
     let state = tempfile::tempdir().expect("state dir");
     // Writable: the case where a stale size used to fail every open.
     let opened = open_view(state.path(), &gateway.endpoint, false);
     let hydrator = MountHydrator::shared(gateway.client(), Arc::clone(&opened.view));
     hydrate(&hydrator).await;
-    assert!(placeholder_at(&backing(state.path(), "big.bin")).unwrap().is_some());
+    assert!(
+        placeholder_at(&backing(state.path(), "big.bin"))
+            .unwrap()
+            .is_some()
+    );
 
     *gateway.remote.rewrite_after_first_range.lock().unwrap() =
         Some(("big.bin".to_string(), new.clone()));
@@ -632,9 +644,15 @@ async fn a_large_file_rewritten_mid_fill_is_fetched_again_whole() {
         .expect("the fill recovers from the rewrite");
     assert_eq!(bytes.len(), new.len(), "filled at the current size");
     assert!(bytes == new, "the new bytes, not a mix of old and new");
-    assert!(placeholder_at(&backing(state.path(), "big.bin")).unwrap().is_none());
+    assert!(
+        placeholder_at(&backing(state.path(), "big.bin"))
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(
-        std::fs::metadata(backing(state.path(), "big.bin")).unwrap().len(),
+        std::fs::metadata(backing(state.path(), "big.bin"))
+            .unwrap()
+            .len(),
         new.len() as u64
     );
 }

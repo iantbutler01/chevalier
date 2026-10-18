@@ -90,14 +90,13 @@ async fn main() -> Result<()> {
         .token
         .or_else(|| std::env::var(args.token_env.as_str()).ok());
     let credential = std::env::var(args.credential_env.as_str()).ok();
-    let auth = VfsAuth::new(&endpoint, credential.as_deref(), token.as_deref()).with_context(
-        || {
+    let auth =
+        VfsAuth::new(&endpoint, credential.as_deref(), token.as_deref()).with_context(|| {
             format!(
                 "missing VFS credential; set {} or {}, or pass --token",
                 args.credential_env, args.token_env
             )
-        },
-    )?;
+        })?;
     let read_only =
         args.read_only || env_truthy("OC_MOUNT_READONLY") || env_truthy("CHEVALIER_VFS_READ_ONLY");
     let state_dir = match args.state_dir {

@@ -1,16 +1,16 @@
 pub mod auth;
 pub mod change_stream;
+#[cfg(test)]
+mod change_stream_tests;
 pub mod client;
 pub mod computer_mounts;
 pub mod control;
 mod dispatch;
 pub mod fs;
 pub mod handle;
-pub(crate) mod local_view;
-#[cfg(test)]
-mod change_stream_tests;
 #[cfg(test)]
 mod lazy_content_tests;
+pub(crate) mod local_view;
 #[cfg(test)]
 mod readonly_reconcile_tests;
 

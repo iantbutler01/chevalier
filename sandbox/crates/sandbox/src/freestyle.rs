@@ -322,10 +322,14 @@ impl FreestyleControl {
     /// `META_SLUG_DEFERRED`). The previous holder keeps running and loses only its slug.
     pub(crate) async fn claim_slug(&self, vm_id: &str, session_id: &str) -> Result<()> {
         let response = self
-            .send(self.client.patch(self.vm_url(vm_id, "")).json(&serde_json::json!({
-                "slug": session_slug(session_id),
-                "reassignSlug": true,
-            })))
+            .send(
+                self.client
+                    .patch(self.vm_url(vm_id, ""))
+                    .json(&serde_json::json!({
+                        "slug": session_slug(session_id),
+                        "reassignSlug": true,
+                    })),
+            )
             .await?;
         let _: FreestyleVm = decode_json(response, "claim slug").await?;
         Ok(())
@@ -2880,13 +2884,26 @@ mod tests {
         std::fs::write(&path, script).unwrap();
         let probe = PROBE_COMMAND
             .replace("/etc/chevalier/mounts.sh", path.to_str().unwrap())
-            .replace("systemctl is-active chevalier-mounts.service 2>/dev/null", "echo active");
-        let output = std::process::Command::new("sh").arg("-c").arg(&probe).output().unwrap();
+            .replace(
+                "systemctl is-active chevalier-mounts.service 2>/dev/null",
+                "echo active",
+            );
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&probe)
+            .output()
+            .unwrap();
         let (starting, digest) = parse_probe(&String::from_utf8(output.stdout).unwrap());
         assert!(!starting);
         assert!(digest.is_some());
-        assert_eq!(control.mount_script_sha256("vm-1", &mounts).unwrap(), digest);
-        assert_ne!(control.mount_script_sha256("vm-2", &mounts).unwrap(), digest);
+        assert_eq!(
+            control.mount_script_sha256("vm-1", &mounts).unwrap(),
+            digest
+        );
+        assert_ne!(
+            control.mount_script_sha256("vm-2", &mounts).unwrap(),
+            digest
+        );
         // No script, or no mounts wanted, is never current.
         assert_eq!(parse_probe("activating\n\n"), (true, None));
         assert_eq!(parse_probe("inactive\n"), (false, None));
