@@ -6,6 +6,12 @@
 //! that until it nears expiry or the gateway answers 401, then exchanges again. Nothing
 //! runs on a timer, so an idle mount makes no calls, and a VM resumed after days simply
 //! exchanges on its first request.
+//!
+//! An exchange that fails for a reason that may pass (no connection, a timeout, a 5xx,
+//! 408 or 429) is retried with backoff for a few seconds before a fallback token answers
+//! instead: a guest fresh from a snapshot can take seconds before its first connection
+//! gets through, and a mount that gave up on that first attempt spent its next minute on
+//! the deployment-wide token. A refusal (401, 403, 404, …) falls back at once.
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -21,6 +27,13 @@ const MAX_REFRESH_MARGIN: Duration = Duration::from_secs(60);
 /// After an exchange fails and a fallback token answered instead, how long the
 /// fallback is used before the exchange is tried again.
 const FALLBACK_RETRY_AFTER: Duration = Duration::from_secs(60);
+/// How long, from the start of the first attempt, an exchange that keeps failing for a
+/// reason that may pass is retried before the fallback token answers instead. The
+/// client's connect timeout is 5 s, so a hung first connect still gets a second attempt.
+const EXCHANGE_RETRY_WINDOW: Duration = Duration::from_secs(10);
+/// First pause between exchange attempts; it doubles up to `EXCHANGE_BACKOFF_MAX`.
+const EXCHANGE_BACKOFF_FIRST: Duration = Duration::from_millis(250);
+const EXCHANGE_BACKOFF_MAX: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub struct VfsAuth {
@@ -29,6 +42,7 @@ pub struct VfsAuth {
     /// fallback for a gateway that cannot exchange yet.
     fallback_token: Option<String>,
     exchange_url: String,
+    exchange_retry_window: Duration,
     cached: Mutex<Option<CachedBearer>>,
 }
 
@@ -49,6 +63,31 @@ impl CachedBearer {
     }
 }
 
+/// Why one exchange attempt failed, and whether trying again may succeed.
+#[derive(Debug)]
+struct ExchangeFailure {
+    error: anyhow::Error,
+    /// No answer arrived (connect, timeout) or the gateway was briefly unable (5xx, 408,
+    /// 429). A refusal or an unusable answer is not transient.
+    transient: bool,
+}
+
+impl ExchangeFailure {
+    fn transient(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            transient: true,
+        }
+    }
+
+    fn refused(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            transient: false,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct AccessTokenResponse {
     access_token: String,
@@ -62,6 +101,7 @@ impl VfsAuth {
             mount_credential: None,
             fallback_token: Some(token.to_string()),
             exchange_url: String::new(),
+            exchange_retry_window: EXCHANGE_RETRY_WINDOW,
             cached: Mutex::new(None),
         }
     }
@@ -87,8 +127,15 @@ impl VfsAuth {
             mount_credential,
             fallback_token,
             exchange_url: format!("{}{ACCESS_TOKEN_PATH}", endpoint.trim_end_matches('/')),
+            exchange_retry_window: EXCHANGE_RETRY_WINDOW,
             cached: Mutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    fn with_exchange_retry_window(mut self, window: Duration) -> Self {
+        self.exchange_retry_window = window;
+        self
     }
 
     /// Whether a rejected bearer can be replaced by exchanging again.
@@ -109,7 +156,7 @@ impl VfsAuth {
         if let Some(bearer) = cached.as_ref().filter(|bearer| bearer.fresh()) {
             return Ok(bearer.token.clone());
         }
-        match self.exchange(client, credential).await {
+        match self.exchange_with_retry(client, credential).await {
             Ok((token, expires_in)) => {
                 let margin = MAX_REFRESH_MARGIN.min(expires_in / 2);
                 let lifetime = expires_in.saturating_sub(margin);
@@ -162,24 +209,75 @@ impl VfsAuth {
         }
     }
 
-    async fn exchange(&self, client: &Client, credential: &str) -> Result<(String, Duration)> {
+    /// Exchanges, retrying a failure that may pass with backoff until
+    /// `exchange_retry_window` after the first attempt began. A refusal returns at once.
+    async fn exchange_with_retry(
+        &self,
+        client: &Client,
+        credential: &str,
+    ) -> Result<(String, Duration)> {
+        let deadline = Instant::now() + self.exchange_retry_window;
+        let mut backoff = EXCHANGE_BACKOFF_FIRST;
+        let mut attempt = 1u32;
+        loop {
+            let failure = match self.exchange(client, credential).await {
+                Ok(exchanged) => return Ok(exchanged),
+                Err(failure) => failure,
+            };
+            if !failure.transient || Instant::now() + backoff >= deadline {
+                return Err(failure.error.context(format!(
+                    "VFS access token exchange gave up after {attempt} attempt(s)"
+                )));
+            }
+            tracing::info!(
+                error = %failure.error,
+                attempt,
+                retry_in_ms = backoff.as_millis() as u64,
+                "VFS access token exchange failed; retrying"
+            );
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(EXCHANGE_BACKOFF_MAX);
+            attempt += 1;
+        }
+    }
+
+    async fn exchange(
+        &self,
+        client: &Client,
+        credential: &str,
+    ) -> std::result::Result<(String, Duration), ExchangeFailure> {
         let response = client
             .post(&self.exchange_url)
             .bearer_auth(credential)
             .send()
             .await
-            .context("send VFS access token exchange")?;
+            .context("send VFS access token exchange")
+            .map_err(ExchangeFailure::transient)?;
         let status = response.status();
         if status != StatusCode::OK {
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("VFS access token exchange failed: {status} {body}"));
+            let error = anyhow!("VFS access token exchange failed: {status} {body}");
+            let passing = status.is_server_error()
+                || status == StatusCode::REQUEST_TIMEOUT
+                || status == StatusCode::TOO_MANY_REQUESTS;
+            return Err(if passing {
+                ExchangeFailure::transient(error)
+            } else {
+                ExchangeFailure::refused(error)
+            });
         }
-        let body: AccessTokenResponse = response
-            .json()
-            .await
-            .context("decode VFS access token response")?;
+        let body: AccessTokenResponse = response.json().await.map_err(|error| {
+            // A body cut off in transit may arrive whole next time; a malformed one won't.
+            let transient = !error.is_decode();
+            ExchangeFailure {
+                error: anyhow::Error::new(error).context("decode VFS access token response"),
+                transient,
+            }
+        })?;
         if body.access_token.trim().is_empty() || body.expires_in == 0 {
-            return Err(anyhow!("VFS access token response carried no usable token"));
+            return Err(ExchangeFailure::refused(anyhow!(
+                "VFS access token response carried no usable token"
+            )));
         }
         Ok((body.access_token, Duration::from_secs(body.expires_in)))
     }
@@ -288,23 +386,150 @@ mod tests {
         server.abort();
     }
 
-    #[test]
-    fn a_failed_exchange_falls_back_to_the_rollout_token() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
+            .unwrap()
+    }
+
+    /// An exchange gateway that answers each attempt with the next status of `script`
+    /// (200 issues a token), and with 200 once the script runs out. Returns its owner
+    /// endpoint and the number of attempts it has seen.
+    fn scripted_gateway(
+        runtime: &tokio::runtime::Runtime,
+        script: Vec<u16>,
+    ) -> (String, Arc<StdMutex<u32>>) {
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
             .unwrap();
-        // Nothing listens here: the exchange fails at connect.
-        let auth = VfsAuth::new("http://127.0.0.1:1/owner", Some("cred"), Some("global")).unwrap();
+        let endpoint = format!("http://{}/owner/nym-1", listener.local_addr().unwrap());
+        let attempts = Arc::new(StdMutex::new(0u32));
+        let seen = Arc::clone(&attempts);
+        let router = axum::Router::new().route(
+            "/owner/nym-1/access-token",
+            axum::routing::post(move || {
+                let seen = Arc::clone(&seen);
+                let script = script.clone();
+                async move {
+                    let attempt = {
+                        let mut seen = seen.lock().unwrap();
+                        *seen += 1;
+                        *seen
+                    };
+                    match script.get(attempt as usize - 1).copied().unwrap_or(200) {
+                        200 => axum::Json(serde_json::json!({
+                            "access_token": format!("access-{attempt}"),
+                            "expires_in": 900,
+                        }))
+                        .into_response(),
+                        status => HttpStatus::from_u16(status).unwrap().into_response(),
+                    }
+                }
+            }),
+        );
+        runtime.spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (endpoint, attempts)
+    }
+
+    /// The staging failure (spec 87 T1-4): a fresh guest's first exchange cannot connect
+    /// for a few seconds. The mount keeps trying and ends up on its own access token, never
+    /// on the deployment-wide one.
+    #[test]
+    fn a_first_exchange_that_cannot_connect_waits_for_the_gateway_instead_of_falling_back() {
+        let runtime = runtime();
+        // Reserve a port, close it, and only start serving on it after a while: until then
+        // every connect is refused, as it is before a restored guest's network is up.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let issued = Arc::new(StdMutex::new(0u32));
+        let server_issued = Arc::clone(&issued);
+        runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let router = axum::Router::new().route(
+                "/owner/nym-1/access-token",
+                axum::routing::post(move || {
+                    *server_issued.lock().unwrap() += 1;
+                    async {
+                        axum::Json(serde_json::json!({ "access_token": "own", "expires_in": 900 }))
+                    }
+                }),
+            );
+            axum::serve(listener, router).await.unwrap();
+        });
+        let endpoint = format!("http://127.0.0.1:{port}/owner/nym-1");
+        let auth = VfsAuth::new(&endpoint, Some("mount-cred"), Some("global")).unwrap();
+
         let token = runtime.block_on(auth.bearer(&Client::new())).unwrap();
+
+        assert_eq!(token, "own");
+        assert!(runtime.block_on(auth.holds_exchanged_token()));
+        assert_eq!(*issued.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_gateway_that_fails_briefly_is_retried_until_it_issues_a_token() {
+        let runtime = runtime();
+        let (endpoint, attempts) = scripted_gateway(&runtime, vec![503, 502, 429]);
+        let auth = VfsAuth::new(&endpoint, Some("mount-cred"), Some("global")).unwrap();
+
+        let token = runtime.block_on(auth.bearer(&Client::new())).unwrap();
+
+        assert_eq!(token, "access-4");
+        assert_eq!(*attempts.lock().unwrap(), 4);
+        assert!(runtime.block_on(auth.holds_exchanged_token()));
+    }
+
+    /// The fallback stays for an exchange that keeps failing; it answers once the retry
+    /// window is spent, not before.
+    #[test]
+    fn an_exchange_that_keeps_failing_falls_back_once_the_window_is_spent() {
+        let runtime = runtime();
+        let window = Duration::from_millis(1200);
+        // Nothing listens here: every attempt fails at connect.
+        let auth = VfsAuth::new("http://127.0.0.1:1/owner", Some("cred"), Some("global"))
+            .unwrap()
+            .with_exchange_retry_window(window);
+        let started = Instant::now();
+        let token = runtime.block_on(auth.bearer(&Client::new())).unwrap();
+        let elapsed = started.elapsed();
         assert_eq!(token, "global");
-        let without_fallback =
-            VfsAuth::new("http://127.0.0.1:1/owner", Some("cred"), None).unwrap();
+        assert!(!runtime.block_on(auth.holds_exchanged_token()));
+        // 250 + 500 ms of backoff fit the window; the next 1 s pause does not. No new
+        // attempt starts past the window, so only one attempt's own failure (bounded by
+        // the 5 s connect timeout, milliseconds when refused) can run over it.
+        assert!(elapsed >= Duration::from_millis(750), "{elapsed:?}");
+        assert!(elapsed < window + Duration::from_secs(5), "{elapsed:?}");
+
+        let without_fallback = VfsAuth::new("http://127.0.0.1:1/owner", Some("cred"), None)
+            .unwrap()
+            .with_exchange_retry_window(window);
         assert!(
             runtime
                 .block_on(without_fallback.bearer(&Client::new()))
                 .is_err()
         );
+    }
+
+    /// A gateway that refuses the credential (or has no exchange route yet) will not
+    /// change its mind in a few seconds: the fallback answers on the first attempt.
+    #[test]
+    fn a_refused_exchange_falls_back_without_retrying() {
+        let runtime = runtime();
+        for refusal in [401, 403, 404] {
+            let (endpoint, attempts) = scripted_gateway(&runtime, vec![refusal]);
+            let auth = VfsAuth::new(&endpoint, Some("mount-cred"), Some("global")).unwrap();
+            let token = runtime.block_on(auth.bearer(&Client::new())).unwrap();
+            assert_eq!(token, "global", "{refusal}");
+            assert_eq!(*attempts.lock().unwrap(), 1, "{refusal}");
+        }
     }
 
     #[test]
