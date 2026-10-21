@@ -58,6 +58,11 @@ const MOUNT_REFRESH_SECS: u64 =
 /// Provider deadlines for the attach-time commands, above the guest-side bounds.
 pub(super) const MOUNT_REFRESH_EXEC_MS: u64 = (MOUNT_REFRESH_SECS + KILL_GRACE_SECS + 2) * 1000;
 pub(super) const MOUNT_REPLAY_EXEC_MS: u64 = (MOUNT_REPLAY_SECS + KILL_GRACE_SECS + 2) * 1000;
+/// Reading the guest's boot id, before a mount restart and while waiting for the new boot.
+pub(super) const GUEST_BOOT_ID_EXEC_MS: u64 = 2_000;
+/// How long a mount restart may take to come back as a new boot. Measured on staging
+/// (2026-10-21): poweroff to the next boot's first log line took 6 s.
+pub(super) const GUEST_RESTART_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 // The bounds nest, outermost last; the API gives a whole attach 45 s.
 const _: () = {
     assert!(MOUNT_LOCK_WAIT_SECS < MOUNT_REPLAY_SECS);

@@ -1282,7 +1282,11 @@ impl FreestyleControl {
         };
         if outcome == MountRefresh::Refreshed {
             // A guest poweroff lets systemd stop the mount daemons, which drain their
-            // publication logs; the boot then runs the new script in mount order.
+            // publication logs; the boot then runs the new script in mount order. Freestyle
+            // restarts a VM created with `automatic_restart` as soon as its guest powers off,
+            // so the VM is seldom reported `stopped`: the restart is over when a new boot
+            // answers.
+            let boot = self.guest_boot_id(vm_id).await;
             let _ = self
                 .exec_await(
                     vm_id,
@@ -1293,16 +1297,69 @@ impl FreestyleControl {
                     Some(ROOT_USER),
                 )
                 .await;
-            if self
-                .wait_for_state(vm_id, FreestyleVmState::Stopped)
-                .await
-                .is_err()
-            {
-                self.vm_action(vm_id, FreestyleVmAction::Stop).await?;
+            match boot {
+                Some(boot) => self.await_new_boot(vm_id, &boot).await?,
+                None => {
+                    if self
+                        .wait_for_state(vm_id, FreestyleVmState::Stopped)
+                        .await
+                        .is_err()
+                    {
+                        self.vm_action(vm_id, FreestyleVmAction::Stop).await?;
+                    }
+                    self.ensure_running(vm_id).await?;
+                }
             }
-            self.ensure_running(vm_id).await?;
         }
         Ok(outcome)
+    }
+
+    /// The guest kernel's id for its current boot, when the guest answers.
+    async fn guest_boot_id(&self, vm_id: &str) -> Option<String> {
+        let result = self
+            .exec_await(
+                vm_id,
+                "cat /proc/sys/kernel/random/boot_id",
+                None,
+                Some(GUEST_BOOT_ID_EXEC_MS),
+                None,
+                Some(ROOT_USER),
+            )
+            .await
+            .ok()?;
+        let boot = result.stdout.unwrap_or_default().trim().to_string();
+        (result.status_code == Some(0) && !boot.is_empty()).then_some(boot)
+    }
+
+    /// Wait until the guest answers from a boot other than `previous`, starting the VM if
+    /// Freestyle reports it stopped rather than restarting it, within `GUEST_RESTART_BOUND`.
+    async fn await_new_boot(&self, vm_id: &str, previous: &str) -> Result<()> {
+        tokio::time::timeout(GUEST_RESTART_BOUND, async {
+            loop {
+                let vm = self.get_sandbox(vm_id).await?;
+                match vm.state {
+                    FreestyleVmState::Stopped => self.ensure_running(vm_id).await?,
+                    FreestyleVmState::Running => {
+                        if self
+                            .guest_boot_id(vm_id)
+                            .await
+                            .is_some_and(|boot| boot != previous)
+                        {
+                            return Ok(());
+                        }
+                    }
+                    _ => {}
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            SandboxError::DaemonUnavailable(format!(
+                "Freestyle VM {vm_id} did not come back from its mount restart within {}s",
+                GUEST_RESTART_BOUND.as_secs()
+            ))
+        })?
     }
 
     fn resolve_mounts(
