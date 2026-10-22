@@ -1168,8 +1168,22 @@ impl RemoteVfsClient {
         if let Some(after) = after {
             request = request.query(&[("after", after)]);
         }
-        let response = self.send_authorized(request).await?;
+        let response = tokio::time::timeout(Duration::from_secs(30), self.send_authorized(request))
+            .await
+            .context("vfs change stream response headers timed out")??;
         let status = response.status();
+        if matches!(
+            status,
+            StatusCode::NOT_FOUND
+                | StatusCode::METHOD_NOT_ALLOWED
+                | StatusCode::UNAUTHORIZED
+                | StatusCode::FORBIDDEN
+        ) && self.auth.refreshable()
+            && !self.auth.holds_exchanged_token().await
+        {
+            return Err(anyhow::Error::new(VfsRequestStatusError { status })
+                .context("vfs change stream requires a recovered per-computer credential"));
+        }
         if status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED {
             return Ok(ChangeStreamOpen::Unsupported);
         }

@@ -989,3 +989,36 @@ async fn a_renamed_subtree_keeps_hard_links_to_paths_outside_it() {
     assert!(!tree.join("dir").exists());
     gateway.server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn temporary_credential_fallback_does_not_disable_feed_recovery() {
+    let old = Gateway::start(&[], false).await;
+    let auth = super::auth::VfsAuth::new(&old.endpoint, Some("mount-credential"), Some("fallback"))
+        .unwrap();
+    let client = RemoteVfsClient::with_auth(&old.endpoint, auth, "").unwrap();
+    assert!(matches!(read_feed_head(&client).await, FeedHead::Unknown));
+    old.server.abort();
+}
+
+#[tokio::test]
+async fn opening_a_change_stream_has_a_response_header_deadline() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        drop(socket);
+    });
+    let client = RemoteVfsClient::new(&format!("http://{address}"), "token", "").unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(35),
+        client.open_change_stream(None),
+    )
+    .await;
+    assert!(
+        result
+            .expect("header timeout must bound stream opening")
+            .is_err()
+    );
+    server.abort();
+}

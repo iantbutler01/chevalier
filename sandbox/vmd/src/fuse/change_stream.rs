@@ -401,6 +401,7 @@ impl ChangeStreamFollower {
         let opened = tokio::select! {
             opened = self.client.open_change_stream(after.as_deref()) => opened?,
             _ = self.cancel.notified() => return Ok(SessionEnd::Stop),
+            _ = self.control.reconnect.notified() => return Ok(SessionEnd::Reconnect),
         };
         let mut stream = match opened {
             ChangeStreamOpen::Unsupported => return Ok(SessionEnd::Unsupported),
