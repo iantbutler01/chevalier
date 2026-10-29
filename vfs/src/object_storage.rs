@@ -464,6 +464,9 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
         }
         let pack_results = stream::iter(packs)
             .map(|(pack_key, slots)| async move {
+                if let Some(bytes) = self.cache.pack_bytes.get(&pack_key) {
+                    return Ok((pack_key, 0, slots, bytes));
+                }
                 let range_start = slots
                     .iter()
                     .map(|(_, _, offset, _)| *offset as u64)
@@ -484,7 +487,7 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
                         "vfs pack {pack_key} not found"
                     )));
                 };
-                Ok::<_, VfsStorageError>((pack_key, range_start, slots, bytes))
+                Ok::<_, VfsStorageError>((pack_key, range_start, slots, Arc::new(bytes)))
             })
             .buffer_unordered(256)
             .try_collect::<Vec<_>>()
@@ -1778,6 +1781,50 @@ mod tests {
                 .and_then(|meta| meta.token_count),
             Some(2)
         );
+    }
+
+    #[tokio::test]
+    async fn batch_reads_use_shared_hot_packs_across_storage_instances() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(LocalObjectStoreClient::new(dir.path().to_path_buf()).unwrap());
+        let index = Arc::new(MemoryIndex::default());
+        let cache = Arc::new(PackCache::new(1024 * 1024));
+        let cfg = ObjectBackedVfsStorageConfig::new(VfsIndexScope::new("shared-hot-packs"));
+        let writer = ObjectBackedVfsStorage::new_with_pack_cache(
+            cfg.clone(),
+            store.clone(),
+            index.clone(),
+            cache.clone(),
+        );
+        writer
+            .write_many_atomic(vec![
+                VfsStorageWrite {
+                    path: "a.md".into(),
+                    mode: None,
+                    bytes: Bytes::from_static(b"alpha"),
+                    token_count: None,
+                    precondition: None,
+                },
+                VfsStorageWrite {
+                    path: "b.md".into(),
+                    mode: None,
+                    bytes: Bytes::from_static(b"beta"),
+                    token_count: None,
+                    precondition: None,
+                },
+            ])
+            .await
+            .expect("warm shared pack");
+        // Prove the fresh reader needs only the shared cache, not the object store.
+        std::fs::remove_dir_all(dir.path()).expect("remove backing objects");
+        let reader = ObjectBackedVfsStorage::new_with_pack_cache(cfg, store, index, cache);
+        let read = reader
+            .read_many(&["a.md".into(), "b.md".into()])
+            .await
+            .expect("read cached pack without backing storage");
+        let by_path = read.into_iter().collect::<HashMap<_, _>>();
+        assert_eq!(&by_path["a.md"][..], b"alpha");
+        assert_eq!(&by_path["b.md"][..], b"beta");
     }
 
     #[tokio::test]
