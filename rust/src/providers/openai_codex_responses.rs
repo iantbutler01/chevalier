@@ -72,6 +72,7 @@ const CODEX_SECONDARY_RESET_AT_HEADER: &str = "x-codex-secondary-reset-at";
 /// ChatGPT Codex Responses client.
 pub struct OpenAICodexResponsesClient {
     model: String,
+    chatgpt_plan: bool,
     token: String,
     account_id: String,
     identity: CodexClientIdentity,
@@ -95,6 +96,7 @@ impl Clone for OpenAICodexResponsesClient {
     fn clone(&self) -> Self {
         Self {
             model: self.model.clone(),
+            chatgpt_plan: self.chatgpt_plan,
             token: self.token.clone(),
             account_id: self.account_id.clone(),
             identity: self.identity.clone(),
@@ -151,6 +153,7 @@ impl OpenAICodexResponsesClient {
 
         Ok(Self {
             model: model.into(),
+            chatgpt_plan: false,
             token: config.token,
             account_id,
             identity: config.identity.unwrap_or_else(|| CodexClientIdentity {
@@ -180,6 +183,14 @@ impl OpenAICodexResponsesClient {
     }
 
     /// Set reasoning effort.
+    /// Use the registered ChatGPT plan protocol on the public Responses endpoint.
+    pub fn with_chatgpt_plan(mut self) -> Self {
+        self.chatgpt_plan = true;
+        self.api_url = "https://api.openai.com/v1/responses".into();
+        self.transport = CodexSubscriptionTransport::Sse;
+        self
+    }
+
     pub fn with_reasoning(mut self, reasoning: impl Into<String>) -> Self {
         self.reasoning = Some(reasoning.into());
         self
@@ -297,6 +308,18 @@ impl OpenAICodexResponsesClient {
             });
         }
 
+        if self.chatgpt_plan {
+            let object = request.as_object_mut().expect("request object");
+            for key in ["temperature", "top_p", "max_output_tokens", "max_tool_calls", "metadata", "background", "conversation", "previous_response_id", "truncation", "prompt_cache_retention", "context_management"] {
+                object.remove(key);
+            }
+            if let Some(Value::Array(tools)) = object.remove("tools") {
+                let tools: Vec<_> = tools.into_iter().filter(|tool| matches!(tool["type"].as_str(), Some("function" | "custom"))).collect();
+                if !tools.is_empty() {
+                    object.insert("tools".into(), serde_json::json!([{ "type": "namespace", "name": "functions", "description": "Nym tools", "tools": tools }]));
+                }
+            }
+        }
         Ok(request)
     }
 
@@ -309,12 +332,13 @@ impl OpenAICodexResponsesClient {
             .post(&self.api_url)
             .timeout(timeout.unwrap_or(Duration::from_secs(180)))
             .header(header::AUTHORIZATION, format!("Bearer {}", self.token))
-            .header("chatgpt-account-id", &self.account_id)
-            .header("originator", &self.identity.originator)
             .header(header::USER_AGENT, &self.identity.user_agent)
             .header("OpenAI-Beta", OPENAI_BETA_RESPONSES)
             .header(header::ACCEPT, "text/event-stream")
             .header(header::CONTENT_TYPE, "application/json");
+        let request = if self.chatgpt_plan { request } else {
+            request.header("chatgpt-account-id", &self.account_id).header("originator", &self.identity.originator)
+        };
         // Codex clients name the conversation with the same id they cache under.
         match &self.prompt_cache_key {
             Some(session) => request.header("session-id", session),
@@ -560,6 +584,9 @@ impl OpenAICodexResponsesClient {
         let rate_limits = codex_rate_limits_from_headers(response.headers());
         let sse_stream = parse_sse_stream(response);
         let request_model = request_body["model"].clone();
+        let plan = self.chatgpt_plan;
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_completed = completed.clone();
         let chunk_stream = sse_stream.scan(
             ResponsesToolAccumulator::new(),
             move |accumulator, sse_result| {
@@ -572,6 +599,12 @@ impl OpenAICodexResponsesClient {
                     eprintln!("codex sse event: {}", sse_json);
                 }
 
+                if plan && sse_json["type"] == "response.incomplete" {
+                    return futures::future::ready(Some(vec![Err(Error::NonRetryable("ChatGPT response was incomplete".into()))]));
+                }
+                if sse_json["type"] == "response.completed" {
+                    saw_completed.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 if let Err(error) = reject_codex_error_event(&sse_json) {
                     return futures::future::ready(Some(vec![Err(error)]));
                 }
@@ -605,7 +638,12 @@ impl OpenAICodexResponsesClient {
 
         Ok(Box::pin(
             futures::stream::iter(header_chunks)
-                .chain(chunk_stream.flat_map(futures::stream::iter)),
+                .chain(chunk_stream.flat_map(futures::stream::iter))
+                .chain(futures::stream::once(async move {
+                    if plan && !completed.load(std::sync::atomic::Ordering::Relaxed) {
+                        Some(Err(Error::Inference("ChatGPT stream ended before response.completed".into())))
+                    } else { None }
+                }).filter_map(futures::future::ready)),
         ))
     }
 
@@ -734,6 +772,7 @@ impl InferenceClient for OpenAICodexResponsesClient {
         let has_tools = config.tools.as_ref().is_some_and(|tools| !tools.is_empty());
 
         match self.transport {
+            _ if self.chatgpt_plan => self.connect_sse_stream(request_body, config.timeout, config.retry_config.clone(), has_tools).await,
             _ if config
                 .responses
                 .as_ref()

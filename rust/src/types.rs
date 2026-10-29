@@ -74,7 +74,7 @@ impl Provider {
             let provider = match parts[0] {
                 "openai" => Provider::OpenAIResponses,
                 "openrouter" => Provider::OpenRouterResponses,
-                "openai-codex-responses" => Provider::OpenAIResponses,
+                "openai-codex-responses" | "openai-chatgpt-plan" => Provider::OpenAIResponses,
                 _ => return Err(Error::InvalidProvider(parts[0].to_string())),
             };
             return Ok((provider, parts[2..].join(":")));
@@ -86,7 +86,7 @@ impl Provider {
             "anthropic" | "kimi-coding" => Provider::Anthropic,
             "openai" if is_gpt6_model(&model_name) => Provider::OpenAIResponses,
             "openai" => Provider::OpenAI,
-            "openai-responses" | "openai-codex-responses" => Provider::OpenAIResponses,
+            "openai-responses" | "openai-codex-responses" | "openai-chatgpt-plan" => Provider::OpenAIResponses,
             "bedrock" => Provider::Bedrock,
             "google-genai" | "gemini" | "google-gemini" => Provider::GoogleGenAI,
             "google-anthropic" | "vertexai" => Provider::GoogleAnthropic,
