@@ -327,10 +327,14 @@ impl OpenAICodexResponsesClient {
                 object.remove(key);
             }
             if let Some(Value::Array(tools)) = object.remove("tools") {
-                let tools: Vec<_> = tools
-                    .into_iter()
-                    .filter(|tool| matches!(tool["type"].as_str(), Some("function" | "custom")))
-                    .collect();
+                if tools
+                    .iter()
+                    .any(|tool| !matches!(tool["type"].as_str(), Some("function" | "custom")))
+                {
+                    return Err(Error::NonRetryable(
+                        "ChatGPT plan connections support function and custom tools only".into(),
+                    ));
+                }
                 if !tools.is_empty() {
                     object.insert("tools".into(), serde_json::json!([{ "type": "namespace", "name": "functions", "description": "Nym tools", "tools": tools }]));
                 }
