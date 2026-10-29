@@ -70,7 +70,10 @@ fn build_runtime_messages(
 }
 
 fn resolve_provider_for_caching(model: &str) -> Option<Provider> {
-    if matches!(resolve_provider_key(model).as_str(), "openai-codex-responses" | "openai-chatgpt-plan") {
+    if matches!(
+        resolve_provider_key(model).as_str(),
+        "openai-codex-responses" | "openai-chatgpt-plan"
+    ) {
         return Some(Provider::OpenAIResponses);
     }
     Provider::from_model_string(model)
@@ -246,7 +249,12 @@ fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
                     ));
                 }
                 "api_key" => inline_api_key = Some(value.to_string()),
-                "account" if matches!(provider.as_str(), "openai-codex-responses" | "openai-chatgpt-plan") && !value.is_empty() => {
+                "account"
+                    if matches!(
+                        provider.as_str(),
+                        "openai-codex-responses" | "openai-chatgpt-plan"
+                    ) && !value.is_empty() =>
+                {
                     subscription_account = Some(value.to_string());
                 }
                 "cache" => prompt_cache_retention = Some(parse_prompt_cache_retention(value)?),
@@ -601,7 +609,9 @@ fn create_inference_client_with_config(
                 .map_err(|_| Error::NonRetryable("OPENAI_API_KEY not set".to_string()))?,
             "openai-responses" => std::env::var("OPENAI_API_KEY")
                 .map_err(|_| Error::NonRetryable("OPENAI_API_KEY not set".to_string()))?,
-            "openai-codex-responses" | "openai-chatgpt-plan" => resolve_codex_subscription_token(api_key, provider_config)?,
+            "openai-codex-responses" | "openai-chatgpt-plan" => {
+                resolve_codex_subscription_token(api_key, provider_config)?
+            }
             "openrouter" => std::env::var("OPENROUTER_API_KEY")
                 .or_else(|_| std::env::var("OPENROUTER_KEY"))
                 .map_err(|_| Error::NonRetryable("OPENROUTER_API_KEY not set".to_string()))?,
@@ -706,7 +716,9 @@ fn create_inference_client_with_config(
             let plan = provider == "openai-chatgpt-plan";
             let config = resolve_codex_subscription_config(key, server_url, provider_config)?;
             let mut client = OpenAICodexResponsesClient::new(config, model_name)?;
-            if plan { client = client.with_chatgpt_plan(); }
+            if plan {
+                client = client.with_chatgpt_plan();
+            }
             if let Some(r) = reasoning {
                 client = client.with_reasoning(r);
             }

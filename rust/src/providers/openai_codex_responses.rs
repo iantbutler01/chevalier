@@ -11,6 +11,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Uri};
 use reqwest::{StatusCode, header};
 use serde_json::Value;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 struct WebSocketTask(tokio::task::AbortHandle);
@@ -310,11 +311,26 @@ impl OpenAICodexResponsesClient {
 
         if self.chatgpt_plan {
             let object = request.as_object_mut().expect("request object");
-            for key in ["temperature", "top_p", "max_output_tokens", "max_tool_calls", "metadata", "background", "conversation", "previous_response_id", "truncation", "prompt_cache_retention", "context_management"] {
+            for key in [
+                "temperature",
+                "top_p",
+                "max_output_tokens",
+                "max_tool_calls",
+                "metadata",
+                "background",
+                "conversation",
+                "previous_response_id",
+                "truncation",
+                "prompt_cache_retention",
+                "context_management",
+            ] {
                 object.remove(key);
             }
             if let Some(Value::Array(tools)) = object.remove("tools") {
-                let tools: Vec<_> = tools.into_iter().filter(|tool| matches!(tool["type"].as_str(), Some("function" | "custom"))).collect();
+                let tools: Vec<_> = tools
+                    .into_iter()
+                    .filter(|tool| matches!(tool["type"].as_str(), Some("function" | "custom")))
+                    .collect();
                 if !tools.is_empty() {
                     object.insert("tools".into(), serde_json::json!([{ "type": "namespace", "name": "functions", "description": "Nym tools", "tools": tools }]));
                 }
@@ -336,8 +352,12 @@ impl OpenAICodexResponsesClient {
             .header("OpenAI-Beta", OPENAI_BETA_RESPONSES)
             .header(header::ACCEPT, "text/event-stream")
             .header(header::CONTENT_TYPE, "application/json");
-        let request = if self.chatgpt_plan { request } else {
-            request.header("chatgpt-account-id", &self.account_id).header("originator", &self.identity.originator)
+        let request = if self.chatgpt_plan {
+            request
+        } else {
+            request
+                .header("chatgpt-account-id", &self.account_id)
+                .header("originator", &self.identity.originator)
         };
         // Codex clients name the conversation with the same id they cache under.
         match &self.prompt_cache_key {
@@ -600,7 +620,9 @@ impl OpenAICodexResponsesClient {
                 }
 
                 if plan && sse_json["type"] == "response.incomplete" {
-                    return futures::future::ready(Some(vec![Err(Error::NonRetryable("ChatGPT response was incomplete".into()))]));
+                    return futures::future::ready(Some(vec![Err(Error::NonRetryable(
+                        "ChatGPT response was incomplete".into(),
+                    ))]));
                 }
                 if sse_json["type"] == "response.completed" {
                     saw_completed.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -639,11 +661,18 @@ impl OpenAICodexResponsesClient {
         Ok(Box::pin(
             futures::stream::iter(header_chunks)
                 .chain(chunk_stream.flat_map(futures::stream::iter))
-                .chain(futures::stream::once(async move {
-                    if plan && !completed.load(std::sync::atomic::Ordering::Relaxed) {
-                        Some(Err(Error::Inference("ChatGPT stream ended before response.completed".into())))
-                    } else { None }
-                }).filter_map(futures::future::ready)),
+                .chain(
+                    futures::stream::once(async move {
+                        if plan && !completed.load(std::sync::atomic::Ordering::Relaxed) {
+                            Some(Err(Error::Inference(
+                                "ChatGPT stream ended before response.completed".into(),
+                            )))
+                        } else {
+                            None
+                        }
+                    })
+                    .filter_map(futures::future::ready),
+                ),
         ))
     }
 
@@ -772,7 +801,15 @@ impl InferenceClient for OpenAICodexResponsesClient {
         let has_tools = config.tools.as_ref().is_some_and(|tools| !tools.is_empty());
 
         match self.transport {
-            _ if self.chatgpt_plan => self.connect_sse_stream(request_body, config.timeout, config.retry_config.clone(), has_tools).await,
+            _ if self.chatgpt_plan => {
+                self.connect_sse_stream(
+                    request_body,
+                    config.timeout,
+                    config.retry_config.clone(),
+                    has_tools,
+                )
+                .await
+            }
             _ if config
                 .responses
                 .as_ref()
@@ -1276,6 +1313,37 @@ mod tests {
             "gpt-5.1-codex",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn chatgpt_plan_uses_public_api_and_namespaced_tools_without_sampling_fields() {
+        let client = test_client().with_chatgpt_plan();
+        let mut config = GenerationConfig::new("gpt-5.5");
+        config.temperature = Some(0.7);
+        config.tools = Some(vec![
+            serde_json::json!({"type":"function","name":"lookup","description":"Look up","parameters":{"type":"object","properties":{}}}),
+        ]);
+        let body = client
+            .build_request_body(
+                &[ConversationMessage::Chat(crate::types::ChatMessage::user(
+                    "hello",
+                ))],
+                &config,
+                true,
+            )
+            .unwrap();
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+        assert!(body.get("temperature").is_none());
+        assert_eq!(body["tools"][0]["type"], "namespace");
+        assert_eq!(body["tools"][0]["tools"][0]["name"], "lookup");
+        let request = client.sse_request_builder(&body, None).build().unwrap();
+        assert_eq!(
+            request.url().as_str(),
+            "https://api.openai.com/v1/responses"
+        );
+        assert!(!request.headers().contains_key("chatgpt-account-id"));
+        assert!(!request.headers().contains_key("originator"));
     }
 
     #[test]
