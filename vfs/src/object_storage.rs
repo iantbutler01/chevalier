@@ -1859,6 +1859,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cold_sparse_pack_reads_return_only_requested_files() {
+        let (writer, reader, _dir) = object_storage_clients();
+        let mut state = 0x12345678u32;
+        let unrelated = (0..65_536)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect::<Vec<_>>();
+        let writes = [
+            ("a.md", Bytes::from_static(b"alpha")),
+            ("middle.bin", Bytes::from(unrelated)),
+            ("z.md", Bytes::from_static(b"omega")),
+        ]
+        .into_iter()
+        .map(|(path, bytes)| VfsStorageWrite {
+            path: path.into(),
+            mode: None,
+            bytes,
+            token_count: None,
+            precondition: None,
+        })
+        .collect();
+        writer
+            .write_many_atomic(writes)
+            .await
+            .expect("write sparse pack");
+        let read = reader
+            .read_many(&["z.md".into(), "a.md".into()])
+            .await
+            .expect("cold sparse read");
+        let by_path = read.into_iter().collect::<HashMap<_, _>>();
+        assert_eq!(by_path.len(), 2);
+        assert_eq!(&by_path["a.md"][..], b"alpha");
+        assert_eq!(&by_path["z.md"][..], b"omega");
+    }
+
+    #[tokio::test]
     async fn batch_reads_use_shared_hot_packs_across_storage_instances() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(LocalObjectStoreClient::new(dir.path().to_path_buf()).unwrap());
