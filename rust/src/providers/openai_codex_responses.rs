@@ -353,13 +353,13 @@ impl OpenAICodexResponsesClient {
             .timeout(timeout.unwrap_or(Duration::from_secs(180)))
             .header(header::AUTHORIZATION, format!("Bearer {}", self.token))
             .header(header::USER_AGENT, &self.identity.user_agent)
-            .header("OpenAI-Beta", OPENAI_BETA_RESPONSES)
             .header(header::ACCEPT, "text/event-stream")
             .header(header::CONTENT_TYPE, "application/json");
         let request = if self.chatgpt_plan {
             request
         } else {
             request
+                .header("OpenAI-Beta", OPENAI_BETA_RESPONSES)
                 .header("chatgpt-account-id", &self.account_id)
                 .header("originator", &self.identity.originator)
         };
@@ -1400,6 +1400,7 @@ mod tests {
         );
         assert!(!request.headers().contains_key("chatgpt-account-id"));
         assert!(!request.headers().contains_key("originator"));
+        assert!(!request.headers().contains_key("openai-beta"));
     }
 
     #[test]
