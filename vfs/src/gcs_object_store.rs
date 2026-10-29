@@ -670,7 +670,7 @@ impl ObjectStoreClient for GcsObjectStoreClient {
         .await
     }
 
-    #[tracing::instrument(name = "gcs.read_range", skip(self), fields(key = %key, offset, length))]
+    #[tracing::instrument(name = "gcs.read_range", skip(self), fields(key = %key, offset = offset, length = length))]
     async fn get_object_range_async(
         &self,
         key: &str,
