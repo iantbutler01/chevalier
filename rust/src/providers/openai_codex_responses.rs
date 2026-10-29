@@ -326,6 +326,16 @@ impl OpenAICodexResponsesClient {
             ] {
                 object.remove(key);
             }
+            if let Some(Value::Array(input)) = object.get_mut("input") {
+                for item in input {
+                    if matches!(
+                        item["type"].as_str(),
+                        Some("function_call" | "custom_tool_call")
+                    ) {
+                        item["namespace"] = serde_json::json!("functions");
+                    }
+                }
+            }
             if let Some(Value::Array(tools)) = object.remove("tools") {
                 if tools
                     .iter()
@@ -1393,6 +1403,17 @@ mod tests {
         assert!(body.get("temperature").is_none());
         assert_eq!(body["tools"][0]["type"], "namespace");
         assert_eq!(body["tools"][0]["tools"][0]["name"], "lookup");
+        let replay = client
+            .build_request_body(
+                &[ConversationMessage::ToolCall(crate::types::ToolCall::new(
+                    "lookup",
+                    serde_json::json!({}),
+                ))],
+                &config,
+                true,
+            )
+            .unwrap();
+        assert_eq!(replay["input"][0]["namespace"], "functions");
         let request = client.sse_request_builder(&body, None).build().unwrap();
         assert_eq!(
             request.url().as_str(),
