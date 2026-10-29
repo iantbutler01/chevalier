@@ -560,6 +560,13 @@ impl OpenAICodexResponsesClient {
         headers: &HeaderMap,
         body: String,
     ) -> Error {
+        if self.chatgpt_plan
+            && (body.contains("subscription_sharing_usage_limit_exceeded")
+                || body.contains("subscription_sharing_user_not_eligible")
+                || body.contains("chatpass_v2_scope_not_authorized"))
+        {
+            return Error::NonRetryable(format!("{status}: {body}"));
+        }
         if let Some(friendly) = codex_friendly_error(status, headers, &body) {
             return friendly;
         }
@@ -626,6 +633,12 @@ impl OpenAICodexResponsesClient {
                 }
                 if sse_json["type"] == "response.completed" {
                     saw_completed.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                if plan && sse_json["type"] == "response.failed" {
+                    return futures::future::ready(Some(vec![Err(Error::NonRetryable(format!(
+                        "ChatGPT response failed: {}",
+                        sse_json["response"]["error"]
+                    )))]));
                 }
                 if let Err(error) = reject_codex_error_event(&sse_json) {
                     return futures::future::ready(Some(vec![Err(error)]));
@@ -1313,6 +1326,45 @@ mod tests {
             "gpt-5.1-codex",
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn chatgpt_plan_requires_a_completed_event_from_the_http_stream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for complete in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 8192];
+                let _ = socket.read(&mut request).await.unwrap();
+                let end = if complete {
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[]}}\n\n"
+                } else {
+                    ""
+                };
+                let body = format!(
+                    "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}}\n\n{end}"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            let mut client = test_client().with_chatgpt_plan();
+            client.api_url = format!("http://{address}/v1/responses");
+            let result = client
+                .get_generation(
+                    &[ConversationMessage::Chat(crate::types::ChatMessage::user(
+                        "hello",
+                    ))],
+                    &GenerationConfig::new("gpt-6.1-sol"),
+                )
+                .await;
+            assert_eq!(result.is_ok(), complete, "{result:?}");
+            server.await.unwrap();
+        }
     }
 
     #[test]
