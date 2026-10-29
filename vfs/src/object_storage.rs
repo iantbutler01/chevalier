@@ -56,6 +56,33 @@ impl ObjectBackedVfsStorageConfig {
     }
 }
 
+const MAX_READ_RANGE_GAP: i64 = 4 * 1024;
+
+struct ReadSlot {
+    path: String,
+    content_hash: String,
+    offset: i64,
+    length: i64,
+}
+
+fn coalesce_read_slots(mut slots: Vec<ReadSlot>) -> Vec<Vec<ReadSlot>> {
+    slots.sort_unstable_by_key(|slot| slot.offset);
+    let mut ranges: Vec<Vec<ReadSlot>> = Vec::new();
+    for slot in slots {
+        match ranges.last_mut() {
+            Some(range)
+                if range.last().is_some_and(|last| {
+                    slot.offset.saturating_sub(last.offset + last.length) <= MAX_READ_RANGE_GAP
+                }) =>
+            {
+                range.push(slot)
+            }
+            _ => ranges.push(vec![slot]),
+        }
+    }
+    ranges
+}
+
 pub struct ObjectBackedVfsStorage {
     cfg: ObjectBackedVfsStorageConfig,
     store: Arc<dyn ObjectStoreClient>,
@@ -453,28 +480,36 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
             manifest_by_path.remove(&path);
         }
 
-        let mut packs: HashMap<String, Vec<(String, String, i64, i64)>> = HashMap::new();
+        let mut packs: HashMap<String, Vec<ReadSlot>> = HashMap::new();
         for (path, manifest) in manifest_by_path {
-            packs.entry(manifest.pack_slot.pack_key).or_default().push((
-                path,
-                manifest.content_hash,
-                manifest.pack_slot.pack_slot_offset,
-                manifest.pack_slot.pack_slot_length,
-            ));
+            packs
+                .entry(manifest.pack_slot.pack_key)
+                .or_default()
+                .push(ReadSlot {
+                    path,
+                    content_hash: manifest.content_hash,
+                    offset: manifest.pack_slot.pack_slot_offset,
+                    length: manifest.pack_slot.pack_slot_length,
+                });
         }
-        let pack_results = stream::iter(packs)
+        let ranges = packs.into_iter().flat_map(|(key, slots)| {
+            coalesce_read_slots(slots)
+                .into_iter()
+                .map(move |slots| (key.clone(), slots))
+        });
+        let pack_results = stream::iter(ranges)
             .map(|(pack_key, slots)| async move {
                 if let Some(bytes) = self.cache.pack_bytes.get(&pack_key) {
                     return Ok((pack_key, 0, slots, bytes, true));
                 }
                 let range_start = slots
                     .iter()
-                    .map(|(_, _, offset, _)| *offset as u64)
+                    .map(|slot| slot.offset as u64)
                     .min()
                     .unwrap_or(0);
                 let range_end = slots
                     .iter()
-                    .map(|(_, _, offset, length)| (*offset + *length) as u64)
+                    .map(|slot| (slot.offset + slot.length) as u64)
                     .max()
                     .unwrap_or(0);
                 let range_length = range_end.saturating_sub(range_start);
@@ -496,15 +531,25 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
         tracing::info!(
             requested_files = paths.len(),
             cached_files = results.len(),
-            cached_packs = pack_results.iter().filter(|result| result.4).count(),
-            fetched_packs = pack_results.iter().filter(|result| !result.4).count(),
+            cached_ranges = pack_results.iter().filter(|result| result.4).count(),
+            fetched_ranges = pack_results.iter().filter(|result| !result.4).count(),
+            fetched_bytes = pack_results
+                .iter()
+                .filter(|result| !result.4)
+                .map(|result| result.3.len())
+                .sum::<usize>(),
             "vfs.batch_read"
         );
         for (_pack_key, range_start, slots, bytes, _) in pack_results {
-            for (path, content_hash, slot_offset, slot_length) in slots {
-                let offset_within_range = slot_offset as u64 - range_start;
-                let extracted =
-                    extract_slot(bytes.as_slice(), offset_within_range, slot_length as u64)?;
+            for ReadSlot {
+                path,
+                content_hash,
+                offset,
+                length,
+            } in slots
+            {
+                let offset_within_range = offset as u64 - range_start;
+                let extracted = extract_slot(bytes.as_slice(), offset_within_range, length as u64)?;
                 let bytes = Bytes::from(extracted.bytes);
                 if bytes.len() <= self.cfg.small_file_cache_max_bytes {
                     self.put_file_bytes_cache(path.clone(), content_hash, bytes.clone());
@@ -1789,6 +1834,27 @@ mod tests {
                 .and_then(|meta| meta.token_count),
             Some(2)
         );
+    }
+
+    #[test]
+    fn sparse_slots_do_not_fetch_intervening_pack_contents() {
+        let slot = |offset, length| ReadSlot {
+            path: "file".into(),
+            content_hash: "hash".into(),
+            offset,
+            length,
+        };
+        let ranges = coalesce_read_slots(vec![slot(5_000_000, 200), slot(0, 100), slot(150, 50)]);
+        assert_eq!(ranges.len(), 2);
+        let extents = ranges
+            .iter()
+            .map(|range| {
+                let first = range.first().unwrap();
+                let last = range.last().unwrap();
+                (first.offset, last.offset + last.length - first.offset)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(extents, [(0, 200), (5_000_000, 200)]);
     }
 
     #[tokio::test]
