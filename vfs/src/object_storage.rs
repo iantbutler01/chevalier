@@ -492,11 +492,12 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
                     length: manifest.pack_slot.pack_slot_length,
                 });
         }
-        let ranges = packs.into_iter().flat_map(|(key, slots)| {
-            coalesce_read_slots(slots)
-                .into_iter()
-                .map(move |slots| (key.clone(), slots))
-        });
+        let mut ranges = Vec::new();
+        for (key, slots) in packs {
+            for slots in coalesce_read_slots(slots) {
+                ranges.push((key.clone(), slots));
+            }
+        }
         let pack_results = stream::iter(ranges)
             .map(|(pack_key, slots)| async move {
                 if let Some(bytes) = self.cache.pack_bytes.get(&pack_key) {
