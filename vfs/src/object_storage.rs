@@ -465,7 +465,7 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
         let pack_results = stream::iter(packs)
             .map(|(pack_key, slots)| async move {
                 if let Some(bytes) = self.cache.pack_bytes.get(&pack_key) {
-                    return Ok((pack_key, 0, slots, bytes));
+                    return Ok((pack_key, 0, slots, bytes, true));
                 }
                 let range_start = slots
                     .iter()
@@ -487,12 +487,20 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
                         "vfs pack {pack_key} not found"
                     )));
                 };
-                Ok::<_, VfsStorageError>((pack_key, range_start, slots, Arc::new(bytes)))
+                Ok::<_, VfsStorageError>((pack_key, range_start, slots, Arc::new(bytes), false))
             })
             .buffer_unordered(256)
             .try_collect::<Vec<_>>()
             .await?;
-        for (_pack_key, range_start, slots, bytes) in pack_results {
+        #[cfg(feature = "tracing")]
+        tracing::info!(
+            requested_files = paths.len(),
+            cached_files = results.len(),
+            cached_packs = pack_results.iter().filter(|result| result.4).count(),
+            fetched_packs = pack_results.iter().filter(|result| !result.4).count(),
+            "vfs.batch_read"
+        );
+        for (_pack_key, range_start, slots, bytes, _) in pack_results {
             for (path, content_hash, slot_offset, slot_length) in slots {
                 let offset_within_range = slot_offset as u64 - range_start;
                 let extracted =
