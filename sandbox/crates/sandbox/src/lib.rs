@@ -164,6 +164,8 @@ pub struct TlsClientConfig {
 
 #[derive(thiserror::Error, Debug)]
 pub enum SandboxError {
+    #[error("provider unavailable: {0}")]
+    ProviderUnavailable(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("transport error: {0}")]
@@ -408,6 +410,8 @@ impl FreestyleBackendConfig {
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct OpenComputerBackendConfig {
+    #[serde(skip)]
+    pub mount_credentials: Option<MountCredentialMinter>,
     pub api_url: String,
     pub api_key: String,
     pub template_id: String,
@@ -485,6 +489,7 @@ impl std::fmt::Debug for MountCredentialMinter {
 impl Default for OpenComputerBackendConfig {
     fn default() -> Self {
         Self {
+            mount_credentials: None,
             api_url: "https://app.opencomputer.dev".to_string(),
             api_key: String::new(),
             template_id: "base".to_string(),
@@ -1355,7 +1360,12 @@ impl ManagedControl {
     /// Look a sandbox up by the logical session id stamped in its metadata.
     async fn find_by_session_id(&self, session_id: &str) -> Result<Option<ManagedSandbox>> {
         match self {
-            Self::OpenComputer(_) => Ok(None),
+            Self::OpenComputer(control) => Ok(control
+                .list_sessions()
+                .await?
+                .into_iter()
+                .find(|session| session.session_id == session_id)
+                .map(|session| ManagedSandbox { id: session.vm_id })),
             Self::Freestyle(control) => Ok(control
                 .find_by_session_id(session_id)
                 .await?
@@ -1366,7 +1376,7 @@ impl ManagedControl {
     /// Bring a paused or stopped sandbox back before it is handed out as attached.
     async fn ensure_running(&self, sandbox_id: &str) -> Result<()> {
         match self {
-            Self::OpenComputer(_) => Ok(()),
+            Self::OpenComputer(control) => control.ensure_running(sandbox_id).await,
             Self::Freestyle(control) => control.ensure_running(sandbox_id).await,
         }
     }
@@ -1382,7 +1392,7 @@ impl ManagedControl {
         match self {
             Self::OpenComputer(control) => {
                 control
-                    .ensure_configured_mounts(sandbox_id, shared_mounts)
+                    .restore_missing_mounts(sandbox_id, shared_mounts)
                     .await
             }
             Self::Freestyle(control) => {
@@ -1543,10 +1553,7 @@ impl ManagedControl {
 
     async fn state(&self, sandbox_id: &str) -> Result<i32> {
         match self {
-            Self::OpenComputer(control) => {
-                control.get_sandbox(sandbox_id).await?;
-                Ok(proto::vmd::v1::VmState::Running as i32)
-            }
+            Self::OpenComputer(control) => control.get_sandbox(sandbox_id).await?.state(),
             Self::Freestyle(control) => Ok(control
                 .get_sandbox(sandbox_id)
                 .await?
@@ -1557,9 +1564,7 @@ impl ManagedControl {
 
     async fn vm_action(&self, sandbox_id: &str, action: SessionVmAction) -> Result<i32> {
         match self {
-            Self::OpenComputer(_) => Err(SandboxError::Unsupported(format!(
-                "{action:?} is not available for OpenComputer sandboxes"
-            ))),
+            Self::OpenComputer(control) => control.vm_action(sandbox_id, action).await,
             Self::Freestyle(control) => {
                 let action = match action {
                     SessionVmAction::Start | SessionVmAction::Resume => {
@@ -1636,7 +1641,7 @@ enum RebindRestorePolicy {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum SessionVmAction {
+pub(crate) enum SessionVmAction {
     Start,
     Restart,
     Pause,
@@ -4740,8 +4745,14 @@ impl Sandbox {
     }
 
     /// What the provider reports about a session's machine, read without touching it:
-    /// state and metadata. Freestyle only.
+    /// state and metadata, without waking a provider-managed computer.
     pub async fn session_info(&self, session_id: &str) -> Result<SessionInfo> {
+        if let ControlBackend::Managed(ManagedControl::OpenComputer(control)) =
+            &self.inner.control_backend
+        {
+            let provider_id = self.managed_provider_session_id(session_id).await;
+            return control.get_sandbox(&provider_id).await?.session_info();
+        }
         let ControlBackend::Managed(ManagedControl::Freestyle(control)) =
             &self.inner.control_backend
         else {
@@ -4799,8 +4810,19 @@ impl Sandbox {
                 Vec::new(),
             ));
         }
-        if matches!(&self.inner.control_backend, ControlBackend::Managed(_)) {
-            return self.attach_session(session_id).await;
+        if let ControlBackend::Managed(ManagedControl::OpenComputer(control)) =
+            &self.inner.control_backend
+        {
+            let provider_id = self.managed_provider_session_id(session_id).await;
+            let sandbox = control.get_sandbox(&provider_id).await?;
+            return Ok(Session::new_with_backend(
+                self.clone(),
+                session_id.to_string(),
+                sandbox.sandbox_id,
+                control.api_url().to_string(),
+                None,
+                Vec::new(),
+            ));
         }
 
         let (vm, node_endpoint) = self

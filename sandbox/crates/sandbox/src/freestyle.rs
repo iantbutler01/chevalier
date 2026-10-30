@@ -2301,6 +2301,11 @@ fn freestyle_error(status: StatusCode, body: String) -> SandboxError {
                 .map(str::to_string)
         });
     match (status, code.as_deref()) {
+        (status, _) if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS => {
+            SandboxError::ProviderUnavailable(format!(
+                "Freestyle request failed with {status}: {body}"
+            ))
+        }
         (StatusCode::NOT_FOUND, _) => SandboxError::SessionNotFound(format!("Freestyle: {body}")),
         (StatusCode::CONFLICT, _) => SandboxError::ProviderConflict {
             message: format!(
@@ -2740,7 +2745,7 @@ mod tests {
         ));
         assert!(matches!(
             freestyle_error(StatusCode::BAD_GATEWAY, "{}".to_string()),
-            SandboxError::InvalidResponse(_)
+            SandboxError::ProviderUnavailable(_)
         ));
     }
 

@@ -21,6 +21,9 @@ use crate::{
 };
 
 const API_KEY_HEADER: &str = "X-API-Key";
+// OpenComputer routes unpinned organizations by SDK major version. Without this header,
+// new sandboxes are sent to the retired v1 fleet.
+const SDK_VERSION: &str = "2.3.1";
 
 #[derive(Clone)]
 pub(crate) struct OpenComputerControl {
@@ -44,7 +47,10 @@ impl OpenComputerControl {
         }
         Ok(Self {
             cfg,
-            client: Client::new(),
+            client: Client::builder()
+                .user_agent("chevalier-opencomputer/2")
+                .build()
+                .map_err(|error| SandboxError::InvalidConfig(error.to_string()))?,
         })
     }
 
@@ -106,6 +112,51 @@ impl OpenComputerControl {
         decode_json(response, "get sandbox").await
     }
 
+    pub(crate) async fn ensure_running(&self, sandbox_id: &str) -> Result<()> {
+        let sandbox = self.get_sandbox(sandbox_id).await?;
+        match sandbox.status.as_str() {
+            "running" => Ok(()),
+            "hibernated" | "paused" => self.wake(sandbox_id).await,
+            state => Err(SandboxError::InvalidResponse(format!(
+                "OpenComputer sandbox {sandbox_id} cannot run from state {state}"
+            ))),
+        }
+    }
+
+    async fn wake(&self, sandbox_id: &str) -> Result<()> {
+        self.send_empty(
+            self.client
+                .post(self.sandbox_url(sandbox_id, "/wake"))
+                .json(&serde_json::json!({"timeout": self.cfg.timeout_secs})),
+        )
+        .await
+    }
+
+    pub(crate) async fn vm_action(
+        &self,
+        sandbox_id: &str,
+        action: crate::SessionVmAction,
+    ) -> Result<i32> {
+        use crate::SessionVmAction;
+        use crate::proto::vmd::v1::VmState;
+        match action {
+            SessionVmAction::Start | SessionVmAction::Resume => {
+                self.wake(sandbox_id).await?;
+                Ok(VmState::Running as i32)
+            }
+            SessionVmAction::Pause | SessionVmAction::Stop => {
+                self.send_empty(self.client.post(self.sandbox_url(sandbox_id, "/hibernate")))
+                    .await?;
+                Ok(VmState::Paused as i32)
+            }
+            SessionVmAction::Restart => {
+                self.send_empty(self.client.post(self.sandbox_url(sandbox_id, "/reboot")))
+                    .await?;
+                Ok(VmState::Running as i32)
+            }
+        }
+    }
+
     pub(crate) async fn delete_sandbox(&self, sandbox_id: &str) -> Result<()> {
         let response = self
             .client
@@ -127,7 +178,7 @@ impl OpenComputerControl {
         sandbox_id: &str,
         shared_mounts: &[SharedMount],
     ) -> Result<()> {
-        let mounts = self.resolve_mounts(shared_mounts)?;
+        let mounts = self.resolve_mounts(sandbox_id, shared_mounts)?;
         for mount in mounts {
             self.add_mount(sandbox_id, mount).await?;
         }
@@ -135,10 +186,35 @@ impl OpenComputerControl {
     }
 
     pub(crate) async fn list_sessions(&self) -> Result<Vec<crate::SessionInfo>> {
-        Err(SandboxError::Unsupported(
-            "OpenComputer does not expose sandbox listing through the documented API; persist session ids in the caller"
-                .to_string(),
-        ))
+        let response = self.send(self.client.get(self.url("/sandboxes"))).await?;
+        let sandboxes: Vec<OpenComputerSandbox> = decode_json(response, "list sandboxes").await?;
+        sandboxes
+            .into_iter()
+            .map(|sandbox| sandbox.session_info())
+            .collect()
+    }
+
+    pub(crate) async fn restore_missing_mounts(
+        &self,
+        sandbox_id: &str,
+        shared_mounts: &[SharedMount],
+    ) -> Result<()> {
+        let mounts = self.resolve_mounts(sandbox_id, shared_mounts)?;
+        if mounts.is_empty() {
+            return Ok(());
+        }
+        let response = self
+            .send(self.client.get(self.sandbox_url(sandbox_id, "/mounts")))
+            .await?;
+        let existing: Vec<serde_json::Value> = decode_json(response, "list mounts").await?;
+        for mount in mounts {
+            if !existing.iter().any(|entry| {
+                entry.get("path").and_then(serde_json::Value::as_str) == Some(mount.path.as_str())
+            }) {
+                self.add_mount(sandbox_id, mount).await?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn read_file(&self, sandbox_id: &str, path: &str) -> Result<Vec<u8>> {
@@ -563,6 +639,7 @@ impl OpenComputerControl {
 
     fn resolve_mounts(
         &self,
+        sandbox_id: &str,
         shared_mounts: &[SharedMount],
     ) -> Result<Vec<OpenComputerMountConfig>> {
         let mut mounts = self.cfg.mounts.clone();
@@ -575,6 +652,16 @@ impl OpenComputerControl {
                 mount.read_only = Some(shared.read_only);
             }
             render_shared_mount_config(&mut mount, shared);
+            if let Some(credential) = self
+                .cfg
+                .mount_credentials
+                .as_ref()
+                .and_then(|minter| minter.mint(shared, sandbox_id))
+            {
+                for value in mount.secrets.values_mut() {
+                    *value = value.replace(crate::MOUNT_CREDENTIAL_PLACEHOLDER, &credential);
+                }
+            }
             mounts.push(mount);
         }
         Ok(mounts)
@@ -672,6 +759,7 @@ impl OpenComputerControl {
     async fn send(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
         let response = builder
             .header(API_KEY_HEADER, self.cfg.api_key.as_str())
+            .header("x-oc-sdk-version", SDK_VERSION)
             .send()
             .await
             .map_err(|err| {
@@ -702,9 +790,45 @@ pub(crate) struct OpenComputerSandbox {
     pub sandbox_id: String,
     #[serde(rename = "sandboxDomain", default)]
     pub sandbox_domain: Option<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
 }
 
 impl OpenComputerSandbox {
+    pub(crate) fn session_info(&self) -> Result<crate::SessionInfo> {
+        Ok(crate::SessionInfo {
+            session_id: self
+                .metadata
+                .get(crate::META_SESSION_ID)
+                .cloned()
+                .unwrap_or_else(|| self.sandbox_id.clone()),
+            vm_id: self.sandbox_id.clone(),
+            name: self
+                .metadata
+                .get("chevalier.name")
+                .cloned()
+                .unwrap_or_default(),
+            state: self.state()?,
+            parent_session_id: self.metadata.get("chevalier.parent_session_id").cloned(),
+            fork_id: self.metadata.get("chevalier.fork_id").cloned(),
+            metadata: self.metadata.clone(),
+        })
+    }
+
+    pub(crate) fn state(&self) -> Result<i32> {
+        use crate::proto::vmd::v1::VmState;
+        match self.status.as_str() {
+            "running" => Ok(VmState::Running as i32),
+            "hibernated" | "paused" => Ok(VmState::Paused as i32),
+            "stopped" => Ok(VmState::Stopped as i32),
+            "error" | "failed" => Ok(VmState::Error as i32),
+            status => Err(SandboxError::InvalidResponse(format!(
+                "unknown OpenComputer sandbox state: {status}"
+            ))),
+        }
+    }
     pub(crate) fn preview_domain(&self, port: u16) -> Option<String> {
         let domain = self.sandbox_domain.as_deref()?.trim();
         (!domain.is_empty()).then(|| format!("{}-p{port}.{domain}", self.sandbox_id))
@@ -1030,6 +1154,14 @@ where
 async fn opencomputer_response_error(response: reqwest::Response) -> SandboxError {
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
+    if status == StatusCode::NOT_FOUND {
+        return SandboxError::SessionNotFound(format!("OpenComputer: {body}"));
+    }
+    if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+        return SandboxError::ProviderUnavailable(format!(
+            "OpenComputer request failed with {status}: {body}"
+        ));
+    }
     SandboxError::InvalidResponse(format!("OpenComputer request failed with {status}: {body}"))
 }
 
@@ -1042,6 +1174,132 @@ mod tests {
     use super::*;
     use crate::{ResourceLimits, SharedMountAvailability, SharedMountContinuity};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn v2_lifecycle_preserves_the_machine_and_classifies_provider_failures() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for (method, path, status, response) in [
+                (
+                    "POST",
+                    "/api/sandboxes",
+                    "200 OK",
+                    r#"{"sandboxID":"sb-test","status":"running"}"#,
+                ),
+                (
+                    "POST",
+                    "/api/sandboxes/sb-test/hibernate",
+                    "204 No Content",
+                    "",
+                ),
+                (
+                    "GET",
+                    "/api/sandboxes/sb-test",
+                    "200 OK",
+                    r#"{"sandboxID":"sb-test","status":"hibernated"}"#,
+                ),
+                (
+                    "POST",
+                    "/api/sandboxes/sb-test/wake",
+                    "200 OK",
+                    r#"{"sandboxID":"sb-test","status":"running"}"#,
+                ),
+                ("GET", "/api/sandboxes/sb-test/mounts", "200 OK", "[]"),
+                ("POST", "/api/sandboxes/sb-test/mounts", "200 OK", "{}"),
+                ("GET", "/api/sandboxes/missing", "404 Not Found", "{}"),
+                (
+                    "GET",
+                    "/api/sandboxes/unavailable",
+                    "503 Service Unavailable",
+                    "{}",
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                }
+                let headers = String::from_utf8(request).unwrap();
+                assert!(
+                    headers.starts_with(&format!("{method} {path} HTTP/1.1")),
+                    "{headers}"
+                );
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("x-oc-sdk-version: 2.3.1")
+                );
+                assert!(headers.to_ascii_lowercase().contains("x-api-key: test-key"));
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(str::to_string)
+                    })
+                    .and_then(|value| value.trim().parse().ok())
+                    .unwrap_or(0);
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).await.unwrap();
+                if path.ends_with("/wake") {
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["timeout"],
+                        0
+                    );
+                }
+                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let mut control = OpenComputerControl::new(OpenComputerBackendConfig {
+            api_url: endpoint,
+            api_key: "test-key".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let created = control
+            .create_sandbox(None, None, HashMap::new(), None, None, &[])
+            .await
+            .unwrap();
+        assert_eq!(created.sandbox_id, "sb-test");
+        control
+            .vm_action(&created.sandbox_id, crate::SessionVmAction::Pause)
+            .await
+            .unwrap();
+        assert_eq!(
+            control
+                .get_sandbox(&created.sandbox_id)
+                .await
+                .unwrap()
+                .state()
+                .unwrap(),
+            crate::proto::vmd::v1::VmState::Paused as i32
+        );
+        control
+            .vm_action(&created.sandbox_id, crate::SessionVmAction::Resume)
+            .await
+            .unwrap();
+        control.cfg.mounts.push(crate::ManagedMountConfig::command(
+            "/mnt/nym",
+            ["test-fuse", "{mountpoint}"],
+        ));
+        control
+            .restore_missing_mounts(&created.sandbox_id, &[])
+            .await
+            .unwrap();
+        assert!(matches!(
+            control.get_sandbox("missing").await,
+            Err(SandboxError::SessionNotFound(_))
+        ));
+        assert!(matches!(
+            control.get_sandbox("unavailable").await,
+            Err(SandboxError::ProviderUnavailable(_))
+        ));
+        server.await.unwrap();
+    }
 
     #[test]
     fn api_urls_match_opencomputer_control_plane_shape() {
@@ -1383,7 +1641,9 @@ mod tests {
             vfs_scope_path: "/task".to_string(),
         };
 
-        let resolved = control.resolve_mounts(&[shared]).expect("mapped mount");
+        let resolved = control
+            .resolve_mounts("sb-test", &[shared])
+            .expect("mapped mount");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].path, "/nym/vm/mounts/task");
         assert_eq!(resolved[0].remote, "gcs:nym-vfs/task");
@@ -1428,7 +1688,9 @@ mod tests {
             vfs_scope_path: "/conversations/abc/0001_assistant/mount".to_string(),
         };
 
-        let resolved = control.resolve_mounts(&[shared]).expect("mapped mount");
+        let resolved = control
+            .resolve_mounts("sb-test", &[shared])
+            .expect("mapped mount");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].path, "/nym/vm/mounts/task");
         assert_eq!(resolved[0].read_only, Some(false));
@@ -1488,7 +1750,7 @@ mod tests {
         };
 
         assert!(matches!(
-            control.resolve_mounts(&[shared]),
+            control.resolve_mounts("sb-test", &[shared]),
             Err(SandboxError::Unsupported(message)) if message.contains("needs an OpenComputerBackendConfig.shared_mounts mapping")
         ));
     }
