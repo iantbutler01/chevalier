@@ -63,6 +63,7 @@ pub struct Runtime {
     /// insertion point onward.
     tool_order: Arc<RwLock<Vec<String>>>,
     model_tool_names: Arc<RwLock<Option<Vec<String>>>>,
+    discovered_tool_names: Arc<RwLock<Option<Vec<String>>>>,
     tool_types: Arc<RwLock<HashMap<String, String>>>, // tool_name -> type_name mapping
     tool_schemas: Arc<RwLock<HashMap<String, ToolSchemaInfo>>>, // tool_name -> schema info
     tool_constructors: Arc<RwLock<HashMap<String, Arc<ToolConstructor>>>>, // For NativeToolParser
@@ -170,6 +171,7 @@ impl Runtime {
             tools: Arc::new(RwLock::new(HashMap::new())),
             tool_order: Arc::new(RwLock::new(Vec::new())),
             model_tool_names: Arc::new(RwLock::new(None)),
+            discovered_tool_names: Arc::new(RwLock::new(None)),
             tool_types: Arc::new(RwLock::new(HashMap::new())),
             tool_schemas: Arc::new(RwLock::new(HashMap::new())),
             tool_constructors: Arc::new(RwLock::new(HashMap::new())),
@@ -192,6 +194,7 @@ impl Runtime {
             tools: Arc::new(RwLock::new(HashMap::new())),
             tool_order: Arc::new(RwLock::new(Vec::new())),
             model_tool_names: Arc::new(RwLock::new(None)),
+            discovered_tool_names: Arc::new(RwLock::new(None)),
             tool_types: Arc::new(RwLock::new(HashMap::new())),
             tool_schemas: Arc::new(RwLock::new(HashMap::new())),
             tool_constructors: Arc::new(RwLock::new(HashMap::new())),
@@ -481,14 +484,10 @@ impl Runtime {
 
     #[cfg(feature = "claude-subscription")]
     pub(crate) async fn claude_tool_names(&self) -> Vec<String> {
-        let filter = self.model_tool_names.read().await;
-        self.tool_order
-            .read()
-            .await
-            .iter()
-            .filter(|name| filter.as_ref().is_none_or(|names| names.contains(name)))
-            .cloned()
-            .collect()
+        if let Some(names) = self.effective_model_tool_names().await {
+            return names;
+        }
+        self.tool_order.read().await.clone()
     }
 
     async fn mark_tool_schema_only(&self, name: &str) -> Result<()> {
@@ -557,7 +556,7 @@ impl Runtime {
             &effective_model,
             self.tools.clone(),
             self.tool_order.clone(),
-            self.model_tool_names.clone(),
+            Arc::new(RwLock::new(self.effective_model_tool_names().await)),
             self.tool_schemas.clone(),
             params.output_type,
             params.output_schema,
@@ -636,7 +635,7 @@ impl Runtime {
             &effective_model,
             self.tools.clone(),
             self.tool_order.clone(),
-            self.model_tool_names.clone(),
+            Arc::new(RwLock::new(self.effective_model_tool_names().await)),
             self.tool_schemas.clone(),
             params.output_type,
             params.output_schema,

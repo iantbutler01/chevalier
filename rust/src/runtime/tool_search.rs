@@ -14,7 +14,7 @@ impl Runtime {
         }
         if !self.get_tool_schemas().await.contains_key("tool_search") {
             let schemas = self.tool_schemas.clone();
-            let visible = self.model_tool_names.clone();
+            let visible = self.discovered_tool_names.clone();
             self.register_tool_with_schema(
                 "tool_search",
                 "Search the entire tool catalog by case-insensitive regular expression over names, descriptions and parameters. Matching tools are loaded for subsequent calls. Use alternatives such as calendar|appointment, or an exact tool name. Search again whenever another capability is needed.",
@@ -53,11 +53,35 @@ impl Runtime {
                 })),
             ).await?;
         }
-        self.set_model_tool_names(Some(loaded)).await
+        let schemas = self.tool_schemas.read().await;
+        let mut seen = std::collections::HashSet::new();
+        loaded.retain(|name| seen.insert(name.clone()));
+        for name in &loaded {
+            if !schemas.contains_key(name) {
+                return Err(Error::ToolNotFound(name.clone()));
+            }
+        }
+        *self.discovered_tool_names.write().await = Some(loaded);
+        Ok(())
     }
 
     /// The ordered schema set to save alongside the host's conversation checkpoint.
     pub async fn loaded_tool_names(&self) -> Option<Vec<String>> {
-        self.model_tool_names.read().await.clone()
+        self.discovered_tool_names.read().await.clone()
+    }
+    async fn effective_model_tool_names(&self) -> Option<Vec<String>> {
+        let discovered = self.discovered_tool_names.read().await;
+        let visible = self.model_tool_names.read().await;
+        match (discovered.as_ref(), visible.as_ref()) {
+            (Some(loaded), Some(visible)) => Some(
+                loaded
+                    .iter()
+                    .filter(|name| visible.contains(name))
+                    .cloned()
+                    .collect(),
+            ),
+            (Some(loaded), None) => Some(loaded.clone()),
+            (None, visible) => visible.cloned(),
+        }
     }
 }
