@@ -51,6 +51,7 @@ async fn complete(
     let mut called = Vec::new();
     let started = Instant::now();
     for _ in 0..10 {
+        let generation_started = Instant::now();
         let params = RunParams {
             model: Some(model.into()),
             history: Some(history.clone()),
@@ -101,13 +102,16 @@ async fn complete(
                     call.tool_name
                 );
             }
+            let execution_started = Instant::now();
             let content = runtime
                 .execute_tool_call(&call)
                 .await
                 .expect("execute real registered tool");
             eprintln!(
                 "{}",
-                json!({"tool":call.tool_name,"args":call.args,"result":content})
+                json!({"tool":call.tool_name,"args":call.args,"result":content,
+                    "execution_us":execution_started.elapsed().as_micros(),
+                    "generation_and_execution_ms":generation_started.elapsed().as_millis()})
             );
             called.push(call.tool_name.clone());
             history.push(ConversationMessage::ToolResult(
