@@ -484,13 +484,14 @@ fn generate_model_tool_schemas(
     // For each tool, generate schema
     let mut schemas = Vec::new();
 
-    let mut tool_names: Vec<&String> = tool_order
+    let order = model_tool_names.unwrap_or(tool_order);
+    let mut tool_names: Vec<&String> = order
         .iter()
         .filter(|name| tools.contains_key(*name))
         .collect();
     let mut unordered: Vec<&String> = tools
         .keys()
-        .filter(|name| !tool_order.contains(name))
+        .filter(|name| model_tool_names.is_none() && !tool_order.contains(name))
         .collect();
     unordered.sort();
     tool_names.extend(unordered);
