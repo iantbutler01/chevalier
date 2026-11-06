@@ -14,6 +14,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--model', required=True)
 parser.add_argument('--upstream', required=True)
 parser.add_argument('--report', required=True)
+parser.add_argument('--baseline', action='store_true')
 args = parser.parse_args()
 requests = []
 
@@ -52,7 +53,7 @@ env = os.environ.copy()
 env['CHEVALIER_DISCOVERY_MODEL'] = args.model + '@server_url=http://127.0.0.1:' + str(server.server_port)
 try:
     result = subprocess.run([os.path.expanduser('~/.cargo/bin/cargo'), '+1.96.0', 'test',
-                             '--test', 'tool_discovery_live', '--', '--ignored', '--nocapture'], env=env)
+                             '--test', 'tool_discovery_live', 'eager_catalog_baseline' if args.baseline else 'discovers_executes', '--', '--ignored', '--nocapture'], env=env)
 finally:
     server.shutdown()
     with open(args.report, 'w') as output:
@@ -76,6 +77,9 @@ def loaded_from(value):
 expected = {'tool_search'}
 for index, record in enumerate(requests):
     names = [tool.get('name', tool.get('function', {}).get('name')) for tool in record['tools']]
+    if args.baseline:
+        assert set(names) == {'read_appointment_record', 'read_invoice_record'}
+        continue
     if index == 0:
         assert names == ['tool_search'], f'Initial request leaked schemas: {names}'
     for loaded in loaded_from(record.get('input')):

@@ -94,12 +94,13 @@ async fn complete(
         }
         history.push(ConversationMessage::AssistantResponse(response));
         for call in calls {
-            let loaded = runtime.loaded_tool_names().await.unwrap();
-            assert!(
-                loaded.contains(&call.tool_name),
-                "model called undiscovered {}",
-                call.tool_name
-            );
+            if let Some(loaded) = runtime.loaded_tool_names().await {
+                assert!(
+                    loaded.contains(&call.tool_name),
+                    "model called undiscovered {}",
+                    call.tool_name
+                );
+            }
             let content = runtime
                 .execute_tool_call(&call)
                 .await
@@ -155,4 +156,29 @@ async fn discovers_executes_and_resumes_through_live_provider() {
             .unwrap()
             .contains(&"read_appointment_record".into())
     );
+}
+
+/// The pre-discovery Chevalier behavior: send every registered schema each turn.
+#[tokio::test]
+#[ignore = "Calls a real provider; requires CHEVALIER_DISCOVERY_MODEL and credentials"]
+async fn eager_catalog_baseline_through_live_provider() {
+    let model = std::env::var("CHEVALIER_DISCOVERY_MODEL").expect("explicit model route required");
+    let mut runtime = registry().await;
+    let first = complete(
+        &mut runtime,
+        &model,
+        "Read my appointment record and give me its confirmation code and arrival time.",
+        "violet-cedar-7281",
+    )
+    .await;
+    assert!(first.contains(&"read_appointment_record".into()));
+    let mut resumed = registry().await;
+    let second = complete(
+        &mut resumed,
+        &model,
+        "Now read my invoice record and give me its confirmation code and total paid.",
+        "amber-heron-4936",
+    )
+    .await;
+    assert!(second.contains(&"read_invoice_record".into()));
 }
