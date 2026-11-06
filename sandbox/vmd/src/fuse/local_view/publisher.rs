@@ -693,6 +693,28 @@ impl PublisherShared {
     // -- namespace ----------------------------------------------------------
 
     async fn publish_namespace(&self, events: Vec<MountEvent>) -> Result<RunOutcome> {
+        let mut pending = Vec::with_capacity(events.len());
+        for event in events {
+            if let MountMutation::CreateHardLink { new_path, .. } = &event.mutation
+                && matches!(
+                    self.wal
+                        .content_successor(new_path, event.last_sequence())?,
+                    ContentSuccessor::Superseded { aliased: false }
+                )
+            {
+                // A later accepted unlink removed this alias without exposing it
+                // through another hard link. Its source may already be gone too.
+                // Recreating that obsolete alias would stall the entire WAL suffix.
+                continue;
+            }
+            pending.push(event);
+        }
+        let events = pending;
+        if events.is_empty() {
+            return Ok(RunOutcome::Complete {
+                revision: self.client.observed_namespace_revision(),
+            });
+        }
         match self.issue_namespace_events(&events).await {
             Ok(publication) => Ok(RunOutcome::Complete {
                 revision: publication.revision,
@@ -2008,6 +2030,69 @@ mod tests {
             LocalKind::Symlink,
         ));
         assert!(kind_intent_is_superseded(None, LocalKind::Symlink));
+    }
+
+    #[tokio::test]
+    async fn obsolete_hard_link_does_not_stall_publication_but_surviving_aliases_do() {
+        for reexported in [false, true] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let wal = MountWal::open(&MountStateLayout::new(temp.path()), None).expect("open WAL");
+            let link = wal
+                .prepare(
+                    MountMutation::CreateHardLink {
+                        existing_path: "missing.o".into(),
+                        new_path: "temporary.o".into(),
+                    },
+                    PayloadSource::None,
+                    MountPreImage::empty(),
+                )
+                .expect("prepare link");
+            wal.commit(link.clone(), None).expect("commit link");
+            if reexported {
+                let alias = wal
+                    .prepare(
+                        MountMutation::CreateHardLink {
+                            existing_path: "temporary.o".into(),
+                            new_path: "surviving.o".into(),
+                        },
+                        PayloadSource::None,
+                        MountPreImage::empty(),
+                    )
+                    .expect("prepare surviving alias");
+                wal.commit(alias, None).expect("commit surviving alias");
+            }
+            let unlink = wal
+                .prepare(
+                    MountMutation::RemoveFile {
+                        path: "temporary.o".into(),
+                        expected_file_id: None,
+                    },
+                    PayloadSource::None,
+                    MountPreImage::empty(),
+                )
+                .expect("prepare unlink");
+            wal.commit(unlink, None).expect("commit unlink");
+            let publisher = PublisherShared {
+                client: RemoteVfsClient::new("http://127.0.0.1:1", "token", "scope")
+                    .expect("client"),
+                wake: wal.notify_handle(),
+                wal,
+                options: PublisherOptions::defaults("test"),
+                progress: Notify::new(),
+                stop: Notify::new(),
+                stopping: AtomicBool::new(false),
+                state: Mutex::new(PublisherState::default()),
+            };
+            let outcome = publisher
+                .publish_namespace(vec![link.event])
+                .await
+                .expect("publish");
+            if reexported {
+                assert!(matches!(outcome, super::RunOutcome::Failed { .. }));
+            } else {
+                assert!(matches!(outcome, super::RunOutcome::Complete { .. }));
+            }
+        }
     }
 
     #[test]

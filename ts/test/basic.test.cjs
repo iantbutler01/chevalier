@@ -967,6 +967,21 @@ test("vfs gateway preserves exact directory modes in namespace batches", async (
   assert.strictEqual(seen.length, 1);
 });
 
+test("missing namespace sources are conflicts rather than ambiguous server failures", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "chev-missing-link-"));
+  try {
+    const handler = createVfsGatewayServer({ resolveStore: async () => VfsStorage.local(root) });
+    const response = await handler(new Request("http://local/internal/chevalier/vfs/owner/namespace-many", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ operation_ids: ["missing-link"], mutations: [
+        { kind: "create_hard_link", source_path: "missing.o", destination_path: "alias.o" },
+      ] }),
+    }));
+    assert.strictEqual(response.status, 409);
+    assert.strictEqual(fs.existsSync(path.join(root, "alias.o")), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test("namespace publication is atomic and a second client observes every mutation at its committed revision", async () => {
   const entries = new Map([
     ["source", {

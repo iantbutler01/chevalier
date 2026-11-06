@@ -991,6 +991,9 @@ function createVfsGatewayServer(opts) {
                     const conflict = conflictResponseFromStoreError(error, "namespace-many");
                     if (conflict !== null)
                         return conflict;
+                    if (isVfsNotFoundError(error)) {
+                        return errorResponse(409, "namespace mutation source or parent is missing");
+                    }
                     throw error;
                 }
             }
