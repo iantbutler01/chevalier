@@ -1,8 +1,9 @@
 //! Explicitly invoked live inference test. Set CHEVALIER_DISCOVERY_MODEL to the
 //! complete model route and provide that route's normal credential environment.
 use chevalier::runtime::{RunParams, Runtime, ToolFunction};
-use chevalier::types::{ChatMessage, ToolResult};
+use chevalier::types::{ChatMessage, ResponseStreamEvent, ToolResult};
 use chevalier::utils::ConversationMessage;
+use futures::StreamExt;
 use serde_json::json;
 use std::time::{Duration, Instant};
 
@@ -50,16 +51,30 @@ async fn complete(
     let mut called = Vec::new();
     let started = Instant::now();
     for _ in 0..10 {
-        let response = runtime
-            .run(RunParams {
-                model: Some(model.into()),
-                history: Some(history.clone()),
-                max_tokens: Some(2048),
-                timeout: Some(Duration::from_secs(120)),
-                ..Default::default()
-            })
-            .await
-            .expect("live provider generation");
+        let params = RunParams {
+            model: Some(model.into()),
+            history: Some(history.clone()),
+            max_tokens: Some(2048),
+            timeout: Some(Duration::from_secs(120)),
+            ..Default::default()
+        };
+        let response = if std::env::var("CHEVALIER_DISCOVERY_STREAM").as_deref() == Ok("1") {
+            let mut stream = runtime
+                .run_stream(params)
+                .await
+                .expect("live provider stream");
+            let mut completed = None;
+            while let Some(event) = stream.next().await {
+                if let ResponseStreamEvent::Complete(response) =
+                    event.expect("provider stream event")
+                {
+                    completed = Some(response);
+                }
+            }
+            completed.expect("completed provider response")
+        } else {
+            runtime.run(params).await.expect("live provider generation")
+        };
         let calls = response
             .tool_calls()
             .into_iter()
