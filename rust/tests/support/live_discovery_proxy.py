@@ -57,6 +57,32 @@ finally:
     server.shutdown()
     with open(args.report, 'w') as output:
         json.dump(requests, output, indent=2)
+def loaded_from(value):
+    if isinstance(value, dict):
+        if isinstance(value.get('loaded_tool_names'), list):
+            yield value['loaded_tool_names']
+        for child in value.values():
+            yield from loaded_from(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from loaded_from(child)
+    elif isinstance(value, str) and value.startswith('{'):
+        try:
+            decoded = json.loads(value)
+        except ValueError:
+            return
+        yield from loaded_from(decoded)
+
+expected = {'tool_search'}
+for index, record in enumerate(requests):
+    names = [tool.get('name', tool.get('function', {}).get('name')) for tool in record['tools']]
+    if index == 0:
+        assert names == ['tool_search'], f'Initial request leaked schemas: {names}'
+    for loaded in loaded_from(record.get('input')):
+        expected.update(loaded)
+    assert set(names) <= expected, f'Undiscovered schemas sent: {set(names) - expected}'
+    assert 'tool_search' in names, 'Discovery vanished from a subsequent request'
+    record['schema_utf8_bytes'] = len(json.dumps(record['tools'], separators=(',', ':')).encode())
 for record in requests:
     print(json.dumps({'status': record['status'], 'tools': [tool.get('name', tool.get('function', {}).get('name')) for tool in record['tools']], 'usage': record.get('usage')}))
 raise SystemExit(result.returncode)
