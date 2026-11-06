@@ -88,3 +88,21 @@ async fn invalid_search_preserves_discovery_and_can_be_corrected() {
         ["tool_search", "calendar_lookup", "invoice_lookup"]
     );
 }
+
+#[tokio::test]
+async fn natural_search_terms_match_independently_and_nullable_limit_uses_default() {
+    let runtime = registry().await;
+    runtime.enable_tool_search(&[]).await.unwrap();
+    let result = runtime
+        .execute_tool_call(&ToolCall::new(
+            "tool_search",
+            json!({
+                "query":"appointment Find", "limit":null
+            }),
+        ))
+        .await
+        .unwrap();
+    let result: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(result["total_matches"], 1);
+    assert_eq!(result["tools"][0]["name"], "calendar_lookup");
+}
