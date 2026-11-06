@@ -89,6 +89,10 @@ async fn complete(
                 .execute_tool_call(&call)
                 .await
                 .expect("execute real registered tool");
+            eprintln!(
+                "{}",
+                json!({"tool":call.tool_name,"args":call.args,"result":content})
+            );
             called.push(call.tool_name.clone());
             history.push(ConversationMessage::ToolResult(
                 ToolResult::success_with_name(call.tool_use_id, call.tool_name, content),

@@ -25,7 +25,7 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers['Content-Length']))
         payload = json.loads(body)
         tools = payload.get('tools', [])
-        record = {'model': payload.get('model'), 'tools': tools}
+        record = {'model': payload.get('model'), 'tools': tools, 'instructions': payload.get('instructions'), 'input': payload.get('input', payload.get('messages'))}
         requests.append(record)
         headers = {key: value for key, value in self.headers.items()
                    if key.lower() not in ('host', 'content-length', 'connection', 'accept-encoding')}
