@@ -45,18 +45,21 @@ async fn complete(
     request: &str,
     expected: &str,
 ) -> Vec<String> {
+    runtime.set_system_messages(vec![ChatMessage::system("Use the registered tools to read the requested record. Discover a missing capability with tool_search. Do not guess record contents. Return the confirmation and requested detail when you have read the record.")]).await;
     let mut history = vec![ConversationMessage::Chat(ChatMessage::user(request))];
     let mut called = Vec::new();
     let started = Instant::now();
     for _ in 0..10 {
-        let response = runtime.run(RunParams {
-            model: Some(model.into()),
-            system: Some("Use the registered tools to read the requested record. Discover a missing capability with tool_search. Do not guess record contents. Return the confirmation and requested detail when you have read the record.".into()),
-            history: Some(history.clone()),
-            max_tokens: Some(2048),
-            timeout: Some(Duration::from_secs(120)),
-            ..Default::default()
-        }).await.expect("live provider generation");
+        let response = runtime
+            .run(RunParams {
+                model: Some(model.into()),
+                history: Some(history.clone()),
+                max_tokens: Some(2048),
+                timeout: Some(Duration::from_secs(120)),
+                ..Default::default()
+            })
+            .await
+            .expect("live provider generation");
         let calls = response
             .tool_calls()
             .into_iter()
