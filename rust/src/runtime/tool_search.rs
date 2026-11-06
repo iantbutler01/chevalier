@@ -38,8 +38,8 @@ impl Runtime {
                         };
                         let schemas = schemas.read().await;
                         let mut matches = schemas.values().filter(|tool| {
-                            let text = format!("{}\n{}\n{}", tool.name, tool.description, tool.parameters.to_json_schema());
-                            patterns.iter().all(|pattern| pattern.is_match(&text))
+                            let parameters = tool.parameters.to_json_schema().to_string();
+                            patterns.iter().all(|pattern| pattern.is_match(&tool.name) || pattern.is_match(&tool.description) || pattern.is_match(&parameters))
                         }).collect::<Vec<_>>();
                         matches.sort_by(|a,b| (a.name != query, &a.name).cmp(&(b.name != query, &b.name)));
                         let total = matches.len();

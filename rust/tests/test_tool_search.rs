@@ -106,3 +106,19 @@ async fn natural_search_terms_match_independently_and_nullable_limit_uses_defaul
     assert_eq!(result["total_matches"], 1);
     assert_eq!(result["tools"][0]["name"], "calendar_lookup");
 }
+
+#[tokio::test]
+async fn anchored_name_search_matches_the_name_field() {
+    let runtime = registry().await;
+    runtime.enable_tool_search(&[]).await.unwrap();
+    let result = runtime
+        .execute_tool_call(&ToolCall::new(
+            "tool_search",
+            json!({"query":"^calendar_lookup$"}),
+        ))
+        .await
+        .unwrap();
+    let result: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(result["total_matches"], 1);
+    assert_eq!(result["tools"][0]["name"], "calendar_lookup");
+}
