@@ -69,7 +69,7 @@ impl Runtime {
     pub async fn loaded_tool_names(&self) -> Option<Vec<String>> {
         self.discovered_tool_names.read().await.clone()
     }
-    async fn effective_model_tool_names(&self) -> Option<Vec<String>> {
+    pub(super) async fn effective_model_tool_names(&self) -> Option<Vec<String>> {
         let discovered = self.discovered_tool_names.read().await;
         let visible = self.model_tool_names.read().await;
         match (discovered.as_ref(), visible.as_ref()) {
