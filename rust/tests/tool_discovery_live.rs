@@ -45,7 +45,7 @@ async fn complete(
     request: &str,
     expected: &str,
 ) -> Vec<String> {
-    runtime.set_system_messages(vec![ChatMessage::system("Use the registered tools to read the requested record. Discover a missing capability with tool_search. Do not guess record contents. Return the confirmation and requested detail when you have read the record.")]).await;
+    runtime.set_system_messages(vec![ChatMessage::system("Use the registered tools to read the requested record. The loaded tools are only a subset of the catalog. Discover a missing capability with tool_search, and search again when a later request needs a different capability. Searching and reading the requested records does not require another permission question. Do not guess record contents. Return the confirmation and requested detail when you have read the record.")]).await;
     let mut history = vec![ConversationMessage::Chat(ChatMessage::user(request))];
     let mut called = Vec::new();
     let started = Instant::now();
