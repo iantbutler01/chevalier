@@ -15,7 +15,7 @@ impl Runtime {
         if !self.get_tool_schemas().await.contains_key("tool_search") {
             let schemas = self.tool_schemas.clone();
             let visible = self.discovered_tool_names.clone();
-            let callable = self.model_tool_names.clone();
+            let callable = self.searchable_tool_names.clone();
             self.register_tool_with_schema(
                 "tool_search",
                 "Search the entire tool catalog by space-separated case-insensitive search terms over names, descriptions and parameters. Every term must match; each term can use regular-expression alternatives. Matching tools are loaded for subsequent calls. Use alternatives such as calendar|appointment, or an exact tool name. Search again whenever another capability is needed.",
@@ -71,6 +71,22 @@ impl Runtime {
             }
         }
         *self.discovered_tool_names.write().await = Some(loaded);
+        Ok(())
+    }
+
+    /// Set the host's discoverable capabilities independently of the model's current
+    /// presentation (which may expose only a code-execution wrapper). None searches
+    /// the entire registry. Internal executors remain registered and callable by the host.
+    pub async fn set_searchable_tool_names(&self, names: Option<Vec<String>>) -> Result<()> {
+        let schemas = self.tool_schemas.read().await;
+        if let Some(names) = &names {
+            for name in names {
+                if !schemas.contains_key(name) {
+                    return Err(Error::ToolNotFound(name.clone()));
+                }
+            }
+        }
+        *self.searchable_tool_names.write().await = names;
         Ok(())
     }
 

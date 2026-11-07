@@ -126,7 +126,12 @@ async fn anchored_name_search_matches_the_name_field() {
 #[tokio::test]
 async fn discovery_offers_callable_surface_without_removing_internal_tools() {
     let runtime = Runtime::new();
-    for name in ["browser_click", "browser_read_page", "browser_use"] {
+    for name in [
+        "browser_click",
+        "browser_read_page",
+        "browser_use",
+        "execute_code",
+    ] {
         runtime
             .register_tool_with_schema(
                 name,
@@ -139,7 +144,11 @@ async fn discovery_offers_callable_surface_without_removing_internal_tools() {
     }
     runtime.enable_tool_search(&[]).await.unwrap();
     runtime
-        .set_model_tool_names(Some(vec!["tool_search".into(), "browser_use".into()]))
+        .set_searchable_tool_names(Some(vec!["tool_search".into(), "browser_use".into()]))
+        .await
+        .unwrap();
+    runtime
+        .set_model_tool_names(Some(vec!["execute_code".into()]))
         .await
         .unwrap();
     let search = runtime
@@ -160,7 +169,7 @@ async fn discovery_offers_callable_surface_without_removing_internal_tools() {
         "executed browser_click",
         "the controller still needs its internal executor"
     );
-    runtime.set_model_tool_names(None).await.unwrap();
+    runtime.set_searchable_tool_names(None).await.unwrap();
     let search = runtime
         .execute_tool_call(&ToolCall::new(
             "tool_search",

@@ -64,6 +64,7 @@ pub struct Runtime {
     tool_order: Arc<RwLock<Vec<String>>>,
     model_tool_names: Arc<RwLock<Option<Vec<String>>>>,
     discovered_tool_names: Arc<RwLock<Option<Vec<String>>>>,
+    searchable_tool_names: Arc<RwLock<Option<Vec<String>>>>,
     tool_types: Arc<RwLock<HashMap<String, String>>>, // tool_name -> type_name mapping
     tool_schemas: Arc<RwLock<HashMap<String, ToolSchemaInfo>>>, // tool_name -> schema info
     tool_constructors: Arc<RwLock<HashMap<String, Arc<ToolConstructor>>>>, // For NativeToolParser
@@ -172,6 +173,7 @@ impl Runtime {
             tool_order: Arc::new(RwLock::new(Vec::new())),
             model_tool_names: Arc::new(RwLock::new(None)),
             discovered_tool_names: Arc::new(RwLock::new(None)),
+            searchable_tool_names: Arc::new(RwLock::new(None)),
             tool_types: Arc::new(RwLock::new(HashMap::new())),
             tool_schemas: Arc::new(RwLock::new(HashMap::new())),
             tool_constructors: Arc::new(RwLock::new(HashMap::new())),
@@ -195,6 +197,7 @@ impl Runtime {
             tool_order: Arc::new(RwLock::new(Vec::new())),
             model_tool_names: Arc::new(RwLock::new(None)),
             discovered_tool_names: Arc::new(RwLock::new(None)),
+            searchable_tool_names: Arc::new(RwLock::new(None)),
             tool_types: Arc::new(RwLock::new(HashMap::new())),
             tool_schemas: Arc::new(RwLock::new(HashMap::new())),
             tool_constructors: Arc::new(RwLock::new(HashMap::new())),
