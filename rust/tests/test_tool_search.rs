@@ -122,3 +122,55 @@ async fn anchored_name_search_matches_the_name_field() {
     assert_eq!(result["total_matches"], 1);
     assert_eq!(result["tools"][0]["name"], "calendar_lookup");
 }
+
+#[tokio::test]
+async fn discovery_offers_callable_surface_without_removing_internal_tools() {
+    let runtime = Runtime::new();
+    for name in ["browser_click", "browser_read_page", "browser_use"] {
+        runtime
+            .register_tool_with_schema(
+                name,
+                "Browser operation",
+                json!({"type":"object","properties":{}}),
+                ToolFunction::Sync(Box::new(move |_| Ok(format!("executed {name}")))),
+            )
+            .await
+            .unwrap();
+    }
+    runtime.enable_tool_search(&[]).await.unwrap();
+    runtime
+        .set_model_tool_names(Some(vec!["tool_search".into(), "browser_use".into()]))
+        .await
+        .unwrap();
+    let search = runtime
+        .execute_tool_call(&ToolCall::new(
+            "tool_search",
+            json!({"query":"browser", "limit":1}),
+        ))
+        .await
+        .unwrap();
+    let result: Value = serde_json::from_str(&search).unwrap();
+    assert_eq!(result["total_matches"], 1);
+    assert_eq!(result["tools"][0]["name"], "browser_use");
+    assert_eq!(
+        runtime
+            .execute_tool_call(&ToolCall::new("browser_click", json!({})))
+            .await
+            .unwrap(),
+        "executed browser_click",
+        "the controller still needs its internal executor"
+    );
+    runtime.set_model_tool_names(None).await.unwrap();
+    let search = runtime
+        .execute_tool_call(&ToolCall::new(
+            "tool_search",
+            json!({"query":"browser_read_page"}),
+        ))
+        .await
+        .unwrap();
+    let result: Value = serde_json::from_str(&search).unwrap();
+    assert_eq!(
+        result["tools"][0]["name"], "browser_read_page",
+        "visibility changes apply without rebuilding discovery"
+    );
+}

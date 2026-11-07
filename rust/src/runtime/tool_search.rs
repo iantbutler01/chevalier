@@ -15,6 +15,7 @@ impl Runtime {
         if !self.get_tool_schemas().await.contains_key("tool_search") {
             let schemas = self.tool_schemas.clone();
             let visible = self.discovered_tool_names.clone();
+            let callable = self.model_tool_names.clone();
             self.register_tool_with_schema(
                 "tool_search",
                 "Search the entire tool catalog by space-separated case-insensitive search terms over names, descriptions and parameters. Every term must match; each term can use regular-expression alternatives. Matching tools are loaded for subsequent calls. Use alternatives such as calendar|appointment, or an exact tool name. Search again whenever another capability is needed.",
@@ -25,6 +26,7 @@ impl Runtime {
                 ToolFunction::Async(Box::new(move |args| {
                     let schemas = schemas.clone();
                     let visible = visible.clone();
+                    let callable = callable.clone();
                     Box::pin(async move {
                         let query = args["query"].as_str().ok_or_else(|| Error::NonRetryable("tool_search requires query".into()))?;
                         let patterns = query.split_whitespace().map(|term| {
@@ -36,8 +38,12 @@ impl Runtime {
                             Some(value) => value.as_u64().and_then(|value| usize::try_from(value).ok()).filter(|&value| value > 0)
                                 .ok_or_else(|| Error::NonRetryable("limit must be a positive integer".into()))?,
                         };
+                        let callable = callable.read().await.clone();
                         let schemas = schemas.read().await;
                         let mut matches = schemas.values().filter(|tool| {
+                            if callable.as_ref().is_some_and(|names| !names.contains(&tool.name)) {
+                                return false;
+                            }
                             let parameters = tool.parameters.to_json_schema().to_string();
                             patterns.iter().all(|pattern| pattern.is_match(&tool.name) || pattern.is_match(&tool.description) || pattern.is_match(&parameters))
                         }).collect::<Vec<_>>();
