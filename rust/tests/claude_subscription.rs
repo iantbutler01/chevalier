@@ -204,6 +204,34 @@ async fn host_dispatch_all_surfaces_handler_backed_tools() {
     session.close().await.unwrap();
 }
 #[tokio::test]
+async fn empty_auth_probe_does_not_abort_session_startup() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut setup = config("empty-auth-probe");
+    let root = std::env::temp_dir().join(format!("claude-startup-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let wrapper = root.join("claude");
+    let probe = root.join("probed");
+    std::fs::write(&wrapper, format!(
+        "#!/bin/sh\nif [ \"$*\" = 'auth status --json' ] && [ ! -f '{probe}' ]; then\n  touch '{probe}'\n  exit 0\nfi\nexec {cli:?} \"$@\"\n",
+        probe = probe.display(), cli = setup.cli_path.as_ref().unwrap(),
+    )).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    setup.cli_path = Some(wrapper);
+    let session = runtime().await.claude_session(setup).await.unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(5), session.next_event())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(event, ClaudeSessionEvent::Init { .. }),
+        "{event:?}"
+    );
+    session.close().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn missing_resume_target_is_reported_as_such() {
     let mut setup = config("resume-missing");
     setup.resume = Some(chevalier::claude_subscription::ResumeTarget {

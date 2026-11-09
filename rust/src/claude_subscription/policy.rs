@@ -168,6 +168,54 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn auth_status_rechecks_only_empty_documents() {
+        use std::os::unix::fs::PermissionsExt;
+        for (body, expected_attempts, ready) in [
+            (
+                "[ \"$n\" -gt 1 ] || exit 0\necho '{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"apiProvider\":\"firstParty\"}'",
+                2,
+                true,
+            ),
+            (
+                "[ \"$n\" -gt 1 ] || kill -KILL $$\necho '{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"apiProvider\":\"firstParty\"}'",
+                2,
+                true,
+            ),
+            ("echo 'probe failed' >&2\nexit 23", 3, false),
+            ("echo '{\"loggedIn\":false}'\nexit 1", 1, false),
+        ] {
+            let root = std::env::temp_dir().join(format!("claude-auth-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let cli = root.join("claude");
+            let count = root.join("probes");
+            std::fs::write(&cli, format!(
+                "#!/bin/sh\n[ \"$*\" = 'auth status --json' ] || exit 77\nn=0\n[ ! -f '{count}' ] || n=$(cat '{count}')\nn=$((n+1))\nprintf '%s' \"$n\" > '{count}'\n{body}\n",
+                count = count.display(),
+            )).unwrap();
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let status = claude_subscription_status(Some(&cli)).await;
+            assert_eq!(
+                matches!(status, ClaudeSubscriptionStatus::Ready { .. }),
+                ready,
+                "{status:?}"
+            );
+            if expected_attempts == 3 {
+                assert!(
+                    matches!(status, ClaudeSubscriptionStatus::Error { message } if message.contains("exit status: 23") && message.contains("probe failed"))
+                );
+            } else if !ready {
+                assert!(matches!(status, ClaudeSubscriptionStatus::NotLoggedIn));
+            }
+            assert_eq!(
+                std::fs::read_to_string(&count).unwrap(),
+                expected_attempts.to_string()
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn concurrent_version_checks_share_one_probe() {
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("claude-version-{}", uuid::Uuid::new_v4()));
@@ -361,34 +409,54 @@ pub async fn claude_subscription_status(cli_path: Option<&Path>) -> ClaudeSubscr
             };
         }
     };
-    let output = tokio::time::timeout(
-        Duration::from_secs(5),
-        Command::new(cli)
-            .args(["auth", "status", "--json"])
-            .env_clear()
-            .envs(spawn_env("chevalier"))
-            .stdin(Stdio::null())
-            .output(),
-    )
-    .await;
-    let output = match output {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => {
-            return ClaudeSubscriptionStatus::Error {
-                message: e.to_string(),
-            };
+    // This is a read-only preflight, before any session or user generation starts. A CLI
+    // process that exits without a status document has not established a logout.
+    let mut empty_attempts = 0;
+    let output = loop {
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            Command::new(&cli)
+                .kill_on_drop(true)
+                .args(["auth", "status", "--json"])
+                .env_clear()
+                .envs(spawn_env("chevalier"))
+                .stdin(Stdio::null())
+                .output(),
+        )
+        .await;
+        let output = match output {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => {
+                return ClaudeSubscriptionStatus::Error {
+                    message: e.to_string(),
+                };
+            }
+            Err(_) => {
+                return ClaudeSubscriptionStatus::Error {
+                    message: "auth status timed out".into(),
+                };
+            }
+        };
+        if output.stdout.iter().all(u8::is_ascii_whitespace) && empty_attempts < 2 {
+            empty_attempts += 1;
+            tokio::time::sleep(Duration::from_millis(100 * empty_attempts)).await;
+            continue;
         }
-        Err(_) => {
-            return ClaudeSubscriptionStatus::Error {
-                message: "auth status timed out".into(),
-            };
-        }
+        break output;
     };
     let value: serde_json::Value = match serde_json::from_slice(&output.stdout) {
         Ok(v) => v,
         Err(e) => {
             return ClaudeSubscriptionStatus::Error {
-                message: e.to_string(),
+                message: format!(
+                    "claude auth status returned invalid JSON ({}): {e}; stderr: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                        .chars()
+                        .take(1024)
+                        .collect::<String>()
+                        .trim(),
+                ),
             };
         }
     };
