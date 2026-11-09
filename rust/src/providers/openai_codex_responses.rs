@@ -842,9 +842,9 @@ impl InferenceClient for OpenAICodexResponsesClient {
                 .as_ref()
                 .is_some_and(|options| options.websocket) =>
             {
-                super::responses_websocket::connect(
+                let connected = super::responses_websocket::connect(
                     self.websocket_builder()?,
-                    request_body,
+                    request_body.clone(),
                     config.timeout,
                     config
                         .responses
@@ -852,7 +852,25 @@ impl InferenceClient for OpenAICodexResponsesClient {
                         .and_then(|options| options.control.clone())
                         .unwrap_or_default(),
                 )
-                .await
+                .await;
+                match connected {
+                    Err(Error::Inference(message))
+                        if message.starts_with(
+                            "expected HTTP 101 Switching Protocols, got status code ",
+                        ) =>
+                    {
+                        // A rejected upgrade has not sent response.create. Keep the controlled socket path
+                        // for successful handshakes, and use the existing HTTP stream only for this failure.
+                        self.connect_sse_stream(
+                            request_body,
+                            config.timeout,
+                            config.retry_config.clone(),
+                            has_tools,
+                        )
+                        .await
+                    }
+                    result => result,
+                }
             }
             CodexSubscriptionTransport::WebSocket => {
                 self.connect_websocket_stream(request_body, config.timeout, has_tools)
@@ -1340,6 +1358,73 @@ mod tests {
             "gpt-5.1-codex",
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn successful_codex_websockets_keep_controlled_tool_continuations() {
+        use crate::providers::responses_control::{ResponsesControl, ResponsesOptions};
+        use tokio::net::TcpListener;
+        use tokio_websockets::{Message, ServerBuilder};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = ServerBuilder::new().accept(socket).await.unwrap();
+            let initial = socket.next().await.unwrap().unwrap();
+            let initial: Value = serde_json::from_str(initial.as_text().unwrap()).unwrap();
+            assert_eq!(initial["type"], "response.create");
+            socket
+                .send(Message::text(
+                    serde_json::json!({"type":"response.created","response":{"id":"r1"}})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+            socket.send(Message::text(serde_json::json!({"type":"response.steer.pending","steer":{"previous_response_id":"r1"},"required_input":[{"type":"function_call_output","call_id":"call1"}]}).to_string())).await.unwrap();
+            let continuation = socket.next().await.unwrap().unwrap();
+            let continuation: Value =
+                serde_json::from_str(continuation.as_text().unwrap()).unwrap();
+            assert_eq!(continuation["type"], "response.create");
+            assert_eq!(continuation["previous_response_id"], "r1");
+            assert_eq!(continuation["input"][0]["output"], "tool result");
+            socket
+                .send(Message::text(
+                    serde_json::json!({"type":"response.output_text.delta","delta":"continued"})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+            socket.send(Message::text(serde_json::json!({"type":"response.completed","response":{"id":"r1","status":"completed","output":[]}}).to_string())).await.unwrap();
+        });
+        let mut client = test_client();
+        client.api_url = format!("http://{address}/codex/responses");
+        client.websocket_url = format!("ws://{address}/codex/responses");
+        let control = ResponsesControl::default();
+        let mut config = GenerationConfig::new("gpt-6.1-sol");
+        config.responses = Some(ResponsesOptions {
+            websocket: true,
+            control: Some(control.clone()),
+            ..Default::default()
+        });
+        let mut stream = client.connect_and_listen(&[], &config).await.unwrap();
+        let mut text = String::new();
+        let mut continuations = 0;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(chunk) = stream.next().await {
+                match chunk.unwrap() {
+                    StreamChunk::Steering(data) if data["status"] == "pending" => {
+                        control.send("response.create", serde_json::json!([{"type":"function_call_output","call_id":"call1","output":"tool result"}])).await.unwrap();
+                        continuations += 1;
+                    }
+                    StreamChunk::Content(delta) => text.push_str(&delta),
+                    _ => {}
+                }
+            }
+        }).await.expect("controlled tool continuation must complete on the original socket");
+        assert_eq!(continuations, 1);
+        assert_eq!(text, "continued");
+        server.await.unwrap();
     }
 
     #[tokio::test]
