@@ -57,16 +57,26 @@ const PROBE_EXEC_MS: u64 = 10_000;
 /// Prints the mount unit's state, then the SHA-256 of the guest's mount script (empty when
 /// it has none). Root's, because the script directory is.
 const PROBE_COMMAND: &str = "systemctl is-active chevalier-mounts.service 2>/dev/null; sha256sum /etc/chevalier/mounts.sh 2>/dev/null | cut -d' ' -f1; true";
+/// The mount unit's journal and the end of each mount daemon's log (`mount_diagnostics`).
+const MOUNT_DIAGNOSTICS_COMMAND: &str = "{ journalctl -u chevalier-mounts.service -n 40 --no-pager -o short-monotonic; for log in /run/chevalier/mounts/*.log; do [ -f \"$log\" ] || continue; echo \"== $log\"; tail -n 20 \"$log\"; done; } 2>&1 | sed 's/\\x1b\\[[0-9;]*m//g'; true";
+/// The most of `MOUNT_DIAGNOSTICS_COMMAND`'s output kept: its end, where the failure is.
+const MOUNT_DIAGNOSTICS_BYTES: usize = 6_000;
 /// Runs ahead of every session command and terminal. While the guest's mount unit is still
 /// bringing its mounts up (a new VM hydrating its NymFS root, or a boot), it waits for it,
 /// so nothing reads the bare mountpoints the mounts will cover or writes files there that
-/// the mount would then hide. A unit that is up, failed or absent holds nothing (an
-/// attach's mount refresh repairs a failed one), and after 300 s the command runs anyway.
+/// the mount would then hide. A unit that failed holds the command for up to 60 s while the
+/// API starts the mounts again or replaces the computer, and then refuses it
+/// (`GUEST_MOUNTS_FAILED_EXIT` with `GUEST_MOUNTS_FAILED_MARKER` on stderr): a command run on
+/// a computer without its files sees an empty `/nym` and rebuilds what it cannot find. A unit
+/// that is up or absent holds nothing, and after 300 s of mounting the command runs anyway.
 /// `is-active` reads systemd's state over D-Bus, so the session user can run it.
-const MOUNT_GATE: &str = r#"n=0
+const MOUNT_GATE: &str = r#"n=0; f=0
 while [ "$n" -lt 1200 ]; do
   case "$(systemctl is-active chevalier-mounts.service 2>/dev/null)" in
     activating|reloading) ;;
+    failed)
+      f=$((f+1))
+      [ "$f" -le 240 ] || { echo "chevalier: this computer's shared mounts failed; the command was not run" >&2; exit 75; };;
     inactive)
       systemctl -q is-enabled chevalier-mounts.service 2>/dev/null || break
       case "$(systemctl is-system-running 2>/dev/null)" in initializing|starting) ;; *) break;; esac;;
@@ -567,7 +577,7 @@ impl FreestyleControl {
     /// Run a trivial command, proving the VM's guest answers commands. It reads the guest's
     /// mount unit and script, so the answer also says whether its mounts are still coming up
     /// (a fresh or rebooted guest hydrating) and which mount script it runs.
-    pub(crate) async fn probe(&self, vm_id: &str) -> Result<(bool, Option<[u8; 32]>)> {
+    pub(crate) async fn probe(&self, vm_id: &str) -> Result<(GuestMountUnit, Option<[u8; 32]>)> {
         let result = self
             .exec_await(
                 vm_id,
@@ -584,6 +594,30 @@ impl FreestyleControl {
                 "Freestyle VM {vm_id} did not run a probe command (status {status:?})"
             ))),
         }
+    }
+
+    /// What the guest says about its mounts: the unit's journal and the end of each mount
+    /// daemon's log, colour codes removed and capped at `MOUNT_DIAGNOSTICS_BYTES`.
+    pub(crate) async fn mount_diagnostics(&self, vm_id: &str) -> Result<String> {
+        let result = self
+            .exec_await(
+                vm_id,
+                MOUNT_DIAGNOSTICS_COMMAND,
+                None,
+                Some(PROBE_EXEC_MS),
+                None,
+                Some(ROOT_USER),
+            )
+            .await?;
+        let mut text = result.stdout.unwrap_or_default();
+        if text.len() > MOUNT_DIAGNOSTICS_BYTES {
+            let mut cut = text.len() - MOUNT_DIAGNOSTICS_BYTES;
+            while !text.is_char_boundary(cut) {
+                cut += 1;
+            }
+            text.drain(..cut);
+        }
+        Ok(text)
     }
 
     /// SHA-256 of the mount script `shared_mounts` render to for `vm_id`; `None` when there
@@ -1682,11 +1716,26 @@ fn detached_command(shell: &str, command: &str) -> String {
     )
 }
 
-/// `PROBE_COMMAND`'s answer: whether the mount unit is still starting, and the guest's
-/// mount script digest when it printed a well-formed one.
-fn parse_probe(stdout: &str) -> (bool, Option<[u8; 32]>) {
+/// The guest's mount unit, as `PROBE_COMMAND` reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GuestMountUnit {
+    /// Its mounts are still coming up.
+    Starting,
+    /// It ended without every mount up: its daemons are gone.
+    Failed,
+    /// Up, or absent (a guest with no mounts).
+    Settled,
+}
+
+/// `PROBE_COMMAND`'s answer: the mount unit's state, and the guest's mount script digest
+/// when it printed a well-formed one.
+fn parse_probe(stdout: &str) -> (GuestMountUnit, Option<[u8; 32]>) {
     let mut lines = stdout.lines().map(str::trim);
-    let starting = lines.next() == Some("activating");
+    let starting = match lines.next() {
+        Some("activating" | "reloading") => GuestMountUnit::Starting,
+        Some("failed") => GuestMountUnit::Failed,
+        _ => GuestMountUnit::Settled,
+    };
     let digest = lines.next().and_then(|hex| {
         let mut digest = [0u8; 32];
         (hex.len() == 64).then_some(())?;
@@ -2761,6 +2810,50 @@ mod tests {
         );
         assert!(MOUNT_GATE.contains("-lt 1200"), "but never forever");
         assert!(!PROBE_COMMAND.contains("while"), "the probe never waits");
+        assert!(MOUNT_GATE.contains(crate::GUEST_MOUNTS_FAILED_MARKER));
+        assert!(MOUNT_GATE.contains(&format!("exit {}", crate::GUEST_MOUNTS_FAILED_EXIT)));
+    }
+
+    /// Runs `MOUNT_GATE` (its failed-unit hold shortened to two polls) and then `echo ran`,
+    /// with a `systemctl` whose answers are the lines of `states`, one per call, the last
+    /// repeated.
+    fn run_gate(states: &str) -> std::process::Output {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().display().to_string();
+        std::fs::write(format!("{root}/states"), states).unwrap();
+        let systemctl = format!(
+            "#!/bin/sh\nn=$(cat {root}/n 2>/dev/null || echo 0); n=$((n+1)); echo $n > {root}/n\nsed -n \"$n{{p;q;}}\" {root}/states | grep . || tail -n 1 {root}/states\n"
+        );
+        std::fs::write(format!("{root}/systemctl"), systemctl).unwrap();
+        std::process::Command::new("chmod")
+            .args(["+x", &format!("{root}/systemctl")])
+            .status()
+            .unwrap();
+        let gate = MOUNT_GATE.replace("-le 240", "-le 2");
+        assert_ne!(gate, MOUNT_GATE, "the hold is shortened");
+        std::process::Command::new("sh")
+            .args(["-c", &format!("{gate}; echo ran")])
+            .env("PATH", format!("{root}:{}", std::env::var("PATH").unwrap()))
+            .output()
+            .unwrap()
+    }
+
+    /// Crow's computer, 2026-11-15: its mount unit failed and every command ran on a bare
+    /// `/nym`. A command on a computer whose mounts failed and stay failed never runs.
+    #[test]
+    fn a_command_on_a_computer_whose_mounts_failed_is_refused_not_run() {
+        let output = run_gate("failed\n");
+        assert_eq!(output.status.code(), Some(crate::GUEST_MOUNTS_FAILED_EXIT));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("ran"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains(crate::GUEST_MOUNTS_FAILED_MARKER));
+    }
+
+    /// Mounts started again while the command is held: it waits for them and then runs.
+    #[test]
+    fn a_command_held_on_failed_mounts_runs_once_they_are_started_again() {
+        let output = run_gate("failed\nfailed\nactivating\nactivating\nactive\n");
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("ran"));
     }
 
     #[test]
@@ -2955,8 +3048,8 @@ mod tests {
             .arg(&probe)
             .output()
             .unwrap();
-        let (starting, digest) = parse_probe(&String::from_utf8(output.stdout).unwrap());
-        assert!(!starting);
+        let (unit, digest) = parse_probe(&String::from_utf8(output.stdout).unwrap());
+        assert_eq!(unit, GuestMountUnit::Settled);
         assert!(digest.is_some());
         assert_eq!(
             control.mount_script_sha256("vm-1", &mounts).unwrap(),
@@ -2967,8 +3060,9 @@ mod tests {
             digest
         );
         // No script, or no mounts wanted, is never current.
-        assert_eq!(parse_probe("activating\n\n"), (true, None));
-        assert_eq!(parse_probe("inactive\n"), (false, None));
+        assert_eq!(parse_probe("activating\n\n"), (GuestMountUnit::Starting, None));
+        assert_eq!(parse_probe("inactive\n"), (GuestMountUnit::Settled, None));
+        assert_eq!(parse_probe("failed\n"), (GuestMountUnit::Failed, None));
         assert_eq!(control.mount_script_sha256("vm-1", &[]).unwrap(), None);
     }
 

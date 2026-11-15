@@ -459,6 +459,14 @@ pub type FreestyleMountConfig = ManagedMountConfig;
 /// Where a Freestyle mount template's secrets take the credential minted for that mount.
 pub const MOUNT_CREDENTIAL_PLACEHOLDER: &str = "{vfs_credential}";
 
+/// The exit status of a guest command refused because the guest's mounts failed: the command
+/// never ran (see [`GUEST_MOUNTS_FAILED_MARKER`]). Freestyle only.
+pub const GUEST_MOUNTS_FAILED_EXIT: i32 = 75;
+/// What a guest command refused for failed mounts prints on stderr, with
+/// [`GUEST_MOUNTS_FAILED_EXIT`].
+pub const GUEST_MOUNTS_FAILED_MARKER: &str =
+    "chevalier: this computer's shared mounts failed; the command was not run";
+
 /// Mints the credential a guest-run mount presents to its VFS gateway, from the shared
 /// mount and the id of the VM it is rendered for. The value replaces
 /// [`MOUNT_CREDENTIAL_PLACEHOLDER`] in the template's secrets (never its argv, which
@@ -1143,6 +1151,10 @@ pub struct GuestProbe {
     /// The guest's shared mounts are still coming up (a fresh or rebooted guest hydrating
     /// its files). Its commands wait for them in the guest; nothing needs to.
     pub mounts_starting: bool,
+    /// The guest's mount unit ended without every mount up. Its commands are held, then
+    /// refused (`GUEST_MOUNTS_FAILED_EXIT`), until the mounts are started again
+    /// ([`Sandbox::restart_guest_mounts`]) or the computer is replaced.
+    pub mounts_failed: bool,
     /// SHA-256 of the guest's mount script, when it has one. Compared through
     /// [`Sandbox::guest_mounts_current`].
     pub(crate) mount_script_sha256: Option<[u8; 32]>,
@@ -4648,11 +4660,42 @@ impl Sandbox {
         else {
             return Ok(GuestProbe::default());
         };
-        let (mounts_starting, mount_script_sha256) = control.probe(session.vm_id()).await?;
+        let (unit, mount_script_sha256) = control.probe(session.vm_id()).await?;
         Ok(GuestProbe {
-            mounts_starting,
+            mounts_starting: unit == freestyle::GuestMountUnit::Starting,
+            mounts_failed: unit == freestyle::GuestMountUnit::Failed,
             mount_script_sha256,
         })
+    }
+
+    /// Start a guest's mounts again from `shared_mounts`, as a create's bootstrap starts them:
+    /// the script is written anew and the unit started, which runs a failed unit again. Returns
+    /// once the unit is starting; the guest's commands wait for the mounts. Freestyle only;
+    /// other backends bring mounts up in their attach.
+    pub async fn restart_guest_mounts(
+        &self,
+        session: &Session,
+        shared_mounts: &[SharedMount],
+    ) -> Result<()> {
+        let ControlBackend::Managed(ManagedControl::Freestyle(control)) =
+            &self.inner.control_backend
+        else {
+            return Ok(());
+        };
+        control
+            .ensure_configured_mounts(session.vm_id(), shared_mounts)
+            .await
+    }
+
+    /// The guest's own account of its mounts: the mount unit's journal and the end of each
+    /// mount daemon's log. Freestyle only; empty elsewhere.
+    pub async fn guest_mount_diagnostics(&self, session: &Session) -> Result<String> {
+        let ControlBackend::Managed(ManagedControl::Freestyle(control)) =
+            &self.inner.control_backend
+        else {
+            return Ok(String::new());
+        };
+        control.mount_diagnostics(session.vm_id()).await
     }
 
     /// Whether the guest `probe` describes already runs the mount script `shared_mounts`

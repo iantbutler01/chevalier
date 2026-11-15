@@ -305,6 +305,79 @@ kill -0 "$old" || {{ echo "the daemon was killed"; exit 1; }}
     )));
 }
 
+/// One mount at `{root}/point` whose stand-in daemon counts its launches in
+/// `{root}/launches` and exits at once until launch `mounts_on`, which mounts and serves.
+fn flaky_mount_script(guest: &Guest, mounts_on: u32) -> String {
+    let (root, point) = (&guest.root, format!("{}/point", guest.root));
+    let mount = RenderedMount {
+        mount_tag: "test".into(),
+        mountpoint: point.clone(),
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "n=$(( $(cat {root}/launches 2>/dev/null || echo 0) + 1 )); echo $n > {root}/launches; echo \"stand-in launch $n\"; [ $n -ge {mounts_on} ] || exit 3; echo '36 25 0:99 / {point} rw - fuse.test test rw' >> {root}/mountinfo; exec sleep 60"
+            ),
+        ],
+        env: HashMap::new(),
+        read_only: false,
+    };
+    fs::write(
+        format!("{root}/mounts.sh"),
+        guest.localize(&mount_script(&[mount])),
+    )
+    .unwrap();
+    point
+}
+
+/// Crow's computer, 2026-11-15: one daemon exit before mounting failed the whole unit, and
+/// every command then ran on a bare `/nym`. A daemon that exits early is launched again.
+#[test]
+fn a_daemon_that_exits_before_mounting_is_launched_again() {
+    let guest = Guest::new();
+    let point = flaky_mount_script(&guest, 3);
+    let output = guest.run(&format!(
+        "timeout --foreground -k 1 20 sh mounts.sh\ngrep -q ' {point} ' mountinfo\n[ \"$(cat launches)\" = 3 ]"
+    ));
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("mount=test: daemon exited before mounting (launch 1): stand-in launch 1"),
+        "each exit is reported with the daemon's log: {stderr}"
+    );
+}
+
+/// A daemon that never mounts still fails the unit, after `MOUNT_DAEMON_LAUNCHES` launches,
+/// with what it logged.
+#[test]
+fn a_daemon_that_never_mounts_fails_after_its_launches() {
+    let guest = Guest::new();
+    flaky_mount_script(&guest, u32::MAX);
+    let output = guest.run(
+        "set +e\ntimeout --foreground -k 1 20 sh mounts.sh\nstatus=$?\nset -e\n[ \"$status\" = 1 ]\n[ \"$(cat launches)\" = 3 ]",
+    );
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("(launch 3): stand-in launch 3"), "{stderr}");
+    assert!(stderr.contains("mount=test: not ready"), "{stderr}");
+}
+
+/// A new guest stalled after a slow create took longer than the mountpoint's two-second
+/// `mkdir` bound, and `set -e` ended the script before its daemon was launched. The daemon
+/// creates its own mountpoint, so a slow `mkdir` no longer stops the mount.
+#[test]
+fn a_mountpoint_slow_to_create_still_mounts() {
+    let guest = Guest::new();
+    let point = single_mount_script(&guest);
+    // Only the mountpoint's `mkdir` stalls; the script's own directories are made as usual.
+    guest.fake("mkdir", "case \"$*\" in *point*) exec sleep 5;; esac\nexec /bin/mkdir \"$@\"\n");
+    let output = guest.run(&format!(
+        "timeout --foreground -k 1 20 sh mounts.sh\ngrep -q ' {point} ' mountinfo"
+    ));
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("slow to create"));
+}
+
 /// Writes the guest's current script and the attach's next one, starts a live stand-in
 /// daemon for every Nym mount, and lists each mount as mounted.
 fn nym_guest(current: &str, next: &str) -> Guest {

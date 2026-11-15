@@ -225,20 +225,25 @@ flock -w {MOUNT_LOCK_WAIT_SECS} 9 || exit 1
 mount_state() {{ P=$1 timeout -k 1 2 awk '$5 == ENVIRON["P"] {{ found = 1 }} END {{ exit found ? 0 : 3 }}' /proc/self/mountinfo; }}
 "#
     );
+    // Each mount's launch is a function, so a wait can launch a daemon again.
+    for (index, mount) in mounts.iter().enumerate() {
+        script.push_str(&format!("launch_{index}() {{\n{}}}\n", mount.start_script()));
+    }
     // A mount waits only for the earlier mounts it sits inside (started on a bare mountpoint,
     // the parent would later hide it); siblings come up side by side, and the script ends
     // once every mount is up.
     for (index, mount) in mounts.iter().enumerate() {
-        for parent in mounts[..index]
+        for (parent_index, parent) in mounts[..index]
             .iter()
-            .filter(|earlier| contains_path(&earlier.mountpoint, &mount.mountpoint))
+            .enumerate()
+            .filter(|(_, earlier)| contains_path(&earlier.mountpoint, &mount.mountpoint))
         {
-            script.push_str(&parent.wait_script());
+            script.push_str(&parent.wait_script(parent_index));
         }
-        script.push_str(&mount.start_script());
+        script.push_str(&format!("launch_{index}\n"));
     }
-    for mount in mounts {
-        script.push_str(&mount.wait_script());
+    for (index, mount) in mounts.iter().enumerate() {
+        script.push_str(&mount.wait_script(index));
     }
     script
 }
@@ -261,6 +266,13 @@ fn contains_path(outer: &str, inner: &str) -> bool {
 /// mountpoint, where the root later hides them. It sits just inside the exec cap the
 /// whole script runs under.
 const MOUNT_READY_WAIT_SECS: u64 = 280;
+
+/// How many times one run of the mount script launches a mount's daemon. A daemon that exits
+/// before its mount appears (a new guest still stalled after its create, a failed first
+/// request) is launched again after `MOUNT_RELAUNCH_PAUSE_SECS` rather than leaving the
+/// computer with no files: one daemon exit used to fail the whole unit.
+const MOUNT_DAEMON_LAUNCHES: u32 = 3;
+const MOUNT_RELAUNCH_PAUSE_SECS: u32 = 1;
 
 /// A shared mount's launch command after `{placeholder}` rendering.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -330,20 +342,31 @@ impl RenderedMount {
         }
     }
 
-    /// Wait for this mount to appear, whoever launched it, while its daemon lives.
-    pub(super) fn wait_script(&self) -> String {
-        let marker = shell_quote(&format!(
-            "{MOUNT_STATE_DIR}/{}",
-            sanitize_tag(&self.mount_tag)
-        ));
+    /// Wait for this mount to appear, whoever launched it. A daemon that exits before its
+    /// mount appears is reported with the end of its log and launched again
+    /// (`launch_{index}`), up to `MOUNT_DAEMON_LAUNCHES` launches in all.
+    pub(super) fn wait_script(&self, index: usize) -> String {
+        let LaunchParts { marker, log, .. } = self.launch_parts();
         format!(
-            r#"pid=$(cat {marker} 2>/dev/null || echo 0)
-for _ in $(seq 1 {polls}); do mount_state {table_path} && break; kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
-mount_state {table_path} || {{ echo mount=not-ready >&2; exit 1; }}
+            r#"pid=$(cat {marker} 2>/dev/null || echo 0); launches=1
+for _ in $(seq 1 {polls}); do
+  mount_state {table_path} && break
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "mount={tag}: daemon exited before mounting (launch $launches): $(sed 's/\x1b\[[0-9;]*m//g' {log} 2>/dev/null | tail -n 5 | tr '\n' ' ')" >&2
+    [ "$launches" -lt {launches} ] || break
+    launches=$((launches + 1)); rm -f {marker}; sleep {pause}; launch_{index}
+    pid=$(cat {marker} 2>/dev/null || echo 0)
+  fi
+  sleep 0.1
+done
+mount_state {table_path} || {{ echo "mount={tag}: not ready" >&2; exit 1; }}
 "#,
+            tag = sanitize_tag(&self.mount_tag),
             table_path = shell_quote(&mount_table_path(&self.mountpoint)),
             // Polled finely: every mount's wait sits on a new computer's first command.
             polls = MOUNT_READY_WAIT_SECS * 10,
+            launches = MOUNT_DAEMON_LAUNCHES,
+            pause = MOUNT_RELAUNCH_PAUSE_SECS,
         )
     }
 
@@ -379,7 +402,11 @@ if [ "$present" = 3 ]; then
   fi
 fi
 if [ ! -e {marker} ]; then
+  set +e
   timeout -k 1 2 mkdir -p {mountpoint}
+  made=$?
+  set -e
+  [ "$made" = 0 ] || echo "mount: the mountpoint was slow to create; its daemon creates it" >&2
   {exports}
   export CHEVALIER_VFS_READ_ONLY={read_only}
   nohup {argv} >{log} 2>&1 </dev/null 9>&- &
