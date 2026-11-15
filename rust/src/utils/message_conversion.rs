@@ -593,9 +593,18 @@ fn assistant_response_to_google_message(response: &AssistantResponse) -> Value {
     })
 }
 
+/// Whether a provider takes reasoning it did not produce as input. OpenAI's own Responses
+/// API takes a reasoning item only as it returned it (kept whole by `preserve_native`) and
+/// refuses the request over one rebuilt from text, so reasoning from another model, or from
+/// a turn whose native items were not kept, is left out there.
+fn accepts_foreign_reasoning(provider: Provider) -> bool {
+    provider != Provider::OpenAIResponses
+}
+
 fn assistant_response_to_responses_items(
     response: &AssistantResponse,
     preserve_native: bool,
+    provider: Provider,
 ) -> Vec<Value> {
     if preserve_native
         && let Some(items) = response
@@ -635,7 +644,9 @@ fn assistant_response_to_responses_items(
                     attach_signature_to_value(&mut item, value, Provider::OpenAIResponses);
                     idx += 1;
                 }
-                items.push(item);
+                if accepts_foreign_reasoning(provider) {
+                    items.push(item);
+                }
             }
             ResponsePart::Tool { call } => {
                 let mut item = call.to_provider_assistant_message(Provider::OpenAIResponses);
@@ -722,6 +733,7 @@ fn responses_input(
                 input_items.extend(assistant_response_to_responses_items(
                     response,
                     preserve_native,
+                    provider,
                 ));
             }
             ConversationMessage::ToolCall(tool_call) => {
@@ -744,13 +756,15 @@ fn responses_input(
                 }));
             }
             ConversationMessage::Reasoning(reasoning_segment) => {
-                input_items.push(json!({
-                    "type": "reasoning",
-                    "content": [{
-                        "type": "output_text",
-                        "text": reasoning_segment.content
-                    }]
-                }));
+                if accepts_foreign_reasoning(provider) {
+                    input_items.push(json!({
+                        "type": "reasoning",
+                        "content": [{
+                            "type": "output_text",
+                            "text": reasoning_segment.content
+                        }]
+                    }));
+                }
             }
             ConversationMessage::Multimodal(multimodal_msg) => {
                 let role = match multimodal_msg.role {
@@ -963,8 +977,9 @@ pub fn convert_messages_to_provider_format(
                             .push(assistant_response_to_openai_chat_message(response));
                     }
                     Provider::OpenAIResponses | Provider::OpenRouterResponses => {
-                        converted_messages
-                            .extend(assistant_response_to_responses_items(response, false));
+                        converted_messages.extend(assistant_response_to_responses_items(
+                            response, false, provider,
+                        ));
                     }
                 }
             }
@@ -1203,6 +1218,43 @@ mod tests {
         assert_eq!(input[0]["content"][0]["type"], "input_text");
         assert_eq!(input[1]["type"], "function_call_output");
         assert_eq!(input[1]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn openai_responses_input_leaves_out_reasoning_it_did_not_return() {
+        // A turn another model answered, as a history restored after a restart holds it.
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("Fix the discard button")),
+            ConversationMessage::AssistantResponse(AssistantResponse::new(vec![
+                ResponsePart::Reasoning {
+                    text: "look at the source first".into(),
+                },
+                ResponsePart::Text {
+                    text: "Looking.".into(),
+                },
+            ])),
+            ConversationMessage::Reasoning(ReasoningSegment::new("then the tests")),
+        ];
+
+        let (_, openai) =
+            responses_input_for_model(&messages, Provider::OpenAIResponses, "gpt-6.1-sol").unwrap();
+        assert!(
+            openai.iter().all(|item| item["type"] != "reasoning"),
+            "OpenAI refuses a reasoning item it did not return: {openai:?}"
+        );
+        assert_eq!(openai.len(), 2);
+        assert_eq!(openai[1]["content"][0]["text"], "Looking.");
+
+        let (_, openrouter) =
+            responses_input_for_model(&messages, Provider::OpenRouterResponses, "deepseek")
+                .unwrap();
+        assert_eq!(
+            openrouter
+                .iter()
+                .filter(|item| item["type"] == "reasoning")
+                .count(),
+            2
+        );
     }
 
     #[test]
