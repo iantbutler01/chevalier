@@ -817,7 +817,7 @@ impl FreestyleControl {
         } else {
             shell_command(&shell, command)
         };
-        let wrapped = format!("{}; {wrapped}", mount_gate_command());
+        let wrapped = gated(&wrapped);
         let result = self
             .exec_await(
                 vm_id,
@@ -907,10 +907,7 @@ impl FreestyleControl {
                 .join(" ");
             exec_line = format!("env {exports} {exec_line}");
         }
-        query.push((
-            "exec".to_string(),
-            format!("{}; {exec_line}", mount_gate_command()),
-        ));
+        query.push(("exec".to_string(), gated(&exec_line)));
         if let Some(cols) = opts.cols {
             query.push(("cols".to_string(), cols.to_string()));
         }
@@ -1750,6 +1747,13 @@ fn parse_probe(stdout: &str) -> (GuestMountUnit, Option<[u8; 32]>) {
 /// `MOUNT_GATE` as a command to run ahead of another.
 fn mount_gate_command() -> String {
     format!("sh -c {}", shell_quote(MOUNT_GATE))
+}
+
+/// `command` behind `MOUNT_GATE`: it runs only when the gate lets it. The gate is its own
+/// shell, so its refusal (`exit GUEST_MOUNTS_FAILED_EXIT`) ends only that shell; joined with
+/// `;`, the command would run anyway on the bare mountpoints and the refusal's status be lost.
+fn gated(command: &str) -> String {
+    format!("{} && {command}", mount_gate_command())
 }
 
 fn unix_now_secs() -> u64 {
@@ -2814,8 +2818,8 @@ mod tests {
         assert!(MOUNT_GATE.contains(&format!("exit {}", crate::GUEST_MOUNTS_FAILED_EXIT)));
     }
 
-    /// Runs `MOUNT_GATE` (its failed-unit hold shortened to two polls) and then `echo ran`,
-    /// with a `systemctl` whose answers are the lines of `states`, one per call, the last
+    /// Runs `echo ran` behind `MOUNT_GATE` the way `gated` sends a command (the failed-unit
+    /// hold shortened to two polls), with a `systemctl` whose answers are the lines of `states`, one per call, the last
     /// repeated.
     fn run_gate(states: &str) -> std::process::Output {
         let dir = tempfile::tempdir().unwrap();
@@ -2829,10 +2833,12 @@ mod tests {
             .args(["+x", &format!("{root}/systemctl")])
             .status()
             .unwrap();
-        let gate = MOUNT_GATE.replace("-le 240", "-le 2");
-        assert_ne!(gate, MOUNT_GATE, "the hold is shortened");
+        // The command as sessions and terminals send it, behind the gate's own shell.
+        let gated_echo = gated("echo ran");
+        let gate = gated_echo.replace("-le 240", "-le 2");
+        assert_ne!(gate, gated_echo, "the hold is shortened");
         std::process::Command::new("sh")
-            .args(["-c", &format!("{gate}; echo ran")])
+            .args(["-c", &gate])
             .env("PATH", format!("{root}:{}", std::env::var("PATH").unwrap()))
             .output()
             .unwrap()
@@ -2848,6 +2854,16 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&output.stderr).contains(crate::GUEST_MOUNTS_FAILED_MARKER)
         );
+    }
+
+    /// Mounts that are up, or a guest with no mount unit, hold nothing: the command runs.
+    #[test]
+    fn a_command_on_a_computer_whose_mounts_are_up_runs() {
+        for states in ["active\n", "unknown\n"] {
+            let output = run_gate(states);
+            assert!(output.status.success(), "{states}: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("ran"));
+        }
     }
 
     /// Mounts started again while the command is held: it waits for them and then runs.
