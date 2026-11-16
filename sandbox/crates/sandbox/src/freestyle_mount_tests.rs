@@ -370,7 +370,10 @@ fn a_mountpoint_slow_to_create_still_mounts() {
     let guest = Guest::new();
     let point = single_mount_script(&guest);
     // Only the mountpoint's `mkdir` stalls; the script's own directories are made as usual.
-    guest.fake("mkdir", "case \"$*\" in *point*) exec sleep 5;; esac\nexec /bin/mkdir \"$@\"\n");
+    guest.fake(
+        "mkdir",
+        "case \"$*\" in *point*) exec sleep 5;; esac\nexec /bin/mkdir \"$@\"\n",
+    );
     let output = guest.run(&format!(
         "timeout --foreground -k 1 20 sh mounts.sh\ngrep -q ' {point} ' mountinfo"
     ));

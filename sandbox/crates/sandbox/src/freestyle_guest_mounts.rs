@@ -227,7 +227,10 @@ mount_state() {{ P=$1 timeout -k 1 2 awk '$5 == ENVIRON["P"] {{ found = 1 }} END
     );
     // Each mount's launch is a function, so a wait can launch a daemon again.
     for (index, mount) in mounts.iter().enumerate() {
-        script.push_str(&format!("launch_{index}() {{\n{}}}\n", mount.start_script()));
+        script.push_str(&format!(
+            "launch_{index}() {{\n{}}}\n",
+            mount.start_script()
+        ));
     }
     // A mount waits only for the earlier mounts it sits inside (started on a bare mountpoint,
     // the parent would later hide it); siblings come up side by side, and the script ends

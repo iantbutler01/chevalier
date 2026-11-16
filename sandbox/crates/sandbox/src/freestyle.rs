@@ -2845,7 +2845,9 @@ mod tests {
         let output = run_gate("failed\n");
         assert_eq!(output.status.code(), Some(crate::GUEST_MOUNTS_FAILED_EXIT));
         assert!(!String::from_utf8_lossy(&output.stdout).contains("ran"));
-        assert!(String::from_utf8_lossy(&output.stderr).contains(crate::GUEST_MOUNTS_FAILED_MARKER));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(crate::GUEST_MOUNTS_FAILED_MARKER)
+        );
     }
 
     /// Mounts started again while the command is held: it waits for them and then runs.
@@ -3060,7 +3062,10 @@ mod tests {
             digest
         );
         // No script, or no mounts wanted, is never current.
-        assert_eq!(parse_probe("activating\n\n"), (GuestMountUnit::Starting, None));
+        assert_eq!(
+            parse_probe("activating\n\n"),
+            (GuestMountUnit::Starting, None)
+        );
         assert_eq!(parse_probe("inactive\n"), (GuestMountUnit::Settled, None));
         assert_eq!(parse_probe("failed\n"), (GuestMountUnit::Failed, None));
         assert_eq!(control.mount_script_sha256("vm-1", &[]).unwrap(), None);
