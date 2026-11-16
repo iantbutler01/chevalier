@@ -96,6 +96,10 @@ const VMD_FORK_CLONE_TIMEOUT: Duration = Duration::from_secs(3600);
 /// few seconds, so issuing `RestartVm` under it guarantees a client-side timeout that
 /// abandons the RPC mid-shutdown. Size the deadline to the lifecycle it covers.
 const VMD_RESTART_TIMEOUT: Duration = Duration::from_secs(240);
+/// A VM counts as still booting for this many readiness budgets after its last start,
+/// resume, or restart. With the default 90 s budget that is 180 s, the same grace vmd
+/// gives a boot before its own health reconciler may act on it.
+const BOOT_GRACE_READINESS_BUDGETS: u32 = 2;
 
 const META_SESSION_ID: &str = "chevalier.session_id";
 const META_PARENT_SESSION_ID: &str = "chevalier.parent_session_id";
@@ -1279,6 +1283,7 @@ struct SandboxInner {
     #[cfg(feature = "host")]
     managed_daemon: Mutex<Option<ManagedDaemon>>,
     ready_vm_rpc: Mutex<HashMap<String, GuestRpcAccess>>,
+    vm_boot_trackers: Mutex<HashMap<String, Arc<VmBootTracker>>>,
     portproxy_channels: Mutex<HashMap<String, Arc<PortproxyChannelEntry>>>,
     node_multiplexers: Mutex<HashMap<String, Arc<NodePortMultiplexer>>>,
     warm_pool_ready: Mutex<HashSet<String>>,
@@ -1616,15 +1621,50 @@ enum ReadinessRecovery {
     /// verbatim and leave the boot in progress. Never restart.
     FreshBoot,
     /// The VM may have been running for a long time with a stale sidecar: allow one
-    /// bounded restart, but only if this call did not itself start/resume the VM.
-    RestartIfNotFreshlyStarted,
+    /// bounded restart, but only once the VM is past its boot grace, whoever started it.
+    RestartIfPastBootGrace,
 }
 
-/// Result of [`Sandbox::ensure_vm_running_tracked`].
-struct EnsuredVm {
-    vm: Vm,
-    /// True when this call issued `StartVm`/`ResumeVm`; false when the VM was already running.
-    freshly_started: bool,
+/// Per-VM state that keeps stale-sidecar recovery from restarting a boot in progress.
+#[derive(Default)]
+struct VmBootTracker {
+    /// Held across the restart decision, the restart, and the readiness wait that
+    /// follows, so concurrent callers share one restart instead of each issuing theirs.
+    restart_gate: Mutex<()>,
+    /// When this facade last asked the daemon to start, resume, or restart the VM.
+    /// Covers resumes and daemons that do not report `started_at`.
+    last_boot_request: std::sync::Mutex<Option<Instant>>,
+}
+
+impl VmBootTracker {
+    fn record_boot_request(&self) {
+        *self
+            .last_boot_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+    }
+
+    fn since_boot_request(&self) -> Option<Duration> {
+        self.last_boot_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map(|requested| requested.elapsed())
+    }
+}
+
+/// Time since the daemon last started this VM, by the daemon's own record.
+fn vm_reported_boot_age(vm: &Vm) -> Option<Duration> {
+    let started_at = vm.started_at.as_ref()?;
+    let started_at = std::time::UNIX_EPOCH.checked_add(Duration::new(
+        u64::try_from(started_at.seconds).ok()?,
+        u32::try_from(started_at.nanos).ok()?,
+    ))?;
+    // A daemon clock slightly ahead of ours reads as a boot that just began.
+    Some(
+        std::time::SystemTime::now()
+            .duration_since(started_at)
+            .unwrap_or_default(),
+    )
 }
 
 #[derive(Clone)]
@@ -1863,7 +1903,7 @@ impl Session {
         self.invalidate_exec_transport_path(endpoint).await;
         let _ = self
             .sandbox
-            .restart_vm_on_endpoint(&self.vm_id, endpoint, "exec transport recovery")
+            .restart_vm_unless_booting(&self.vm_id, endpoint, "exec transport recovery")
             .await;
     }
 
@@ -4095,6 +4135,7 @@ impl Sandbox {
                 #[cfg(feature = "host")]
                 managed_daemon: Mutex::new(None),
                 ready_vm_rpc: Mutex::new(HashMap::new()),
+                vm_boot_trackers: Mutex::new(HashMap::new()),
                 portproxy_channels: Mutex::new(HashMap::new()),
                 node_multiplexers: Mutex::new(HashMap::new()),
                 warm_pool_ready: Mutex::new(HashSet::new()),
@@ -4262,7 +4303,7 @@ impl Sandbox {
                 self.maybe_wait_for_session_guest_rpc(
                     &vm.id,
                     &node_endpoint,
-                    ReadinessRecovery::RestartIfNotFreshlyStarted,
+                    ReadinessRecovery::RestartIfPastBootGrace,
                 )
                 .await?;
             }
@@ -4594,7 +4635,7 @@ impl Sandbox {
             self.maybe_wait_for_session_guest_rpc(
                 &vm.id,
                 &node_endpoint,
-                ReadinessRecovery::RestartIfNotFreshlyStarted,
+                ReadinessRecovery::RestartIfPastBootGrace,
             )
             .await?;
         }
@@ -6457,14 +6498,6 @@ impl Sandbox {
     }
 
     async fn ensure_vm_running(&self, vm_id: &str, endpoint: &str) -> Result<Vm> {
-        Ok(self.ensure_vm_running_tracked(vm_id, endpoint).await?.vm)
-    }
-
-    /// Like [`Self::ensure_vm_running`], but also reports whether this call had to
-    /// start or resume the VM. Readiness policy depends on that distinction: a VM
-    /// that was already running and stops answering has a stale sidecar, while a VM
-    /// we just booted is simply still booting.
-    async fn ensure_vm_running_tracked(&self, vm_id: &str, endpoint: &str) -> Result<EnsuredVm> {
         let mut client = self.vmd_client_for_endpoint(endpoint).await?;
         let mut vm = client
             .get_vm(self.request_with_auth(GetVmRequest {
@@ -6474,9 +6507,9 @@ impl Sandbox {
             .into_inner();
 
         let is_running = vm.state == proto::vmd::v1::VmState::Running as i32;
-        let mut freshly_started = false;
         if !is_running {
             self.invalidate_ready_vm_rpc(vm_id, endpoint).await;
+            let boot_tracker = self.vm_boot_tracker(vm_id, endpoint).await;
             let action_request = self.request_with_auth(VmActionRequest {
                 vm_id: vm_id.to_string(),
             });
@@ -6485,13 +6518,51 @@ impl Sandbox {
             } else {
                 client.start_vm(action_request).await?.into_inner()
             };
-            freshly_started = true;
+            boot_tracker.record_boot_request();
         }
 
-        Ok(EnsuredVm {
-            vm,
-            freshly_started,
-        })
+        Ok(vm)
+    }
+
+    async fn vm_boot_tracker(&self, vm_id: &str, endpoint: &str) -> Arc<VmBootTracker> {
+        let mut trackers = self.inner.vm_boot_trackers.lock().await;
+        Arc::clone(trackers.entry(ready_key(endpoint, vm_id)).or_default())
+    }
+
+    /// Whether the VM started, resumed, or restarted recently enough that a silent
+    /// guest means "still booting" rather than "stale sidecar". Decided from the VM's
+    /// own start time, so it holds for every caller and not only the one that booted it.
+    fn vm_is_within_boot_grace(&self, vm: &Vm, boot_tracker: &VmBootTracker) -> bool {
+        let boot_grace = self.inner.cfg.portproxy_ready_timeout * BOOT_GRACE_READINESS_BUDGETS;
+        let boot_age = match (vm_reported_boot_age(vm), boot_tracker.since_boot_request()) {
+            (Some(reported), Some(requested)) => Some(reported.min(requested)),
+            (reported, requested) => reported.or(requested),
+        };
+        boot_age.is_some_and(|age| age < boot_grace)
+    }
+
+    /// Restart a VM whose guest RPC path keeps failing, unless it is still booting or
+    /// another caller's restart is already in flight.
+    async fn restart_vm_unless_booting(
+        &self,
+        vm_id: &str,
+        endpoint: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let boot_tracker = self.vm_boot_tracker(vm_id, endpoint).await;
+        let _single_flight = boot_tracker.restart_gate.lock().await;
+        let mut client = self.vmd_client_for_endpoint(endpoint).await?;
+        let vm = client
+            .get_vm(self.request_with_auth(GetVmRequest {
+                vm_id: vm_id.to_string(),
+            }))
+            .await?
+            .into_inner();
+        if self.vm_is_within_boot_grace(&vm, &boot_tracker) {
+            return Ok(());
+        }
+        boot_tracker.record_boot_request();
+        self.restart_vm_on_endpoint(vm_id, endpoint, reason).await
     }
 
     async fn invalidate_ready_vm_rpc(&self, vm_id: &str, endpoint: &str) {
@@ -6564,7 +6635,7 @@ impl Sandbox {
         self.ensure_vm_and_get_rpc_access_with(
             vm_id,
             endpoint,
-            ReadinessRecovery::RestartIfNotFreshlyStarted,
+            ReadinessRecovery::RestartIfPastBootGrace,
         )
         .await
     }
@@ -6579,23 +6650,20 @@ impl Sandbox {
             return Ok(access);
         }
 
-        let EnsuredVm {
-            vm,
-            freshly_started,
-        } = self.ensure_vm_running_tracked(vm_id, endpoint).await?;
+        let vm = self.ensure_vm_running(vm_id, endpoint).await?;
         let access = self.guest_rpc_access_from_vm(&vm, endpoint)?;
-        let fresh_boot = freshly_started || recovery == ReadinessRecovery::FreshBoot;
 
         match self.ensure_portproxy_ready(vm_id, endpoint, &access).await {
             Ok(()) => Ok(access),
-            // @dive: A VM this operation just created, started, or resumed is still
-            //        booting; a missed readiness budget is reported as-is and the VM is
-            //        left running for the caller to decide. Restarting it here would only
-            //        mask the real cause and discard the boot in progress.
-            Err(err) if fresh_boot => Err(err),
+            // @dive: A VM this operation just created is still booting; a missed
+            //        readiness budget is reported as-is and the VM is left running for
+            //        the caller to decide. Restarting it here would only mask the real
+            //        cause and discard the boot in progress.
+            Err(err) if recovery == ReadinessRecovery::FreshBoot => Err(err),
             // @dive: A VM that was already running can survive daemon fail-stop while its
             //        guest RPC sidecars are stale; force exactly one bounded local restart
             //        before cross-node escalation, keeping the original failure attached.
+            //        The restart path itself refuses a VM that is still booting.
             Err(err @ SandboxError::GuestRpcNotReady { .. }) => {
                 self.restart_stale_sidecar_and_wait(vm_id, endpoint, err)
                     .await
@@ -6619,7 +6687,22 @@ impl Sandbox {
             SandboxError::GuestRpcNotReady { waited, .. } => *waited,
             _ => Duration::ZERO,
         };
+        let boot_tracker = self.vm_boot_tracker(vm_id, endpoint).await;
+        let _single_flight = boot_tracker.restart_gate.lock().await;
+        // A caller that held the gate before us may already have recovered the guest.
+        if let Some(access) = self.cached_guest_rpc_access(vm_id, endpoint).await {
+            return Ok(access);
+        }
+        let vm = self.ensure_vm_running(vm_id, endpoint).await?;
+        // @dive: Any caller can find a booting VM already Running: the one that issued
+        //        StartVm, one racing it, or one arriving after another caller's restart.
+        //        Restarting here would kill the boot in progress, and every concurrent
+        //        caller would do the same. Report the miss as-is instead.
+        if self.vm_is_within_boot_grace(&vm, &boot_tracker) {
+            return Err(cause);
+        }
         self.invalidate_ready_vm_rpc(vm_id, endpoint).await;
+        boot_tracker.record_boot_request();
         self.restart_vm_on_endpoint(vm_id, endpoint, &reason)
             .await?;
         let vm = self.ensure_vm_running(vm_id, endpoint).await?;
@@ -6810,6 +6893,11 @@ impl Sandbox {
             }))
             .await?;
         self.invalidate_ready_vm_rpc(vm_id, endpoint).await;
+        self.inner
+            .vm_boot_trackers
+            .lock()
+            .await
+            .remove(&ready_key(endpoint, vm_id));
         self.clear_session_route(session_id, vm_id, expected_fence)
             .await?;
         Ok(())
@@ -7737,6 +7825,7 @@ mod tests {
                 #[cfg(feature = "host")]
                 managed_daemon: Mutex::new(None),
                 ready_vm_rpc: Mutex::new(HashMap::new()),
+                vm_boot_trackers: Mutex::new(HashMap::new()),
                 portproxy_channels: Mutex::new(HashMap::new()),
                 node_multiplexers: Mutex::new(HashMap::new()),
                 warm_pool_ready: Mutex::new(HashSet::new()),
@@ -7788,6 +7877,7 @@ mod tests {
                 #[cfg(feature = "host")]
                 managed_daemon: Mutex::new(None),
                 ready_vm_rpc: Mutex::new(HashMap::new()),
+                vm_boot_trackers: Mutex::new(HashMap::new()),
                 portproxy_channels: Mutex::new(HashMap::new()),
                 node_multiplexers: Mutex::new(HashMap::new()),
                 warm_pool_ready: Mutex::new(HashSet::new()),

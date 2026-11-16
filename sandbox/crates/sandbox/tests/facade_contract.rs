@@ -4,7 +4,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chevalier_sandbox::proto::bracket::portproxy::v1::port_proxy_server::{
     PortProxy, PortProxyServer,
@@ -18,7 +18,7 @@ use chevalier_sandbox::proto::bracket::portproxy::v1::{
     ReadFileResponse, WriteFileRequest, WriteFileStreamRequest, exec_request, exec_response,
     interactive_shell_request, interactive_shell_response, write_file_stream_request,
 };
-use chevalier_sandbox::proto::google::protobuf::Empty;
+use chevalier_sandbox::proto::google::protobuf::{Empty, Timestamp};
 use chevalier_sandbox::proto::vmd::v1::vmd_service_server::{VmdService, VmdServiceServer};
 use chevalier_sandbox::proto::vmd::v1::{
     AttachPciDeviceRequest, CreateSnapshotRequest, CreateVmRequest, CreateVmStreamResponse,
@@ -354,6 +354,7 @@ impl VmdService for MockVmd {
             .get_mut(&vm_id)
             .ok_or_else(|| Status::not_found("vm not found"))?;
         vm.state = VmState::Running as i32;
+        vm.started_at = Some(timestamp_before_now(Duration::ZERO));
         let vm_clone = vm.clone();
         guard.start_calls += 1;
         Ok(Response::new(vm_clone))
@@ -367,11 +368,17 @@ impl VmdService for MockVmd {
     }
 
     async fn restart_vm(&self, request: Request<VmActionRequest>) -> Result<Response<Vm>, Status> {
-        let vm = self
-            .vm_mutate(&request.into_inner().vm_id, VmState::Running as i32, false)
-            .await?;
-        self.state.lock().await.restart_calls += 1;
-        Ok(Response::new(vm))
+        let vm_id = request.into_inner().vm_id;
+        let mut guard = self.state.lock().await;
+        let vm = guard
+            .vms
+            .get_mut(&vm_id)
+            .ok_or_else(|| Status::not_found("vm not found"))?;
+        vm.state = VmState::Running as i32;
+        vm.started_at = Some(timestamp_before_now(Duration::ZERO));
+        let vm_clone = vm.clone();
+        guard.restart_calls += 1;
+        Ok(Response::new(vm_clone))
     }
 
     async fn pause_vm(&self, request: Request<VmActionRequest>) -> Result<Response<Vm>, Status> {
@@ -841,6 +848,25 @@ fn sandbox_config() -> SandboxConfig {
         daemon_start_timeout: Duration::from_secs(2),
         portproxy_ready_timeout: Duration::from_millis(700),
         ..SandboxConfig::default()
+    }
+}
+
+/// A readiness budget long enough that scheduling jitter cannot push a caller that
+/// waited one budget past the two-budget boot grace.
+fn slow_boot_sandbox_config() -> SandboxConfig {
+    SandboxConfig {
+        portproxy_ready_timeout: Duration::from_millis(1500),
+        ..sandbox_config()
+    }
+}
+
+fn timestamp_before_now(age: Duration) -> Timestamp {
+    let since_epoch = (SystemTime::now() - age)
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after the unix epoch");
+    Timestamp {
+        seconds: since_epoch.as_secs() as i64,
+        nanos: since_epoch.subsec_nanos() as i32,
     }
 }
 
@@ -2156,6 +2182,146 @@ async fn stale_sidecar_restart_failure_reports_original_cause() {
 
     let guard = harness.vmd_state.lock().await;
     assert_eq!(guard.restart_calls, 1, "restart is bounded to one attempt");
+    drop(guard);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn callers_joining_a_boot_in_progress_never_restart_it() {
+    let harness = TestHarness::start().await;
+    wait_for_port_open(harness.portproxy_port as u16).await;
+
+    let starter = Sandbox::connect(harness.vmd_endpoint.clone(), slow_boot_sandbox_config())
+        .await
+        .expect("connect starting facade");
+    starter
+        .session(SessionOptions {
+            session_id: Some("session-cold".to_string()),
+            auto_start: false,
+            ..SessionOptions::default()
+        })
+        .await
+        .expect("create stopped session");
+
+    // The guest stays silent for longer than any caller's readiness budget.
+    harness.shell_exec_state.lock().await.fail_readiness_probes = true;
+
+    let wake = tokio::spawn(async move { starter.attach_session("session-cold").await.err() });
+    for _ in 0..400 {
+        if harness.vmd_state.lock().await.start_calls >= 1 {
+            break;
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        harness.vmd_state.lock().await.start_calls,
+        1,
+        "the waking caller starts the stopped VM"
+    );
+
+    // These callers did not start the VM and only ever see it Running. A separate
+    // facade has no local record of the start, so only the daemon's start time can
+    // tell them the VM is still booting.
+    let joiner = Sandbox::connect(harness.vmd_endpoint.clone(), slow_boot_sandbox_config())
+        .await
+        .expect("connect joining facade");
+    let joins: Vec<_> = (0..4)
+        .map(|_| {
+            let joiner = joiner.clone();
+            tokio::spawn(async move { joiner.attach_session("session-cold").await.err() })
+        })
+        .collect();
+
+    let mut errors = vec![wake.await.expect("waking caller task")];
+    for join in joins {
+        errors.push(join.await.expect("joining caller task"));
+    }
+    for err in errors {
+        match err {
+            Some(SandboxError::GuestRpcNotReady { restarted, .. }) => {
+                assert!(!restarted, "a booting VM is reported as not ready, as-is");
+            }
+            other => panic!("expected GuestRpcNotReady from a silent guest, got {other:?}"),
+        }
+    }
+
+    let guard = harness.vmd_state.lock().await;
+    assert_eq!(
+        guard.restart_calls, 0,
+        "no caller may restart a VM that is still booting"
+    );
+    assert_eq!(guard.start_calls, 1, "the boot in progress is left alone");
+    drop(guard);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_callers_share_one_restart_of_a_stale_vm() {
+    let harness = TestHarness::start().await;
+    wait_for_port_open(harness.portproxy_port as u16).await;
+
+    let creator = Sandbox::connect(harness.vmd_endpoint.clone(), slow_boot_sandbox_config())
+        .await
+        .expect("connect creator facade");
+    let session = creator
+        .session(SessionOptions {
+            session_id: Some("session-stale-shared".to_string()),
+            auto_start: true,
+            ..SessionOptions::default()
+        })
+        .await
+        .expect("create healthy session");
+    let vm_id = session.vm_id().to_string();
+
+    // The VM has been up for an hour and its sidecar has gone stale: probes fail
+    // until vmd restarts it.
+    harness
+        .vmd_state
+        .lock()
+        .await
+        .vms
+        .get_mut(&vm_id)
+        .expect("vm exists")
+        .started_at = Some(timestamp_before_now(Duration::from_secs(3600)));
+    harness.shell_exec_state.lock().await.fail_readiness_probes = true;
+    let vmd_state = Arc::clone(&harness.vmd_state);
+    let shell_state = Arc::clone(&harness.shell_exec_state);
+    let repair = tokio::spawn(async move {
+        for _ in 0..1000 {
+            if vmd_state.lock().await.restart_calls >= 1 {
+                shell_state.lock().await.fail_readiness_probes = false;
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!("restart never observed");
+    });
+
+    let attacher = Sandbox::connect(harness.vmd_endpoint.clone(), slow_boot_sandbox_config())
+        .await
+        .expect("connect attaching facade");
+    let attaches: Vec<_> = (0..5)
+        .map(|_| {
+            let attacher = attacher.clone();
+            tokio::spawn(async move { attacher.attach_session("session-stale-shared").await })
+        })
+        .collect();
+    for attach in attaches {
+        let attached = attach
+            .await
+            .expect("attach task")
+            .expect("every caller recovers through the one shared restart");
+        assert_eq!(attached.vm_id(), vm_id);
+    }
+    repair.await.expect("repair task");
+
+    let guard = harness.vmd_state.lock().await;
+    assert_eq!(
+        guard.restart_calls, 1,
+        "five concurrent callers must produce exactly one restart"
+    );
     drop(guard);
 
     harness.shutdown().await;
