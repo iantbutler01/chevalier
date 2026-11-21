@@ -1,10 +1,15 @@
-//! A second model for a first one that fails before it answers.
+//! Answering from a second model when the first fails before it answers.
 //!
-//! The host publishes pairs of model strings, primary to fallback. A client built for a
-//! primary with a pair asks the primary first, once, with a short timeout; when the primary
-//! fails before producing any output (a refused connection, an error status, a timeout, a
-//! stream whose first event is an error) the same request goes to the fallback with the
-//! caller's own retry and timeout settings. A failed primary is skipped for a cooldown, so an
+//! The caller names the fallback with each request (`RunParams::fallback_model`); which
+//! model backs up which is the host's policy, not this crate's. What lives here is the
+//! mechanism and the one piece of state it needs: when a primary last failed.
+//!
+//! A request with a fallback asks the primary first, once, and gives it `PRIMARY_START` to
+//! begin answering. When the primary fails before producing any output (a refused
+//! connection, an error status, no first chunk in time, a stream whose first event is an
+//! error) the same request goes to the fallback with the caller's own retry and timeout
+//! settings. Once output has begun the primary owns the answer: switching then would splice
+//! two models' answers into one. A failed primary is passed over for `COOLDOWN`, so an
 //! outage costs one failed attempt rather than one per call.
 //!
 //! Only Chat Completions providers pair, because the request (tool schemas, message format)
@@ -12,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -28,62 +33,34 @@ use crate::utils::ConversationMessage;
 
 /// How long a failed primary is passed over before it is asked again.
 const COOLDOWN: Duration = Duration::from_secs(60);
-/// The longest the primary may go without sending a byte before the fallback is asked.
-const PRIMARY_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the primary has to connect and send its first chunk. Shorter than a host's own
+/// start deadline (Nym's is 30 s), so the fallback still has time to answer within it.
+const PRIMARY_START: Duration = Duration::from_secs(20);
 /// Providers whose requests share the Chat Completions wire format.
 const CHAT_COMPLETIONS: &[&str] = &["opencode", "openrouter", "custom-openai", "openai"];
 
-pub(super) struct Route {
-    fallback: String,
-    down_until: Mutex<Option<Instant>>,
+/// When each primary model string last failed, until its cooldown ends.
+static DOWN_UNTIL: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(Default::default);
+
+fn primary_up(model: &str) -> bool {
+    let down = DOWN_UNTIL.lock().unwrap_or_else(|e| e.into_inner());
+    down.get(model).is_none_or(|until| Instant::now() >= *until)
 }
 
-impl Route {
-    fn primary_up(&self) -> bool {
-        let down_until = self.down_until.lock().unwrap_or_else(|e| e.into_inner());
-        down_until.is_none_or(|until| Instant::now() >= until)
-    }
-
-    fn mark_down(&self) {
-        *self.down_until.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(Instant::now() + COOLDOWN);
-    }
+fn mark_down(model: &str) {
+    DOWN_UNTIL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(model.to_owned(), Instant::now() + COOLDOWN);
 }
 
-static ROUTES: LazyLock<RwLock<HashMap<String, Arc<Route>>>> = LazyLock::new(Default::default);
-
-/// Replace the published primary-to-fallback pairs. A pair that is unchanged keeps its
-/// cooldown; a pair outside Chat Completions, or one naming itself, is dropped with a warning.
-pub fn set_model_fallbacks(pairs: HashMap<String, String>) {
-    let mut routes = ROUTES.write().unwrap_or_else(|e| e.into_inner());
-    let previous = std::mem::take(&mut *routes);
-    for (primary, fallback) in pairs {
-        if primary == fallback || !chat_completions(&primary) || !chat_completions(&fallback) {
-            tracing::warn!(%primary, %fallback, "model fallback ignored: both models must be distinct Chat Completions models");
-            continue;
-        }
-        let route = match previous.get(&primary) {
-            Some(route) if route.fallback == fallback => route.clone(),
-            _ => Arc::new(Route {
-                fallback,
-                down_until: Mutex::new(None),
-            }),
-        };
-        routes.insert(primary, route);
-    }
-}
-
-fn chat_completions(model: &str) -> bool {
-    super::inference::parse_model_provider(model)
-        .is_some_and(|provider| CHAT_COMPLETIONS.contains(&provider.as_str()))
-}
-
-/// The fallback published for `model`, with the route that remembers its cooldown.
-pub(super) fn route_for(model: &str) -> Option<(String, Arc<Route>)> {
-    let routes = ROUTES.read().unwrap_or_else(|e| e.into_inner());
-    routes
-        .get(model)
-        .map(|route| (route.fallback.clone(), route.clone()))
+/// Whether `primary` can be backed by `fallback`: two distinct Chat Completions models.
+pub(super) fn pairable(primary: &str, fallback: &str) -> bool {
+    let chat = |model: &str| {
+        super::inference::parse_model_provider(model)
+            .is_some_and(|provider| CHAT_COMPLETIONS.contains(&provider.as_str()))
+    };
+    primary != fallback && chat(primary) && chat(fallback)
 }
 
 /// Whether the primary's failure says the provider is unwell, so the fallback should answer.
@@ -100,33 +77,34 @@ fn provider_failed(error: &Error) -> bool {
 pub(super) struct FailoverClient {
     primary_model: String,
     primary: Box<dyn InferenceClient>,
+    fallback_model: String,
     fallback: Box<dyn InferenceClient>,
-    route: Arc<Route>,
 }
+
+type ChunkStream = Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>;
 
 impl FailoverClient {
     pub(super) fn new(
         primary_model: &str,
         primary: Box<dyn InferenceClient>,
+        fallback_model: &str,
         fallback: Box<dyn InferenceClient>,
-        route: Arc<Route>,
     ) -> Self {
         Self {
             primary_model: primary_model.to_owned(),
             primary,
+            fallback_model: fallback_model.to_owned(),
             fallback,
-            route,
         }
     }
 
-    /// One attempt, bounded by `PRIMARY_TIMEOUT`, so a failing primary hands over quickly.
+    /// The caller's request asked once: retries are the fallback's job.
     fn primary_config(config: &GenerationConfig) -> GenerationConfig {
         let mut config = config.clone();
         config.retry_config = Some(RetryConfig {
             max_retries: 0,
-            ..RetryConfig::default()
+            ..config.retry_config.unwrap_or_default()
         });
-        config.timeout = Some(config.timeout.map_or(PRIMARY_TIMEOUT, |t| t.min(PRIMARY_TIMEOUT)));
         config
     }
 
@@ -134,14 +112,41 @@ impl FailoverClient {
         if !provider_failed(error) {
             return false;
         }
-        self.route.mark_down();
+        mark_down(&self.primary_model);
         tracing::warn!(
             model = %self.primary_model,
-            fallback = %self.route.fallback,
+            fallback = %self.fallback_model,
             error = %error,
             "inference.primary_failed; asking the fallback"
         );
         true
+    }
+
+    /// The primary's stream once its first chunk is in hand, or why it never began.
+    async fn primary_start(
+        &self,
+        messages: &[ConversationMessage],
+        config: &GenerationConfig,
+    ) -> Result<ChunkStream> {
+        let config = Self::primary_config(config);
+        let start = async {
+            let mut chunks = self.primary.connect_and_listen(messages, &config).await?;
+            match chunks.next().await {
+                Some(Ok(first)) => {
+                    Ok(Box::pin(stream::once(async { Ok(first) }).chain(chunks)) as ChunkStream)
+                }
+                Some(Err(error)) => Err(error),
+                None => Ok(Box::pin(stream::empty()) as ChunkStream),
+            }
+        };
+        tokio::time::timeout(PRIMARY_START, start)
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::Inference(format!(
+                    "no first chunk within {}s",
+                    PRIMARY_START.as_secs()
+                )))
+            })
     }
 }
 
@@ -152,7 +157,7 @@ impl InferenceClient for FailoverClient {
         messages: &[ConversationMessage],
         config: &GenerationConfig,
     ) -> Result<GenerationResponse> {
-        if self.route.primary_up() {
+        if primary_up(&self.primary_model) {
             match self
                 .primary
                 .get_generation(messages, &Self::primary_config(config))
@@ -170,24 +175,10 @@ impl InferenceClient for FailoverClient {
         &self,
         messages: &[ConversationMessage],
         config: &GenerationConfig,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
-        if self.route.primary_up() {
-            match self
-                .primary
-                .connect_and_listen(messages, &Self::primary_config(config))
-                .await
-            {
-                Ok(mut chunks) => match chunks.next().await {
-                    // Output has begun; from here the primary owns the answer.
-                    Some(Ok(first)) => {
-                        return Ok(Box::pin(stream::once(async { Ok(first) }).chain(chunks)));
-                    }
-                    None => return Ok(Box::pin(stream::empty())),
-                    Some(Err(error)) if !self.hand_over(&error) => {
-                        return Ok(Box::pin(stream::once(async { Err(error) })));
-                    }
-                    Some(Err(_)) => {}
-                },
+    ) -> Result<ChunkStream> {
+        if primary_up(&self.primary_model) {
+            match self.primary_start(messages, config).await {
+                Ok(chunks) => return Ok(chunks),
                 Err(error) if !self.hand_over(&error) => return Err(error),
                 Err(_) => {}
             }
@@ -212,12 +203,19 @@ impl InferenceClient for FailoverClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::StreamChunk;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Copy)]
+    enum Behaviour {
+        Answer,
+        Fail(fn() -> Error),
+        Hang,
+    }
 
     struct Fake {
         name: &'static str,
-        fail: Option<fn() -> Error>,
+        behaviour: Behaviour,
         calls: Arc<AtomicUsize>,
     }
 
@@ -229,9 +227,9 @@ mod tests {
             _config: &GenerationConfig,
         ) -> Result<GenerationResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            match self.fail {
-                Some(error) => Err(error()),
-                None => Ok(GenerationResponse::text(self.name)),
+            match self.behaviour {
+                Behaviour::Fail(error) => Err(error()),
+                _ => Ok(GenerationResponse::text(self.name)),
             }
         }
 
@@ -239,16 +237,16 @@ mod tests {
             &self,
             _messages: &[ConversationMessage],
             _config: &GenerationConfig,
-        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
+        ) -> Result<ChunkStream> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let fail = self.fail;
-            let name = self.name;
-            Ok(Box::pin(stream::once(async move {
-                match fail {
-                    Some(error) => Err(error()),
-                    None => Ok(StreamChunk::Content(name.to_owned())),
-                }
-            })))
+            let (behaviour, name) = (self.behaviour, self.name);
+            Ok(match behaviour {
+                Behaviour::Hang => Box::pin(stream::pending()),
+                Behaviour::Fail(error) => Box::pin(stream::once(async move { Err(error()) })),
+                Behaviour::Answer => Box::pin(stream::once(async move {
+                    Ok(StreamChunk::Content(name.to_owned()))
+                })),
+            })
         }
 
         fn provider(&self) -> Provider {
@@ -256,15 +254,22 @@ mod tests {
         }
     }
 
+    /// A client whose primary behaves as given, under a model name no other test shares
+    /// (the cooldown is process-wide, keyed by model string).
     fn pair(
-        fail: Option<fn() -> Error>,
+        primary_model: &str,
+        behaviour: Behaviour,
     ) -> (FailoverClient, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let (primary_calls, fallback_calls) = (Arc::default(), Arc::default());
         let client = FailoverClient::new(
-            "opencode:m",
-            Box::new(Fake { name: "primary", fail, calls: Arc::clone(&primary_calls) }),
-            Box::new(Fake { name: "fallback", fail: None, calls: Arc::clone(&fallback_calls) }),
-            Arc::new(Route { fallback: "openrouter:m".into(), down_until: Mutex::new(None) }),
+            primary_model,
+            Box::new(Fake { name: "primary", behaviour, calls: Arc::clone(&primary_calls) }),
+            "openrouter:m",
+            Box::new(Fake {
+                name: "fallback",
+                behaviour: Behaviour::Answer,
+                calls: Arc::clone(&fallback_calls),
+            }),
         );
         (client, primary_calls, fallback_calls)
     }
@@ -280,60 +285,79 @@ mod tests {
         }
     }
 
+    fn calls(primary: &AtomicUsize, fallback: &AtomicUsize) -> (usize, usize) {
+        (primary.load(Ordering::SeqCst), fallback.load(Ordering::SeqCst))
+    }
+
     #[tokio::test]
     async fn a_healthy_primary_answers_and_the_fallback_is_never_asked() {
-        let (client, primary, fallback) = pair(None);
+        let (client, primary, fallback) = pair("opencode:healthy", Behaviour::Answer);
         assert_eq!(first_content(&client).await.unwrap(), "primary");
         let response = client.get_generation(&[], &GenerationConfig::default()).await.unwrap();
         assert_eq!(response.content, "primary");
-        assert_eq!((primary.load(Ordering::SeqCst), fallback.load(Ordering::SeqCst)), (2, 0));
+        assert_eq!(calls(&primary, &fallback), (2, 0));
     }
 
     #[tokio::test]
-    async fn an_outage_hands_the_request_over_and_skips_the_primary_while_it_cools_down() {
-        let (client, primary, fallback) =
-            pair(Some(|| Error::Inference("503 Service Unavailable".into())));
+    async fn an_outage_hands_over_and_the_primary_is_passed_over_while_it_cools_down() {
+        let (client, primary, fallback) = pair(
+            "opencode:outage",
+            Behaviour::Fail(|| Error::Inference("503 Service Unavailable".into())),
+        );
         assert_eq!(first_content(&client).await.unwrap(), "fallback");
         assert_eq!(first_content(&client).await.unwrap(), "fallback");
-        let response = client.get_generation(&[], &GenerationConfig::default()).await.unwrap();
-        assert_eq!(response.content, "fallback");
-        assert_eq!((primary.load(Ordering::SeqCst), fallback.load(Ordering::SeqCst)), (1, 3));
+        // A new client for the same primary (the next call) remembers the outage too.
+        let (next, next_primary, _) = pair("opencode:outage", Behaviour::Answer);
+        assert_eq!(first_content(&next).await.unwrap(), "fallback");
+        assert_eq!(calls(&primary, &fallback), (1, 2));
+        assert_eq!(next_primary.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_primary_that_never_starts_answering_is_given_up_on_in_time() {
+        let (client, _, fallback) = pair("opencode:hang", Behaviour::Hang);
+        let started = tokio::time::Instant::now();
+        assert_eq!(first_content(&client).await.unwrap(), "fallback");
+        assert_eq!(started.elapsed(), PRIMARY_START);
+        assert_eq!(fallback.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn a_revoked_key_or_exhausted_balance_hands_over_too() {
-        let (client, _, _) = pair(Some(|| Error::NonRetryable("401 Unauthorized: bad key".into())));
+    async fn a_revoked_key_or_spent_balance_hands_over_too() {
+        let (client, _, _) = pair(
+            "opencode:revoked",
+            Behaviour::Fail(|| Error::NonRetryable("401 Unauthorized: bad key".into())),
+        );
         assert_eq!(first_content(&client).await.unwrap(), "fallback");
-        let (client, _, _) = pair(Some(|| Error::Inference("402 Payment Required: balance".into())));
+        let (client, _, _) = pair(
+            "opencode:spent",
+            Behaviour::Fail(|| Error::Inference("402 Payment Required: balance".into())),
+        );
         assert_eq!(first_content(&client).await.unwrap(), "fallback");
     }
 
     #[tokio::test]
     async fn a_request_rejected_on_its_merits_returns_to_the_caller() {
-        let (client, primary, fallback) =
-            pair(Some(|| Error::ContextLengthExceeded("too long".into())));
+        let (client, _, fallback) = pair(
+            "opencode:too-long",
+            Behaviour::Fail(|| Error::ContextLengthExceeded("too long".into())),
+        );
         assert!(matches!(first_content(&client).await, Err(Error::ContextLengthExceeded(_))));
-        let (bad, _, bad_fallback) =
-            pair(Some(|| Error::NonRetryable("400 Bad Request: schema".into())));
+        let (bad, _, bad_fallback) = pair(
+            "opencode:malformed",
+            Behaviour::Fail(|| Error::NonRetryable("400 Bad Request: schema".into())),
+        );
         assert!(bad.get_generation(&[], &GenerationConfig::default()).await.is_err());
-        assert_eq!(primary.load(Ordering::SeqCst), 1);
-        assert_eq!(fallback.load(Ordering::SeqCst) + bad_fallback.load(Ordering::SeqCst), 0);
-        assert!(client.route.primary_up());
+        assert_eq!(calls(&fallback, &bad_fallback), (0, 0));
+        assert!(primary_up("opencode:too-long") && primary_up("opencode:malformed"));
     }
 
     #[test]
-    fn only_distinct_chat_completions_pairs_are_kept() {
-        let up = "opencode:deepseek-v4.1-flash@reasoning=medium";
-        let down = "openrouter:deepseek/deepseek-v4.1-flash-1017@server_url=https://us.openrouter.ai/api/v1";
-        set_model_fallbacks(HashMap::from([
-            (up.to_owned(), down.to_owned()),
-            ("anthropic:claude-x".to_owned(), down.to_owned()),
-            (down.to_owned(), down.to_owned()),
-        ]));
-        assert_eq!(route_for(up).map(|(fallback, _)| fallback).as_deref(), Some(down));
-        assert!(route_for("anthropic:claude-x").is_none());
-        assert!(route_for(down).is_none());
-        set_model_fallbacks(HashMap::new());
-        assert!(route_for(up).is_none());
+    fn only_distinct_chat_completions_models_pair() {
+        let opencode = "opencode:deepseek-v4.1-flash@reasoning=medium";
+        let us = "openrouter:deepseek/deepseek-v4.1-flash-1017@server_url=https://us.openrouter.ai/api/v1";
+        assert!(pairable(opencode, us));
+        assert!(!pairable("anthropic:claude-x", us));
+        assert!(!pairable(us, us));
     }
 }

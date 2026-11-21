@@ -129,6 +129,10 @@ pub struct RunParams {
     pub max_tokens: Option<u32>,
     pub reasoning_effort: Option<String>,
     pub model: Option<String>,
+    /// A model to answer instead when `model` fails before it answers (an outage, an error
+    /// status, no first chunk in time). Both must be Chat Completions models; see
+    /// `model_fallback`.
+    pub fallback_model: Option<String>,
     pub api_key: Option<String>,
     pub timeout: Option<std::time::Duration>,
     /// Retry policy for the provider request. When `None`, providers fall back
@@ -558,6 +562,7 @@ impl Runtime {
         let result = inference::call_llm(
             Some(&prompt_text),
             &effective_model,
+            params.fallback_model.as_deref(),
             self.tools.clone(),
             self.tool_order.clone(),
             Arc::new(RwLock::new(self.effective_model_tool_names().await)),
@@ -637,6 +642,7 @@ impl Runtime {
         inference::call_llm_stream(
             Some(&prompt_text),
             &effective_model,
+            params.fallback_model.as_deref(),
             self.tools.clone(),
             self.tool_order.clone(),
             Arc::new(RwLock::new(self.effective_model_tool_names().await)),

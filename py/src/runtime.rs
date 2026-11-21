@@ -82,6 +82,7 @@ impl RunOptions {
             max_tokens: self.max_tokens,
             reasoning_effort: None,
             model: self.model,
+            fallback_model: None,
             api_key: self.api_key,
             timeout: self
                 .timeout_ms

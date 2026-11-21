@@ -39,6 +39,7 @@ fn run_params(
         max_tokens,
         reasoning_effort: None,
         model: model.map(|s| s.to_string()),
+        fallback_model: None,
         api_key: api_key.map(|s| s.to_string()),
         timeout: None,
         retry_config: None,

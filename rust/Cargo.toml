@@ -84,6 +84,7 @@ async-stream = "0.3.6"
 claude-codes = { version = "=2.1.281", default-features = false, features = ["types"], optional = true }
 
 [dev-dependencies]
+tokio = { version = "1.40", features = ["full", "test-util"] }
 tokio-test = "0.4"
 proptest = "1.4"
 tokio-websockets = { version = "0.10.1", features = ["server"] }

@@ -155,6 +155,7 @@ async fn analyze_video(
             max_tokens: None,
             reasoning_effort: None,
             model: None,   // use default from agentic macro
+            fallback_model: None,
             api_key: None, // use default from env
             timeout: None,
             retry_config: None,

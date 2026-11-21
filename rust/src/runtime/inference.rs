@@ -581,30 +581,34 @@ pub fn create_inference_client(
     model_str: &str,
     api_key: Option<&str>,
 ) -> Result<Box<dyn InferenceClient>> {
-    create_inference_client_with_config(model_str, api_key, None)
+    create_inference_client_with_config(model_str, api_key, None, None)
 }
 
-/// The client for `model_str`, answered by its published fallback when it fails before
-/// answering (see `model_fallback`). The caller's `api_key` belongs to the primary; the
-/// fallback resolves its own.
+/// The client for `model_str`, answered by `fallback_model` when it fails before answering
+/// (see `model_fallback`). The caller's `api_key` and `provider_config` belong to the
+/// primary; the fallback resolves its own credentials.
 fn create_inference_client_with_config(
     model_str: &str,
     api_key: Option<&str>,
     provider_config: Option<&ProviderConfig>,
+    fallback_model: Option<&str>,
 ) -> Result<Box<dyn InferenceClient>> {
     let primary = create_single_inference_client(model_str, api_key, provider_config)?;
-    let Some((fallback_model, route)) = super::model_fallback::route_for(model_str) else {
+    let Some(fallback_model) = fallback_model else {
         return Ok(primary);
     };
-    match create_single_inference_client(&fallback_model, None, None) {
-        Ok(fallback) => Ok(Box::new(super::model_fallback::FailoverClient::new(
-            model_str, primary, fallback, route,
-        ))),
-        Err(error) => {
-            tracing::warn!(model = %model_str, fallback = %fallback_model, error = %error, "model fallback unavailable");
-            Ok(primary)
-        }
+    if !super::model_fallback::pairable(model_str, fallback_model) {
+        return Err(Error::NonRetryable(format!(
+            "fallback model '{fallback_model}' cannot back '{model_str}': both must be distinct Chat Completions models"
+        )));
     }
+    let fallback = create_single_inference_client(fallback_model, None, None)?;
+    Ok(Box::new(super::model_fallback::FailoverClient::new(
+        model_str,
+        primary,
+        fallback_model,
+        fallback,
+    )))
 }
 
 /// OpenCode's pay-as-you-go Chat Completions base.
@@ -981,6 +985,7 @@ fn parse_duration_ms(value: &str) -> Result<std::time::Duration> {
 pub async fn call_llm(
     prompt: Option<&str>,
     model: &str,
+    fallback_model: Option<&str>,
     tools: Arc<RwLock<HashMap<String, ToolFunction>>>,
     tool_order: Arc<RwLock<Vec<String>>>,
     model_tool_names: Arc<RwLock<Option<Vec<String>>>>,
@@ -1005,7 +1010,8 @@ pub async fn call_llm(
 ) -> Result<CallResult> {
     // Create client
     let provider_config = resolve_call_provider_config(model, provider_config).await?;
-    let client = create_inference_client_with_config(model, api_key, provider_config.as_ref())?;
+    let client =
+        create_inference_client_with_config(model, api_key, provider_config.as_ref(), fallback_model)?;
     let parsed_model = parse_model_string(model)?;
     let provider_key = resolve_provider_key(model);
     if allow_tool_calls == Some(false)
@@ -1104,6 +1110,7 @@ pub async fn call_llm(
 pub async fn call_llm_stream(
     prompt: Option<&str>,
     model: &str,
+    fallback_model: Option<&str>,
     tools: Arc<RwLock<HashMap<String, ToolFunction>>>,
     tool_order: Arc<RwLock<Vec<String>>>,
     model_tool_names: Arc<RwLock<Option<Vec<String>>>>,
@@ -1129,7 +1136,8 @@ pub async fn call_llm_stream(
 ) -> Result<Pin<Box<dyn Stream<Item = Result<ResponseStreamEvent>> + Send>>> {
     // Create client
     let provider_config = resolve_call_provider_config(model, provider_config).await?;
-    let client = create_inference_client_with_config(model, api_key, provider_config.as_ref())?;
+    let client =
+        create_inference_client_with_config(model, api_key, provider_config.as_ref(), fallback_model)?;
     let parsed_model = parse_model_string(model)?;
     let provider_key = resolve_provider_key(model);
     if allow_tool_calls == Some(false)
@@ -1293,7 +1301,7 @@ mod tests {
             base_url: None,
             user_agent: Some("OpenBracket".to_string()),
         }));
-        let result = create_inference_client_with_config("kimi-coding:k3", None, Some(&config));
+        let result = create_inference_client_with_config("kimi-coding:k3", None, Some(&config), None);
         assert!(result.is_ok());
     }
 
