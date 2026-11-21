@@ -22,6 +22,7 @@ use futures::future::BoxFuture;
 
 pub mod decorators;
 pub mod inference;
+pub mod model_fallback;
 mod tool_search;
 
 /// Accumulated state during runtime execution

@@ -93,6 +93,8 @@ impl Provider {
             "google-genai" | "gemini" | "google-gemini" => Provider::GoogleGenAI,
             "google-anthropic" | "vertexai" => Provider::GoogleAnthropic,
             "openrouter" => Provider::OpenRouter,
+            // OpenCode serves the OpenAI Chat Completions API.
+            "opencode" => Provider::OpenAI,
             _ => return Err(Error::InvalidProvider(provider_str.to_string())),
         };
         Ok((provider, model_name))

@@ -576,6 +576,7 @@ fn resolve_provider_key(model: &str) -> String {
 /// - `openrouter:resp:openai/o4-mini`
 /// - `custom-openai:llama-3@server_url=http://localhost:8000/v1`
 /// - `custom-openai:my-model@server_url=http://localhost:11434/v1@api_key=ollama`
+/// - `opencode:deepseek-v4.1-flash@reasoning=medium` (key from `OPENCODE_API_KEY`)
 pub fn create_inference_client(
     model_str: &str,
     api_key: Option<&str>,
@@ -583,7 +584,38 @@ pub fn create_inference_client(
     create_inference_client_with_config(model_str, api_key, None)
 }
 
+/// The client for `model_str`, answered by its published fallback when it fails before
+/// answering (see `model_fallback`). The caller's `api_key` belongs to the primary; the
+/// fallback resolves its own.
 fn create_inference_client_with_config(
+    model_str: &str,
+    api_key: Option<&str>,
+    provider_config: Option<&ProviderConfig>,
+) -> Result<Box<dyn InferenceClient>> {
+    let primary = create_single_inference_client(model_str, api_key, provider_config)?;
+    let Some((fallback_model, route)) = super::model_fallback::route_for(model_str) else {
+        return Ok(primary);
+    };
+    match create_single_inference_client(&fallback_model, None, None) {
+        Ok(fallback) => Ok(Box::new(super::model_fallback::FailoverClient::new(
+            model_str, primary, fallback, route,
+        ))),
+        Err(error) => {
+            tracing::warn!(model = %model_str, fallback = %fallback_model, error = %error, "model fallback unavailable");
+            Ok(primary)
+        }
+    }
+}
+
+/// OpenCode's pay-as-you-go Chat Completions base.
+const OPENCODE_API_BASE: &str = "https://opencode.ai/inference/openai/v1";
+
+/// The provider of a model string, or `None` when it does not parse.
+pub(super) fn parse_model_provider(model: &str) -> Option<String> {
+    parse_model_string(model).ok().map(|parsed| parsed.provider)
+}
+
+fn create_single_inference_client(
     model_str: &str,
     api_key: Option<&str>,
     provider_config: Option<&ProviderConfig>,
@@ -631,6 +663,8 @@ fn create_inference_client_with_config(
             "custom-openai" => {
                 std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "not-needed".to_string())
             }
+            "opencode" => std::env::var("OPENCODE_API_KEY")
+                .map_err(|_| Error::NonRetryable("OPENCODE_API_KEY not set".to_string()))?,
             _ => {
                 return Err(Error::NonRetryable(format!(
                     "Unknown provider: {}",
@@ -776,6 +810,17 @@ fn create_inference_client_with_config(
                 && let Ok(budget) = r.parse::<u32>()
             {
                 client = client.with_thinking_budget(budget);
+            }
+            Box::new(client.with_image_input(image_input))
+        }
+        "opencode" => {
+            // `@server_url=` names another OpenCode API base; the Chat Completions path is
+            // appended, as for OpenRouter.
+            let base = server_url.as_deref().unwrap_or(OPENCODE_API_BASE);
+            let mut client = OAIClient::new(key, model_name)
+                .with_api_url(format!("{}/chat/completions", base.trim_end_matches('/')));
+            if let Some(r) = reasoning {
+                client = client.with_reasoning(r);
             }
             Box::new(client.with_image_input(image_input))
         }
@@ -969,6 +1014,7 @@ pub async fn call_llm(
             "openai"
                 | "openrouter"
                 | "custom-openai"
+                | "opencode"
                 | "openai-responses"
                 | "openrouter-responses"
                 | "openai-codex-responses"
@@ -1092,6 +1138,7 @@ pub async fn call_llm_stream(
             "openai"
                 | "openrouter"
                 | "custom-openai"
+                | "opencode"
                 | "openai-responses"
                 | "openrouter-responses"
                 | "openai-codex-responses"
@@ -1262,6 +1309,16 @@ mod tests {
     fn test_create_inference_client_invalid_format() {
         let result = create_inference_client("invalid-format", None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn opencode_is_a_chat_completions_provider_with_its_own_key() {
+        assert!(create_inference_client("opencode:deepseek-v4.1-flash@reasoning=medium", Some("k")).is_ok());
+        assert_eq!(resolve_provider_key("opencode:deepseek-v4.1-flash"), "opencode");
+        assert_eq!(
+            Provider::from_model_string("opencode:deepseek-v4.1-flash").unwrap(),
+            (Provider::OpenAI, "deepseek-v4.1-flash".to_string())
+        );
     }
 
     #[test]
