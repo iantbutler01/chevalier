@@ -60,6 +60,9 @@ pub struct RunOptions {
     pub max_tokens: Option<u32>,
     /// Override the runtime's model for this call.
     pub model: Option<String>,
+    /// A model to answer instead when `model` fails before it answers (an outage, an error status, no first
+    /// chunk in time). Both must be Chat Completions models.
+    pub fallback_model: Option<String>,
     /// Override the runtime's API key for this call.
     pub api_key: Option<String>,
     /// JSON Schema for structured output (the TS layer derives this from Zod).
@@ -97,6 +100,7 @@ impl RunOptions {
             max_tokens: self.max_tokens,
             reasoning_effort: None,
             model: self.model,
+            fallback_model: self.fallback_model,
             api_key: self.api_key,
             timeout: self.timeout_ms.map(|ms| Duration::from_millis(ms as u64)),
             retry_config: None,

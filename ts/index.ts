@@ -197,6 +197,8 @@ export interface RunArgs<T = unknown> {
   allowToolCalls?: boolean;
   maxTokens?: number;
   model?: string;
+  /** A model to answer instead when `model` fails before it answers; both must be Chat Completions models. */
+  fallbackModel?: string;
   apiKey?: string;
   /** Zod schema (gives a typed, validated `value`) or a raw JSON Schema. */
   output?: ZodType<T> | object;

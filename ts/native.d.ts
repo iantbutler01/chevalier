@@ -317,6 +317,11 @@ export interface RunOptions {
   maxTokens?: number
   /** Override the runtime's model for this call. */
   model?: string
+  /**
+   * A model to answer instead when `model` fails before it answers (an outage, an error status, no first
+   * chunk in time). Both must be Chat Completions models.
+   */
+  fallbackModel?: string
   /** Override the runtime's API key for this call. */
   apiKey?: string
   /** JSON Schema for structured output (the TS layer derives this from Zod). */
