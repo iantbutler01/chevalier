@@ -263,7 +263,11 @@ mod tests {
         let (primary_calls, fallback_calls) = (Arc::default(), Arc::default());
         let client = FailoverClient::new(
             primary_model,
-            Box::new(Fake { name: "primary", behaviour, calls: Arc::clone(&primary_calls) }),
+            Box::new(Fake {
+                name: "primary",
+                behaviour,
+                calls: Arc::clone(&primary_calls),
+            }),
             "openrouter:m",
             Box::new(Fake {
                 name: "fallback",
@@ -286,14 +290,20 @@ mod tests {
     }
 
     fn calls(primary: &AtomicUsize, fallback: &AtomicUsize) -> (usize, usize) {
-        (primary.load(Ordering::SeqCst), fallback.load(Ordering::SeqCst))
+        (
+            primary.load(Ordering::SeqCst),
+            fallback.load(Ordering::SeqCst),
+        )
     }
 
     #[tokio::test]
     async fn a_healthy_primary_answers_and_the_fallback_is_never_asked() {
         let (client, primary, fallback) = pair("opencode:healthy", Behaviour::Answer);
         assert_eq!(first_content(&client).await.unwrap(), "primary");
-        let response = client.get_generation(&[], &GenerationConfig::default()).await.unwrap();
+        let response = client
+            .get_generation(&[], &GenerationConfig::default())
+            .await
+            .unwrap();
         assert_eq!(response.content, "primary");
         assert_eq!(calls(&primary, &fallback), (2, 0));
     }
@@ -342,12 +352,19 @@ mod tests {
             "opencode:too-long",
             Behaviour::Fail(|| Error::ContextLengthExceeded("too long".into())),
         );
-        assert!(matches!(first_content(&client).await, Err(Error::ContextLengthExceeded(_))));
+        assert!(matches!(
+            first_content(&client).await,
+            Err(Error::ContextLengthExceeded(_))
+        ));
         let (bad, _, bad_fallback) = pair(
             "opencode:malformed",
             Behaviour::Fail(|| Error::NonRetryable("400 Bad Request: schema".into())),
         );
-        assert!(bad.get_generation(&[], &GenerationConfig::default()).await.is_err());
+        assert!(
+            bad.get_generation(&[], &GenerationConfig::default())
+                .await
+                .is_err()
+        );
         assert_eq!(calls(&fallback, &bad_fallback), (0, 0));
         assert!(primary_up("opencode:too-long") && primary_up("opencode:malformed"));
     }

@@ -1010,8 +1010,12 @@ pub async fn call_llm(
 ) -> Result<CallResult> {
     // Create client
     let provider_config = resolve_call_provider_config(model, provider_config).await?;
-    let client =
-        create_inference_client_with_config(model, api_key, provider_config.as_ref(), fallback_model)?;
+    let client = create_inference_client_with_config(
+        model,
+        api_key,
+        provider_config.as_ref(),
+        fallback_model,
+    )?;
     let parsed_model = parse_model_string(model)?;
     let provider_key = resolve_provider_key(model);
     if allow_tool_calls == Some(false)
@@ -1136,8 +1140,12 @@ pub async fn call_llm_stream(
 ) -> Result<Pin<Box<dyn Stream<Item = Result<ResponseStreamEvent>> + Send>>> {
     // Create client
     let provider_config = resolve_call_provider_config(model, provider_config).await?;
-    let client =
-        create_inference_client_with_config(model, api_key, provider_config.as_ref(), fallback_model)?;
+    let client = create_inference_client_with_config(
+        model,
+        api_key,
+        provider_config.as_ref(),
+        fallback_model,
+    )?;
     let parsed_model = parse_model_string(model)?;
     let provider_key = resolve_provider_key(model);
     if allow_tool_calls == Some(false)
@@ -1301,7 +1309,8 @@ mod tests {
             base_url: None,
             user_agent: Some("OpenBracket".to_string()),
         }));
-        let result = create_inference_client_with_config("kimi-coding:k3", None, Some(&config), None);
+        let result =
+            create_inference_client_with_config("kimi-coding:k3", None, Some(&config), None);
         assert!(result.is_ok());
     }
 
@@ -1321,8 +1330,14 @@ mod tests {
 
     #[test]
     fn opencode_is_a_chat_completions_provider_with_its_own_key() {
-        assert!(create_inference_client("opencode:deepseek-v4.1-flash@reasoning=medium", Some("k")).is_ok());
-        assert_eq!(resolve_provider_key("opencode:deepseek-v4.1-flash"), "opencode");
+        assert!(
+            create_inference_client("opencode:deepseek-v4.1-flash@reasoning=medium", Some("k"))
+                .is_ok()
+        );
+        assert_eq!(
+            resolve_provider_key("opencode:deepseek-v4.1-flash"),
+            "opencode"
+        );
         assert_eq!(
             Provider::from_model_string("opencode:deepseek-v4.1-flash").unwrap(),
             (Provider::OpenAI, "deepseek-v4.1-flash".to_string())
