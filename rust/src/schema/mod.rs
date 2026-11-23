@@ -475,7 +475,7 @@ pub(crate) fn apply_tool_strict_for_provider(
                 object.insert("strict".to_string(), Value::Bool(strict));
             }
         }
-        "openai" | "openrouter" | "custom-openai" => {
+        "openai" | "openrouter" | "custom-openai" | "opencode" => {
             if let Some(function) = tool
                 .get_mut("function")
                 .and_then(|value| value.as_object_mut())
@@ -502,6 +502,7 @@ pub fn get_schema_generator(provider: &str) -> Result<Box<dyn SchemaGenerator>> 
         "openai" => Ok(Box::new(OpenAISchemaGenerator)),
         "openrouter" => Ok(Box::new(OpenAISchemaGenerator)), // OpenRouter uses OpenAI format
         "custom-openai" => Ok(Box::new(OpenAISchemaGenerator)), // custom-openai uses OpenAI format
+        "opencode" => Ok(Box::new(OpenAISchemaGenerator)),   // OpenCode Zen speaks chat completions
         "openai-responses" => Ok(Box::new(OpenAIResponsesSchemaGenerator)),
         "openrouter-responses" => Ok(Box::new(OpenAIResponsesSchemaGenerator)),
         "openai-codex-responses" | "openai-chatgpt-plan" => {
@@ -662,6 +663,17 @@ mod tests {
     fn test_get_schema_generator_openrouter() {
         let result = get_schema_generator("openrouter");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn opencode_tools_are_chat_completions_functions_with_strict_kept() {
+        let generator = get_schema_generator("opencode").expect("opencode has a schema generator");
+        let mut tool =
+            generator.generate_schema("lookup", "Look it up", serde_json::json!({"type":"object"}));
+        apply_tool_strict_for_provider(&mut tool, "opencode", Some(true));
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["function"]["name"], "lookup");
+        assert_eq!(tool["function"]["strict"], true);
     }
 
     #[test]
