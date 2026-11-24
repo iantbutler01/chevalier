@@ -656,3 +656,103 @@ async fn a_large_file_rewritten_mid_fill_is_fetched_again_whole() {
         new.len() as u64
     );
 }
+
+/// A Nym root whose history dwarfs the rest: two conversations of `turns` turns, each turn a
+/// directory with a file in it plus a file beside it (Crow's shape: 7,600 turn directories),
+/// and a handful of notes.
+fn history_heavy_root(turns: usize) -> BTreeMap<String, Vec<u8>> {
+    let mut tree = BTreeMap::new();
+    for conversation in ["c0", "c1"] {
+        for turn in 0..turns {
+            tree.insert(
+                format!("conversations/{conversation}/{turn:04}_assistant/out.md"),
+                format!("{conversation} turn {turn}\n").into_bytes(),
+            );
+            tree.insert(
+                format!("conversations/{conversation}/{turn:04}_user.md"),
+                b"hi\n".to_vec(),
+            );
+        }
+    }
+    for note in 0..20 {
+        tree.insert(format!("notes/n{note}.md"), b"note\n".to_vec());
+    }
+    tree
+}
+
+/// The computer's root mount leaves conversation history alone entirely: no walk goes below
+/// `conversations/`, so a long history costs the mount no requests. A task binding's
+/// mountpoint under it, made when the binding mounts, survives the reconcile a restarted
+/// mount runs, and a change the feed reports under it asks the gateway nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_long_history_costs_the_root_mount_nothing() {
+    let files = history_heavy_root(2_000);
+    let gateway = Gateway::start(files).await;
+    gateway.set_latency(Duration::from_millis(25));
+    let state = tempfile::tempdir().expect("state dir");
+    let opened = open_view(state.path(), &gateway.endpoint, true);
+    let hydrator = MountHydrator::shared_skipping(
+        gateway.client(),
+        Arc::clone(&opened.view),
+        &["conversations"],
+    );
+
+    let (outcome, ready) = hydrate(&hydrator).await;
+    let requests = gateway.remote.requests.load(Ordering::SeqCst);
+    eprintln!(
+        "history-heavy root (4,000 turn directories) at 25 ms: ready in {ready:?}, {requests} \
+         requests, {} directories",
+        outcome.directories
+    );
+    // The root, `notes`, `conversations` itself and the closing root listing; nothing below.
+    assert!(requests <= 4, "{requests} requests");
+    assert!(backing(state.path(), "conversations").is_dir());
+    assert!(!backing(state.path(), "conversations/c0").exists());
+    assert_eq!(
+        read_through_view(&opened.view, "notes/n3.md")
+            .await
+            .unwrap(),
+        b"note\n"
+    );
+
+    let mountpoint = "conversations/c0/0003_assistant/mount";
+    assert!(hydrator.ensure_local_directory(mountpoint).unwrap());
+    hydrator.reconcile().await.expect("reconcile");
+    assert!(
+        backing(state.path(), mountpoint).is_dir(),
+        "a binding's mountpoint survives the reconcile"
+    );
+
+    let before = gateway.remote.requests.load(Ordering::SeqCst);
+    hydrator
+        .rehydrate_paths(
+            &["conversations/c0/0004_user.md".to_string()],
+            &["conversations/c1".to_string(), "conversations".to_string()],
+        )
+        .await
+        .expect("rehydrate under the skipped prefix");
+    assert_eq!(
+        gateway.remote.requests.load(Ordering::SeqCst) - before,
+        0,
+        "feed changes under conversations ask the gateway nothing"
+    );
+    assert!(!backing(state.path(), "conversations/c0/0004_user.md").exists());
+    assert!(backing(state.path(), mountpoint).is_dir());
+}
+
+/// The same root without the skip, for the comparison: every turn directory is listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_the_skip_every_turn_directory_is_walked() {
+    let files = history_heavy_root(500);
+    let gateway = Gateway::start(files).await;
+    gateway.set_latency(Duration::from_millis(25));
+    let state = tempfile::tempdir().expect("state dir");
+    let opened = open_view(state.path(), &gateway.endpoint, true);
+    let hydrator = MountHydrator::shared_skipping(gateway.client(), Arc::clone(&opened.view), &[]);
+    let (_, ready) = hydrate(&hydrator).await;
+    let requests = gateway.remote.requests.load(Ordering::SeqCst);
+    eprintln!(
+        "history-heavy root (1,000 turn directories) unskipped at 25 ms: {ready:?}, {requests} requests"
+    );
+    assert!(requests > 1_000, "{requests} requests");
+}

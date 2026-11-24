@@ -275,10 +275,13 @@ pub(crate) struct MountHydrator {
     /// through one `buffer_unordered` of this width, so the hydrate never has
     /// more than this many round trips outstanding.
     concurrency: usize,
-    /// Path prefixes (relative to the scope) whose files this mount never holds. Their
-    /// directories are still materialized so nested mounts keep their mountpoints.
+    /// Path prefixes (relative to the scope) this mount never holds anything under: the
+    /// prefix directory itself is materialized, but no walk descends into it and nothing
+    /// below it is listed, fetched or refreshed. A nested mount below one (a task binding
+    /// under `conversations/`) gets its mountpoint from `ensure_local_directory` when it
+    /// mounts, so the walk does not need to bring those directories down.
     /// Set from `CHEVALIER_VFS_SKIP_FILES_UNDER` (comma separated).
-    skip_files_under: Vec<String>,
+    skipped_under: Vec<String>,
     /// Whether a hydrate may leave placeholders (see `lazy.rs`). Off when
     /// `CHEVALIER_VFS_EAGER_HYDRATE=1`; a backing filesystem without user extended
     /// attributes turns it off per hydrate.
@@ -316,12 +319,35 @@ impl MountHydrator {
         Self::build(client, view, false)
     }
 
+    /// `shared` with `skipped_under` given rather than read from the environment.
+    #[cfg(test)]
+    pub(crate) fn shared_skipping(
+        client: RemoteVfsClient,
+        view: Arc<MountLocalView>,
+        skipped_under: &[&str],
+    ) -> Arc<Self> {
+        let skipped = skipped_under
+            .iter()
+            .map(|prefix| prefix.to_string())
+            .collect();
+        Self::build_with(client, view, true, skipped)
+    }
+
     fn build(client: RemoteVfsClient, view: Arc<MountLocalView>, lazy: bool) -> Arc<Self> {
+        Self::build_with(client, view, lazy, skip_files_under_from_env())
+    }
+
+    fn build_with(
+        client: RemoteVfsClient,
+        view: Arc<MountLocalView>,
+        lazy: bool,
+        skipped_under: Vec<String>,
+    ) -> Arc<Self> {
         let hydrator = Arc::new(Self {
             client,
             view,
             concurrency: HYDRATE_CONCURRENCY,
-            skip_files_under: skip_files_under_from_env(),
+            skipped_under,
             lazy,
             follows_feed: AtomicBool::new(false),
             synthetic: std::sync::RwLock::default(),
@@ -349,6 +375,11 @@ impl MountHydrator {
             .synthetic
             .write()
             .unwrap_or_else(|error| error.into_inner()) = paths;
+    }
+
+    /// Whether `path` is one of the skipped prefixes itself (see `skipped_under`).
+    fn is_skipped_prefix(&self, path: &str) -> bool {
+        self.skipped_under.iter().any(|prefix| prefix == path)
     }
 
     fn is_synthetic(&self, path: &str) -> bool {
@@ -696,6 +727,9 @@ impl MountHydrator {
             // The prefix's own entry is not in its own listing, so it is
             // refreshed as a point path first; only a directory is then walked.
             let kind = self.refresh_path(subtree, &mut state).await?;
+            if self.is_skipped_prefix(subtree) || under_any(subtree, &self.skipped_under) {
+                continue;
+            }
             if subtree.is_empty() || matches!(kind, Some(LocalKind::Directory)) {
                 self.walk_subtree(subtree, true, &mut state).await?;
                 walked.push(subtree.clone());
@@ -808,7 +842,10 @@ impl MountHydrator {
             let Some(kind) = LocalKind::from_wire_kind(entry.kind.as_str()) else {
                 bail!("vfs entry {path:?} has an unknown kind {:?}", entry.kind);
             };
-            if kind != LocalKind::Directory && under_any(&path, &self.skip_files_under) {
+            if under_any(&path, &self.skipped_under) {
+                // Kept in `names` so pruning leaves alone whatever is already here, such
+                // as a task binding's mountpoint.
+                names.insert(entry.name.clone());
                 continue;
             }
             names.insert(entry.name.clone());
@@ -821,7 +858,9 @@ impl MountHydrator {
                     tree.hydrate_directory(&path, mode)
                         .with_context(|| format!("hydrate the backing directory {path:?}"))?;
                     state.outcome.directories += 1;
-                    children.push(path);
+                    if !self.is_skipped_prefix(&path) {
+                        children.push(path);
+                    }
                 }
                 LocalKind::Symlink => {
                     let target = entry.link_target.as_deref().ok_or_else(|| {
@@ -880,14 +919,24 @@ impl MountHydrator {
         if self.is_synthetic(path) {
             return Ok(tree.lstat(path)?.map(|local| local.kind));
         }
-        if under_any(path, &self.skip_files_under) {
-            if let Some(local) = tree.lstat(path)? {
-                if local.kind != LocalKind::Directory {
-                    self.view.lazy().forget(path);
-                    remove_backing_entry(&backing_path(tree, path)?)?;
-                    return Ok(None);
-                }
+        if self.is_skipped_prefix(path) {
+            // The prefix directory is the mount's own, holding only mountpoints; the gateway
+            // is not asked about it, so a change to it can never take the mountpoints away.
+            self.ensure_local_directory(path)?;
+            return Ok(Some(LocalKind::Directory));
+        }
+        if under_any(path, &self.skipped_under) {
+            // Nothing below a skipped prefix is mirrored: a file left by an older hydrate
+            // goes, and a directory (a mountpoint) stays as it is, without asking the gateway.
+            let local = tree.lstat(path)?;
+            if let Some(local) = &local
+                && local.kind != LocalKind::Directory
+            {
+                self.view.lazy().forget(path);
+                remove_backing_entry(&backing_path(tree, path)?)?;
+                return Ok(None);
             }
+            return Ok(local.map(|local| local.kind));
         }
         let answer = self
             .client
