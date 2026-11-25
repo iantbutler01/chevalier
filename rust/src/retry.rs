@@ -93,7 +93,21 @@ impl RetryConfig {
 ///     }).await;
 /// }
 /// ```
-pub async fn retry_with_backoff<F, Fut, T>(config: RetryConfig, mut f: F) -> Result<T>
+pub async fn retry_with_backoff<F, Fut, T>(config: RetryConfig, f: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    retry_with_backoff_when(config, Error::is_retryable, f).await
+}
+
+/// [`retry_with_backoff`] for the errors `should_retry` accepts; any other error returns at
+/// once, as it is.
+pub async fn retry_with_backoff_when<F, Fut, T>(
+    config: RetryConfig,
+    should_retry: impl Fn(&Error) -> bool,
+    mut f: F,
+) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
@@ -113,8 +127,7 @@ where
         match f().await {
             Ok(result) => return Ok(result),
             Err(err) => {
-                // Check if error is retryable
-                if !err.is_retryable() {
+                if !should_retry(&err) {
                     return Err(err);
                 }
 

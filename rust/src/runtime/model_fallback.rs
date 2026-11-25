@@ -7,7 +7,7 @@
 //! A request with a fallback asks the primary first, once, and gives it `PRIMARY_START` to
 //! begin answering. When the primary fails before producing any output (a refused
 //! connection, an error status, no first chunk in time, a stream whose first event is an
-//! error) the same request goes to the fallback with the caller's own retry and timeout
+//! error, an answer with nothing in it) the same request goes to the fallback with the caller's own retry and timeout
 //! settings. Once output has begun the primary owns the answer: switching then would splice
 //! two models' answers into one. A failed primary is passed over for `COOLDOWN`, so an
 //! outage costs one failed attempt rather than one per call.

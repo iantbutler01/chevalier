@@ -25,6 +25,7 @@ use crate::types::{
 };
 use crate::utils::ConversationMessage;
 
+use super::empty_answer::{RequireAnswer, empty_answer};
 use super::{Accumulators, ToolFunction, ToolSchemaInfo};
 
 fn supports_system_message_blocks(provider: Provider) -> bool {
@@ -585,15 +586,21 @@ pub fn create_inference_client(
 }
 
 /// The client for `model_str`, answered by `fallback_model` when it fails before answering
-/// (see `model_fallback`). The caller's `api_key` and `provider_config` belong to the
-/// primary; the fallback resolves its own credentials.
+/// (see `model_fallback`). Each model's answer must say something: an empty one is retried
+/// and then counts as a failure before answering (see `empty_answer`). The caller's
+/// `api_key` and `provider_config` belong to the primary; the fallback resolves its own
+/// credentials.
 fn create_inference_client_with_config(
     model_str: &str,
     api_key: Option<&str>,
     provider_config: Option<&ProviderConfig>,
     fallback_model: Option<&str>,
 ) -> Result<Box<dyn InferenceClient>> {
-    let primary = create_single_inference_client(model_str, api_key, provider_config)?;
+    let primary = RequireAnswer::wrap(create_single_inference_client(
+        model_str,
+        api_key,
+        provider_config,
+    )?);
     let Some(fallback_model) = fallback_model else {
         return Ok(primary);
     };
@@ -602,7 +609,7 @@ fn create_inference_client_with_config(
             "fallback model '{fallback_model}' cannot back '{model_str}': both must be distinct Chat Completions models"
         )));
     }
-    let fallback = create_single_inference_client(fallback_model, None, None)?;
+    let fallback = RequireAnswer::wrap(create_single_inference_client(fallback_model, None, None)?);
     Ok(Box::new(super::model_fallback::FailoverClient::new(
         model_str,
         primary,
@@ -1095,14 +1102,8 @@ pub async fn call_llm(
         responses,
     };
 
-    // Make API call
+    // Make API call; the client has already refused an empty answer.
     let response = client.get_generation(&messages, &config).await?;
-
-    if response.response.output.is_empty() {
-        return Err(Error::Inference(
-            "Provider returned an empty assistant response".to_string(),
-        ));
-    }
 
     Ok(CallResult {
         response: response.response,
@@ -1249,13 +1250,13 @@ pub async fn call_llm_stream(
         })
         .flat_map(futures::stream::iter);
 
+    // The client retries an attempt that ends before its answer begins. One that began (a
+    // partial tool call) and completed nothing has shown its start already, so it fails here.
     let final_response = response.clone();
     let completed = futures::stream::once(async move {
         let response = final_response.read().await.clone();
         if response.output.is_empty() {
-            Err(Error::Inference(
-                "Provider returned an empty assistant response".to_string(),
-            ))
+            Err(empty_answer())
         } else {
             Ok(ResponseStreamEvent::Complete(response))
         }
