@@ -112,6 +112,18 @@ const ABSENT_PRECONDITION: &str = "absent";
 const RETRY_BACKOFF_MIN: Duration = Duration::from_millis(100);
 const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
+/// Consecutive failed passes after which the publisher stops retrying on a timer (about
+/// half a minute of backoff). The suffix stays durable in the WAL and is reported blocked;
+/// the next pass is a single attempt, run when something announces work: a new commit, a
+/// drain that waits on the suffix, or the slow re-arm below.
+const MAX_FAILED_PASSES: u32 = 12;
+
+/// How long a publisher that gave up waits, absent any event, before one more attempt. A
+/// gateway outage leaves nothing on the guest to announce its end, so a write made just
+/// before it would otherwise wait for the next write; one request per stalled mount every
+/// five minutes is the bound.
+const GAVE_UP_REARM: Duration = Duration::from_secs(5 * 60);
+
 /// Longest a drain waits between cursor re-reads when no progress notification
 /// arrives. Purely a liveness backstop; the progress notify is the fast path.
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -226,6 +238,12 @@ pub(crate) struct PublisherOptions {
     /// append is retained and retried until a later whole-file generation of
     /// the path supersedes it.
     pub(crate) generations: Option<GenerationSource>,
+    /// The failed-pass backoff, and how many consecutive failed passes it runs for before
+    /// the publisher gives up and waits for an event (`MAX_FAILED_PASSES`).
+    pub(crate) retry_backoff_min: Duration,
+    pub(crate) retry_backoff_max: Duration,
+    pub(crate) max_failed_passes: u32,
+    pub(crate) gave_up_rearm: Duration,
 }
 
 impl PublisherOptions {
@@ -241,6 +259,10 @@ impl PublisherOptions {
             tree_generation: None,
             authoritative_paths: None,
             generations: None,
+            retry_backoff_min: RETRY_BACKOFF_MIN,
+            retry_backoff_max: RETRY_BACKOFF_MAX,
+            max_failed_passes: MAX_FAILED_PASSES,
+            gave_up_rearm: GAVE_UP_REARM,
         }
     }
 
@@ -328,6 +350,9 @@ impl MountPublisher {
         deadline: Duration,
     ) -> Result<DrainOutcome> {
         let expiry = Instant::now() + deadline;
+        // A block that predates this drain is not its answer: the drain's wake makes the
+        // publisher that gave up try once more, and only that attempt's block is.
+        let blocks_before = self.shared.state().blocks;
         loop {
             // Register for the progress signal *before* reading the cursor, so a
             // publication that completes between the read and the wait cannot be
@@ -343,8 +368,9 @@ impl MountPublisher {
                     through_sequence: acknowledged,
                 });
             }
-            if let Some((blocked_sequence, reason)) = self.shared.blocked()
+            if let Some((blocked_sequence, reason, blocks)) = self.shared.blocked()
                 && blocked_sequence <= sequence
+                && blocks > blocks_before
             {
                 return Ok(DrainOutcome::Blocked {
                     blocked_sequence,
@@ -396,6 +422,9 @@ impl MountPublisher {
 struct PublisherState {
     blocked_sequence: Option<u64>,
     blocked_reason: Option<String>,
+    /// How many times the publisher has given up (`give_up`), so a drain can tell a block
+    /// its own wake produced from one it found.
+    blocks: u64,
     last_error: Option<String>,
     /// Sequences of append generations the gateway has already refused. An
     /// append is never re-sent once refused: a later pass that still has to
@@ -451,31 +480,42 @@ impl PublishFailure {
 }
 
 async fn coordinate(shared: Arc<PublisherShared>) {
-    let mut backoff = RETRY_BACKOFF_MIN;
+    let options = shared.options.clone();
+    let mut backoff = options.retry_backoff_min;
+    let mut failed_passes = 0u32;
     loop {
         if shared.stopping.load(Ordering::Acquire) {
             break;
         }
         match shared.publish_once().await {
             Ok(PublishProgress::Advanced) => {
-                backoff = RETRY_BACKOFF_MIN;
+                failed_passes = 0;
+                backoff = options.retry_backoff_min;
                 shared.coalesce_live_tail().await;
+                continue;
             }
             Ok(PublishProgress::Idle) => {
-                backoff = RETRY_BACKOFF_MIN;
+                failed_passes = 0;
+                backoff = options.retry_backoff_min;
                 shared.wait_for_work().await;
+                continue;
             }
-            Ok(PublishProgress::Stalled) => {
-                shared.sleep_or_stop(backoff).await;
-                backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
-            }
+            Ok(PublishProgress::Stalled) => {}
             Err(error) => {
                 shared.record_error(format!("{error:#}"));
                 tracing::warn!(error = %format!("{error:#}"), "vfs mount publication pass failed");
-                shared.sleep_or_stop(backoff).await;
-                backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
             }
         }
+        failed_passes = failed_passes.saturating_add(1);
+        if failed_passes >= options.max_failed_passes {
+            // Past the cap every pass is a single attempt, run only when something announces
+            // work, and a failed one blocks again at once.
+            shared.give_up(failed_passes);
+            shared.wait_for_event(options.gave_up_rearm).await;
+            continue;
+        }
+        shared.sleep_or_stop(backoff).await;
+        backoff = (backoff * 2).min(options.retry_backoff_max);
     }
 }
 
@@ -486,7 +526,8 @@ impl PublisherShared {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn blocked(&self) -> Option<(u64, String)> {
+    /// The blocked sequence, why, and how many times the publisher has given up so far.
+    fn blocked(&self) -> Option<(u64, String, u64)> {
         let state = self.state();
         let sequence = state.blocked_sequence?;
         Some((
@@ -495,6 +536,7 @@ impl PublisherShared {
                 .blocked_reason
                 .clone()
                 .unwrap_or_else(|| "publication blocked".to_string()),
+            state.blocks,
         ))
     }
 
@@ -507,10 +549,10 @@ impl PublisherShared {
         {
             let mut state = self.state();
             state.last_error = Some(failure.reason.clone());
-            // A replica rejection can stall the ordered suffix, but it cannot
-            // become an operator-cleared terminal state. The accepted local WAL
-            // remains authoritative and the coordinator keeps repairing or
-            // retrying it in place.
+            // A replica rejection can stall the ordered suffix, but it never
+            // becomes an operator-cleared terminal state: the accepted local WAL
+            // remains authoritative. The coordinator retries it in place on a
+            // bounded backoff, then on events only (`give_up`).
             state.blocked_sequence = None;
             state.blocked_reason = None;
         }
@@ -520,6 +562,40 @@ impl PublisherShared {
             "vfs mount publication retrying"
         );
         self.progress.notify_waiters();
+    }
+
+    /// Stop retrying the failed suffix on a timer: report it blocked (a drain waiting on it
+    /// returns `Blocked` rather than timing out) until a pass gets through.
+    fn give_up(&self, failed_passes: u32) {
+        let sequence = self.wal.acknowledged_sequence().saturating_add(1);
+        let reason = {
+            let mut state = self.state();
+            let reason = state
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "publication kept failing".to_string());
+            state.blocked_sequence = Some(sequence);
+            state.blocked_reason = Some(reason.clone());
+            state.blocks += 1;
+            reason
+        };
+        tracing::error!(
+            sequence,
+            failed_passes,
+            reason = %reason,
+            "vfs mount publication stopped retrying; the next write or drain tries again"
+        );
+        self.progress.notify_waiters();
+    }
+
+    /// Wait for a commit, a drain's wake or stop, or at most `rearm`. No coalescing window:
+    /// the publisher that gave up makes one attempt per event.
+    async fn wait_for_event(&self, rearm: Duration) {
+        tokio::select! {
+            _ = self.wake.notified() => {}
+            _ = self.stop.notified() => {}
+            _ = sleep(rearm) => {}
+        }
     }
 
     fn clear_failure(&self) {
@@ -2017,6 +2093,158 @@ mod tests {
             hash_algorithm: "blake3".to_string(),
             content_hash: format!("hash-{sequence}"),
         }
+    }
+
+    /// A gateway that refuses every request while `failing`, and otherwise accepts the
+    /// namespace batches a directory creation publishes. Counts every request it sees.
+    #[derive(Default)]
+    struct FlakyGateway {
+        failing: AtomicBool,
+        requests: std::sync::atomic::AtomicUsize,
+        revision: std::sync::atomic::AtomicU64,
+    }
+
+    async fn serve_flaky(
+        axum::extract::State(gateway): axum::extract::State<Arc<FlakyGateway>>,
+        uri: axum::http::Uri,
+    ) -> axum::response::Response {
+        use std::sync::atomic::Ordering;
+        gateway.requests.fetch_add(1, Ordering::SeqCst);
+        if gateway.failing.load(Ordering::SeqCst) {
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        let revision = gateway.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut response = match uri.path() {
+            "/lease" => {
+                let mut response = Json(serde_json::json!({
+                    "resource_key": "implicit:test",
+                    "owner_token": uuid::Uuid::nil(),
+                    "task_id": null
+                }))
+                .into_response();
+                response.headers_mut().insert(
+                    CHEVALIER_VFS_LEASE_MODE_HEADER,
+                    axum::http::HeaderValue::from_static(CHEVALIER_VFS_LEASE_MODE_IMPLICIT),
+                );
+                response
+            }
+            "/namespace-many" => Json(serde_json::json!({ "entries": [] })).into_response(),
+            other => panic!("flaky gateway does not serve {other}"),
+        };
+        response.headers_mut().insert(
+            CHEVALIER_VFS_NAMESPACE_REVISION_HEADER,
+            axum::http::HeaderValue::from_str(&revision.to_string()).unwrap(),
+        );
+        response
+    }
+
+    fn commit_directory(wal: &MountWal, path: &str) {
+        let prepared = wal
+            .prepare(
+                MountMutation::CreateDirectory {
+                    path: path.into(),
+                    mode: 0o755,
+                },
+                PayloadSource::None,
+                MountPreImage::empty(),
+            )
+            .expect("prepare mkdir");
+        wal.commit(prepared, None).expect("commit mkdir");
+    }
+
+    /// A gateway that keeps refusing a mount's writes gets a bounded burst of retries, then
+    /// nothing until the guest writes again or something drains; the suffix stays durable,
+    /// is reported blocked, and publishes once the gateway takes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_publication_the_gateway_keeps_refusing_stops_retrying_until_an_event() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let gateway = Arc::new(FlakyGateway::default());
+        gateway.failing.store(true, Ordering::SeqCst);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let router = axum::Router::new()
+            .route("/{*path}", axum::routing::any(serve_flaky))
+            .with_state(Arc::clone(&gateway));
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let wal = MountWal::open(&MountStateLayout::new(temp.path()), None).expect("open WAL");
+        let mut options = PublisherOptions::defaults("test");
+        options.retry_backoff_min = Duration::from_millis(5);
+        options.retry_backoff_max = Duration::from_millis(20);
+        options.max_failed_passes = 4;
+        options.gave_up_rearm = Duration::from_secs(3600);
+        let publisher = super::MountPublisher::spawn(
+            RemoteVfsClient::new(&endpoint, "token", "scope").expect("client"),
+            wal.clone(),
+            tokio::runtime::Handle::current(),
+            options,
+        );
+
+        commit_directory(&wal, "a");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while publisher.health().blocked_sequence.is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the publisher never gave up"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let gave_up_at = gateway.requests.load(Ordering::SeqCst);
+        assert!(gave_up_at >= 4, "{gave_up_at} requests before giving up");
+        // Idle: no timer retries the refused suffix.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(gateway.requests.load(Ordering::SeqCst), gave_up_at);
+        assert_eq!(publisher.health().acknowledged_sequence, 0);
+
+        // A new write is an event: one more attempt, refused, blocked again at once.
+        commit_directory(&wal, "b");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while gateway.requests.load(Ordering::SeqCst) == gave_up_at {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a new write did not retry"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(gateway.requests.load(Ordering::SeqCst), gave_up_at + 1);
+        assert!(publisher.health().blocked_sequence.is_some());
+
+        // A drain while the gateway still refuses is answered by the attempt its wake starts.
+        let outcome = publisher
+            .drain(Duration::from_secs(10))
+            .await
+            .expect("drain");
+        assert!(
+            matches!(
+                outcome,
+                super::DrainOutcome::Blocked {
+                    blocked_sequence: 1,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+
+        // The gateway recovers; a drain announces the waiting suffix and it publishes.
+        gateway.failing.store(false, Ordering::SeqCst);
+        let outcome = publisher
+            .drain(Duration::from_secs(10))
+            .await
+            .expect("drain");
+        assert!(
+            matches!(
+                outcome,
+                super::DrainOutcome::Drained {
+                    through_sequence: 2
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(publisher.health().blocked_sequence.is_none());
     }
 
     #[test]

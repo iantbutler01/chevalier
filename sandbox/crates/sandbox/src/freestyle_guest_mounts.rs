@@ -107,7 +107,7 @@ if [ -f "$cur" ]; then
   if [ -n "$wanted" ] && [ "$wanted" = "$running" ]; then mv "$next" "$cur"; chmod 600 "$cur"; replay; echo mounts=updated; exit 0; fi
 fi
 pids=""
-for marker in "$state"/*; do case "$marker" in *.log) continue;; esac; [ -f "$marker" ] && pids="$pids $(cat "$marker")"; done
+for marker in "$state"/*; do case "$marker" in *.log|*.launches) continue;; esac; [ -f "$marker" ] && pids="$pids $(cat "$marker")"; done
 points=$(awk '$3 ~ /^fuse/ && $3 != "fusectl" {{print $2}}' /proc/mounts)
 scan=$(cat <<'SCAN'
 for proc in /proc/[0-9]*; do
@@ -277,6 +277,17 @@ const MOUNT_READY_WAIT_SECS: u64 = 280;
 const MOUNT_DAEMON_LAUNCHES: u32 = 3;
 const MOUNT_RELAUNCH_PAUSE_SECS: u32 = 1;
 
+/// How many daemons in a row one mount may launch in a boot without one of them mounting.
+/// Every run of the script (boot, and every attach's replay) launches a missing daemon, so
+/// without this a daemon that keeps exiting before it mounts (a walk that keeps failing) is
+/// launched, and walks the scope from the start, again at every attach, unseen. Past it the
+/// script fails, which the attach reports. Counted in `/run`, so a boot starts over, and
+/// cleared once the mount is up.
+const MOUNT_LAUNCHES_PER_BOOT: u32 = 6;
+
+/// Prefix of the line a launch after the first prints on stderr, which an attach logs.
+pub(super) const MOUNT_RELAUNCH_REPORT: &str = "launching its daemon again";
+
 /// A shared mount's launch command after `{placeholder}` rendering.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct RenderedMount {
@@ -353,7 +364,7 @@ impl RenderedMount {
         format!(
             r#"pid=$(cat {marker} 2>/dev/null || echo 0); launches=1
 for _ in $(seq 1 {polls}); do
-  mount_state {table_path} && break
+  mount_state {table_path} && {{ rm -f {marker}.launches; break; }}
   if ! kill -0 "$pid" 2>/dev/null; then
     echo "mount={tag}: daemon exited before mounting (launch $launches): $(sed 's/\x1b\[[0-9;]*m//g' {log} 2>/dev/null | tail -n 5 | tr '\n' ' ')" >&2
     [ "$launches" -lt {launches} ] || break
@@ -412,12 +423,23 @@ if [ ! -e {marker} ]; then
   [ "$made" = 0 ] || echo "mount: the mountpoint was slow to create; its daemon creates it" >&2
   {exports}
   export CHEVALIER_VFS_READ_ONLY={read_only}
+  n=$(cat {marker}.launches 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0;; esac
+  if [ "$n" -ge {per_boot} ]; then
+    echo "mount={tag}: not launched again: {per_boot} daemons in a row exited before mounting this boot" >&2
+    return 1
+  fi
+  n=$((n + 1)); echo "$n" > {marker}.launches
+  [ "$n" = 1 ] || echo "mount={tag}: {relaunch} (launch $n this boot): $(sed 's/\x1b\[[0-9;]*m//g' {log} 2>/dev/null | tail -n 3 | tr '\n' ' ')" >&2
   nohup {argv} >{log} 2>&1 </dev/null 9>&- &
   echo $! > {marker}
 fi
 "#,
             table_path = shell_quote(&mount_table_path(&self.mountpoint)),
             mounted_log = shell_quote(&format!("fuser::session: Mounting {}", self.mountpoint)),
+            tag = sanitize_tag(&self.mount_tag),
+            per_boot = MOUNT_LAUNCHES_PER_BOOT,
+            relaunch = MOUNT_RELAUNCH_REPORT,
         )
     }
 
