@@ -416,6 +416,7 @@ impl RemoteVfsClient {
                 ])
                 .timeout(METADATA_READ_ATTEMPT_TIMEOUT),
             METADATA_READ_RETRY_TIMEOUT,
+            AttemptTimeout::Growing,
             |status, body| {
                 if status == StatusCode::NOT_FOUND {
                     return Ok(None);
@@ -463,6 +464,7 @@ impl RemoteVfsClient {
                 })
                 .timeout(METADATA_READ_ATTEMPT_TIMEOUT),
             METADATA_READ_RETRY_TIMEOUT,
+            AttemptTimeout::Fixed,
             |status, body| {
                 if status == StatusCode::NOT_FOUND {
                     return Err(anyhow::Error::new(VfsRequestStatusError { status })
@@ -515,6 +517,7 @@ impl RemoteVfsClient {
                 })
                 .timeout(FILE_READ_ATTEMPT_TIMEOUT),
             FILE_READ_RETRY_TIMEOUT,
+            AttemptTimeout::Fixed,
             |status, body| {
                 if status == StatusCode::NOT_FOUND {
                     return Err(anyhow::Error::new(VfsRequestStatusError { status })
@@ -550,6 +553,7 @@ impl RemoteVfsClient {
                 .query(&query)
                 .timeout(METADATA_READ_ATTEMPT_TIMEOUT),
             METADATA_READ_RETRY_TIMEOUT,
+            AttemptTimeout::Fixed,
             |status, body| {
                 if status == StatusCode::NOT_FOUND {
                     return Ok(None);
@@ -569,6 +573,7 @@ impl RemoteVfsClient {
                 .query(&[("path", self.path_arg(path))])
                 .timeout(FILE_READ_ATTEMPT_TIMEOUT),
             FILE_READ_RETRY_TIMEOUT,
+            AttemptTimeout::Fixed,
             |status, body| {
                 if status == StatusCode::NOT_FOUND {
                     return Ok(None);
@@ -601,15 +606,20 @@ impl RemoteVfsClient {
         if let Some(fingerprint) = fingerprint {
             request = request.header(RANGE_FINGERPRINT_HEADER, fingerprint);
         }
-        self.read_decoded(request, FILE_READ_RETRY_TIMEOUT, |status, body| {
-            if status == StatusCode::NOT_FOUND {
-                return Ok(RangeRead::NotFound);
-            }
-            if status == StatusCode::PRECONDITION_FAILED {
-                return Ok(RangeRead::Stale);
-            }
-            Ok(RangeRead::Bytes(body.to_vec()))
-        })
+        self.read_decoded(
+            request,
+            FILE_READ_RETRY_TIMEOUT,
+            AttemptTimeout::Fixed,
+            |status, body| {
+                if status == StatusCode::NOT_FOUND {
+                    return Ok(RangeRead::NotFound);
+                }
+                if status == StatusCode::PRECONDITION_FAILED {
+                    return Ok(RangeRead::Stale);
+                }
+                Ok(RangeRead::Bytes(body.to_vec()))
+            },
+        )
         .await
     }
 
@@ -1295,6 +1305,7 @@ impl RemoteVfsClient {
         &self,
         builder: reqwest::RequestBuilder,
         retry_timeout: Duration,
+        attempts: AttemptTimeout,
         mut decode: impl FnMut(StatusCode, &[u8]) -> Result<T>,
     ) -> Result<Versioned<T>> {
         let request_url = builder
@@ -1304,10 +1315,23 @@ impl RemoteVfsClient {
             .unwrap_or_else(|| "<unavailable>".to_string());
         let deadline = Instant::now() + retry_timeout;
         let mut retry_delay = READ_RETRY_DELAY_MIN;
+        let mut attempt_timeout = builder
+            .try_clone()
+            .and_then(|request| request.build().ok())
+            .and_then(|request| request.timeout().copied());
+        let mut timed_out = false;
         loop {
-            let request = builder
+            let mut request = builder
                 .try_clone()
                 .ok_or_else(|| anyhow!("cannot clone vfs read request for retry"))?;
+            if timed_out
+                && attempts == AttemptTimeout::Growing
+                && let Some(timeout) = attempt_timeout.as_mut()
+            {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                *timeout = (*timeout * 2).min(remaining.max(*timeout));
+                request = request.timeout(*timeout);
+            }
             let outcome = async {
                 let response = self
                     .send_authorized(request)
@@ -1363,7 +1387,8 @@ impl RemoteVfsClient {
                     });
                 }
                 Err(failure) if failure.transient && Instant::now() < deadline => {
-                    tracing::debug!(error = %failure.error, "retrying transient vfs read failure");
+                    timed_out = failure.timed_out();
+                    tracing::debug!(error = %failure.error, timed_out, "retrying transient vfs read failure");
                     tokio::time::sleep(retry_delay).await;
                     retry_delay = retry_delay.saturating_mul(2).min(READ_RETRY_DELAY_MAX);
                 }
@@ -1483,6 +1508,19 @@ pub fn request_status(error: &anyhow::Error) -> Option<StatusCode> {
         .map(|status_error| status_error.status)
 }
 
+/// How a read's attempts are bounded after one times out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttemptTimeout {
+    /// Every attempt gets the request's own timeout.
+    Fixed,
+    /// An attempt that timed out is retried with twice the time, within the budget. For a
+    /// directory listing, whose cost grows with the directory: one that takes longer than an
+    /// attempt allows (a very large directory, a loaded gateway) then completes, where
+    /// retrying it at the same bound would time out every attempt and fail the walk that
+    /// needed it, which the mount then starts again from the top.
+    Growing,
+}
+
 struct ReadFailure {
     transient: bool,
     error: anyhow::Error,
@@ -1501,6 +1539,15 @@ impl ReadFailure {
             transient: false,
             error,
         }
+    }
+
+    /// The attempt ran out of time (sending, or reading the body).
+    fn timed_out(&self) -> bool {
+        self.error.chain().any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout)
+        })
     }
 }
 
@@ -1589,6 +1636,43 @@ mod tests {
     fn read_retry_budgets_exceed_their_attempt_timeouts() {
         assert!(METADATA_READ_RETRY_TIMEOUT > METADATA_READ_ATTEMPT_TIMEOUT);
         assert!(FILE_READ_RETRY_TIMEOUT > FILE_READ_ATTEMPT_TIMEOUT);
+    }
+
+    /// A listing that takes longer than one metadata attempt allows is retried with more
+    /// time and completes, rather than timing out every attempt and failing the walk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_listing_slower_than_one_attempt_still_completes() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = Arc::clone(&attempts);
+        let slow = METADATA_READ_ATTEMPT_TIMEOUT + Duration::from_secs(1);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/tree",
+                    axum::routing::get(move || {
+                        let served = Arc::clone(&served);
+                        async move {
+                            served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            tokio::time::sleep(slow).await;
+                            axum::Json(serde_json::json!([]))
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let client = RemoteVfsClient::new(&endpoint, "token", "scope").unwrap();
+        let listed = client.list_dir_versioned("dir").await.expect("listed");
+        assert_eq!(listed.value.map(|entries| entries.len()), Some(0));
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one timed-out attempt, then one with twice the time"
+        );
     }
 
     #[test]

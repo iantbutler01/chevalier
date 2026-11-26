@@ -1301,6 +1301,7 @@ impl FreestyleControl {
             )
             .await?;
         let stdout = result.stdout.unwrap_or_default();
+        report_mount_relaunches(vm_id, result.stderr.as_deref());
         let outcome = match (result.status_code, MountRefresh::from_report(&stdout)) {
             (Some(0), Some(outcome)) => outcome,
             _ => {
@@ -1711,6 +1712,23 @@ fn detached_command(shell: &str, command: &str) -> String {
         shell_quote(shell),
         shell_quote(command)
     )
+}
+
+/// Log each mount daemon the guest's script launched again because the last one exited
+/// before mounting: a fresh walk of that scope, which nothing else reports.
+fn report_mount_relaunches(vm_id: &str, stderr: Option<&str>) {
+    for line in stderr
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(guest_mounts::MOUNT_RELAUNCH_REPORT))
+    {
+        tracing::warn!(
+            computer_event = "mount_daemon_relaunched",
+            vm_id,
+            report = line.trim(),
+            "the guest launched a mount daemon again; its scope is walked from the start"
+        );
+    }
 }
 
 /// The guest's mount unit, as `PROBE_COMMAND` reads it.
@@ -2985,7 +3003,7 @@ mod tests {
         // The wait sits after the launch block, so a run that finds the mount already
         // launched by another run still waits for it before starting the next.
         let launch_block_end = script.rfind("\nfi\n").unwrap();
-        let waited = script.find("mount_state '/mnt/nymfs' && break").unwrap();
+        let waited = script.find("mount_state '/mnt/nymfs' && { rm -f").unwrap();
         assert!(script.find("nohup").unwrap() < launch_block_end && launch_block_end < waited);
         assert!(script.contains("pid=$(cat '/run/chevalier/mounts/nymfs-root'"));
     }

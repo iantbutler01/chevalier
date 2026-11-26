@@ -362,6 +362,49 @@ fn a_daemon_that_never_mounts_fails_after_its_launches() {
     assert!(stderr.contains("mount=test: not ready"), "{stderr}");
 }
 
+/// Every run of the script (boot, then each attach's replay) launches a daemon that is gone,
+/// so a daemon that keeps exiting before it mounts walked its scope again at every attach,
+/// unreported. Each launch after the first is reported, and past `MOUNT_LAUNCHES_PER_BOOT`
+/// in a row the script stops launching and fails.
+#[test]
+fn a_daemon_that_keeps_exiting_is_launched_a_bounded_number_of_times_per_boot() {
+    let guest = Guest::new();
+    flaky_mount_script(&guest, u32::MAX);
+    let output = guest.run(
+        "set +e
+for run in 1 2 3; do timeout --foreground -k 1 20 sh mounts.sh; echo \"status=$?\"; done
+set -e
+[ \"$(cat launches)\" = 6 ]",
+    );
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.matches("status=1").count(), 3, "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for launch in 2..=6 {
+        assert!(
+            stderr.contains(&format!(
+                "{MOUNT_RELAUNCH_REPORT} (launch {launch} this boot)"
+            )),
+            "launch {launch} is reported: {stderr}"
+        );
+    }
+    assert!(stderr.contains("not launched again"), "{stderr}");
+}
+
+/// A mount that comes up clears its count, so a daemon that exits much later is launched
+/// again as on a fresh boot.
+#[test]
+fn a_mount_that_comes_up_starts_its_launch_count_over() {
+    let guest = Guest::new();
+    flaky_mount_script(&guest, 2);
+    let output = guest.run(
+        "timeout --foreground -k 1 20 sh mounts.sh
+[ \"$(cat launches)\" = 2 ]
+[ ! -e run/mounts/test.launches ]",
+    );
+    assert_success(&output);
+}
+
 /// A new guest stalled after a slow create took longer than the mountpoint's two-second
 /// `mkdir` bound, and `set -e` ended the script before its daemon was launched. The daemon
 /// creates its own mountpoint, so a slow `mkdir` no longer stops the mount.
