@@ -950,6 +950,8 @@ impl FreestyleControl {
         let (input_tx, mut input_rx) = mpsc::channel(64);
         let (event_tx, event_rx) = mpsc::channel(128);
         let session_id = Arc::new(std::sync::OnceLock::<String>::new());
+        let input_attempted = Arc::new(AtomicBool::new(false));
+        let writing_input = Arc::clone(&input_attempted);
         let (client, api_key, sessions_url, ended_session) = (
             self.client.clone(),
             self.cfg.api_key.clone(),
@@ -971,6 +973,11 @@ impl FreestyleControl {
                         Message::Binary(Bytes::from_static(&[0x04]))
                     }
                 };
+                if matches!(&frame, Message::Binary(data) if !data.is_empty()) {
+                    // Once a send starts, a connection failure cannot tell us whether
+                    // the guest received the bytes.
+                    writing_input.store(true, Ordering::Release);
+                }
                 if write.send(frame).await.is_err() {
                     break;
                 }
@@ -1029,7 +1036,9 @@ impl FreestyleControl {
                                 let _ = session_id.set(id);
                             }
                         }
-                        Some(PtyControl::LossyReplay) => {
+                        Some(PtyControl::LossyReplay)
+                            if input_attempted.load(Ordering::Acquire) =>
+                        {
                             let _ = event_tx
                                 .send(Err(SandboxError::DaemonUnavailable(
                                     "Freestyle pty: the terminal's host restarted and input \
@@ -1039,6 +1048,9 @@ impl FreestyleControl {
                                 .await;
                             break;
                         }
+                        // Inexact replay describes scrollback. Before we have sent any
+                        // input, there is no program input to lose.
+                        Some(PtyControl::LossyReplay) => {}
                         None => {}
                     },
                     Ok(Message::Close(_)) => {
@@ -2177,9 +2189,8 @@ enum PtyControl {
     Error(String),
     /// The session's id, for ending it: closing the socket only detaches from it.
     SessionInfo(Option<String>),
-    /// The terminal's host restarted and replayed scrollback behind a terminal reset. When
-    /// the replay is not exact, input written around the restart is gone (measured: a 15 KB
-    /// burst of input triggers this, and the program never sees that input or any after it).
+    /// The gateway is replaying scrollback without exact boundaries. If we have sent input,
+    /// it may have been lost around the restart (measured with a 15 KB input burst).
     LossyReplay,
 }
 
@@ -2476,6 +2487,50 @@ mod tests {
             ws.next().await.unwrap().unwrap(),
             Message::Binary(Bytes::from_static(b"terminal-ready"))
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pty_can_start_after_inexact_replay_but_fails_if_input_may_have_been_lost() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let replay = Message::Text(r#"{"type":"replayStart","exact":false}"#.into());
+            ws.send(replay.clone()).await.unwrap();
+            ws.send(Message::Binary(Bytes::from_static(b"ready")))
+                .await
+                .unwrap();
+            assert_eq!(
+                ws.next().await.unwrap().unwrap(),
+                Message::Binary(Bytes::from_static(b"program\n"))
+            );
+            ws.send(replay).await.unwrap();
+        });
+        let control = FreestyleControl::new(FreestyleBackendConfig {
+            api_url: format!("http://{address}"),
+            api_key: "test-key".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut shell = control
+            .shell("test", ShellOptions::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            shell.events.next().await,
+            Some(Ok(ShellEvent::Output(data))) if data == b"ready"
+        ));
+        shell
+            .input
+            .send(ShellInput::Data(b"program\n".to_vec()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            shell.events.next().await,
+            Some(Err(SandboxError::DaemonUnavailable(_)))
+        ));
         server.await.unwrap();
     }
 
