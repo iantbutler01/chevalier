@@ -2218,7 +2218,8 @@ fn pty_control_event(text: &str) -> Option<PtyControl> {
                 _ => None,
             },
         ))),
-        "replayStart" if value.get("exact").and_then(serde_json::Value::as_bool) != Some(true) => {
+        // Freestyle omits exact for normal replay and sends false for the fallback.
+        "replayStart" if value.get("exact").and_then(serde_json::Value::as_bool) == Some(false) => {
             Some(PtyControl::LossyReplay)
         }
         _ => None,
@@ -2506,6 +2507,15 @@ mod tests {
                 ws.next().await.unwrap().unwrap(),
                 Message::Binary(Bytes::from_static(b"program\n"))
             );
+            ws.send(Message::Text(r#"{"type":"replayStart"}"#.into()))
+                .await
+                .unwrap();
+            ws.send(Message::Text(r#"{"type":"replayEnd"}"#.into()))
+                .await
+                .unwrap();
+            ws.send(Message::Binary(Bytes::from_static(b"output")))
+                .await
+                .unwrap();
             ws.send(replay).await.unwrap();
         });
         let control = FreestyleControl::new(FreestyleBackendConfig {
@@ -2527,6 +2537,10 @@ mod tests {
             .send(ShellInput::Data(b"program\n".to_vec()))
             .await
             .unwrap();
+        assert!(matches!(
+            shell.events.next().await,
+            Some(Ok(ShellEvent::Output(data))) if data == b"output"
+        ));
         assert!(matches!(
             shell.events.next().await,
             Some(Err(SandboxError::DaemonUnavailable(_)))
@@ -3182,6 +3196,7 @@ mod tests {
             Some(PtyControl::LossyReplay)
         ));
         assert!(pty_control_event(r#"{"type":"replayStart","exact":true}"#).is_none());
+        assert!(pty_control_event(r#"{"type":"replayStart"}"#).is_none());
         assert!(pty_control_event(r#"{"type":"keepalive","intervalMs":20000}"#).is_none());
         assert!(pty_control_event("not json").is_none());
     }
